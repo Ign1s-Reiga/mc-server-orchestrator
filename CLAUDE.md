@@ -6,7 +6,7 @@ This is not a Kubernetes operator. There is no k8s, no CRDs registered against a
 
 ## Stack
 
-- Kotlin 2.x / JVM 21, Gradle Kotlin DSL (multi-module)
+- Kotlin 2.x / JVM 25, Gradle Kotlin DSL (multi-module)
 - containerd via the CRI gRPC API (`RuntimeService` / `ImageService`), stubs generated from `.proto` with the protobuf Gradle plugin + grpc-kotlin. We do not write Go.
 - State in an embedded store (SQLite via JDBC), behind an interface so it can be swapped later
 - API server for the dashboard backend (the SPA lives in a separate repo and is out of scope here)
