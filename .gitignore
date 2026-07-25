@@ -31,5 +31,7 @@ out/
 secrets/
 *forwarding.secret
 
-# Local dev containerd state
+# Scratch space for local dev. The dev containerd instance keeps its state
+# outside the repo (/run/mcorch-dev, /var/lib/mcorch-dev) so root-owned files
+# never land in the working tree — see scripts/dev/containerd-env.sh.
 .dev/
