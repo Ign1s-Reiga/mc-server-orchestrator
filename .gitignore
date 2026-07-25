@@ -1,0 +1,32 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Generated CRI stubs are build output, never committed as source.
+# (They land under :cri/build/generated/, already covered by build/ above.)
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.kotlin/
+out/
+
+# OS
+.DS_Store
+
+# Claude Code — local, machine-specific state
+.claude/settings.local.json
+.claude/agent-memory-local/
+
+# Secrets. The Velocity forwarding secret only ever travels through the
+# secret store — never a definition YAML, a log line, or a fixture.
+*.env
+.env
+secrets/
+*forwarding.secret
+
+# Local dev containerd state
+.dev/

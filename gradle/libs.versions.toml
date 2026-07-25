@@ -1,0 +1,83 @@
+# Version catalog. Every version here was verified to resolve on Maven Central
+# on 2026-07-26 — see the notes on skew below before bumping anything.
+
+[versions]
+kotlin = "2.4.10"
+coroutines = "1.11.0"
+
+# protoc and the protobuf runtimes must move together — there is no documented
+# cross-version tolerance between them.
+protobuf = "4.35.1"
+protobufPlugin = "0.10.0"
+
+# grpc-kotlin lags grpc-java badly: grpc-kotlin-stub 1.5.0 declares grpc-stub
+# 1.62.2 as an ordinary compile dependency. That is a FLOOR, not a ceiling —
+# Gradle resolves to the highest requested version, so declaring grpc 1.82.1
+# below wins and the Kotlin stub layer rides on top of it. If a future
+# grpc-java bump breaks the generated Kotlin, pin `grpc` down to grpcKotlin's
+# declared version rather than pinning grpcKotlin up.
+grpc = "1.82.1"
+grpcKotlin = "1.5.0"
+
+# MUST match the netty that grpc-netty pulls transitively — check with
+# `./gradlew :cri:dependencies --configuration runtimeClasspath | grep io.netty`
+# after any grpc bump. A mismatch between the epoll native library and netty
+# core fails at runtime, not at build time.
+netty = "4.1.133.Final"
+
+sqliteJdbc = "3.53.2.0"
+spotless = "8.8.0"
+junit = "5.14.4"
+kotest = "6.1.5"
+
+# Provenance for the CRI proto pipeline. Not Gradle dependencies — these pin
+# which .proto gets vendored in phase 2. See the generate-cri-stubs skill.
+# containerd 2.3.3 depends on k8s.io/cri-api v0.36.0; the canonical proto is
+# kubernetes/cri-api @ v0.36.0 : pkg/apis/runtime/v1/api.proto
+containerd = "2.3.3"
+criApi = "0.36.0"
+
+[libraries]
+# --- build-logic classpath (consumed by buildSrc) ---
+kotlin-gradlePlugin = { module = "org.jetbrains.kotlin:kotlin-gradle-plugin", version.ref = "kotlin" }
+spotless-gradlePlugin = { module = "com.diffplug.spotless:spotless-plugin-gradle", version.ref = "spotless" }
+
+# --- runtime ---
+kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
+
+protobuf-java = { module = "com.google.protobuf:protobuf-java", version.ref = "protobuf" }
+protobuf-kotlin = { module = "com.google.protobuf:protobuf-kotlin", version.ref = "protobuf" }
+
+grpc-stub = { module = "io.grpc:grpc-stub", version.ref = "grpc" }
+grpc-protobuf = { module = "io.grpc:grpc-protobuf", version.ref = "grpc" }
+# Non-shaded netty + the native epoll transport: the CRI endpoint is a Unix
+# domain socket, which needs epoll on Linux. grpc-netty-shaded relocates its
+# netty packages, so the stock native transport cannot bind to it.
+grpc-netty = { module = "io.grpc:grpc-netty", version.ref = "grpc" }
+# The native transport itself. Without this, grpc-netty has the UDS *API*
+# (netty-transport-native-unix-common) but no implementation to run it on, and
+# a DomainSocketAddress channel fails at runtime. Classifier is per-arch; add
+# linux-aarch_64 alongside if this ever has to run on arm64.
+netty-transportNativeEpoll = { module = "io.netty:netty-transport-native-epoll", version.ref = "netty" }
+grpc-kotlin-stub = { module = "io.grpc:grpc-kotlin-stub", version.ref = "grpcKotlin" }
+
+sqlite-jdbc = { module = "org.xerial:sqlite-jdbc", version.ref = "sqliteJdbc" }
+
+# --- proto codegen (wired in phase 2 by the generate-cri-stubs skill) ---
+protobuf-protoc = { module = "com.google.protobuf:protoc", version.ref = "protobuf" }
+grpc-protocGenJava = { module = "io.grpc:protoc-gen-grpc-java", version.ref = "grpc" }
+# NOTE: this one is a plain JAR, so it needs the `jdk8` classifier and an
+# explicit @jar type when referenced from the protobuf plugin's `plugins` block.
+grpc-protocGenKotlin = { module = "io.grpc:protoc-gen-grpc-kotlin", version.ref = "grpcKotlin" }
+
+# --- test ---
+junit-bom = { module = "org.junit:junit-bom", version.ref = "junit" }
+junit-jupiter = { module = "org.junit.jupiter:junit-jupiter" }
+junit-platformLauncher = { module = "org.junit.platform:junit-platform-launcher" }
+kotest-assertions-core = { module = "io.kotest:kotest-assertions-core", version.ref = "kotest" }
+kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "coroutines" }
+
+[plugins]
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+protobuf = { id = "com.google.protobuf", version.ref = "protobufPlugin" }
+spotless = { id = "com.diffplug.spotless", version.ref = "spotless" }
