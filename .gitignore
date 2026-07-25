@@ -20,6 +20,9 @@ out/
 # Claude Code — local, machine-specific state
 .claude/settings.local.json
 .claude/agent-memory-local/
+# Isolated worktrees used by the write-capable subagents. These are real git
+# worktrees checked out under the repo; they are never part of a commit.
+.claude/worktrees/
 
 # Secrets. The Velocity forwarding secret only ever travels through the
 # secret store — never a definition YAML, a log line, or a fixture.

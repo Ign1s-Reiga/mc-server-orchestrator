@@ -30,9 +30,11 @@ spotless = "8.8.0"
 junit = "5.14.4"
 kotest = "6.1.5"
 
-# Provenance for the CRI proto pipeline. Not Gradle dependencies — these pin
-# which .proto gets vendored in phase 2. See the generate-cri-stubs skill.
-# containerd 2.3.3 depends on k8s.io/cri-api v0.36.0; the canonical proto is
+# Provenance for the vendored CRI proto. Not Gradle dependencies — these record
+# which .proto is checked in at cri/src/main/proto/, and must be bumped together
+# with it. Full details in cri/PROTO_SOURCE.md; procedure in the
+# generate-cri-stubs skill.
+# containerd 2.3.3 depends on k8s.io/cri-api v0.36.0, so the vendored proto is
 # kubernetes/cri-api @ v0.36.0 : pkg/apis/runtime/v1/api.proto
 containerd = "2.3.3"
 criApi = "0.36.0"
@@ -63,7 +65,9 @@ grpc-kotlin-stub = { module = "io.grpc:grpc-kotlin-stub", version.ref = "grpcKot
 
 sqlite-jdbc = { module = "org.xerial:sqlite-jdbc", version.ref = "sqliteJdbc" }
 
-# --- proto codegen (wired in phase 2 by the generate-cri-stubs skill) ---
+# --- proto codegen (consumed by :cri's protobuf block; see the skill) ---
+# protoc and protoc-gen-grpc-java resolve as native executables via the
+# os-detector classifier the protobuf plugin supplies by default.
 protobuf-protoc = { module = "com.google.protobuf:protoc", version.ref = "protobuf" }
 grpc-protocGenJava = { module = "io.grpc:protoc-gen-grpc-java", version.ref = "grpc" }
 # NOTE: this one is a plain JAR, so it needs the `jdk8` classifier and an
