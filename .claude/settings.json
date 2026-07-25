@@ -1,0 +1,54 @@
+{
+  "env": {
+    "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "2",
+    "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "30",
+    "CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION": "500"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(./gradlew:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(ctr:*)",
+      "Bash(nerdctl:*)",
+      "Bash(crictl:*)",
+      "Bash(scripts/dev/containerd-up.sh)",
+      "Bash(scripts/dev/containerd-down.sh)"
+    ],
+    "ask": [
+      "Bash(git push:*)"
+    ],
+    "deny": [
+      "Read(./**/*.env)",
+      "Read(./secrets/**)",
+      "Read(./**/forwarding.secret)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/claude/guard-runtime.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/claude/format-changed.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
