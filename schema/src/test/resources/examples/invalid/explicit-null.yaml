@@ -1,0 +1,15 @@
+# `storage:` with nothing under it is not the same as omitting it. Reading it
+# as "the default" would let an operator think they wrote something.
+# Expected: spec.storage — must not be null
+apiVersion: mcorch.dev/v1alpha1
+kind: PaperServer
+metadata:
+  name: survival-01
+spec:
+  eulaAccepted: true
+  image: docker.io/itzg/minecraft-server:2026.6.1
+  paper:
+    minecraftVersion: "1.21.8"
+  resources:
+    memory: 4Gi
+  storage:

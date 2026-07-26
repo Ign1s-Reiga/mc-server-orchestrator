@@ -25,6 +25,15 @@ grpcKotlin = "1.5.0"
 # core fails at runtime, not at build time.
 netty = "4.1.133.Final"
 
+# YAML 1.2 parser for :schema. Chosen over kaml/Jackson because the schema
+# reports *all* validation problems in one pass with field paths and line
+# numbers, which needs the composed node tree (marks included), not a
+# fail-fast object binder. Verified on Maven Central 2026-07-26: 3.0.1 is the
+# current release, it still ships the `org.snakeyaml.engine.v2` package of the
+# 2.x line (the major bump did not rename it), and it declares no runtime
+# dependencies of its own.
+snakeyamlEngine = "3.0.1"
+
 sqliteJdbc = "3.53.2.0"
 spotless = "8.8.0"
 junit = "5.14.4"
@@ -62,6 +71,8 @@ grpc-netty = { module = "io.grpc:grpc-netty", version.ref = "grpc" }
 # linux-aarch_64 alongside if this ever has to run on arm64.
 netty-transportNativeEpoll = { module = "io.netty:netty-transport-native-epoll", version.ref = "netty" }
 grpc-kotlin-stub = { module = "io.grpc:grpc-kotlin-stub", version.ref = "grpcKotlin" }
+
+snakeyaml-engine = { module = "org.snakeyaml:snakeyaml-engine", version.ref = "snakeyamlEngine" }
 
 sqlite-jdbc = { module = "org.xerial:sqlite-jdbc", version.ref = "sqliteJdbc" }
 

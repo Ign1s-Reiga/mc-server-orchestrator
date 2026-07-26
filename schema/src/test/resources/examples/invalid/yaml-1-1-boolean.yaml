@@ -1,0 +1,14 @@
+# `yes` is a string in YAML 1.2, not a boolean. Accepting it quietly is how a
+# flag ends up meaning the opposite of what was written.
+# Expected: spec.eulaAccepted — expected a boolean `true` or `false`
+apiVersion: mcorch.dev/v1alpha1
+kind: PaperServer
+metadata:
+  name: survival-01
+spec:
+  eulaAccepted: yes
+  image: docker.io/itzg/minecraft-server:2026.6.1
+  paper:
+    minecraftVersion: "1.21.8"
+  resources:
+    memory: 4Gi
