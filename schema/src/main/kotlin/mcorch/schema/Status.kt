@@ -1,0 +1,266 @@
+package mcorch.schema
+
+import java.time.Instant
+
+/**
+ * Observed state. Written by the reconcile loop, served by the API, never
+ * parsed from an operator's YAML — there is no reader for these types on
+ * purpose.
+ *
+ * Two rules shape everything below.
+ *
+ * 1. It has to be *comparable*. Every type here is a data class of value types,
+ *    so a pass can decide "nothing changed, do nothing" by comparing the status
+ *    it would write against the one already stored, instead of re-issuing side
+ *    effects. That is how the loop stays idempotent.
+ * 2. It must never carry player identity. Occupancy is a count. Endpoints are
+ *    the server's own address, never a client's. Nothing here has a name, a
+ *    UUID or an IP of a player in it, so the default `toString` of any of these
+ *    types is safe to log.
+ */
+public sealed interface ServerStatus {
+    public val name: ResourceName
+    public val apiVersion: SchemaVersion
+    public val kind: ServerKind
+
+    /** The definition generation this observation reflects. The store assigns generations. */
+    public val observedGeneration: Long
+    public val phase: ServerPhase
+
+    /** When the loop last looked. A status that stops advancing is an alert, not a steady state. */
+    public val observedAt: Instant
+}
+
+/** Coarse lifecycle position, for the dashboard and for deciding what to do next. */
+public enum class ServerPhase {
+    /** Accepted, not acted on yet. */
+    PENDING,
+
+    IMAGE_PULLING,
+    CREATING,
+
+    /** Container started, not joinable yet. */
+    STARTING,
+
+    /** Running; see `ready` for whether players can actually join. */
+    RUNNING,
+
+    /** A drain is in progress; see `drain` for where it is. */
+    DRAINING,
+
+    STOPPING,
+    STOPPED,
+
+    /** Permanently failed; see `failure`. Requires human attention. */
+    FAILED,
+
+    /** The node or runtime could not be reached this pass. Not a reason to act. */
+    UNKNOWN,
+}
+
+/** The drain state machine, mirrored onto observed state so a restart of the loop can resume. */
+public enum class DrainState {
+    DRAIN_REQUESTED,
+    SEALED,
+    TARGET_RESOLVED,
+    TRANSFERRING,
+    SAVING,
+    DEREGISTERED,
+    STOPPING,
+
+    /** Aborted. There is no edge from here to a stop: a failed drain leaves the server running. */
+    DRAIN_FAILED,
+}
+
+/** Whether the loop should try again or stop and surface the problem. */
+public enum class FailureClass {
+    RETRYABLE,
+    PERMANENT,
+}
+
+/** Closed set of failure causes, so the API and the dashboard can key off them. */
+public enum class FailureReason {
+    IMAGE_PULL_FAILED,
+    IMAGE_REFERENCE_REJECTED,
+    SANDBOX_CREATE_FAILED,
+    CONTAINER_CREATE_FAILED,
+    CONTAINER_START_FAILED,
+    CONTAINER_EXITED,
+    READINESS_TIMEOUT,
+    VOLUME_UNAVAILABLE,
+    NODE_UNAVAILABLE,
+    RUNTIME_UNREACHABLE,
+    DRAIN_NO_DESTINATION,
+    DRAIN_TRANSFER_FAILED,
+    DRAIN_SAVE_TIMEOUT,
+    DRAIN_STALLED,
+    UNKNOWN,
+}
+
+/**
+ * A classified failure. [message] is operator-facing detail — it must not
+ * contain player names, UUIDs or addresses.
+ */
+public data class FailureStatus(
+    val reason: FailureReason,
+    val failureClass: FailureClass,
+    val message: String,
+    val occurredAt: Instant,
+    val attempts: Int = 1,
+)
+
+/**
+ * What the loop knows about the image. [resolvedDigest] is what makes a repeat
+ * pass skip the pull instead of re-pulling.
+ */
+public data class ImageStatus(
+    val requested: ImageRef,
+    val resolvedDigest: String? = null,
+    val pulledAt: Instant? = null,
+) {
+    public val available: Boolean get() = resolvedDigest != null
+}
+
+/**
+ * The runtime objects backing this server, and the node they are on.
+ *
+ * Recorded so that a pass can find what it already created instead of creating
+ * it again. [containerId] is null between sandbox creation and container
+ * creation — an honest gap, not a placeholder.
+ */
+public data class RuntimeIdentity(
+    val node: NodeName,
+    val sandboxId: String,
+    val containerId: String? = null,
+    val createdAt: Instant? = null,
+    val startedAt: Instant? = null,
+    val finishedAt: Instant? = null,
+    val exitCode: Int? = null,
+    val restartCount: Int = 0,
+)
+
+/** Where the proxy (or an operator) reaches this server. Never a client address. */
+public data class ServerEndpoint(
+    val node: NodeName,
+    val address: String,
+    val port: Int,
+)
+
+/** Occupancy, as counts. Identities are not observed and must not be added here. */
+public data class PlayerOccupancy(
+    val online: Int,
+    val max: Int,
+    val observedAt: Instant,
+) {
+    init {
+        require(online >= 0) { "online must not be negative" }
+        require(max >= 0) { "max must not be negative" }
+    }
+
+    public val empty: Boolean get() = online == 0
+}
+
+/**
+ * Observed storage. [lastSaveConfirmedAt] is the evidence for "the world save
+ * completed" — it is set when a save *completion* was confirmed, never when a
+ * save was merely requested.
+ */
+public data class StorageStatus(
+    val persistent: Boolean,
+    val volumeName: ResourceName? = null,
+    val bound: Boolean = false,
+    val lastSaveConfirmedAt: Instant? = null,
+)
+
+/**
+ * A drain in flight, or the one that failed.
+ *
+ * The `*RequestedAt` fields exist for idempotency: the loop may re-enter a
+ * state any number of times, and re-sending a save request costs the server
+ * real work. If the timestamp is set, the request went out; wait for the
+ * confirmation instead of asking again.
+ */
+public data class DrainStatus(
+    val state: DrainState,
+    val startedAt: Instant,
+    val enteredStateAt: Instant,
+    val playersEvacuated: Boolean = false,
+    val worldSaved: Boolean = false,
+    val sealRequestedAt: Instant? = null,
+    val saveRequestedAt: Instant? = null,
+    val deregisteredAt: Instant? = null,
+    val transferAttempts: Int = 0,
+    /** Where players were sent. A server name, never a player. */
+    val destination: ResourceName? = null,
+    val failure: FailureStatus? = null,
+)
+
+public enum class ConditionType {
+    IMAGE_AVAILABLE,
+    VOLUME_BOUND,
+    CONTAINER_RUNNING,
+
+    /** Actually joinable, not merely running. */
+    READY,
+    DRAINING,
+    PLAYERS_EVACUATED,
+    WORLD_SAVED,
+}
+
+public enum class ConditionStatus {
+    TRUE,
+    FALSE,
+    UNKNOWN,
+}
+
+/**
+ * An extensible observation with its own transition time, so timeouts can be
+ * measured from when a thing became true rather than from when the pass ran.
+ */
+public data class StatusCondition(
+    val type: ConditionType,
+    val status: ConditionStatus,
+    val message: String = "",
+    val lastTransitionAt: Instant,
+)
+
+/** Observed state of a [PaperServerDefinition]. */
+public data class PaperServerStatus(
+    override val name: ResourceName,
+    override val observedGeneration: Long,
+    override val phase: ServerPhase,
+    override val observedAt: Instant,
+    val lastTransitionAt: Instant,
+    /** Joinable. `phase == RUNNING` is necessary but not sufficient. */
+    val ready: Boolean = false,
+    val image: ImageStatus? = null,
+    val runtime: RuntimeIdentity? = null,
+    val endpoint: ServerEndpoint? = null,
+    val players: PlayerOccupancy? = null,
+    val storage: StorageStatus? = null,
+    val drain: DrainStatus? = null,
+    val failure: FailureStatus? = null,
+    val conditions: List<StatusCondition> = emptyList(),
+    override val apiVersion: SchemaVersion = SchemaVersion.CURRENT,
+) : ServerStatus {
+    override val kind: ServerKind get() = ServerKind.PAPER_SERVER
+
+    /** True while a drain is in flight or has failed — the loop must not "heal" the server back to running. */
+    public val draining: Boolean get() = drain != null && drain.state != DrainState.DRAIN_FAILED
+
+    public companion object {
+        /** The status to record the moment a definition is accepted and nothing has been observed yet. */
+        public fun pending(
+            name: ResourceName,
+            observedGeneration: Long,
+            at: Instant,
+        ): PaperServerStatus =
+            PaperServerStatus(
+                name = name,
+                observedGeneration = observedGeneration,
+                phase = ServerPhase.PENDING,
+                observedAt = at,
+                lastTransitionAt = at,
+            )
+    }
+}

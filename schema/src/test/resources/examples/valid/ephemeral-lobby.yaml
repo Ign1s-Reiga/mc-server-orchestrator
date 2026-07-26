@@ -1,0 +1,24 @@
+# A disposable lobby. Ephemeral storage has to be asked for by name — omitting
+# `storage` gives a persistent volume, never this.
+apiVersion: mcorch.dev/v1alpha1
+kind: PaperServer
+metadata:
+  name: lobby-01
+  labels:
+    role: lobby
+spec:
+  eulaAccepted: true
+  image: docker.io/itzg/minecraft-server:2026.6.1
+  paper:
+    minecraftVersion: "1.21.8"
+  maxPlayers: 200
+  resources:
+    memory: 2Gi
+  storage:
+    mode: ephemeral
+    mountPath: /data
+  lifecycle:
+    drain:
+      # Still drains. Disposable storage does not mean disposable players.
+      saveTimeout: 30s
+    stopGracePeriod: 90s

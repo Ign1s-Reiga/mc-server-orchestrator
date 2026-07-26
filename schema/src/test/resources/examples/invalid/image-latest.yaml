@@ -1,0 +1,13 @@
+# A moving tag makes an image change invisible to reconcile.
+# Expected: spec.image — must not use the `latest` tag
+apiVersion: mcorch.dev/v1alpha1
+kind: PaperServer
+metadata:
+  name: survival-01
+spec:
+  eulaAccepted: true
+  image: docker.io/itzg/minecraft-server:latest
+  paper:
+    minecraftVersion: "1.21.8"
+  resources:
+    memory: 4Gi

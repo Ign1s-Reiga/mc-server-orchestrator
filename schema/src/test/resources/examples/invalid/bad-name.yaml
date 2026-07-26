@@ -1,0 +1,13 @@
+# The name becomes a container name and a volume name.
+# Expected: metadata.name — must be lowercase / must match the RFC 1123 pattern
+apiVersion: mcorch.dev/v1alpha1
+kind: PaperServer
+metadata:
+  name: Survival_01
+spec:
+  eulaAccepted: true
+  image: docker.io/itzg/minecraft-server:2026.6.1
+  paper:
+    minecraftVersion: "1.21.8"
+  resources:
+    memory: 4Gi

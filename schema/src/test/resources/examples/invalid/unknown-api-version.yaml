@@ -1,0 +1,12 @@
+# Expected: apiVersion — must be one of `mcorch.dev/v1alpha1`
+apiVersion: mcorch.dev/v9
+kind: PaperServer
+metadata:
+  name: survival-01
+spec:
+  eulaAccepted: true
+  image: docker.io/itzg/minecraft-server:2026.6.1
+  paper:
+    minecraftVersion: "1.21.8"
+  resources:
+    memory: 4Gi
