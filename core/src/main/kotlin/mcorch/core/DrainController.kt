@@ -169,7 +169,13 @@ internal class DrainController(
         if (observation.state == WorkloadState.SANDBOX_ONLY) {
             return abort(
                 server = definition.metadata.name,
-                drain = drain.forgetSaveEvidence(),
+                // The *confirmation* goes, because nothing was observed this
+                // pass and the world may have moved on. The record of a
+                // delivered save request stays: it is the only thing keeping a
+                // second `save-all flush` off a live server, and a runtime that
+                // has stopped reporting a container is not a reason to lift a
+                // wedge that exists to make a human confirm the world state.
+                drain = drain.forgetSaveConfirmation(),
                 occupancy = null,
                 now = now,
                 reason = FailureReason.DRAIN_STALLED,
@@ -731,6 +737,14 @@ internal class DrainController(
                 outcome = ReconcileOutcome.Retry("the container is still running after a stop was issued"),
             )
         }
+        // Unreachable as things stand: `advance` sends every non-`RUNNING`
+        // observation somewhere else before `step` runs — `EXITED`, `CREATED`
+        // and a `SANDBOX_ONLY` sandbox with no history are already down,
+        // `UNKNOWN` waits, and a `SANDBOX_ONLY` sandbox that had a container
+        // aborts. Kept as the honest answer for a container observed stopped
+        // here, and worth leaving alone: reporting `containerDown` for anything
+        // this branch has not established is how a teardown starts on an
+        // `UNKNOWN` container.
         return DrainProgress(
             drain = drain,
             occupancy = occupancy,
@@ -1019,28 +1033,44 @@ private fun DrainStatus.saveEvidenceProblem(containerStartedAt: Instant?): Strin
 
 /**
  * Voids everything this drain had established about getting the server empty and
- * on disk.
+ * on disk, **including the record of a save request that was delivered**.
  *
- * Called when a player is observed on a server being drained, and only there.
- * The confirmation described the world as it was; from the next tick it does
- * not, and the drain has to ask for a fresh save — which means `saveRequestedAt`
- * has to go too, or the re-entered save would refuse to send one.
- * `playersEvacuated` goes with them: it is the claim that this server was
- * confirmed empty, and somebody just joined it.
+ * Called only from a pass that has just *observed* somebody on the server: the
+ * three `requireEmpty` branches and the players-online branch of `awaitStopped`.
+ * That observation is what justifies the last part. Clearing `saveRequestedAt`
+ * lifts the wedge that stops a delivered-but-unconfirmed save from ever being
+ * re-sent — deliberately, because a player has been on the server since, which
+ * makes the old request worth nothing, and because the fresh save that follows
+ * is the only thing that can let the drain finish. A pass *can* reach here
+ * holding such a record, since an outstanding delete lifts the permanent-failure
+ * gate.
  *
- * Note what this does *not* undo on its own: an unconfirmed save that was
- * genuinely delivered is never re-sent by any path that does not come through
- * here. A pass *can* reach this function holding one — a delete that is
- * outstanding lifts the permanent-failure gate — and clearing it then is
- * deliberate rather than incidental: it only happens because a player was just
- * observed, which is exactly what makes the old request worth nothing, and the
- * fresh save that follows is what lets the drain finish at all.
+ * **A pass that observed nothing must not use this.** It has no player to point
+ * at, so it has no grounds to lift the wedge, and doing so silently sends a
+ * second `save-all flush` to a live server. Use [forgetSaveConfirmation].
  */
 internal fun DrainStatus.forgetSaveEvidence(): DrainStatus =
     if (!worldSaved && saveRequestedAt == null && !playersEvacuated) {
         this
     } else {
         copy(worldSaved = false, saveRequestedAt = null, playersEvacuated = false)
+    }
+
+/**
+ * Voids what this drain had established, and keeps the record of what it sent.
+ *
+ * For a pass that cannot vouch for the world any more but has observed nothing
+ * that would make a delivered save request worthless — the runtime no longer
+ * reporting a container, say. The confirmation and the claim of emptiness go;
+ * `saveRequestedAt` stays, so a save that went out once still never goes out
+ * twice (CLAUDE.md invariant 5), and the drain still needs a human if it had
+ * one outstanding.
+ */
+internal fun DrainStatus.forgetSaveConfirmation(): DrainStatus =
+    if (!worldSaved && !playersEvacuated) {
+        this
+    } else {
+        copy(worldSaved = false, playersEvacuated = false)
     }
 
 /** Moves to a new state, stamping the transition. Re-entering the same state does not restamp. */

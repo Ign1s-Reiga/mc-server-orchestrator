@@ -759,7 +759,26 @@ public class Reconciler(
         cause: DrainCause,
     ): ReconcileOutcome {
         if (observation is WorkloadObservation.Present) {
-            node.removeWorkload(observation.handle)
+            val removal = node.removeWorkload(observation.handle)
+            if (!removal.complete) {
+                // The container is gone and the sandbox is not. Recording the
+                // first half is not bookkeeping — it is what lets the next pass
+                // tell "this loop removed the container" from "the runtime has
+                // stopped reporting a container that may still be serving
+                // players". Without it the drain refuses to touch the sandbox
+                // again and the delete never completes.
+                LOG.warn(
+                    "workload for server={} on node={} is partly removed: {}",
+                    pass.name,
+                    node.name,
+                    removal.detail,
+                )
+                val partial =
+                    status.copy(
+                        runtime = status.runtime?.copy(containerId = null),
+                    )
+                return write(pass, partial) { ReconcileOutcome.Retry(removal.detail) }
+            }
             LOG.info(
                 "removed workload for server={} node={}; persistent storage is untouched",
                 pass.name,

@@ -43,7 +43,12 @@ internal class FakeNode(
     val creates: MutableList<WorkloadSpec> = mutableListOf()
     val starts: MutableList<WorkloadHandle> = mutableListOf()
     val stops: MutableList<Pair<WorkloadHandle, Duration>> = mutableListOf()
+
+    /** Workloads taken away in full: container *and* sandbox. */
     val removals: MutableList<WorkloadHandle> = mutableListOf()
+
+    /** Containers removed, whether or not the sandbox went with them. */
+    val containerRemovals: MutableList<WorkloadHandle> = mutableListOf()
     val execs: MutableList<List<String>> = mutableListOf()
 
     /** Every call that reached the node, failed ones included. Counts attempts. */
@@ -63,6 +68,14 @@ internal class FakeNode(
     var online: Int = 0
     var joinable: Boolean = true
     var savesCleanly: Boolean = true
+
+    /**
+     * Makes the sandbox half of a removal fail after the container half
+     * succeeded — a CNI teardown flake, in practice. The interesting part is
+     * what the node reports afterwards, since the caller has to record progress
+     * it can no longer see.
+     */
+    var sandboxRemovalFails: Boolean = false
 
     /**
      * What a stop does to the workload. The default is what a healthy runtime
@@ -197,16 +210,36 @@ internal class FakeNode(
         workload = onStop(present)
     }
 
-    override suspend fun removeWorkload(handle: WorkloadHandle) {
+    override suspend fun removeWorkload(handle: WorkloadHandle): WorkloadRemoval {
         check(NodeOperation.REMOVE)
         val present = workload as? WorkloadObservation.Present
         if (present?.state == WorkloadState.RUNNING) {
             throw NodeException.Rejected(name, NodeOperation.REMOVE, "the container is still running")
         }
+        if (present?.handle?.containerId != null) containerRemovals += handle
+        if (sandboxRemovalFails) {
+            // The realistic partial failure: the container went, and tearing the
+            // sandbox down did not. What the runtime reports afterwards is a
+            // sandbox with nothing in it — indistinguishable, from the outside,
+            // from one whose container it has simply stopped mentioning.
+            present?.let {
+                workload =
+                    it.copy(
+                        state = WorkloadState.SANDBOX_ONLY,
+                        handle = it.handle.copy(containerId = null),
+                    )
+            }
+            return WorkloadRemoval(
+                containerRemoved = true,
+                sandboxRemoved = false,
+                detail = "the sandbox teardown failed",
+            )
+        }
         removals += handle
         workload = WorkloadObservation.Absent
         // `volumes` is deliberately not touched: the world outlives the
         // container.
+        return WorkloadRemoval.COMPLETE
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────

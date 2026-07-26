@@ -316,6 +316,89 @@ internal class DrainTest {
         }
 
     @Test
+    fun `a teardown that removed the container and not the sandbox finishes on a later pass`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.store.deleteDefinition(name)
+            // The container goes; tearing the sandbox down flakes. What the node
+            // reports next is a sandbox with nothing in it — which is exactly
+            // what a runtime hiding a live container looks like, and the drain
+            // refuses to act on that. It has to be told the difference, or the
+            // delete never completes and nobody can remove this server without
+            // `crictl`.
+            harness.node.sandboxRemovalFails = true
+
+            harness.settle(name, limit = 16)
+
+            harness.node.containerRemovals shouldHaveSize 1
+            harness.node.removals shouldHaveSize 0
+            harness.store.getServer(name).shouldNotBeNull()
+
+            // The flake passes.
+            harness.node.sandboxRemovalFails = false
+            harness.settle(name, limit = 12)
+
+            harness.node.removals shouldHaveSize 1
+            harness.store.getServer(name) shouldBe null
+            harness.node.volumes shouldHaveSize 1
+        }
+
+    @Test
+    fun `a runtime that hides a container does not lift the wedge on a delivered save`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            // A save that reached the server and never confirmed. It is never
+            // re-sent: only a human can say what is on disk.
+            harness.node.savesCleanly = false
+            harness.store.deleteDefinition(name)
+            repeat(6) { harness.pass(name) }
+            harness.node.saves shouldHaveSize 1
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .saveRequestedAt
+                .shouldNotBeNull()
+
+            // Now the runtime stops reporting the container. That pass observes
+            // nothing at all — no probe is even possible — so it has no grounds
+            // to decide the outstanding request no longer matters.
+            val running = harness.node.workload.shouldBeInstanceOf<WorkloadObservation.Present>()
+            harness.node.workload =
+                running.copy(
+                    state = WorkloadState.SANDBOX_ONLY,
+                    handle = running.handle.copy(containerId = null),
+                )
+            repeat(4) { harness.pass(name) }
+
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .saveRequestedAt
+                .shouldNotBeNull()
+
+            // And when the container comes back into view, the drain is still
+            // wedged where a human left it: no second save on a live server.
+            harness.node.savesCleanly = true
+            harness.node.workload = running
+            repeat(6) { harness.pass(name) }
+
+            harness.node.saves shouldHaveSize 1
+            harness.node.stops shouldHaveSize 0
+        }
+
+    @Test
     fun `a sandbox that has never had a container is still torn down`() =
         coreTest {
             val harness = Harness()
