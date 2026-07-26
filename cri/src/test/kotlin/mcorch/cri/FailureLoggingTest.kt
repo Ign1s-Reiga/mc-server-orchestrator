@@ -55,7 +55,7 @@ class FailureLoggingTest {
                 // how it was classified — only the runtime's prose is held back.
                 logged shouldContain "op=CREATE_CONTAINER"
                 logged shouldContain "code=INVALID_ARGUMENT"
-                logged shouldContain "not logged"
+                logged shouldContain CriException.WITHHELD_DESCRIPTION
             }
         }
 
@@ -113,6 +113,110 @@ class FailureLoggingTest {
                 }
 
                 CapturedLogs.text() shouldContain "timeout 10s exceeded"
+            }
+        }
+
+    /**
+     * The persisted copy, which is what `:core` puts on observed status and the
+     * API then serves.
+     *
+     * `LocalNode.describe()` is plain delegation to [CriException.safeMessage],
+     * so there is no decision left in `:core` to get backwards — which matters,
+     * because `:core` cannot name a `mcorch.cri` type in its own tests and could
+     * not have caught an inverted one.
+     */
+    @Test
+    fun `the persisted message withholds the same descriptions the log does`() =
+        runCriTest {
+            val runtime = FakeCriServer.RuntimeBehaviour(failWith = errorQuotingTheRequest())
+            FakeCriServer(runtime = runtime).use { fake ->
+                val thrown =
+                    shouldThrow<CriException> {
+                        fake.client.createContainer(SandboxId("s"), sampleSandboxSpec(), sampleContainerSpec())
+                    }
+
+                thrown.safeMessage shouldNotContain SECRET
+                thrown.safeMessage shouldNotContain "RCON_PASSWORD"
+                thrown.safeDescription shouldBe CriException.WITHHELD_DESCRIPTION
+                // Still says which call failed and how it was classified.
+                thrown.safeMessage shouldContain "CREATE_CONTAINER failed"
+                thrown.safeMessage shouldContain "INVALID_ARGUMENT"
+                // And the unredacted form is still available inside this module,
+                // which is what makes `message` unsafe to persist and `description`
+                // unsafe to repeat.
+                thrown.message shouldContain SECRET
+            }
+        }
+
+    /**
+     * `:core` pins this one with `shouldBe` on the whole rendered string, so a
+     * byte-for-byte pass-through is a contract and not an accident. It is also
+     * the message that identified the cause of a misdiagnosed integration stall.
+     */
+    @Test
+    fun `an exec failure is passed through byte for byte`() =
+        runCriTest {
+            val description = "failed to exec in container: timeout 10s exceeded: context deadline exceeded"
+            val runtime =
+                FakeCriServer.RuntimeBehaviour(failWith = Status.DEADLINE_EXCEEDED.withDescription(description))
+            FakeCriServer(runtime = runtime).use { fake ->
+                val thrown =
+                    shouldThrow<CriException> {
+                        fake.client.execSync(ContainerId("c"), listOf("mc-monitor", "status"), 10.seconds)
+                    }
+
+                thrown.safeMessage shouldBe thrown.message
+                thrown.safeDescription shouldBe thrown.description
+                thrown.safeMessage shouldContain description
+            }
+        }
+
+    /**
+     * The persist side does **not** truncate, and that is not an oversight.
+     *
+     * Go renders a rejected request from the front, so a prefix of a failed
+     * `CreateContainer` error is a prefix of the container's environment. A cap
+     * is a defence against log volume, not against disclosure, and applying it
+     * as though it were the second would be worse than not having it.
+     */
+    @Test
+    fun `the persisted message is not truncated where the log is`() =
+        runCriTest {
+            val flood = "x".repeat(20_000)
+            val runtime =
+                FakeCriServer.RuntimeBehaviour(
+                    failWith = Status.INTERNAL.withDescription("snapshotter failed: $flood"),
+                )
+            FakeCriServer(runtime = runtime).use { fake ->
+                val thrown = shouldThrow<CriException> { fake.client.containerStatus(ContainerId("c")) }
+
+                thrown.safeMessage shouldContain flood
+                CapturedLogs.text() shouldNotContain flood
+            }
+        }
+
+    /**
+     * A message this client wrote itself is not the runtime quoting a request,
+     * and is not withheld as though it were.
+     *
+     * Every operation `emptyIdentifier` can fire for is a secret-bearing one, so
+     * without the exemption a precise report of a broken runtime would be
+     * replaced, in every case, by a warning about secrets the sentence does not
+     * contain.
+     */
+    @Test
+    fun `our own account of a broken response is not withheld`() =
+        runCriTest {
+            // A successful CreateContainer that names no container.
+            FakeCriServer().use { fake ->
+                val thrown =
+                    shouldThrow<CriException> {
+                        fake.client.createContainer(SandboxId("s"), sampleSandboxSpec(), sampleContainerSpec())
+                    }
+
+                thrown.safeDescription shouldBe "containerd returned a successful response with an empty container_id"
+                thrown.safeMessage shouldBe thrown.message
+                CapturedLogs.text() shouldContain "empty container_id"
             }
         }
 

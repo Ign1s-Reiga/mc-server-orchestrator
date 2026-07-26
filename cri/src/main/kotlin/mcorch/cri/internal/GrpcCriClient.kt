@@ -442,16 +442,15 @@ internal class GrpcCriClient private constructor(
      * then leaves nothing behind at all.
      *
      * **The description is a third party's free-form string and is treated as
-     * one.** It is bounded to [MAX_LOGGED_DESCRIPTION_CHARS], and it is withheld
-     * entirely for the operations [CriOperation.requestMayCarrySecrets] names —
-     * read that for why, and change the list there rather than here. A cap alone
-     * would not do for those: Go error wrapping routinely renders the rejected
-     * request, and a truncated prefix of a rejected `CreateContainer` is still a
-     * prefix of the container's environment.
+     * one.** It is bounded to [MAX_LOGGED_DESCRIPTION_CHARS] here, and it is
+     * withheld for some operations by [CriException.safeDescription] — that is
+     * where the decision lives and where to change it, not here.
      *
      * If you are here to restore the full text because a failure was hard to
-     * diagnose: the whole string is still on the server's observed status, and
-     * that is the copy to go and read. It is deliberately not this one.
+     * diagnose: it is not on the server's observed status either, which withholds
+     * the same operations for the same reason. The place it does exist is the
+     * container runtime's own log on the node, which is what
+     * [CriException.WITHHELD_DESCRIPTION] tells the operator to read.
      *
      * Nothing else from the request reaches the log. Specs, environment and
      * registry credentials never appear.
@@ -482,25 +481,43 @@ internal class GrpcCriClient private constructor(
         }
     }
 
-    /** The most of a failure description that may safely be written to a log. See [instrumented]. */
+    /**
+     * The most of a failure description that may be written to a log.
+     *
+     * The withholding is [CriException.safeDescription]'s and is not repeated
+     * here. What *is* only the log's business is the cap: a bound on a third
+     * party's string so a runtime that renders a whole request into an error
+     * cannot flood the log with it. The persisted copy is deliberately not
+     * capped — see [CriException.safeDescription] for why a prefix is not a safe
+     * unit to keep.
+     */
     private fun loggableDetail(failure: CriException): String {
-        if (failure.operation.requestMayCarrySecrets) return WITHHELD_DETAIL
-        val description = failure.description
-        if (description.length <= MAX_LOGGED_DESCRIPTION_CHARS) return description
-        val dropped = description.length - MAX_LOGGED_DESCRIPTION_CHARS
-        return description.take(MAX_LOGGED_DESCRIPTION_CHARS) + "… [$dropped more characters not logged]"
+        val safe = failure.safeDescription
+        if (safe.length <= MAX_LOGGED_DESCRIPTION_CHARS) return safe
+        val dropped = safe.length - MAX_LOGGED_DESCRIPTION_CHARS
+        return safe.take(MAX_LOGGED_DESCRIPTION_CHARS) + "… [$dropped more characters not logged]"
     }
 
     private fun elapsedMillis(startedAtNanos: Long): Long = (System.nanoTime() - startedAtNanos) / 1_000_000
 
+    /**
+     * A response that succeeded and then named nothing.
+     *
+     * Every operation this can be raised for is one whose *request* carries
+     * secret material, so the description is marked as ours rather than the
+     * runtime's. Otherwise a precise report of a broken runtime would be
+     * replaced by a warning about secrets that this sentence does not contain.
+     */
     private fun emptyIdentifier(
         operation: CriOperation,
         field: String,
     ): CriException =
         CriException.RuntimeFailure(
-            operation,
-            CriStatusCode.UNKNOWN,
-            "containerd returned a successful response with an empty $field",
+            operation = operation,
+            code = CriStatusCode.UNKNOWN,
+            description = "containerd returned a successful response with an empty $field",
+            cause = null,
+            describedByRuntime = false,
         )
 
     internal companion object {
@@ -518,11 +535,6 @@ internal class GrpcCriClient private constructor(
          * has no length contract, not because 300 is special.
          */
         internal const val MAX_LOGGED_DESCRIPTION_CHARS: Int = 300
-
-        /** Stands in for a description that may quote a request holding secret material. */
-        internal const val WITHHELD_DETAIL: String =
-            "<not logged: this operation's request carries secret material and the runtime's error may quote " +
-                "it; the full text is on the server's observed status>"
 
         fun connect(config: CriClientConfig): CriClient {
             val handle = buildChannel(config)
