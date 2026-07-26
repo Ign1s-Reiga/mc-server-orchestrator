@@ -12,6 +12,7 @@ import mcorch.core.NodeStatus
 import mcorch.core.StorageRequest
 import mcorch.core.WorkloadHandle
 import mcorch.core.WorkloadObservation
+import mcorch.core.WorkloadRemoval
 import mcorch.core.WorkloadSpec
 import mcorch.core.WorkloadState
 import mcorch.cri.ContainerFilter
@@ -27,6 +28,7 @@ import mcorch.cri.CriException
 import mcorch.cri.ImageName
 import mcorch.cri.LinuxContainerSpec
 import mcorch.cri.LinuxResources
+import mcorch.cri.LinuxSandboxSpec
 import mcorch.cri.PortMapping
 import mcorch.cri.SandboxFilter
 import mcorch.cri.SandboxId
@@ -80,6 +82,7 @@ public class LocalNode internal constructor(
     private val volumeRoot: Path,
     private val logRoot: Path,
     private val sandboxNamespace: String,
+    private val cgroupParent: String?,
 ) : Node,
     AutoCloseable {
     // ── health ───────────────────────────────────────────────────────────────
@@ -130,7 +133,7 @@ public class LocalNode internal constructor(
             sandboxId = status.id.value,
             sandboxLabels = status.labels,
             sandboxCreatedAt = status.createdAt,
-            containers = containersIn(status.id, server, status.containerStatuses),
+            containers = containersIn(status.id, server, status.containerStatuses.map { it.toDetail() }),
         )
 
     /**
@@ -155,23 +158,22 @@ public class LocalNode internal constructor(
     private suspend fun containersIn(
         sandbox: SandboxId,
         server: ResourceName?,
-        reported: List<ContainerStatus>,
+        reported: List<ContainerDetail>,
     ): List<ContainerView> {
-        val detail = reported.associateBy { it.id.value }
-        return client.listContainers(ContainerFilter.inSandbox(sandbox)).map { summary ->
-            val known = detail[summary.id.value]
-            when {
-                known != null -> {
-                    known.toView()
-                }
-
-                server != null && summary.labels[Labels.SERVER] == server.value -> {
-                    statusOrNull(summary.id)?.toView() ?: summary.toView()
-                }
-
-                else -> {
-                    summary.toView()
-                }
+        // The enumeration decides who exists. The overlay only decorates, and
+        // the two are different types so they cannot be passed the wrong way
+        // round.
+        val listed = client.listContainers(ContainerFilter.inSandbox(sandbox)).map { it.toView() }
+        val merged = WorkloadView.merge(listed, reported)
+        if (server == null) return merged
+        // Anything of this server's that the overlay did not describe: fetch the
+        // detail the enumeration cannot carry. At most one round trip, and only
+        // on a runtime that leaves the optional field empty.
+        return merged.map { view ->
+            if (view.labels[Labels.SERVER] == server.value && view.startedAt == null) {
+                statusOrNull(ContainerId(view.id))?.toView() ?: view
+            } else {
+                view
             }
         }
     }
@@ -367,54 +369,76 @@ public class LocalNode internal constructor(
         }
     }
 
-    override suspend fun removeWorkload(handle: WorkloadHandle) {
-        translating(NodeOperation.REMOVE) {
-            val containerId = handle.containerId?.let(::ContainerId)
-            if (containerId != null) {
-                val state = containerStateOf(containerId)
-                // Anything but a container that has provably exited or gone.
-                // Removing a running one forcibly kills it, with no grace and no
-                // save, and a state the runtime cannot classify is not evidence
-                // that nothing is inside it — the reconcile loop refuses to act
-                // on that same signal.
-                if (state == ContainerState.RUNNING || state == ContainerState.UNKNOWN) {
-                    throw NodeException.Rejected(
-                        name,
-                        NodeOperation.REMOVE,
-                        "refusing to remove container ${containerId.value}: the runtime reports it as " +
-                            "$state, not stopped. It must be drained and stopped first",
-                    )
+    override suspend fun removeWorkload(handle: WorkloadHandle): WorkloadRemoval {
+        val sandboxId = SandboxId(handle.sandboxId)
+        val plan =
+            translating(NodeOperation.REMOVE) {
+                // Everything still inside, not just the container this workload
+                // knows about. `StopPodSandbox` kills whatever is in there with
+                // no grace and no save, so "my container is gone" is not the
+                // question — "is the sandbox empty" is. A container this
+                // orchestrator did not create, or one left by a create that
+                // raced, is somebody's running process either way.
+                //
+                // No server and no overlay: the guard needs an id and a state,
+                // and both come from the enumeration. Handing it the optional
+                // status field would be handing it the empty list that made this
+                // guard necessary.
+                val containers = containersIn(sandboxId, server = null, reported = emptyList())
+                WorkloadView.teardown(
+                    own = containers.firstOrNull { it.id == handle.containerId },
+                    containers = containers,
+                    ownId = handle.containerId,
+                )
+            }
+
+        var containerRemoved = handle.containerId == null
+        for (step in plan) {
+            when (step) {
+                is TeardownStep.Refuse -> {
+                    throw NodeException.Rejected(name, NodeOperation.REMOVE, step.reason)
                 }
-                client.removeContainer(containerId)
+
+                is TeardownStep.RemoveContainer -> {
+                    translating(NodeOperation.REMOVE) { client.removeContainer(ContainerId(step.id)) }
+                    containerRemoved = true
+                }
+
+                TeardownStep.RemoveSandbox -> {
+                    // Safe now, and only now: there is nothing left inside to
+                    // kill. A failure here is reported rather than thrown, so
+                    // the caller can record that the container is gone — if it
+                    // does not, the next pass sees a sandbox with no containers,
+                    // cannot tell that from a runtime hiding a live one, and
+                    // never retries this.
+                    val failure =
+                        try {
+                            client.stopSandbox(sandboxId)
+                            client.removeSandbox(sandboxId)
+                            null
+                        } catch (failure: CriException) {
+                            failure.asNodeException(NodeOperation.REMOVE)
+                        }
+                    if (failure != null) {
+                        if (!containerRemoved) throw failure
+                        LOG.warn(
+                            "server workload on node={} had its container removed but its sandbox {} did not go " +
+                                "away: {}",
+                            name,
+                            sandboxId,
+                            failure.message,
+                        )
+                        return WorkloadRemoval(
+                            containerRemoved = true,
+                            sandboxRemoved = false,
+                            detail = failure.message,
+                        )
+                    }
+                    // The persistent volume directory is deliberately untouched.
+                }
             }
-            val sandboxId = SandboxId(handle.sandboxId)
-            // Everything still inside, not just the container this workload
-            // knows about. `StopPodSandbox` kills whatever is in there with no
-            // grace and no save, so "my container is gone" is not the question —
-            // "is the sandbox empty" is. A container that this orchestrator did
-            // not create, or one left by a create that raced, is somebody's
-            // running process either way.
-            val occupants =
-                WorkloadView.occupants(
-                    // No server, so no per-status detail is fetched: the guard
-                    // needs an id and a state, and both are in the summary.
-                    containers = containersIn(sandboxId, server = null, reported = emptyList()),
-                    own = handle.containerId,
-                )
-            if (occupants.isNotEmpty()) {
-                throw NodeException.Rejected(
-                    name,
-                    NodeOperation.REMOVE,
-                    "refusing to tear down sandbox ${sandboxId.value}: ${occupants.size} container(s) inside it " +
-                        "are not stopped (${occupants.joinToString { it.state.name }}), and removing the sandbox " +
-                        "would kill them with no grace period and no save. Drain and stop them first",
-                )
-            }
-            // Safe now, and only now: there is nothing left inside to kill.
-            client.stopSandbox(sandboxId)
-            client.removeSandbox(sandboxId)
-            // The persistent volume directory is deliberately untouched.
         }
+        return WorkloadRemoval.COMPLETE
     }
 
     private suspend fun containerStateOf(id: ContainerId): ContainerState? =
@@ -448,6 +472,12 @@ public class LocalNode internal constructor(
                     port.hostPort?.let { PortMapping(containerPort = port.containerPort, hostPort = it) }
                 },
             labels = spec.labels + (Labels.SPEC_HASH to spec.specHash),
+            // Without this, a host running the systemd cgroup driver rejects
+            // every sandbox: containerd falls back to a cgroupfs-shaped path and
+            // runc refuses it, wanting `slice:prefix:name`. Nothing this
+            // orchestrator creates can start. See [LocalNodeConfig.cgroupParent]
+            // for why it is not a constant.
+            linux = LinuxSandboxSpec(cgroupParent = cgroupParent),
         )
 
     private suspend fun containerSpecFor(spec: WorkloadSpec): ContainerSpec =
@@ -665,6 +695,7 @@ public class LocalNode internal constructor(
                 volumeRoot = config.volumeRoot,
                 logRoot = config.logRoot,
                 sandboxNamespace = config.sandboxNamespace,
+                cgroupParent = config.cgroupParent,
             )
     }
 }
@@ -686,10 +717,42 @@ public data class LocalNodeConfig(
     val logRoot: Path,
     /** Groups this orchestrator's sandboxes. Not a Kubernetes namespace; nothing resolves it anywhere. */
     val sandboxNamespace: String = "mcorch",
+    /**
+     * The cgroup every sandbox this node creates is placed under.
+     *
+     * **Its shape depends on the runtime's cgroup driver, so it cannot be a
+     * constant.** With the systemd driver — what containerd selects on a systemd
+     * host with cgroup v2, and what `scripts/dev/containerd-up.sh` configures —
+     * this is a slice name, which containerd expands into the
+     * `slice:prefix:name` path runc demands. With the cgroupfs driver it is a
+     * path fragment instead, so an operator on such a host sets `/mcorch`; a
+     * slice name there would create a directory literally called
+     * `mcorch.slice`.
+     *
+     * Null leaves the field unset, which is containerd's own default — and on a
+     * systemd host that default is exactly what makes every `RunPodSandbox`
+     * fail, so it is a deliberate opt-out rather than a sensible blank.
+     *
+     * The slice need not exist as a unit file: systemd creates a transient
+     * slice on demand.
+     */
+    val cgroupParent: String? = DEFAULT_CGROUP_PARENT,
 ) {
     init {
         require(runtimeEndpoint.isNotBlank()) { "runtimeEndpoint must not be blank" }
         require(sandboxNamespace.isNotBlank()) { "sandboxNamespace must not be blank" }
+        require(cgroupParent == null || cgroupParent.isNotBlank()) {
+            "cgroupParent must not be blank; use null to leave the choice to the runtime"
+        }
+    }
+
+    public companion object {
+        /**
+         * A systemd slice, because that is the driver containerd selects on the
+         * hosts this targets. Everything the orchestrator runs lands under it,
+         * so a host's Minecraft servers can be accounted for in one place.
+         */
+        public const val DEFAULT_CGROUP_PARENT: String = "mcorch.slice"
     }
 }
 
@@ -697,6 +760,8 @@ public data class LocalNodeConfig(
  * The detail view. `ListContainers` does not carry timings or exit information,
  * so a summary-derived view leaves them null rather than guessing.
  */
+private fun ContainerStatus.toDetail(): ContainerDetail = ContainerDetail(toView())
+
 private fun ContainerStatus.toView(): ContainerView =
     ContainerView(
         id = id.value,

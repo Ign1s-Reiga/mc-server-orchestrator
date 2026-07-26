@@ -31,6 +31,24 @@ internal data class ContainerView(
 )
 
 /**
+ * Extra detail about a container that an enumeration does not carry — when it
+ * started, when it finished, how it exited.
+ *
+ * A separate type from [ContainerView] on purpose, and the reason is safety
+ * rather than tidiness. It comes from CRI's optional
+ * `PodSandboxStatusResponse.containers_statuses`, which on containerd 2.3.3 is
+ * simply always empty and on other versions may be partial. It is therefore an
+ * *overlay* and never a source of truth about which containers exist: a
+ * container missing from it is not a container that is gone. Making the two
+ * roles different types means [WorkloadView.merge] cannot be called with them
+ * the wrong way round, which is the mistake that let a sandbox holding a live
+ * Paper server read as empty.
+ */
+internal data class ContainerDetail(
+    val container: ContainerView,
+)
+
+/**
  * What a node concludes from a sandbox and the containers inside it.
  *
  * Two questions, both of which have killed a live server when answered from
@@ -118,4 +136,77 @@ internal object WorkloadView {
         containers: List<ContainerView>,
         own: String?,
     ): List<ContainerView> = containers.filter { it.id != own && it.state != WorkloadState.EXITED }
+
+    /**
+     * The enumerated containers, enriched with whatever detail was reported for
+     * them.
+     *
+     * [listed] decides membership; [detail] only decorates. An entry in [detail]
+     * for a container the enumeration does not contain is discarded rather than
+     * added — it describes something the authoritative source says is not there.
+     */
+    fun merge(
+        listed: List<ContainerView>,
+        detail: List<ContainerDetail>,
+    ): List<ContainerView> {
+        if (detail.isEmpty()) return listed
+        val byId = detail.associateBy { it.container.id }
+        return listed.map { byId[it.id]?.container ?: it }
+    }
+
+    /**
+     * The order a workload comes apart in, and the reasons not to start.
+     *
+     * A plan rather than something done inline, so that the ordering and the
+     * refusals can be tested without a runtime. Both matter: `StopPodSandbox`
+     * and `RemovePodSandbox` kill every container still inside with no grace
+     * period and no save, so the container is removed first, always, and the
+     * sandbox is not touched while anything in it might still have a process.
+     */
+    fun teardown(
+        own: ContainerView?,
+        containers: List<ContainerView>,
+        ownId: String?,
+    ): List<TeardownStep> {
+        if (own != null && own.state != WorkloadState.EXITED && own.state != WorkloadState.CREATED) {
+            // A `CREATED` container has never had `StartContainer` called on it,
+            // so removing it cannot kill a serving process. Anything else —
+            // running, or a state the runtime will not name — has to be drained
+            // and stopped first.
+            return listOf(
+                TeardownStep.Refuse(
+                    "refusing to remove container ${own.id}: the runtime reports it as ${own.state}, not " +
+                        "stopped. It must be drained and stopped first",
+                ),
+            )
+        }
+        val occupants = occupants(containers, own = ownId)
+        if (occupants.isNotEmpty()) {
+            return listOf(
+                TeardownStep.Refuse(
+                    "refusing to tear down the sandbox: ${occupants.size} container(s) inside it are not " +
+                        "stopped (${occupants.joinToString { it.state.name }}), and removing the sandbox would " +
+                        "kill them with no grace period and no save. Drain and stop them first",
+                ),
+            )
+        }
+        return buildList {
+            if (ownId != null) add(TeardownStep.RemoveContainer(ownId))
+            add(TeardownStep.RemoveSandbox)
+        }
+    }
+}
+
+/** One step of taking a workload apart, in the order it has to happen. */
+internal sealed interface TeardownStep {
+    data class RemoveContainer(
+        val id: String,
+    ) : TeardownStep
+
+    /** Stops and removes the sandbox. Only ever after every container in it is gone. */
+    data object RemoveSandbox : TeardownStep
+
+    data class Refuse(
+        val reason: String,
+    ) : TeardownStep
 }

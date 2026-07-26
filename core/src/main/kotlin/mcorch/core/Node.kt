@@ -149,8 +149,19 @@ public interface Node {
      * is still inside with no grace and no save.
      *
      * Idempotent: removing what is already gone succeeds.
+     *
+     * ## Partial progress is reported, not thrown
+     *
+     * Removing a workload is two operations with a required order, and the
+     * second can fail after the first succeeded. That is reported as a
+     * [WorkloadRemoval] rather than as an exception, because the caller has to
+     * record it: a container this node has removed must stop counting as one
+     * that exists, or the next pass sees a sandbox with no containers in it,
+     * cannot tell that from a runtime hiding a live container, and refuses to
+     * retry the half that failed — for ever. A failure with *nothing* removed
+     * still throws; there is nothing to record.
      */
-    public suspend fun removeWorkload(handle: WorkloadHandle)
+    public suspend fun removeWorkload(handle: WorkloadHandle): WorkloadRemoval
 }
 
 /** What a node reports about itself. */
@@ -248,6 +259,29 @@ public sealed interface WorkloadObservation {
         /** Runtime detail. Never player data. */
         val message: String = "",
     ) : WorkloadObservation
+}
+
+/**
+ * How far a [Node.removeWorkload] got.
+ *
+ * [complete] is the only thing a caller may treat as "this workload is gone".
+ * Anything else means the node made progress it cannot undo and the call has to
+ * come back — with the *progress recorded first*, which is the whole reason this
+ * is a value and not an exception.
+ */
+public data class WorkloadRemoval(
+    /** True once no container remains for this workload, including "there never was one". */
+    val containerRemoved: Boolean,
+    /** True once the sandbox is gone too. */
+    val sandboxRemoved: Boolean,
+    /** Why it did not finish, for an operator. Empty when it did. */
+    val detail: String = "",
+) {
+    public val complete: Boolean get() = containerRemoved && sandboxRemoved
+
+    public companion object {
+        public val COMPLETE: WorkloadRemoval = WorkloadRemoval(containerRemoved = true, sandboxRemoved = true)
+    }
 }
 
 /** The result of making an image available. */

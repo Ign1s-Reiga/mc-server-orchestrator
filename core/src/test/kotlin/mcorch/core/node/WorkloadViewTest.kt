@@ -2,6 +2,7 @@ package mcorch.core.node
 
 import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.types.shouldBeInstanceOf
 import mcorch.core.Labels
 import mcorch.core.WorkloadState
 import mcorch.core.nodeName
@@ -117,5 +118,81 @@ internal class WorkloadViewTest {
         val containers = listOf(container("mine"), container("exited-stranger", state = WorkloadState.EXITED))
 
         WorkloadView.occupants(containers, own = "mine") shouldHaveSize 0
+    }
+
+    @Test
+    fun `detail decorates the enumeration and cannot contradict it`() {
+        val listed = listOf(container("a"), container("b"))
+        val detail =
+            listOf(
+                ContainerDetail(container("a").copy(exitCode = 137, reason = "OOMKilled")),
+                // Describes something the enumeration says is not there. A
+                // runtime that reports containers piecemeal must not be able to
+                // *add* one, and — the direction that matters — the enumeration
+                // is what decides membership, so a partial detail list cannot
+                // suppress a container either.
+                ContainerDetail(container("ghost")),
+            )
+
+        val merged = WorkloadView.merge(listed, detail)
+
+        merged.map { it.id } shouldBe listOf("a", "b")
+        merged.single { it.id == "a" }.exitCode shouldBe 137
+        // Untouched by an overlay that says nothing about it.
+        merged.single { it.id == "b" }.exitCode shouldBe null
+        // The empty overlay containerd 2.3.3 always sends changes nothing.
+        WorkloadView.merge(listed, emptyList()) shouldBe listed
+    }
+
+    @Test
+    fun `teardown removes the container before it touches the sandbox`() {
+        val mine = container("mine", state = WorkloadState.EXITED)
+
+        val plan = WorkloadView.teardown(own = mine, containers = listOf(mine), ownId = "mine")
+
+        // The order is the whole point: `StopPodSandbox` kills anything still
+        // inside with no grace period and no save.
+        plan shouldBe listOf(TeardownStep.RemoveContainer("mine"), TeardownStep.RemoveSandbox)
+    }
+
+    @Test
+    fun `teardown refuses while this workload's own container might still be alive`() {
+        for (state in listOf(WorkloadState.RUNNING, WorkloadState.UNKNOWN)) {
+            val mine = container("mine", state = state)
+
+            WorkloadView
+                .teardown(own = mine, containers = listOf(mine), ownId = "mine")
+                .single()
+                .shouldBeInstanceOf<TeardownStep.Refuse>()
+        }
+
+        // A `CREATED` container has never been started, so removing it cannot
+        // kill a serving process.
+        val created = container("mine", state = WorkloadState.CREATED)
+        WorkloadView.teardown(own = created, containers = listOf(created), ownId = "mine") shouldBe
+            listOf(TeardownStep.RemoveContainer("mine"), TeardownStep.RemoveSandbox)
+    }
+
+    @Test
+    fun `teardown refuses while anything else is still in the sandbox`() {
+        val mine = container("mine", state = WorkloadState.EXITED)
+        val stranger = container("stranger", mine = false, state = WorkloadState.CREATED)
+
+        val plan = WorkloadView.teardown(own = mine, containers = listOf(mine, stranger), ownId = "mine")
+
+        // A foreign `CREATED` container does block it: this orchestrator did not
+        // start it and cannot know it is not about to be started.
+        plan
+            .single()
+            .shouldBeInstanceOf<TeardownStep.Refuse>()
+            .reason
+            .contains("CREATED") shouldBe true
+    }
+
+    @Test
+    fun `a sandbox with no container of ours is torn down on its own`() {
+        val plan = WorkloadView.teardown(own = null, containers = emptyList(), ownId = null)
+
+        plan shouldBe listOf(TeardownStep.RemoveSandbox)
     }
 }
