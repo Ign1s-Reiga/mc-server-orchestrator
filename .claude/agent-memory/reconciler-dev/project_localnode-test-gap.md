@@ -1,6 +1,6 @@
 ---
 name: localnode-test-gap
-description: LocalNode cannot be unit-tested without naming a mcorch.cri type in :core tests — three findings have now landed there, and the third is the escalation trigger this memory set
+description: :core tests may not name a mcorch.cri type, so LocalNode's mapping is untestable from here — three findings landed there, and the pattern that resolved the third is the one to reach for first
 metadata:
   type: project
 ---
@@ -10,8 +10,8 @@ checked by grep, and `LocalNode.kt` being the only importer is verified on every
 hand-off). `CriClient` is an interface, so a fake is technically easy — the
 constraint is the invariant, not the language.
 
-**Three findings have now landed in exactly the code that constraint makes
-unreachable:**
+Three findings have landed in exactly the code that constraint makes
+unreachable:
 
 1. the `AlreadyExists` adoption path;
 2. an empty `PodSandboxStatusResponse.containers_statuses` reading as an empty
@@ -21,36 +21,39 @@ unreachable:**
    `fmt.Errorf("...: %+v", config)` habit means a rejected `CreateContainer` can
    come back with the container's environment in it.
 
-**The answer taken, three times:** move the *decisions* out of `LocalNode` into
-objects over this module's own types — `HostPaths`, `WorkloadView`, and now
-`runtimeDetail` — and unit-test those. What stays in `LocalNode` is mechanical:
-a field copy, or a single token passed through.
+## Two ways out, and the second is much better
 
-**Why:** it keeps the invariant *and* tests the logic, and it holds the line at
-the same place the interface already does.
+**Move the decision into `:core`**, over this module's own types — `HostPaths`,
+`WorkloadView` — and unit-test it there. This resolved the first two. What stays
+in `LocalNode` is a mechanical field copy.
 
-## The third one is the trigger this memory set, and it is different in kind
+**Move the decision *further into* `:cri`** so `LocalNode` has nothing left to
+decide. This resolved the third, and it is the better instinct whenever the
+decision is genuinely `:cri`'s to make. The intermediate shape — `:cri` exposing
+a predicate (`CriOperation.requestMayCarrySecrets`) that `:core` combined with
+the raw text itself — looked like reuse and was the worst of both: a one-token
+security decision sitting in a module that could not test it, where inverting
+the token left every `:core` test green. Replacing it with
+`CriException.safeDescription`, which makes the decision once and hands back
+only the safe string, **deleted** the gap instead of documenting it.
 
-The first two were *decisions* that could be moved out whole. This one cannot:
-the decision is `CriOperation.requestMayCarrySecrets`, which is `:cri`'s list by
-design and must not be forked (a security list that drifts between two modules
-is worse than no list). So `runtimeDetail` takes the answer as a plain boolean,
-and the surviving untested link is the one token in `LocalNode.describe` that
-supplies it. No `:core` test can cover it without naming `CriOperation`.
+**The tell:** if a fix leaves `:core` holding both a raw value *and* a flag
+about that value, the seam is in the wrong place. A caller that can only receive
+the already-correct answer cannot get it wrong.
 
-That is a genuine security-relevant gap, not merely an aesthetic one: if the
-pass-through were inverted or dropped, every `:core` test still passes.
+## How to apply
 
-**How to apply:** escalate on the next round. Two shapes are worth proposing,
-and the second is better — ask the coordinator to route it to
-`cri-integration-dev`:
+Reach for collapsing the decision into whichever module owns it before proposing
+a fake `CriClient` in `:core` tests — the fake costs the grep property the
+coordinator verifies every round, and `cri-integration-dev` agreed one test is
+not worth that trade.
 
-- a fake `CriClient` in `:core` tests, which costs the grep property the
-  coordinator verifies every round; or
-- `:cri` exposing an already-redacted accessor (`CriException.persistableMessage`
-  alongside its existing log-side `loggableDetail`), so `describe()` becomes a
-  plain delegation with no decision left in `:core` at all, and the whole thing
-  is tested where the list lives. See [[audit-remedies-are-hypotheses]] for why
-  the exact shape should still be checked against the suite rather than assumed.
+Where a genuine end-to-end property survives the collapse, test *that* rather
+than re-testing the decision. `FailureDetailPersistenceTest` is the example: a
+`NodeException` deliberately keeps the original exception as its `cause`, and
+that still holds the unredacted description, so anything downstream serialising
+the cause chain would leak into `state.db` with every `:cri` test passing. That
+is real, it is `:core`'s to own, and it is testable from here.
 
-Until then the mapping stays `integration-tester` territory.
+See [[audit-remedies-are-hypotheses]] — the prescribed remedy is a hypothesis
+even when the finding is certain, and the suite is what arbitrates.
