@@ -684,7 +684,21 @@ public class LocalNode internal constructor(
             is CriException.Cancelled -> NodeException.Rejected(name, operation, describe(), this)
         }
 
-    private fun CriException.describe(): String = message
+    /**
+     * The runtime's account of a failure, as much of it as may be recorded.
+     *
+     * This is the one place a `mcorch.cri` string crosses into a
+     * [NodeException], and from there into `FailureStatus.message`, SQLite and
+     * the API. See [runtimeDetail] for what is withheld and why — and note that
+     * the *list* is `:cri`'s, consulted here rather than copied.
+     */
+    private fun CriException.describe(): String =
+        runtimeDetail(
+            operation = operation.name,
+            code = code.name,
+            rendered = message,
+            requestMayCarrySecrets = operation.requestMayCarrySecrets,
+        )
 
     private fun WorkloadHandle.requireContainer(operation: NodeOperation): ContainerId =
         containerId?.let(::ContainerId)
