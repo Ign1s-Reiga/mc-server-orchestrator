@@ -481,7 +481,30 @@ public class Reconciler(
             }
 
             is ProbeOutcome.NotJoinable -> {
-                val startedAt = observation.startedAt ?: pass.previous?.lastTransitionAt ?: pass.now
+                // The anchor has to be a fact about the *container*, and the
+                // last two fallbacks are ordered by how stable they are rather
+                // than by how precise.
+                //
+                // `lastTransitionAt` is restamped whenever the phase changes, so
+                // it is not an anchor at all for a server whose phase is moving:
+                // a flapping exec channel alternating a cut-short probe
+                // (STARTING) with a node that did not answer (UNKNOWN) resets it
+                // every other pass, and the startup timeout below can then never
+                // elapse — a wedged server that never surfaces as failed, plus a
+                // store write per pass because the phase change defeats the
+                // unchanged-status skip. `createdAt` does not move.
+                //
+                // Reaching past `startedAt` at all needs a runtime that does not
+                // report one for a running container, which containerd does; the
+                // normal path is unchanged, byte for byte. Anchoring earlier
+                // than the start only ever makes `waited` larger, so the timeout
+                // surfaces sooner — the safe direction for a failure that is
+                // retryable and stops nothing.
+                val startedAt =
+                    observation.startedAt
+                        ?: observation.createdAt
+                        ?: pass.previous?.lastTransitionAt
+                        ?: pass.now
                 val waited = JavaDuration.between(startedAt, pass.now).toKotlinDuration()
                 if (waited <= pass.definition.spec.lifecycle.startupTimeout) {
                     write(pass, status(ServerPhase.STARTING, ready = false, players = null)) {

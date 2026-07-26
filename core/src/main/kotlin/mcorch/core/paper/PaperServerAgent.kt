@@ -331,20 +331,43 @@ internal sealed interface ProbeOutcome {
         val max: Int,
     ) : ProbeOutcome
 
+    /**
+     * Every answer that is not a player count.
+     *
+     * The two below differ in what they say about the *node*, which is what
+     * bring-up needs in order to report a starting server differently from a
+     * sick runtime. They do not differ at all in what they say about **who is
+     * online**, which is the only question a drain asks — and that is why this
+     * type exists rather than two sibling cases.
+     *
+     * A drain matches on this, once. Treating an unanswered probe as "nobody is
+     * online" is how a drain stops a server that still has people on it, and the
+     * reason to make the two indistinguishable *here* is that a distinction
+     * maintained by convention across two branches is a distinction that
+     * eventually diverges under an edit aimed at only one of them.
+     */
+    sealed interface Unanswered : ProbeOutcome {
+        val detail: String
+
+        /** Whether asking again could plausibly get a different answer. */
+        val retryable: Boolean
+    }
+
     /** The probe ran and the server did not answer it. Still starting, or wedged. */
     data class NotJoinable(
-        val detail: String,
-    ) : ProbeOutcome
+        override val detail: String,
+    ) : Unanswered {
+        // The server may yet answer: it is still generating a world, or it is
+        // frozen and somebody will restart it. Nothing about a silent server
+        // makes asking again pointless.
+        override val retryable: Boolean get() = true
+    }
 
-    /**
-     * The probe could not be run at all. **Not** the same as zero players:
-     * treating an unrunnable probe as "nobody is online" is how a drain stops a
-     * server that still has people on it.
-     */
+    /** The probe could not be run at all — the node refused it, or never answered. */
     data class Unavailable(
-        val detail: String,
-        val retryable: Boolean,
-    ) : ProbeOutcome
+        override val detail: String,
+        override val retryable: Boolean,
+    ) : Unanswered
 }
 
 /** What a save request achieved. */
