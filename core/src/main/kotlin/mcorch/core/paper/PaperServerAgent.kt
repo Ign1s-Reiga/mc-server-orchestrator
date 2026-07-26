@@ -76,22 +76,20 @@ internal class PaperServerAgent(
      * a workload created before those labels existed reports none, and the
      * definition is the only thing left to go on.
      */
-    fun contractOf(
-        observation: WorkloadObservation.Present,
-        storageWasPersistent: Boolean? = null,
-    ): WorkloadContract {
+    fun contractOf(observation: WorkloadObservation.Present): WorkloadContract {
         val worldData = Labels.booleanValue(observation.labels, Labels.WORLD_DATA)
         val saveChannel = Labels.booleanValue(observation.labels, Labels.SAVE_CONFIRMABLE)
         return WorkloadContract(
             // An absent label means "this workload does not say", which is not
-            // the same as "no". Falling back to the definition would hand the
-            // decision straight back to the edit this is meant to be defending
-            // against: on a `persistent` → `ephemeral` change it would read
-            // false, the drain would find nothing to flush, and the container
-            // would stop with a world in it. So the fallback is the last
-            // observation written *before* the edit, and failing that the safe
-            // side — CLAUDE.md invariant 2 says default to persistent.
-            holdsWorldData = worldData ?: storageWasPersistent ?: true,
+            // the same as "no" — and there is no second source worth asking.
+            // The definition is the thing being edited; the last observed
+            // storage status is *computed from* the definition every pass, so
+            // it agrees with the edit within one pass of it landing. Both would
+            // answer "ephemeral" for a container holding a world, the drain
+            // would find nothing to flush, and the container would stop with
+            // the world in it. So this is the safe side and nothing else:
+            // CLAUDE.md invariant 2 says default to persistent.
+            holdsWorldData = worldData ?: true,
             // The save channel has no safe side in the same way: assuming one
             // exists costs a retryable failure, assuming it does not costs a
             // server nobody can drain. The definition is the better guess.

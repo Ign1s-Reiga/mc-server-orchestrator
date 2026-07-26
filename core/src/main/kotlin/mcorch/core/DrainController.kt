@@ -65,15 +65,26 @@ import java.time.Duration as JavaDuration
 internal class DrainController(
     private val clock: Clock,
     /**
-     * The longest gap between two recorded observations that still counts as
+     * The longest gap between two *successful probes* that still counts as
      * having watched the server.
      *
      * A confirmed save is only worth anything while the loop has been looking
      * the whole time since. Nothing else notices a gap: a probe reports what is
      * online *now*, so half an hour of play between two passes leaves no trace
      * anywhere, and the zero-player reading that follows it is true and
-     * worthless. The loop's own heartbeat is the only witness that it was
-     * watching at all.
+     * worthless.
+     *
+     * The witness has to be a probe rather than "a status was written". A status
+     * is also written by a pass that never reached the node, which observes
+     * nothing about who is online, and an unchanged status is skipped for up to
+     * `statusHeartbeat` — so writes are both too generous and too sparse. The
+     * last occupancy reading is the honest one: it exists only when a probe
+     * answered, and it stops advancing the moment they stop answering.
+     *
+     * Related constants, and the order they have to keep:
+     * `stepInterval` (1s) < this (30s) << the backoff cap (5min). Much below ten
+     * seconds a healthy drain would re-save between its own passes; far above
+     * this, a play session fits inside the window.
      */
     private val evidenceGap: Duration = DEFAULT_EVIDENCE_GAP,
     private val attentionAfter: Duration = DEFAULT_ATTENTION_AFTER,
@@ -83,9 +94,11 @@ internal class DrainController(
      * effect.
      *
      * @param current the drain recorded last pass, or null to start one.
-     * @param lastObservedAt when the last observation of this server was
-     *   recorded, or null if there is none. The evidence chain is measured
-     *   against it.
+     * @param lastProbedAt when a probe last answered for this server, or null if
+     *   none ever has. The evidence chain is measured against it.
+     * @param hadContainer whether a container has ever been observed for this
+     *   server. A sandbox that reports no containers means something different
+     *   depending on the answer.
      */
     @Suppress("LongParameterList")
     suspend fun advance(
@@ -95,8 +108,8 @@ internal class DrainController(
         observation: WorkloadObservation,
         current: DrainStatus?,
         cause: DrainCause,
-        lastObservedAt: Instant?,
-        storageWasPersistent: Boolean?,
+        lastProbedAt: Instant?,
+        hadContainer: Boolean,
     ): DrainProgress {
         val now = clock.instant()
         val recorded = current ?: started(now)
@@ -117,7 +130,7 @@ internal class DrainController(
         // flush, so the drain is already where it was trying to get to. This is
         // the runtime reporting a reaped process or an absent workload — it is
         // never inferred from a failed probe or an unreachable node.
-        val down = observation.containerIsDown()
+        val down = observation.containerIsDown(hadContainer)
         if (down != null) {
             return DrainProgress(
                 drain = recorded.moveTo(DrainState.STOPPING, now).copy(playersEvacuated = true),
@@ -135,15 +148,36 @@ internal class DrainController(
         // Two ways a confirmation stops describing the world, neither of which
         // any probe can report, both dropped here so that every state below
         // sees a drain whose evidence is about the container in front of it.
-        val drain = recorded.dropUnusableSaveEvidence(observation.startedAt, lastObservedAt, now, evidenceGap)
+        val drain = recorded.dropUnusableSaveEvidence(observation.startedAt, lastProbedAt, now, evidenceGap)
         if (drain !== recorded) {
             LOG.warn(
                 "server={} has a world save confirmed at {} that is no longer evidence: the container now " +
-                    "running started at {} and the last recorded observation was at {}. The drain will save again",
+                    "running started at {} and a probe last answered at {}. The drain will save again",
                 definition.metadata.name,
                 recorded.saveRequestedAt,
                 observation.startedAt,
-                lastObservedAt,
+                lastProbedAt,
+            )
+        }
+
+        // The runtime lists no container for a workload that has had one. That
+        // is not "the container was never created" — it is the runtime failing
+        // to tell us about a process that may well be serving players, and the
+        // one thing that must not follow is a teardown. There is nothing to
+        // probe either, since the handle has no container to exec into, so this
+        // stops here and comes back.
+        if (observation.state == WorkloadState.SANDBOX_ONLY) {
+            return abort(
+                server = definition.metadata.name,
+                drain = drain.forgetSaveEvidence(),
+                occupancy = null,
+                now = now,
+                reason = FailureReason.DRAIN_STALLED,
+                failureClass = FailureClass.RETRYABLE,
+                message =
+                    "the runtime reports no container in sandbox ${observation.handle.sandboxId} for a server " +
+                        "that has had one. Nothing is stopped or removed on the strength of that: an " +
+                        "unreported container is not an absent one, and the process may still be serving players",
             )
         }
 
@@ -164,7 +198,7 @@ internal class DrainController(
                 occupancy = occupancy,
                 // Read once per pass, off the running container rather than off
                 // the definition, and threaded through every decision below.
-                contract = agent.contractOf(observation, storageWasPersistent),
+                contract = agent.contractOf(observation),
                 now = now,
             )
         return step(pass, drain)
@@ -313,7 +347,20 @@ internal class DrainController(
                     // just taken. Returning here instead would report progress
                     // for a pass that did nothing, and the loop reads that as a
                     // reason to forget how long this has been failing.
-                    step(pass, drain.moveTo(resume, now).copy(failure = null))
+                    //
+                    // The recorded failure travels *with* it. If the resumed
+                    // state fails again, `recordFailure` needs the previous one
+                    // to carry the attempt count and the first-occurrence time
+                    // forward — clearing it here made every pass of a failing
+                    // drain report "attempt 1, first seen now", which is the
+                    // number the escalation is built on. It is cleared below
+                    // instead, on the passes that actually got somewhere.
+                    val resumed = step(pass, drain.moveTo(resume, now))
+                    if (resumed.drain.state == DrainState.DRAIN_FAILED) {
+                        resumed
+                    } else {
+                        resumed.copy(drain = resumed.drain.copy(failure = null))
+                    }
                 }
             }
         }
@@ -718,7 +765,16 @@ internal class DrainController(
         sideEffectIssued: Boolean = false,
     ): DrainProgress {
         val stuckFor = JavaDuration.between(drain.startedAt, now).toKotlinDuration()
-        val needsAttention = failureClass == FailureClass.RETRYABLE && stuckFor >= attentionAfter
+        // `DRAIN_NO_DESTINATION` is excluded on purpose: it means somebody is
+        // playing on a server that was asked to go away, which is the protocol
+        // working exactly as designed and resolves itself when they log off. An
+        // escalation that fires on a busy evening every backoff interval teaches
+        // operators that the marker means nothing, and it is the only escalation
+        // signal there is.
+        val needsAttention =
+            failureClass == FailureClass.RETRYABLE &&
+                reason != FailureReason.DRAIN_NO_DESTINATION &&
+                stuckFor >= attentionAfter
         val reported =
             if (needsAttention) {
                 "$ATTENTION this drain has been unable to finish for ${stuckFor.inWholeMinutes} minutes and is " +
@@ -934,14 +990,14 @@ private fun DrainStatus.mayStop(
  */
 internal fun DrainStatus.dropUnusableSaveEvidence(
     containerStartedAt: Instant?,
-    lastObservedAt: Instant?,
+    lastProbedAt: Instant?,
     now: Instant,
     maxGap: Duration,
 ): DrainStatus {
     if (!worldSaved) return this
     val watched =
-        lastObservedAt != null &&
-            !JavaDuration.between(lastObservedAt, now).toKotlinDuration().let { it > maxGap || it.isNegative() }
+        lastProbedAt != null &&
+            !JavaDuration.between(lastProbedAt, now).toKotlinDuration().let { it > maxGap || it.isNegative() }
     return if (saveIsCurrent(containerStartedAt, now, maxGap) && watched) {
         this
     } else {
@@ -999,7 +1055,7 @@ private fun DrainStatus.moveTo(
  * is "still running" or "not known" — an unreachable node is not a stopped
  * container.
  */
-private fun WorkloadObservation.containerIsDown(): String? =
+private fun WorkloadObservation.containerIsDown(hadContainer: Boolean): String? =
     when (this) {
         WorkloadObservation.Absent -> {
             "gone"
@@ -1008,8 +1064,18 @@ private fun WorkloadObservation.containerIsDown(): String? =
         is WorkloadObservation.Present -> {
             when (state) {
                 WorkloadState.EXITED -> "exited"
-                WorkloadState.SANDBOX_ONLY -> "never created"
+
+                // Only for a workload that has never had a container. The same
+                // observation on one that *has* had a container is the runtime
+                // failing to report it, and the two are indistinguishable from
+                // the sandbox alone — so the drain's own record of having seen
+                // one is what separates them. Getting this wrong tears down a
+                // sandbox with a live server inside it, killed with no grace
+                // period and no save.
+                WorkloadState.SANDBOX_ONLY -> if (hadContainer) null else "never created"
+
                 WorkloadState.CREATED -> "never started"
+
                 WorkloadState.RUNNING, WorkloadState.UNKNOWN -> null
             }
         }
