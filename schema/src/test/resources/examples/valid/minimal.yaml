@@ -1,0 +1,17 @@
+# The smallest definition that parses.
+#
+# Everything omitted here defaults to the safe side: persistent storage on a
+# volume named after the server, drain-before-stop waiting for zero players,
+# a stop grace period 60s above the save timeout, and a JVM heap sized to leave
+# the container headroom so it cannot be OOM-killed.
+apiVersion: mcorch.dev/v1alpha1
+kind: PaperServer
+metadata:
+  name: survival-01
+spec:
+  eulaAccepted: true
+  image: docker.io/itzg/minecraft-server:2026.6.1
+  paper:
+    minecraftVersion: "1.21.8"
+  resources:
+    memory: 4Gi
