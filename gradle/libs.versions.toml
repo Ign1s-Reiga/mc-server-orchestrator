@@ -25,6 +25,9 @@ grpcKotlin = "1.5.0"
 # core fails at runtime, not at build time.
 netty = "4.1.133.Final"
 
+# API only, no binding. :cri logs through it; :app picks the implementation.
+slf4j = "2.0.17"
+
 # YAML 1.2 parser for :schema. Chosen over kaml/Jackson because the schema
 # reports *all* validation problems in one pass with field paths and line
 # numbers, which needs the composed node tree (marks included), not a
@@ -71,8 +74,13 @@ grpc-netty = { module = "io.grpc:grpc-netty", version.ref = "grpc" }
 # linux-aarch_64 alongside if this ever has to run on arm64.
 netty-transportNativeEpoll = { module = "io.netty:netty-transport-native-epoll", version.ref = "netty" }
 grpc-kotlin-stub = { module = "io.grpc:grpc-kotlin-stub", version.ref = "grpcKotlin" }
+# In-process transport: lets :cri's tests drive the real wrapper against a fake
+# CRI server with no socket, no netty and no containerd. Test-only.
+grpc-inprocess = { module = "io.grpc:grpc-inprocess", version.ref = "grpc" }
 
-snakeyaml-engine = { module = "org.snakeyaml:snakeyaml-engine", version.ref = "snakeyamlEngine" }
+slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
+
+snakeyaml-engine ={ module = "org.snakeyaml:snakeyaml-engine", version.ref = "snakeyamlEngine" }
 
 sqlite-jdbc = { module = "org.xerial:sqlite-jdbc", version.ref = "sqliteJdbc" }
 
