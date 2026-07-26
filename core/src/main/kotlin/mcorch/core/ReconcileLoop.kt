@@ -159,20 +159,36 @@ public class ReconcileLoop(
     /**
      * One worker: take a server, reconcile it, decide when to look again.
      *
-     * The catch is the last line of defence, and it is deliberately broad. A
-     * [Reconciler] pass classifies everything it expects, but an exception it
-     * did not expect would escape `launch`, cancel this scope, and take the
-     * resync ticker, the change-feed poller and the other workers with it — so
-     * one server with a bad definition or a node throwing something untranslated
-     * would stop the orchestrator reconciling *every* server. Nothing is
-     * swallowed: it is logged at error and the server comes back on a backoff.
+     * ## Nothing but cancellation leaves this function
+     *
+     * An exception escaping `launch` cancels this scope and takes the resync
+     * ticker, the change-feed poller and every other worker with it — so one
+     * server with a bad definition, or a node throwing something untranslated,
+     * would stop the orchestrator reconciling *every* server. There are two
+     * guards rather than one because there are two places it can come from, and
+     * for a while only the inner one existed:
+     *
+     * - the **pass**, which is where an untranslated node or store failure
+     *   arrives. Logged at error, and the server comes back on a backoff.
+     * - the **requeue**, which takes locks and computes a delay. Logged at
+     *   error and left to the resync, which cannot miss it.
+     *
+     * `queue.take()` sits outside both on purpose: it is the one call whose
+     * failure is not this server's problem, and it now reports a closed queue by
+     * returning null rather than by throwing. That is what an orderly shutdown
+     * looks like from in here.
+     *
+     * Nothing is swallowed and nothing is retried silently.
      */
     private suspend fun work(
         queue: WorkQueue,
         worker: Int,
     ) {
         while (true) {
-            val name = queue.take()
+            // The queue is closed: the loop is shutting down and there is no
+            // more work coming. Returning ends this worker cleanly, which is
+            // the whole point — see [WorkQueue.take].
+            val name = queue.take() ?: return
             try {
                 val outcome =
                     try {
@@ -189,6 +205,19 @@ public class ReconcileLoop(
                         ReconcileOutcome.Retry("the pass failed unexpectedly: ${unexpected.message}")
                     }
                 requeue(queue, name, outcome)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (unexpected: Throwable) {
+                // Requeueing failed, which is not something a pass can classify
+                // — the pass is already over. The server simply does not get its
+                // scheduled re-add, and the resync brings it back, so the cost
+                // is latency rather than correctness. What must not happen is
+                // this worker dying and taking the others with it.
+                LOG.error(
+                    "server={} finished a pass that could not be requeued; the resync will pick it up",
+                    name,
+                    unexpected,
+                )
             } finally {
                 // Even a cancelled pass releases the name, so a restarted
                 // worker can pick the server up again. Under `NonCancellable`

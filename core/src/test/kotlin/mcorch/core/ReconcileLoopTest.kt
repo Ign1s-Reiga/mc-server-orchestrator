@@ -7,6 +7,7 @@ import io.kotest.matchers.ints.shouldBeLessThan
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runTest
@@ -239,5 +240,62 @@ internal class ReconcileLoopTest {
             harness.node.stops shouldHaveSize 1
             harness.store.getServer(name) shouldBe null
             job.cancel()
+        }
+
+    /**
+     * Shutting the loop down must not itself fail.
+     *
+     * `run`'s `finally` closes the queue while cancellation is still
+     * propagating to the workers, so a worker parked in `take()` could be
+     * resumed by the close rather than by the cancellation and escape with
+     * `ClosedReceiveChannelException` — an orderly shutdown reporting a channel
+     * error nobody can act on, which masks any genuine error on the way out.
+     *
+     * `cancelAndJoin` is the assertion: `launch` reports an unhandled child
+     * exception to its parent scope, so a loop that throws on the way out fails
+     * this test, which is exactly how it surfaced in `:app`.
+     *
+     * **This test does not reproduce the race, and did not catch it.** Under
+     * `runTest` the dispatcher is single-threaded and virtual, so cancellation
+     * reaches the workers before the close every time and this passed against
+     * the broken code. Measured on a real dispatcher the losing interleaving
+     * came up 4 times in 200 shutdowns — real, and far too rare to assert on.
+     * The deterministic pin is `WorkQueueTest`'s parked-worker test; this one is
+     * a cheap guard on the surrounding behaviour, and it is worth knowing which
+     * is which.
+     */
+    @Test
+    fun `a loop shut down with its workers parked exits cleanly`() =
+        runTest {
+            val harness = Harness()
+
+            val job = launch { loopFor(harness).run() }
+            // Long enough to seed, find nothing, and park every worker.
+            advanceTimeBy(1.seconds)
+
+            job.cancelAndJoin()
+
+            job.isCancelled shouldBe true
+        }
+
+    /**
+     * The same shutdown, with a pass actually in flight rather than every worker
+     * idle — the other half of the race, and the one that decides whether an
+     * abandoned pass can take the loop down with it.
+     */
+    @Test
+    fun `a loop shut down mid-pass exits cleanly`() =
+        runTest {
+            val harness = Harness()
+            harness.declare(paperDefinition())
+
+            val job = launch { loopFor(harness).run() }
+            // Mid-bring-up: created and starting, so a worker is inside a pass
+            // rather than waiting for one.
+            advanceTimeBy(150.milliseconds)
+
+            job.cancelAndJoin()
+
+            job.isCancelled shouldBe true
         }
 }
