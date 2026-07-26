@@ -253,14 +253,15 @@ public class LocalNode internal constructor(
                     prepareHostPaths(spec)
                     try {
                         client.runSandbox(sandboxSpec)
-                    } catch (exists: CriException.AlreadyExists) {
+                    } catch (collision: CriException) {
                         // Something created it between the list and the create.
                         // Adopt it here rather than reporting "busy, try again":
                         // if the second look cannot find it either, the object
                         // exists under a name this build cannot see, and every
                         // future pass would repeat the same find-create-collide
                         // cycle for ever without anyone being asked to look.
-                        adoptAfterCollision(spec.server, exists)
+                        if (!collision.isNameCollision()) throw collision
+                        adoptAfterCollision(spec.server, collision)
                     }
                 }
 
@@ -272,10 +273,11 @@ public class LocalNode internal constructor(
             val containerId =
                 try {
                     client.createContainer(sandboxId, sandboxSpec, containerSpec)
-                } catch (exists: CriException.AlreadyExists) {
+                } catch (collision: CriException) {
+                    if (!collision.isNameCollision()) throw collision
                     val adopted = observationOf(spec.server, client.sandboxStatus(sandboxId))
                     if (adopted.state == WorkloadState.SANDBOX_ONLY) {
-                        throw unadoptable(NodeOperation.CREATE, "container for `${spec.server}`", exists)
+                        throw unadoptable(NodeOperation.CREATE, "container for `${spec.server}`", collision)
                     }
                     return@translating adopted
                 }
@@ -294,8 +296,31 @@ public class LocalNode internal constructor(
      */
     private suspend fun adoptAfterCollision(
         server: ResourceName,
-        cause: CriException.AlreadyExists,
+        cause: CriException,
     ): SandboxId = findSandbox(server) ?: throw unadoptable(NodeOperation.CREATE, "sandbox for `$server`", cause)
+
+    /**
+     * Whether a failed create means "that name is already taken".
+     *
+     * Two status codes, because containerd does not use the obvious one.
+     * containerd 2.3.3's CRI plugin rejects a duplicate at *name reservation*,
+     * and a reservation conflict is `FAILED_PRECONDITION` — verified against a
+     * real runtime, where `RunPodSandbox` and `CreateContainer` both answer
+     * `failed to reserve ... name "..." is reserved for "<id>"`. Matching only
+     * `ALREADY_EXISTS` made the adoption below dead code, so a create that lost
+     * a race surfaced as a permanent rejection instead of adopting what is
+     * already there.
+     *
+     * The narrowing is done here rather than in `:cri`'s code mapping, which is
+     * right as it stands: `FAILED_PRECONDITION` legitimately covers other
+     * things, and only a caller that has just attempted a create knows a
+     * precondition failure is a name collision. The *message* carries the
+     * colliding ID, and this deliberately does not parse it out — listing by
+     * label finds the object whether or not containerd words it that way
+     * tomorrow.
+     */
+    private fun CriException.isNameCollision(): Boolean =
+        this is CriException.AlreadyExists || this is CriException.FailedPrecondition
 
     private fun unadoptable(
         operation: NodeOperation,
@@ -632,11 +657,13 @@ public class LocalNode internal constructor(
 
             is CriException.RuntimeFailure -> NodeException.Busy(name, operation, describe(), this)
 
-            // Both create paths adopt after a collision before this is reached,
-            // so an `AlreadyExists` that gets here has already survived a second
-            // lookup that found nothing. Retrying repeats that for ever and
-            // shows `RETRYABLE` while never asking anyone to look, so it is
-            // reported instead.
+            // A name collision from either create path has already been through
+            // `adoptAfterCollision` and survived a second lookup that found
+            // nothing — see [isNameCollision], and note that containerd reports
+            // one as `FAILED_PRECONDITION` rather than this. Whichever code it
+            // arrives as, retrying repeats the same find-create-collide cycle
+            // for ever and shows `RETRYABLE` while never asking anyone to look,
+            // so it is reported instead.
             is CriException.AlreadyExists -> NodeException.Rejected(name, operation, describe(), this)
 
             is CriException.NotFound -> NodeException.NotFound(name, operation, describe(), this)

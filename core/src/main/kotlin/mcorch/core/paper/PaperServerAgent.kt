@@ -331,8 +331,18 @@ internal object PaperCommands {
         listOf("mc-monitor", "status", "--host", "127.0.0.1", "--port", port.toString())
 
     /**
-     * `flush` makes the save synchronous, so the reply arrives after the write
-     * rather than after the request was accepted.
+     * **`flush` is load-bearing and must not be dropped.**
+     *
+     * Verified against a real Paper server: `save-all flush` blocks until the
+     * write completes and only then replies, while plain `save-all` replies
+     * with the *byte-identical* `Saved the game` about six seconds before the
+     * write finishes. Nothing downstream can tell the two apart —
+     * [SAVE_CONFIRMED] matches both, by construction — so this argument is the
+     * only thing standing between a confirmed save and a container stopped
+     * mid-write.
+     *
+     * `PaperCommandsTest` pins the exact argument list. If you are here to
+     * simplify this call, that test is the conversation.
      */
     fun saveAll(): List<String> = listOf("rcon-cli", "save-all", "flush")
 
@@ -358,11 +368,18 @@ internal object PaperCommands {
      * Client-side failures worth telling an operator about, matched as whole
      * phrases against the output.
      *
-     * A whitelist rather than a truncation of whatever came back. Output from a
-     * Minecraft server can carry player names — an SLP reply has a
-     * `players.sample` block of names and UUIDs, and any console reply is the
-     * server's text — and CLAUDE.md bans those from logs and from status. So
-     * nothing here is ever echoed: a recognised phrase is reported by name and
+     * A whitelist rather than a truncation of whatever came back, because
+     * neither of these outputs is ours to repeat. `mc-monitor status` prints one
+     * summary line — `<host>:<port> : version=Paper 1.21.4 online=0 max=20
+     * motd='...'` — which carries no player sample, but `motd` is free text an
+     * operator can put anything in, and the version token contains a space, so
+     * nothing may parse it positionally either. A console reply is whatever the
+     * server or a plugin printed. And the SLP payload behind the summary does
+     * carry a `players.sample` block of names and UUIDs, which is one flag or
+     * one tool change away from reaching here.
+     *
+     * CLAUDE.md bans names, UUIDs and addresses from logs and from status, so
+     * nothing is ever echoed: a recognised phrase is reported by name and
      * everything else is reported as a byte count.
      */
     private val DIAGNOSTICS =
