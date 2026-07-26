@@ -16,9 +16,11 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.io.TempDir
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.concurrent.TimeUnit
 import kotlin.io.path.exists
 import kotlin.io.path.listDirectoryEntries
 import kotlin.time.Duration.Companion.seconds
@@ -37,6 +39,7 @@ import kotlin.time.Duration.Companion.seconds
  * throughout the drain protocol: **no stop was issued**, **the container is
  * still running**, **the world is still on disk**.
  */
+@Timeout(value = 8, unit = TimeUnit.MINUTES)
 internal class PaperServerLifecycleIT {
     @TempDir
     lateinit var root: Path
