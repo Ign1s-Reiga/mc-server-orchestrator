@@ -171,10 +171,14 @@ internal class DrainController(
                 server = definition.metadata.name,
                 // The *confirmation* goes, because nothing was observed this
                 // pass and the world may have moved on. The record of a
-                // delivered save request stays: it is the only thing keeping a
-                // second `save-all flush` off a live server, and a runtime that
-                // has stopped reporting a container is not a reason to lift a
-                // wedge that exists to make a human confirm the world state.
+                // delivered-but-unconfirmed save request stays: it is the only
+                // thing keeping a second `save-all flush` off a live server, and
+                // a runtime that has stopped reporting a container is not a
+                // reason to lift a wedge that exists to make a human confirm the
+                // world state. A request that *was* confirmed leaves nothing
+                // behind, because there is no wedge to keep — see
+                // [forgetSaveConfirmation] for why the two cannot share an
+                // answer.
                 drain = drain.forgetSaveConfirmation(),
                 occupancy = null,
                 now = now,
@@ -458,34 +462,37 @@ internal class DrainController(
                 }
             }
 
-            // The server did not answer. That is not a zero-player report, and
-            // treating it as one is how a drain stops a server with people on
-            // it.
+            // The server did not answer, and it makes no difference here whether
+            // that is because the probe ran and got silence or because the probe
+            // could not be run at all. Neither is a zero-player report, and
+            // treating either as one is how a drain stops a server with people
+            // on it. One branch, on purpose: see [ProbeOutcome.Unanswered] for
+            // why the distinction is deliberately not available at this call
+            // site.
             //
-            // The evidence goes for the same reason it goes when a player *is*
-            // seen. A drain can sit here for as long as the exec path is
-            // unhealthy, and nothing seals joins meanwhile: players can arrive,
-            // play and leave entirely inside the blind window, and the zero-
-            // player probe that eventually succeeds is silent about all of it.
-            // So a confirmed save survives only while the chain of zero-player
-            // observations behind it is unbroken. The cost of breaking it is one
-            // more `save-all flush` on an empty server.
-            is ProbeOutcome.NotJoinable -> {
+            // The *confirmation* goes. A drain can sit here for as long as the
+            // exec path is unhealthy, and nothing seals joins meanwhile: players
+            // can arrive, play and leave entirely inside the blind window, and
+            // the zero-player probe that eventually succeeds is silent about all
+            // of it. So a confirmed save survives only while the chain of
+            // zero-player observations behind it is unbroken. The cost of
+            // breaking it is one more `save-all flush` on an empty server.
+            //
+            // The record of a *delivered* save request stays, which is why this
+            // is `forgetSaveConfirmation` and not `forgetSaveEvidence`. This
+            // pass observed nothing, so it has no grounds to lift the wedge that
+            // keeps a second `save-all flush` off a live server: only seeing a
+            // player does that, because only that makes the earlier request
+            // worthless. With the stronger call here, a delivered-but-
+            // unconfirmed save followed by one failed probe would drop
+            // `saveRequestedAt`, demote the abort from permanent to retryable,
+            // and let the next healthy pass re-send the save — silently
+            // replacing "a human confirms the world state" with "the exec
+            // channel flickered".
+            is ProbeOutcome.Unanswered -> {
                 abort(
                     server = definition.metadata.name,
-                    drain = drain.forgetSaveEvidence(),
-                    occupancy = occupancy,
-                    now = now,
-                    reason = FailureReason.DRAIN_STALLED,
-                    failureClass = FailureClass.RETRYABLE,
-                    message = "cannot confirm zero players: ${probe.detail}",
-                )
-            }
-
-            is ProbeOutcome.Unavailable -> {
-                abort(
-                    server = definition.metadata.name,
-                    drain = drain.forgetSaveEvidence(),
+                    drain = drain.forgetSaveConfirmation(),
                     occupancy = occupancy,
                     now = now,
                     reason = FailureReason.DRAIN_STALLED,
@@ -1057,20 +1064,36 @@ internal fun DrainStatus.forgetSaveEvidence(): DrainStatus =
     }
 
 /**
- * Voids what this drain had established, and keeps the record of what it sent.
+ * Voids what this drain had established, and keeps the record of a request whose
+ * completion was never confirmed.
  *
  * For a pass that cannot vouch for the world any more but has observed nothing
- * that would make a delivered save request worthless — the runtime no longer
- * reporting a container, say. The confirmation and the claim of emptiness go;
- * `saveRequestedAt` stays, so a save that went out once still never goes out
- * twice (CLAUDE.md invariant 5), and the drain still needs a human if it had
- * one outstanding.
+ * that would make a delivered save request worthless — a probe that did not
+ * answer, or a runtime that has stopped reporting a container.
+ *
+ * **`saveRequestedAt` carries two different facts, and only [worldSaved] says
+ * which.** Getting this wrong wedges a healthy drain or repeats a side effect,
+ * so the two are separated here rather than at either call site:
+ *
+ * - [worldSaved] **true** — the field is the instant a *completed* save was
+ *   confirmed (see [saveConfirmedAt]). What expired is the confirmation, not the
+ *   request: the save finished, so asking for another one is an ordinary step
+ *   and not a repeat of an outstanding side effect. Both go, exactly as
+ *   [dropUnusableSaveEvidence] does and for the reason documented there —
+ *   leaving the timestamp behind would make the re-entered save read as "a
+ *   request went out and was never confirmed" and abort permanently on a save
+ *   that actually completed.
+ * - [worldSaved] **false** — the field is the record of a request that was
+ *   delivered and never confirmed. That is the wedge keeping a second
+ *   `save-all flush` off a live server (CLAUDE.md invariant 5), and only
+ *   observing a *player* may lift it, because only that makes the old request
+ *   worthless. It stays, and the drain still needs a human.
  */
 internal fun DrainStatus.forgetSaveConfirmation(): DrainStatus =
-    if (!worldSaved && !playersEvacuated) {
-        this
-    } else {
-        copy(worldSaved = false, playersEvacuated = false)
+    when {
+        worldSaved -> copy(worldSaved = false, saveRequestedAt = null, playersEvacuated = false)
+        playersEvacuated -> copy(playersEvacuated = false)
+        else -> this
     }
 
 /** Moves to a new state, stamping the transition. Re-entering the same state does not restamp. */
