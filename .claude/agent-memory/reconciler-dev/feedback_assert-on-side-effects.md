@@ -31,3 +31,14 @@ warning. This invalidated 54 of `:cri`'s tests before they noticed.
 **How to apply:** route suspending bodies through a helper with an explicit
 `Unit` return (`coreTest` here, `runCriTest` in `:cri`), and after the suite
 passes, count the `@Test` annotations and compare against the reported total.
+`Fixtures.kt` contains the string `@Test` inside a KDoc block, so a raw grep
+count is one higher than the real number.
+
+**3. Hold the fakes to the contract, not to what the loop happens to use.**
+`TestStore` ignored `deletedAt`, preconditions and kind mismatches, so the
+loop's store assumptions were being validated against something more permissive
+than the real store — and two of my drain tests only "passed" because of it.
+`TestStoreContractTest` now pins the clauses the reconciler leans on; delete it
+when `:store` publishes its `StoreConformanceSuite` as a test fixture and run
+that instead. Same for `FakeNode`: it carries the labels it was created with,
+because a fake that forgets them cannot catch a drain reading the wrong facts.
