@@ -33,6 +33,45 @@ public object Labels {
      */
     public const val SPEC_HASH: String = "mcorch.dev/spec-hash"
 
+    /**
+     * Whether this workload holds world data that has to be flushed before it
+     * stops. `true` or `false`, and absent means "created before this label
+     * existed" — which is not the same as `false`.
+     *
+     * Recorded on the workload rather than read from the definition because a
+     * drain is conducted against the *container*. An operator who flips
+     * `storage.mode` to `ephemeral` has changed the definition, not the
+     * container that is running with a world in it, and a drain that believed
+     * the definition would skip the save.
+     */
+    public const val WORLD_DATA: String = "mcorch.dev/world-data"
+
+    /**
+     * Whether this workload was created with a channel that can *confirm* a
+     * completed save. Same reasoning as [WORLD_DATA]: enabling RCON in the
+     * definition does nothing for a container that is already running without
+     * it, and a drain that believed the definition would send a save request
+     * into a socket that is not listening and then have to guess what happened.
+     */
+    public const val SAVE_CONFIRMABLE: String = "mcorch.dev/save-confirmable"
+
+    /** Reads a boolean fact off a workload's labels. Null means the workload does not carry it. */
+    public fun booleanValue(
+        labels: Map<String, String>,
+        key: String,
+    ): Boolean? =
+        when (labels[key]) {
+            TRUE -> true
+            FALSE -> false
+            else -> null
+        }
+
+    /** Renders a boolean fact for a label value. */
+    public fun booleanLabel(value: Boolean): String = if (value) TRUE else FALSE
+
+    private const val TRUE: String = "true"
+    private const val FALSE: String = "false"
+
     /** The labels identifying one server's workload. */
     public fun forServer(
         server: ResourceName,

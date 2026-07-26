@@ -225,6 +225,18 @@ public sealed interface WorkloadObservation {
          * loop sees "the definition changed under a running server".
          */
         val specHash: String? = null,
+        /**
+         * The labels the workload actually carries, as the runtime reports
+         * them.
+         *
+         * This is how a caller reads *what the container was built with* rather
+         * than what the definition says today. A drain has to be conducted
+         * against the running container — whether it holds world data, whether
+         * it has a channel that can confirm a save — and after an edit the
+         * definition no longer describes it. Empty when the runtime reports no
+         * labels, which means "unknown", never "false".
+         */
+        val labels: Map<String, String> = emptyMap(),
         /** What the runtime resolved the image to, for drift detection. */
         val imageId: String? = null,
         val createdAt: Instant? = null,

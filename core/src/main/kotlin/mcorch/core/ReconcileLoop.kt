@@ -1,8 +1,12 @@
 package mcorch.core
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import mcorch.schema.DrainState
 import mcorch.schema.ResourceName
 import mcorch.store.ChangeFeed
@@ -58,11 +62,24 @@ public class ReconcileLoop(
     public suspend fun run(): Unit =
         coroutineScope {
             val queue = WorkQueue(this)
-            resumeDrains(queue)
-            val cursor = seed(queue)
-            launch { watchChanges(queue, cursor) }
-            launch { resyncPeriodically(queue) }
-            repeat(config.concurrency) { worker -> launch { work(queue, worker) } }
+            try {
+                resumeDrains(queue)
+                val cursor = seed(queue)
+                buildList {
+                    add(launch { watchChanges(queue, cursor) })
+                    add(launch { resyncPeriodically(queue) })
+                    repeat(config.concurrency) { worker -> add(launch { work(queue, worker) }) }
+                    // Joined explicitly rather than left to `coroutineScope`, so
+                    // that the shutdown below happens after the workers stop and
+                    // not the moment they are launched.
+                }.joinAll()
+            } finally {
+                // Only reached on the way out, since the children above never
+                // return on their own. Pending delayed re-adds are the queue's,
+                // not the scope's, so they are cancelled here rather than left
+                // to a scope that is already shutting down.
+                withContext(NonCancellable) { queue.close() }
+            }
         }
 
     /**
@@ -139,6 +156,17 @@ public class ReconcileLoop(
         }
     }
 
+    /**
+     * One worker: take a server, reconcile it, decide when to look again.
+     *
+     * The catch is the last line of defence, and it is deliberately broad. A
+     * [Reconciler] pass classifies everything it expects, but an exception it
+     * did not expect would escape `launch`, cancel this scope, and take the
+     * resync ticker, the change-feed poller and the other workers with it — so
+     * one server with a bad definition or a node throwing something untranslated
+     * would stop the orchestrator reconciling *every* server. Nothing is
+     * swallowed: it is logged at error and the server comes back on a backoff.
+     */
     private suspend fun work(
         queue: WorkQueue,
         worker: Int,
@@ -146,12 +174,28 @@ public class ReconcileLoop(
         while (true) {
             val name = queue.take()
             try {
-                val outcome = reconciler.reconcile(name)
+                val outcome =
+                    try {
+                        reconciler.reconcile(name)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (unexpected: Throwable) {
+                        LOG.error(
+                            "server={} failed a pass with an unhandled exception; the loop keeps running and " +
+                                "will retry it",
+                            name,
+                            unexpected,
+                        )
+                        ReconcileOutcome.Retry("the pass failed unexpectedly: ${unexpected.message}")
+                    }
                 requeue(queue, name, outcome)
             } finally {
                 // Even a cancelled pass releases the name, so a restarted
-                // worker can pick the server up again.
-                queue.done(name)
+                // worker can pick the server up again. Under `NonCancellable`
+                // because `done` takes a lock, and taking a lock from a
+                // cancelled coroutine throws instead of waiting — which would
+                // leave the name held for good.
+                withContext(NonCancellable) { queue.done(name) }
             }
             LOG.trace("worker {} finished a pass for server={}", worker, name)
         }
