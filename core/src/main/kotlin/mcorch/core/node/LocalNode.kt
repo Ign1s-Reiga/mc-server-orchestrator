@@ -649,7 +649,12 @@ public class LocalNode internal constructor(
         when (this) {
             is CriException.Unavailable -> NodeException.Unreachable(name, operation, describe(), this)
 
-            is CriException.Timeout -> NodeException.Timeout(name, operation, describe(), this)
+            // The trailing argument is `commandTimeout`, carried across rather
+            // than re-derived: :cri decides it by elapsed time against its own
+            // deadline, and that deadline is not visible from anywhere above
+            // this line. Nothing above may look at a gRPC code either, so this
+            // is the only place the two kinds of timeout can be told apart.
+            is CriException.Timeout -> NodeException.Timeout(name, operation, describe(), this, commandTimeout)
 
             is CriException.ResourceExhausted -> NodeException.Busy(name, operation, describe(), this)
 

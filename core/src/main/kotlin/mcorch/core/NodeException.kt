@@ -55,12 +55,35 @@ public sealed class NodeException(
      * Retryable as a *call*, but note what it does not tell you: a save that
      * timed out has not been confirmed, and a timeout is never a reason to stop
      * a container (`failure-modes.md` item 1).
+     *
+     * **Two different things arrive here and [commandTimeout] separates them.**
+     * Either the node did not answer, or it answered promptly to say that a
+     * command *the caller asked it to run* outran the timeout the caller gave
+     * it. Only the first says anything about the node's health, and conflating
+     * them once reported a healthy runtime as unreachable for a Paper server
+     * that was merely still generating its world.
      */
     public class Timeout(
         node: NodeName,
         operation: NodeOperation,
         message: String,
         cause: Throwable? = null,
+        /**
+         * True when the node answered and the *command* ran out of time; false
+         * when the node itself did not answer.
+         *
+         * Only [NodeOperation.EXEC] can set it — that is the one call carrying a
+         * caller-supplied timeout the node enforces on the caller's behalf. A
+         * true here is a statement about the workload, not about the node, and a
+         * caller that reads it as "the runtime is unreachable" is wrong.
+         *
+         * It stays a boolean rather than a separate subclass on purpose: it does
+         * not change [retryable], every existing call site's decision is still
+         * correct without consulting it, and a distributed node implementation
+         * has the same two cases to report — its agent not answering, and a
+         * command its agent ran overrunning.
+         */
+        public val commandTimeout: Boolean = false,
     ) : NodeException(node, operation, message, cause) {
         override val retryable: Boolean get() = true
     }

@@ -132,6 +132,27 @@ internal class FakeNode(
     fun rejected(operation: NodeOperation): NodeException =
         NodeException.Rejected(name, operation, "the runtime refused the request")
 
+    /**
+     * The node did not answer at all: this loop's own deadline elapsed waiting
+     * on it. The node may be sick.
+     */
+    fun unanswered(operation: NodeOperation): NodeException =
+        NodeException.Timeout(name, operation, "the node did not answer within the deadline")
+
+    /**
+     * The node answered promptly to say the *command* outran the timeout it was
+     * given. Says nothing about the node's health — which is the entire point of
+     * having it distinct from [unanswered], since both arrive as the same
+     * `DEADLINE_EXCEEDED` from a real runtime.
+     */
+    fun commandTimedOut(operation: NodeOperation): NodeException =
+        NodeException.Timeout(
+            name,
+            operation,
+            "the command did not finish within the timeout it was given, and the runtime stopped it",
+            commandTimeout = true,
+        )
+
     // ── Node ─────────────────────────────────────────────────────────────────
 
     override suspend fun status(): NodeStatus {
