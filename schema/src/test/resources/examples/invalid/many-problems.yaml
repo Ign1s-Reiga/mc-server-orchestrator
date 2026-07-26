@@ -1,0 +1,24 @@
+# One parse reports all of these, so the file can be fixed in one pass:
+#   metadata.name              — must be lowercase
+#   spec.image                 — must not use the `latest` tag
+#   spec.paper.minecraftVersion— expected a Minecraft release
+#   spec.resources.memory      — must be at least 1Gi
+#   spec.network.port          — must be between 1 and 65535
+#   spec.maxPlayers            — must be between 1 and 10000
+#   spec.strage                — unknown field (did you mean `storage`?)
+apiVersion: mcorch.dev/v1alpha1
+kind: PaperServer
+metadata:
+  name: Survival-01
+spec:
+  eulaAccepted: true
+  image: docker.io/itzg/minecraft-server:latest
+  paper:
+    minecraftVersion: "snapshot-24w14a"
+  maxPlayers: 0
+  network:
+    port: 0
+  resources:
+    memory: 128Mi
+  strage:
+    mode: ephemeral

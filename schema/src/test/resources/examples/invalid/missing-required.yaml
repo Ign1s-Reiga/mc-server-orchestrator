@@ -1,0 +1,8 @@
+# Expected, all in one parse: spec.image, spec.paper, spec.resources,
+# spec.eulaAccepted — is required
+apiVersion: mcorch.dev/v1alpha1
+kind: PaperServer
+metadata:
+  name: survival-01
+spec:
+  maxPlayers: 20

@@ -1,0 +1,49 @@
+# Every field a PaperServer accepts in mcorch.dev/v1alpha1, set explicitly.
+apiVersion: mcorch.dev/v1alpha1
+kind: PaperServer
+metadata:
+  name: survival-02
+  labels:
+    tier: survival
+    region: eu-west
+spec:
+  eulaAccepted: true
+  # Pinned by digest. A tag works too, as long as it is not `latest`.
+  image: registry.example.com:5000/mc/paper@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  paper:
+    minecraftVersion: "1.21.8"
+    build: 42
+  maxPlayers: 60
+  network:
+    port: 25565
+    hostPort: 30002
+    rcon:
+      enabled: true
+      port: 25575
+      # There is no inline password field. The value lives in the secret store.
+      passwordSecret:
+        name: survival-02-rcon
+        key: password
+  resources:
+    memory: 8Gi
+    cpu: "2500m"
+    heap:
+      max: 6Gi
+      min: 6Gi
+  storage:
+    mode: persistent
+    mountPath: /data
+    volume:
+      name: survival-02-world
+      size: 50Gi
+  lifecycle:
+    drain:
+      policy: waitForZeroPlayers
+      playerTransferTimeout: 4m
+      saveTimeout: 5m
+    # Must stay at least 30s above saveTimeout.
+    stopGracePeriod: 6m30s
+    startupTimeout: 8m
+  placement:
+    # Optional pin. Omit it and the scheduler chooses.
+    node: node-a

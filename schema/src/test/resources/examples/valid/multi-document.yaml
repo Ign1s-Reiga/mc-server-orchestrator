@@ -1,0 +1,24 @@
+# One file, several servers. Names must be unique within the input.
+apiVersion: mcorch.dev/v1alpha1
+kind: PaperServer
+metadata:
+  name: survival-a
+spec:
+  eulaAccepted: true
+  image: docker.io/itzg/minecraft-server:2026.6.1
+  paper:
+    minecraftVersion: "1.21.8"
+  resources:
+    memory: 4Gi
+---
+apiVersion: mcorch.dev/v1alpha1
+kind: PaperServer
+metadata:
+  name: survival-b
+spec:
+  eulaAccepted: true
+  image: docker.io/itzg/minecraft-server:2026.6.1
+  paper:
+    minecraftVersion: "1.21.8"
+  resources:
+    memory: 4Gi
