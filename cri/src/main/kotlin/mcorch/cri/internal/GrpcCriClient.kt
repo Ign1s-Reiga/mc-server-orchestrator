@@ -435,18 +435,26 @@ internal class GrpcCriClient private constructor(
     /**
      * Deadline, logging and error translation, applied uniformly.
      *
-     * A failure logs the runtime's own description alongside the code. Without
-     * it the only actionable half of a CRI failure exists nowhere but on the
-     * observed status of whichever server happened to make the call — so a
-     * failure during a call that has no server to hang itself on, or made by a
-     * process whose store write also failed, left nothing behind at all. The
-     * description is containerd's error text, never anything read out of a
-     * container: it can name an object, an image reference or a host path, and
-     * it cannot carry a player name, a UUID or a player's address, because
-     * containerd has never seen one.
+     * A failure logs the runtime's own description alongside the code, because
+     * without it the actionable half of a CRI failure exists nowhere but on the
+     * observed status of whichever server happened to make the call — and a call
+     * with no server to hang itself on, or one whose status write also failed,
+     * then leaves nothing behind at all.
      *
-     * Nothing else from the request is logged. Specs, environment and registry
-     * credentials still never appear.
+     * **The description is a third party's free-form string and is treated as
+     * one.** It is bounded to [MAX_LOGGED_DESCRIPTION_CHARS], and it is withheld
+     * entirely for the operations [CriOperation.requestMayCarrySecrets] names —
+     * read that for why, and change the list there rather than here. A cap alone
+     * would not do for those: Go error wrapping routinely renders the rejected
+     * request, and a truncated prefix of a rejected `CreateContainer` is still a
+     * prefix of the container's environment.
+     *
+     * If you are here to restore the full text because a failure was hard to
+     * diagnose: the whole string is still on the server's observed status, and
+     * that is the copy to go and read. It is deliberately not this one.
+     *
+     * Nothing else from the request reaches the log. Specs, environment and
+     * registry credentials never appear.
      */
     private suspend fun <T> instrumented(
         operation: CriOperation,
@@ -468,10 +476,19 @@ internal class GrpcCriClient private constructor(
                 e.code,
                 e.retryable,
                 elapsedMillis(startedAt),
-                e.description,
+                loggableDetail(e),
             )
             throw e
         }
+    }
+
+    /** The most of a failure description that may safely be written to a log. See [instrumented]. */
+    private fun loggableDetail(failure: CriException): String {
+        if (failure.operation.requestMayCarrySecrets) return WITHHELD_DETAIL
+        val description = failure.description
+        if (description.length <= MAX_LOGGED_DESCRIPTION_CHARS) return description
+        val dropped = description.length - MAX_LOGGED_DESCRIPTION_CHARS
+        return description.take(MAX_LOGGED_DESCRIPTION_CHARS) + "… [$dropped more characters not logged]"
     }
 
     private fun elapsedMillis(startedAtNanos: Long): Long = (System.nanoTime() - startedAtNanos) / 1_000_000
@@ -490,6 +507,22 @@ internal class GrpcCriClient private constructor(
         private val logger = LoggerFactory.getLogger("mcorch.cri.CriClient")
 
         private val FORCED_SHUTDOWN_WAIT: Duration = 2.seconds
+
+        /**
+         * How much of a runtime failure description reaches the log.
+         *
+         * Enough for containerd's own one-line errors, which is what almost
+         * every failure actually is, and short enough that a runtime which
+         * renders a whole rejected request into its error cannot fill the log
+         * with it. The bound exists because the string is a third party's and
+         * has no length contract, not because 300 is special.
+         */
+        internal const val MAX_LOGGED_DESCRIPTION_CHARS: Int = 300
+
+        /** Stands in for a description that may quote a request holding secret material. */
+        internal const val WITHHELD_DETAIL: String =
+            "<not logged: this operation's request carries secret material and the runtime's error may quote " +
+                "it; the full text is on the server's observed status>"
 
         fun connect(config: CriClientConfig): CriClient {
             val handle = buildChannel(config)
