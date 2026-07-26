@@ -3,6 +3,7 @@ package mcorch.core
 import io.kotest.matchers.booleans.shouldBeFalse
 import io.kotest.matchers.booleans.shouldBeTrue
 import io.kotest.matchers.collections.shouldHaveSize
+import io.kotest.matchers.ints.shouldBeGreaterThan
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.types.shouldBeInstanceOf
@@ -262,6 +263,81 @@ internal class DrainTest {
 
             harness.node.saves shouldHaveSize 0
             harness.node.stops shouldHaveSize 1
+            harness.store.getServer(name) shouldBe null
+        }
+
+    @Test
+    fun `a runtime that stops reporting a container is not a container that has gone`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            val running = harness.node.workload.shouldBeInstanceOf<WorkloadObservation.Present>()
+
+            // The node can no longer see the container, while the Paper server
+            // inside it carries on serving. CRI's sandbox status carries
+            // container statuses in an optional field: an empty one is
+            // indistinguishable from an empty sandbox, and reading it that way
+            // makes a live server look like one that was never created.
+            harness.node.workload =
+                running.copy(
+                    state = WorkloadState.SANDBOX_ONLY,
+                    handle = running.handle.copy(containerId = null),
+                )
+            harness.store.deleteDefinition(name)
+
+            repeat(8) { harness.pass(name) }
+
+            // No probe was possible, no save was taken, and above all the
+            // sandbox was not torn down — which would have killed the server
+            // with no grace period and no save.
+            harness.node.stops shouldHaveSize 0
+            harness.node.removals shouldHaveSize 0
+            harness.node.saves shouldHaveSize 0
+            harness.store.getServer(name).shouldNotBeNull()
+            val drain =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            drain.state shouldBe DrainState.DRAIN_FAILED
+            drain.failure.shouldNotBeNull().reason shouldBe FailureReason.DRAIN_STALLED
+
+            // And when the runtime starts reporting it again, the drain carries
+            // on and finishes properly.
+            harness.node.workload = running
+            harness.settle(name, limit = 16)
+            harness.node.saves shouldHaveSize 1
+            harness.node.stops shouldHaveSize 1
+            harness.store.getServer(name) shouldBe null
+        }
+
+    @Test
+    fun `a sandbox that has never had a container is still torn down`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            // A pass that got as far as the sandbox and then died. Nothing was
+            // ever created in it, so there is provably no process inside and
+            // the drain may clear it away.
+            harness.node.workload =
+                WorkloadObservation.Present(
+                    handle = WorkloadHandle(harness.node.name, "sandbox-$name"),
+                    state = WorkloadState.SANDBOX_ONLY,
+                    createdAt = harness.clock.instant(),
+                )
+            harness.store.deleteDefinition(name)
+
+            harness.settle(name, limit = 12)
+
+            harness.node.saves shouldHaveSize 0
+            harness.node.stops shouldHaveSize 0
+            harness.node.removals shouldHaveSize 1
             harness.store.getServer(name) shouldBe null
         }
 
@@ -861,29 +937,37 @@ internal class DrainTest {
         }
 
     @Test
-    fun `a drain that has been stuck for long enough says so, and still does not stop anything`() =
+    fun `a drain that is broken and stuck says so, and still does not stop anything`() =
         coreTest {
             val harness = Harness(config = ReconcilerConfig(drainAttentionAfter = 10.minutes))
             val definition = paperDefinition()
             val name = definition.metadata.name
             harness.declare(definition)
             harness.settle(name)
-            harness.node.online = 2
+            // The wrong RCON password: permanent in practice, indistinguishable
+            // from a hiccup to the loop, so it is retried for ever and nothing
+            // ever asks anybody to look at it.
+            harness.node.onExec = { command ->
+                if (command == PaperCommands.saveAll()) {
+                    ExecOutcome(1, "", "authentication failed")
+                } else {
+                    harness.node.defaultExec(command)
+                }
+            }
             harness.store.deleteDefinition(name)
 
-            repeat(3) { harness.pass(name) }
-            val early =
-                harness
-                    .status(name)
-                    .shouldNotBeNull()
-                    .drain
-                    .shouldNotBeNull()
-                    .failure
-                    .shouldNotBeNull()
-            early.message.startsWith(ATTENTION).shouldBeFalse()
+            repeat(6) { harness.pass(name) }
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .failure
+                .shouldNotBeNull()
+                .message
+                .startsWith(ATTENTION)
+                .shouldBeFalse()
 
-            // Long enough that this is not a busy evening, it is a drain that
-            // is not going to finish without somebody looking at it.
             harness.clock.advance(11.minutes)
             val outcome = harness.pass(name)
 
@@ -899,6 +983,10 @@ internal class DrainTest {
                 .message
                 .startsWith(ATTENTION)
                 .shouldBeTrue()
+            // The count an operator is shown has to be the count. A resume that
+            // threw away the failure it was retrying made every pass of a
+            // failing drain report its first attempt, occurring now.
+            failure.attempts shouldBeGreaterThan 1
 
             // Everything else is exactly as it was. `failure-modes.md` item 7:
             // at a limit you stop trying, you do not stop the container — and
@@ -906,13 +994,45 @@ internal class DrainTest {
             failure.failureClass shouldBe FailureClass.RETRYABLE
             outcome.shouldBeInstanceOf<ReconcileOutcome.Retry>()
             harness.node.stops shouldHaveSize 0
-            harness.node.saves shouldHaveSize 0
             harness.node.workload
                 .shouldBeInstanceOf<WorkloadObservation.Present>()
                 .state shouldBe WorkloadState.RUNNING
+        }
 
-            // And it is still a drain: the players leave, it finishes on its
-            // own, and the marker goes with the failure.
+    @Test
+    fun `a drain waiting for players to log off is never escalated, however long it waits`() =
+        coreTest {
+            val harness = Harness(config = ReconcilerConfig(drainAttentionAfter = 10.minutes))
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.node.online = 2
+            harness.store.deleteDefinition(name)
+
+            repeat(3) { harness.pass(name) }
+            // Four hours of people playing on a server somebody asked to delete.
+            // That is the protocol working as designed, and it resolves itself.
+            harness.clock.advance(4.hours)
+            repeat(3) { harness.pass(name) }
+
+            val status = harness.status(name).shouldNotBeNull()
+            val failure =
+                status.drain
+                    .shouldNotBeNull()
+                    .failure
+                    .shouldNotBeNull()
+            failure.reason shouldBe FailureReason.DRAIN_NO_DESTINATION
+            // Crying wolf on a busy evening every backoff interval is how an
+            // operator learns the marker means nothing, and it is the only
+            // escalation signal there is.
+            failure.message.startsWith(ATTENTION).shouldBeFalse()
+            status.conditions
+                .single { it.type == ConditionType.DRAINING }
+                .message
+                .startsWith(ATTENTION)
+                .shouldBeFalse()
+
             harness.node.online = 0
             harness.settle(name, limit = 16)
             harness.node.stops shouldHaveSize 1
@@ -920,7 +1040,7 @@ internal class DrainTest {
         }
 
     @Test
-    fun `a workload that does not say what it holds is treated as holding a world`() =
+    fun `a workload that does not say what it holds is saved before it is replaced`() =
         coreTest {
             val harness = Harness()
             val definition = paperDefinition()
@@ -929,10 +1049,36 @@ internal class DrainTest {
             harness.settle(name)
             // A container carrying none of this orchestrator's facts about
             // itself: created by an older build, or by hand. Absent is not
-            // `false`, and the only other source is the definition — which is
-            // the thing being edited.
+            // `false`, and neither the edited definition nor the storage status
+            // derived from it is a second opinion worth having.
             val present = harness.node.workload.shouldBeInstanceOf<WorkloadObservation.Present>()
             harness.node.workload = present.copy(labels = emptyMap())
+
+            var savedBeforeStopping = 0
+            harness.recordingStops { savedBeforeStopping = harness.node.saves.size }
+            harness.store.putDefinition(paperDefinition(storage = StorageSpec.Ephemeral()))
+            harness.settle(name, limit = 16)
+
+            // The edit is applied. Refusing it would make every replacement of a
+            // genuinely ephemeral pre-label lobby a permanent failure, since
+            // nothing here can tell that case from a transition. What must not
+            // happen is the container going down without its world on disk.
+            savedBeforeStopping shouldBe 1
+            harness.node.stops shouldHaveSize 1
+            harness.node.creates shouldHaveSize 2
+            harness.node.creates[1]
+                .storage
+                .shouldBeInstanceOf<StorageRequest.Ephemeral>()
+        }
+
+    @Test
+    fun `a workload that says it holds a world refuses the same edit, because that one is a transition`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
 
             harness.store.putDefinition(paperDefinition(storage = StorageSpec.Ephemeral()))
             repeat(8) { harness.pass(name) }
@@ -943,11 +1089,9 @@ internal class DrainTest {
                 .failure
                 .shouldNotBeNull()
                 .failureClass shouldBe FailureClass.PERMANENT
+            harness.node.saves shouldHaveSize 0
             harness.node.stops shouldHaveSize 0
             harness.node.removals shouldHaveSize 0
-            harness.node.workload
-                .shouldBeInstanceOf<WorkloadObservation.Present>()
-                .state shouldBe WorkloadState.RUNNING
         }
 
     @Test
