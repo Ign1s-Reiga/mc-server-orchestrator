@@ -7,6 +7,8 @@ import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.types.shouldBeInstanceOf
 import mcorch.core.paper.PaperImageContract
+import mcorch.schema.FailureClass
+import mcorch.schema.FailureReason
 import mcorch.schema.MemoryQuantity
 import mcorch.schema.ServerPhase
 import mcorch.schema.StorageSpec
@@ -87,6 +89,106 @@ internal class BringUpTest {
             // was stopped or removed.
             harness.node.stops.shouldHaveSize(0)
             harness.node.removals.shouldHaveSize(0)
+        }
+
+    /**
+     * The bug this pins: a Paper server generating its world takes longer to
+     * answer a Server List Ping than the probe's own ten seconds, containerd
+     * stops the probe and reports `DEADLINE_EXCEEDED` — the same code it uses
+     * when it has stopped answering altogether — and the loop recorded a healthy
+     * runtime as `RUNTIME_UNREACHABLE` at `phase=UNKNOWN`.
+     */
+    @Test
+    fun `a probe the node cut short on a starting server is not an unreachable runtime`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition(startupTimeout = 5.minutes)
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.pass(name)
+            harness.pass(name)
+            // The node answers, runs the probe, and stops it at its timeout:
+            // world generation is outrunning the ten seconds a ping is allowed.
+            harness.node.failAlways(NodeOperation.EXEC, harness.node.commandTimedOut(NodeOperation.EXEC))
+
+            val outcome = harness.pass(name)
+
+            outcome.shouldBeInstanceOf<ReconcileOutcome.Waiting>()
+            val status = harness.status(name).shouldNotBeNull()
+            status.phase shouldBe ServerPhase.STARTING
+            status.ready.shouldBeFalse()
+            // Nothing is wrong yet, so nothing is recorded as wrong. This is the
+            // assertion the old behaviour failed.
+            status.failure shouldBe null
+
+            // And the startup timeout is still what ends it, unchanged.
+            harness.clock.advance(10.minutes)
+            harness.pass(name).shouldBeInstanceOf<ReconcileOutcome.Retry>()
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .failure
+                .shouldNotBeNull()
+                .reason shouldBe FailureReason.READINESS_TIMEOUT
+        }
+
+    @Test
+    fun `a probe the node never answered is still an unreachable runtime`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.pass(name)
+            harness.pass(name)
+            // The other half of the same gRPC code: this loop's deadline
+            // elapsed with no answer at all. The node may well be sick, and
+            // that has to keep surfacing.
+            harness.node.failAlways(NodeOperation.EXEC, harness.node.unanswered(NodeOperation.EXEC))
+
+            val outcome = harness.pass(name)
+
+            outcome.shouldBeInstanceOf<ReconcileOutcome.Retry>()
+            val status = harness.status(name).shouldNotBeNull()
+            status.phase shouldBe ServerPhase.UNKNOWN
+            status.ready.shouldBeFalse()
+            val failure = status.failure.shouldNotBeNull()
+            failure.reason shouldBe FailureReason.RUNTIME_UNREACHABLE
+            failure.failureClass shouldBe FailureClass.RETRYABLE
+        }
+
+    /**
+     * The boundary case: a server that was joinable and stops answering
+     * `mc-monitor` may be frozen (`failure-modes.md`, "agent responds but the
+     * server does not"). The node is fine, so this is not `RUNTIME_UNREACHABLE`
+     * — it is a readiness failure, it stays retryable, and nothing restarts the
+     * container, because a restart is a stop path and a stop path drains.
+     */
+    @Test
+    fun `a running server that stops answering surfaces a readiness failure, not an unreachable node`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition(startupTimeout = 1.minutes)
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.status(name).shouldNotBeNull().phase shouldBe ServerPhase.RUNNING
+
+            harness.clock.advance(2.minutes)
+            harness.node.failAlways(NodeOperation.EXEC, harness.node.commandTimedOut(NodeOperation.EXEC))
+            val outcome = harness.pass(name)
+
+            outcome.shouldBeInstanceOf<ReconcileOutcome.Retry>()
+            val status = harness.status(name).shouldNotBeNull()
+            status.ready.shouldBeFalse()
+            val failure = status.failure.shouldNotBeNull()
+            failure.reason shouldBe FailureReason.READINESS_TIMEOUT
+            failure.failureClass shouldBe FailureClass.RETRYABLE
+            harness.node.stops shouldHaveSize 0
+            harness.node.removals shouldHaveSize 0
+            harness.node.workload
+                .shouldBeInstanceOf<WorkloadObservation.Present>()
+                .state shouldBe WorkloadState.RUNNING
         }
 
     @Test

@@ -200,25 +200,47 @@ internal class DrainTest {
     @Test
     fun `a probe that cannot run is not a zero-player report`() =
         coreTest {
-            val harness = Harness()
-            val definition = paperDefinition()
-            val name = definition.metadata.name
-            harness.declare(definition)
-            harness.settle(name)
-            harness.node.failAlways(NodeOperation.EXEC, harness.node.unreachable(NodeOperation.EXEC))
-            harness.store.deleteDefinition(name)
-
-            repeat(6) { harness.pass(name) }
-
-            harness
-                .status(name)
-                .shouldNotBeNull()
-                .drain
-                .shouldNotBeNull()
-                .state shouldBe DrainState.DRAIN_FAILED
-            harness.node.stops shouldHaveSize 0
-            harness.node.saves shouldHaveSize 0
+            unanswerableProbeNeverReadsAsEmpty { node -> node.unreachable(NodeOperation.EXEC) }
         }
+
+    /**
+     * The same rule for the probe failure that now reads as "not joinable"
+     * rather than "the runtime is unreachable" — see
+     * [mcorch.core.paper.PaperServerAgent]. The reclassification must not have
+     * bought a nicer bring-up message at the cost of a drain that mistakes
+     * silence for an empty server: a probe stopped at its own timeout answers
+     * nothing about who is online, whoever's clock ran out.
+     */
+    @Test
+    fun `a probe the node cut short is not a zero-player report either`() =
+        coreTest {
+            unanswerableProbeNeverReadsAsEmpty { node -> node.commandTimedOut(NodeOperation.EXEC) }
+        }
+
+    private suspend fun unanswerableProbeNeverReadsAsEmpty(failure: (FakeNode) -> NodeException) {
+        val harness = Harness()
+        val definition = paperDefinition()
+        val name = definition.metadata.name
+        harness.declare(definition)
+        harness.settle(name)
+        harness.node.failAlways(NodeOperation.EXEC, failure(harness.node))
+        harness.store.deleteDefinition(name)
+
+        repeat(6) { harness.pass(name) }
+
+        harness
+            .status(name)
+            .shouldNotBeNull()
+            .drain
+            .shouldNotBeNull()
+            .state shouldBe DrainState.DRAIN_FAILED
+        harness.node.stops shouldHaveSize 0
+        harness.node.saves shouldHaveSize 0
+        harness.node.removals shouldHaveSize 0
+        harness.node.workload
+            .shouldBeInstanceOf<WorkloadObservation.Present>()
+            .state shouldBe WorkloadState.RUNNING
+    }
 
     @Test
     fun `a server with world data and no RCON cannot be drained and is not stopped`() =

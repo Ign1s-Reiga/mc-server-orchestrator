@@ -112,10 +112,7 @@ internal class PaperServerAgent(
             try {
                 node.exec(handle, request)
             } catch (failure: NodeException) {
-                return ProbeOutcome.Unavailable(
-                    detail = failure.message,
-                    retryable = failure.retryable,
-                )
+                return probeFailed(failure)
             }
         if (!result.exitedCleanly) {
             return ProbeOutcome.NotJoinable(
@@ -128,6 +125,53 @@ internal class PaperServerAgent(
                     "the Server List Ping reply carried no occupancy report (${result.diagnose()})",
                 )
         return ProbeOutcome.Joinable(online = occupancy.online, max = occupancy.max)
+    }
+
+    /**
+     * What a probe that never produced a result means.
+     *
+     * The whole distinction is between *the node could not be asked* and *the
+     * node was asked, ran the probe, and the server did not answer it*. They
+     * arrive as the same exception type because they arrive as the same gRPC
+     * code, and reading the second as the first is what put a healthy runtime on
+     * observed status as `RUNTIME_UNREACHABLE` while a Paper server was doing
+     * nothing worse than generating its world.
+     *
+     * A command timeout is therefore [ProbeOutcome.NotJoinable] — the same
+     * answer as `mc-monitor` exiting non-zero, and for the same reason: the
+     * probe ran and the server did not reply to it. That single mapping is
+     * enough for both cases the caller has to tell apart, because the caller
+     * already tells them apart by the clock rather than by the probe:
+     *
+     * - **Still starting.** The server stays `STARTING` with this as the
+     *   readiness detail, and `spec.lifecycle.startupTimeout` is what eventually
+     *   fails it. Nothing else changes.
+     * - **Past startup, previously running.** The same detail is past the
+     *   startup timeout, so it surfaces as a retryable `READINESS_TIMEOUT` — a
+     *   server that has stopped answering `mc-monitor` may be frozen
+     *   (`failure-modes.md`, "agent responds but the server does not"), and that
+     *   is what a readiness failure on a long-running server says. It stays
+     *   retryable and nothing restarts it: a restart is a stop path, a stop path
+     *   drains, and a drain cannot confirm zero players on a server that is not
+     *   answering.
+     *
+     * Neither is a reason to stop anything, and neither is a player count. The
+     * drain reads any non-[ProbeOutcome.Joinable] answer as "cannot confirm zero
+     * players" and aborts, so a probe that times out can never be mistaken for
+     * an empty server whichever of the two it was.
+     */
+    private fun probeFailed(failure: NodeException): ProbeOutcome {
+        if (failure is NodeException.Timeout && failure.commandTimeout) {
+            return ProbeOutcome.NotJoinable(
+                "the server did not answer a Server List Ping within ${PROBE_TIMEOUT.inWholeSeconds}s, and the " +
+                    "node stopped the probe at that timeout. The node answered promptly, so it is reachable: " +
+                    "this is the server not replying — still generating its world, or wedged",
+            )
+        }
+        return ProbeOutcome.Unavailable(
+            detail = failure.message,
+            retryable = failure.retryable,
+        )
     }
 
     /**
@@ -159,6 +203,16 @@ internal class PaperServerAgent(
                     // the server, so the request counts as issued and must not
                     // be sent again — but it is not confirmed, and a timeout is
                     // never a reason to stop a container.
+                    //
+                    // `commandTimeout` is deliberately *not* consulted here, and
+                    // this is the asymmetry with `probe` above. A probe is a
+                    // read, so knowing whose clock ran out changes what may be
+                    // concluded from the silence. A save is a side effect: once
+                    // the exec was dispatched the request may have reached the
+                    // server whether the node cut it short or never answered, so
+                    // both go in the bucket that is never re-sent. Refining this
+                    // would only ever move a case *out* of that bucket, which is
+                    // a second `save-all flush` on a live server.
                     is NodeException.Timeout -> {
                         SaveOutcome.Unconfirmed("the save did not report completion within the save timeout")
                     }

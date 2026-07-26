@@ -103,6 +103,47 @@ internal class IdempotencyTest {
             harness.status(name).shouldNotBeNull().drain shouldBe null
         }
 
+    /**
+     * A probe the node keeps cutting short now reads as "not joinable yet"
+     * rather than as an unreachable runtime, which means a starting server sits
+     * in this state for as long as world generation takes — thirty passes, in
+     * the run that found the bug. Every one of them must do exactly what the
+     * last one did.
+     */
+    @Test
+    fun `a second pass against a server whose probe keeps timing out changes nothing`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.pass(name)
+            harness.pass(name)
+            harness.node.failAlways(NodeOperation.EXEC, harness.node.commandTimedOut(NodeOperation.EXEC))
+
+            val first = harness.pass(name)
+            val pulls = harness.node.pulls.size
+            val creates = harness.node.creates.size
+            val starts = harness.node.starts.size
+            val writes = harness.store.statusWrites
+            val status = harness.status(name)
+
+            val second = harness.pass(name)
+
+            second shouldBe first
+            harness.node.pulls shouldHaveSize pulls
+            harness.node.creates shouldHaveSize creates
+            harness.node.starts shouldHaveSize starts
+            harness.node.stops shouldHaveSize 0
+            harness.node.removals shouldHaveSize 0
+            harness.node.saves shouldHaveSize 0
+            // The observation did not change, so it was not rewritten — a
+            // starting server must not generate a store write per pass for the
+            // whole of world generation.
+            harness.store.statusWrites shouldBe writes
+            harness.status(name) shouldBe status
+        }
+
     @Test
     fun `a resumed drain does not re-send a save request that already went out`() =
         coreTest {
