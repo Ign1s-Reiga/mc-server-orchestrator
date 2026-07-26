@@ -1,9 +1,12 @@
 package mcorch.cri
 
+import io.grpc.Status
 import io.kotest.assertions.throwables.shouldThrow
+import io.kotest.matchers.booleans.shouldBeFalse
 import io.kotest.matchers.booleans.shouldBeTrue
 import io.kotest.matchers.longs.shouldBeLessThan
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.types.shouldBeInstanceOf
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -128,6 +131,68 @@ class TimeoutAndCancellationTest {
                 shouldThrow<IllegalArgumentException> {
                     fake.client.execSync(ContainerId("c"), listOf("save-all", "flush"), (-1).seconds)
                 }
+            }
+        }
+
+    /**
+     * The runtime enforcing the caller's command timeout is not the runtime
+     * failing to answer, and the two must not be reported the same way.
+     *
+     * This is the failure a real containerd 2.3.3 returns when `ExecSync`
+     * outruns its timeout: `DEADLINE_EXCEEDED`, promptly, with
+     * `failed to exec in container: timeout 10s exceeded: context deadline
+     * exceeded`. Reported as an ordinary transport timeout it became
+     * `RUNTIME_UNREACHABLE` on a node that was answering perfectly — a Paper
+     * server that was still generating its world took longer than ten seconds
+     * to answer a Server List Ping, and the runtime got the blame.
+     */
+    @Test
+    fun `a command that outruns its own timeout is not reported as an unreachable runtime`() =
+        runCriTest {
+            val runtime =
+                FakeCriServer.RuntimeBehaviour(
+                    failWith =
+                        Status.DEADLINE_EXCEEDED.withDescription(
+                            "failed to exec in container: timeout 10s exceeded: context deadline exceeded",
+                        ),
+                )
+            FakeCriServer(runtime = runtime).use { fake ->
+                // Slack far larger than anything this call can take, so an
+                // elapsed time below the transport deadline is unambiguous.
+                val client = fake.clientWith(CriTimeouts(deadlineSlack = 60.seconds))
+
+                val thrown =
+                    shouldThrow<CriException.Timeout> {
+                        client.execSync(ContainerId("c"), listOf("mc-monitor", "status"), 10.seconds)
+                    }
+
+                thrown.commandTimeout.shouldBeTrue()
+                thrown.retryable.shouldBeTrue()
+                // The operator is told which timeout ran out, in seconds...
+                thrown.message shouldContain "10s timeout"
+                // ...that the node is not the problem...
+                thrown.message shouldContain "reachable"
+                // ...and what the runtime itself said, not a paraphrase of it.
+                thrown.message shouldContain "timeout 10s exceeded"
+            }
+        }
+
+    @Test
+    fun `a runtime that stops answering an exec is still reported as a transport timeout`() =
+        runCriTest {
+            val runtime = FakeCriServer.RuntimeBehaviour(hang = true)
+            FakeCriServer(runtime = runtime).use { fake ->
+                val client = fake.clientWith(CriTimeouts(deadlineSlack = 100.milliseconds))
+
+                val thrown =
+                    shouldThrow<CriException.Timeout> {
+                        client.execSync(ContainerId("c"), listOf("mc-monitor", "status"), 100.milliseconds)
+                    }
+
+                // Nothing came back before our own deadline, so this is the
+                // call giving up — not the runtime reporting a slow command.
+                thrown.commandTimeout.shouldBeFalse()
+                thrown.retryable.shouldBeTrue()
             }
         }
 }

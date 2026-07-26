@@ -58,6 +58,7 @@ import runtime.v1.stopPodSandboxRequest
 import runtime.v1.versionRequest
 import java.util.concurrent.TimeUnit
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.nanoseconds
 import kotlin.time.Duration.Companion.seconds
 
 /**
@@ -300,16 +301,61 @@ internal class GrpcCriClient private constructor(
         // reported by containerd rather than cut off as a transport deadline.
         val commandSeconds = timeout.roundUpToWholeSeconds()
         val deadline = commandSeconds.seconds + timeouts.deadlineSlack
-        return runtimeCall(CriOperation.EXEC_SYNC, deadline, target = id.value) { stub ->
-            stub
-                .execSync(
-                    execSyncRequest {
-                        containerId = id.value
-                        cmd += command
-                        this.timeout = commandSeconds
-                    },
-                ).toWrapper()
+        val startedAt = System.nanoTime()
+        return try {
+            runtimeCall(CriOperation.EXEC_SYNC, deadline, target = id.value) { stub ->
+                stub
+                    .execSync(
+                        execSyncRequest {
+                            containerId = id.value
+                            cmd += command
+                            this.timeout = commandSeconds
+                        },
+                    ).toWrapper()
+            }
+        } catch (timedOut: CriException.Timeout) {
+            throw attribute(timedOut, commandSeconds, deadline, System.nanoTime() - startedAt)
         }
+    }
+
+    /**
+     * Says whose clock ran out when an `ExecSync` came back `DEADLINE_EXCEEDED`.
+     *
+     * containerd enforces the command timeout itself and reports the expiry as
+     * `DEADLINE_EXCEEDED` — the same code this client's own transport deadline
+     * produces. Left undistinguished, a Server List Ping that takes longer than
+     * its ten seconds against a Paper server still generating a world is
+     * indistinguishable from a containerd that has stopped answering, and gets
+     * reported as an unreachable node. It was.
+     *
+     * The discriminator is time, not message text — descriptions are free-form
+     * and change between releases (see [translateStatus]). grpc raises a
+     * client-side `DEADLINE_EXCEEDED` at or after the deadline and never before
+     * it, and [elapsedNanos] is measured after the call returned, so anything
+     * shorter than the deadline cannot be this client giving up. containerd
+     * answered, and the command timeout is the only deadline it was given.
+     *
+     * The inequality is deliberately one-sided: when the two are too close to
+     * separate — a [CriTimeouts.deadlineSlack] configured down to nothing — this
+     * reports the ordinary transport timeout, which is the cautious answer.
+     */
+    private fun attribute(
+        failure: CriException.Timeout,
+        commandSeconds: Long,
+        deadline: Duration,
+        elapsedNanos: Long,
+    ): CriException.Timeout {
+        if (elapsedNanos.nanoseconds >= deadline) return failure
+        return CriException.Timeout(
+            operation = CriOperation.EXEC_SYNC,
+            description =
+                "the command did not finish within the ${commandSeconds}s timeout it was given, and the runtime " +
+                    "stopped it. The runtime answered this promptly, so it is reachable and healthy as far as " +
+                    "this call can tell — the command was slow, which is not the same thing. It said: " +
+                    failure.description,
+            cause = failure.cause,
+            commandTimeout = true,
+        )
     }
 
     override suspend fun execStreamUrl(
@@ -389,9 +435,18 @@ internal class GrpcCriClient private constructor(
     /**
      * Deadline, logging and error translation, applied uniformly.
      *
-     * Only operation names, container/sandbox IDs, image references and status
-     * codes reach the log. Specs, environment, registry credentials and sandbox
-     * IPs never do.
+     * A failure logs the runtime's own description alongside the code. Without
+     * it the only actionable half of a CRI failure exists nowhere but on the
+     * observed status of whichever server happened to make the call — so a
+     * failure during a call that has no server to hang itself on, or made by a
+     * process whose store write also failed, left nothing behind at all. The
+     * description is containerd's error text, never anything read out of a
+     * container: it can name an object, an image reference or a host path, and
+     * it cannot carry a player name, a UUID or a player's address, because
+     * containerd has never seen one.
+     *
+     * Nothing else from the request is logged. Specs, environment and registry
+     * credentials still never appear.
      */
     private suspend fun <T> instrumented(
         operation: CriOperation,
@@ -407,12 +462,13 @@ internal class GrpcCriClient private constructor(
             return result
         } catch (e: CriException) {
             logger.warn(
-                "cri failed op={} target={} code={} retryable={} durationMs={}",
+                "cri failed op={} target={} code={} retryable={} durationMs={} detail={}",
                 operation,
                 target ?: "-",
                 e.code,
                 e.retryable,
                 elapsedMillis(startedAt),
+                e.description,
             )
             throw e
         }
