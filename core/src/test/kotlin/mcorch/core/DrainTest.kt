@@ -13,6 +13,8 @@ import mcorch.schema.FailureReason
 import mcorch.schema.RconSpec
 import mcorch.schema.StorageSpec
 import org.junit.jupiter.api.Test
+import kotlin.time.Duration.Companion.hours
+import kotlin.time.Duration.Companion.minutes
 
 /**
  * The drain protocol.
@@ -337,6 +339,388 @@ internal class DrainTest {
                     DrainState.DEREGISTERED,
                     DrainState.STOPPING,
                 )
+        }
+
+    @Test
+    fun `a save confirmed before a player joined does not authorise the stop after they leave`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.store.deleteDefinition(name)
+
+            // The drain gets as far as a confirmed save on an empty server.
+            repeat(6) { harness.pass(name) }
+            harness.node.saves shouldHaveSize 1
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .worldSaved
+                .shouldBeTrue()
+
+            // Somebody joins before the stop is issued, plays for an hour, and
+            // logs off. Nothing seals joins on a standalone server, so this is
+            // an ordinary thing to happen mid-drain.
+            harness.node.online = 1
+            harness.pass(name)
+            harness.node.stops shouldHaveSize 0
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .worldSaved
+                .shouldBeFalse()
+            harness.clock.advance(60.minutes)
+            repeat(3) { harness.pass(name) }
+            harness.node.stops shouldHaveSize 0
+
+            harness.node.online = 0
+            harness.settle(name, limit = 14)
+
+            // An hour of play is not covered by a save taken before it. The
+            // drain had to ask for a second one, and only then could it stop.
+            harness.node.saves shouldHaveSize 2
+            harness.node.stops shouldHaveSize 1
+            harness.store.getServer(name) shouldBe null
+        }
+
+    @Test
+    fun `a drain resumed from the store does not stop on a save from the previous container`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.store.deleteDefinition(name)
+
+            // Reach DEREGISTERED: zero players, save confirmed, stop not issued.
+            repeat(6) { harness.pass(name) }
+            val drain =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            drain.state shouldBe DrainState.DEREGISTERED
+            drain.worldSaved.shouldBeTrue()
+            harness.node.stops shouldHaveSize 0
+
+            // The loop stops here. A day passes, the container is restarted by
+            // hand — a new process, a new world in memory — and the loop comes
+            // back to a drain record that still says the world is saved. The
+            // one probe it takes reports zero players, which is true and says
+            // nothing about the day in between.
+            harness.clock.advance(24.hours)
+            val present = harness.node.workload.shouldBeInstanceOf<WorkloadObservation.Present>()
+            harness.node.workload = present.copy(startedAt = harness.clock.instant())
+
+            harness.pass(name)
+
+            // No stop on a day-old confirmation from a process that is gone.
+            harness.node.stops shouldHaveSize 0
+            harness.node.workload
+                .shouldBeInstanceOf<WorkloadObservation.Present>()
+                .state shouldBe WorkloadState.RUNNING
+
+            harness.settle(name, limit = 14)
+
+            // It went back and saved again before it stopped anything.
+            harness.node.saves shouldHaveSize 2
+            harness.node.stops shouldHaveSize 1
+        }
+
+    @Test
+    fun `a stop is not re-issued while players are on a container that would not stop`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.store.deleteDefinition(name)
+
+            // The stop is issued and does not take: the container is still
+            // running on the next pass.
+            harness.node.onStop = { present -> present }
+            repeat(7) { harness.pass(name) }
+            harness.node.stops shouldHaveSize 1
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .state shouldBe DrainState.STOPPING
+
+            // Somebody is on the server that refused to stop. Re-issuing a stop
+            // is normally safe — the save is on disk — but not when the save no
+            // longer describes what they are doing.
+            harness.node.online = 2
+            repeat(4) { harness.pass(name) }
+
+            harness.node.stops shouldHaveSize 1
+            val drain =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            drain.state shouldBe DrainState.DRAIN_FAILED
+            drain.worldSaved.shouldBeFalse()
+            drain.failure.shouldNotBeNull().failureClass shouldBe FailureClass.RETRYABLE
+        }
+
+    @Test
+    fun `an RCON client that never reached the server may try again`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            // `rcon-cli` cannot connect: a non-zero exit with nothing from the
+            // server in it. Nothing was delivered, so nothing has to be
+            // preserved and a later attempt is safe.
+            harness.node.onExec = { command ->
+                if (command == PaperCommands.saveAll()) {
+                    ExecOutcome(1, "", "dial tcp 127.0.0.1:25575: connection refused")
+                } else {
+                    harness.node.defaultExec(command)
+                }
+            }
+            harness.store.deleteDefinition(name)
+
+            repeat(8) { harness.pass(name) }
+
+            val drain =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            drain.state shouldBe DrainState.DRAIN_FAILED
+            drain.failure.shouldNotBeNull().failureClass shouldBe FailureClass.RETRYABLE
+            // The distinction the whole fix turns on: no delivered request, so
+            // no record of one, so the server is not wedged.
+            drain.saveRequestedAt shouldBe null
+            drain.worldSaved.shouldBeFalse()
+            harness.node.stops shouldHaveSize 0
+
+            // The hiccup passes and the drain finishes on its own.
+            harness.node.onExec = { command -> harness.node.defaultExec(command) }
+            harness.settle(name, limit = 14)
+
+            harness.node.saves
+                .isNotEmpty()
+                .shouldBeTrue()
+            harness.node.stops shouldHaveSize 1
+            harness.store.getServer(name) shouldBe null
+        }
+
+    @Test
+    fun `a save the server acknowledged and did not finish is still never re-sent`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            // The server replied — it started saving — and the client then
+            // failed. The request was delivered, so it must not be delivered
+            // again on a guess.
+            harness.node.onExec = { command ->
+                if (command == PaperCommands.saveAll()) {
+                    ExecOutcome(1, "Saving the game (this may take a moment!)", "connection reset")
+                } else {
+                    harness.node.defaultExec(command)
+                }
+            }
+            harness.store.deleteDefinition(name)
+
+            repeat(10) { harness.pass(name) }
+
+            val drain =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            drain.failure.shouldNotBeNull().failureClass shouldBe FailureClass.PERMANENT
+            drain.saveRequestedAt.shouldNotBeNull()
+            harness.node.saves shouldHaveSize 1
+            harness.node.stops shouldHaveSize 0
+        }
+
+    @Test
+    fun `enabling RCON on a container that has none does not wedge the server`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition(rcon = RconSpec.Disabled)
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+
+            // The operator follows the advice on the stalled drain and enables
+            // RCON. It is in the spec hash, so it asks for a recreate — and the
+            // recreate has to drain the container that is running, which was
+            // created with RCON disabled and has nothing listening. The loop
+            // must not believe the new definition, must not send a save into
+            // that socket, and above all must not record a request it never
+            // delivered: that record is what used to make the state permanent
+            // and unrecoverable.
+            harness.store.putDefinition(paperDefinition(rcon = RconSpec.Enabled(passwordSecret = secretRef())))
+            repeat(8) { harness.pass(name) }
+
+            val stalled =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            stalled.failure.shouldNotBeNull().reason shouldBe FailureReason.DRAIN_STALLED
+            stalled.failure.shouldNotBeNull().failureClass shouldBe FailureClass.PERMANENT
+            stalled.saveRequestedAt shouldBe null
+            stalled.worldSaved.shouldBeFalse()
+            harness.node.saves shouldHaveSize 0
+            harness.node.stops shouldHaveSize 0
+            harness.node.creates shouldHaveSize 1
+            harness.node.workload
+                .shouldBeInstanceOf<WorkloadObservation.Present>()
+                .state shouldBe WorkloadState.RUNNING
+            // It says which way is out, and the way out is not another edit
+            // against this container.
+            stalled.failure
+                .shouldNotBeNull()
+                .message
+                .contains("revert spec.network.rcon")
+                .shouldBeTrue()
+
+            // Reverting works, which is the whole point: the server goes back to
+            // running with nothing left over.
+            harness.store.putDefinition(definition)
+            harness.settle(name, limit = 8).shouldBeInstanceOf<ReconcileOutcome.Settled>()
+            val recovered = harness.status(name).shouldNotBeNull()
+            recovered.drain shouldBe null
+            recovered.ready.shouldBeTrue()
+            harness.node.stops shouldHaveSize 0
+        }
+
+    @Test
+    fun `a deleted server whose container has no RCON is finished off by hand and then torn down`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition(rcon = RconSpec.Disabled)
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.store.deleteDefinition(name)
+            repeat(8) { harness.pass(name) }
+
+            val stalled =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            stalled.failure.shouldNotBeNull().failureClass shouldBe FailureClass.PERMANENT
+            stalled.saveRequestedAt shouldBe null
+            harness.node.saves shouldHaveSize 0
+            harness.node.stops shouldHaveSize 0
+            // A deleted definition cannot be edited back into shape — the store
+            // refuses to write a tombstoned name — so the only way out is a
+            // human, and the message has to say so rather than pointing at an
+            // edit that cannot be made.
+            stalled.failure
+                .shouldNotBeNull()
+                .message
+                .contains("save the world and stop the container yourself")
+                .shouldBeTrue()
+
+            // So they do exactly that. The loop has to still be watching, or the
+            // advice it gave is a dead end: a permanently failed drain that is
+            // never looked at again cannot notice the container is gone.
+            val present = harness.node.workload.shouldBeInstanceOf<WorkloadObservation.Present>()
+            harness.node.workload = present.copy(state = WorkloadState.EXITED, exitCode = 0)
+            harness.settle(name, limit = 12)
+
+            harness.node.stops shouldHaveSize 0
+            harness.node.removals shouldHaveSize 1
+            harness.store.getServer(name) shouldBe null
+            // And the world it was never able to save is still on disk.
+            harness.node.volumes shouldHaveSize 1
+        }
+
+    @Test
+    fun `switching a running server to ephemeral storage is refused rather than stopped without a save`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+
+            // `storage.mode` is in the spec hash, so this asks for a recreate —
+            // and the recreate drains the container that is holding the world.
+            harness.store.putDefinition(paperDefinition(storage = StorageSpec.Ephemeral()))
+            repeat(8) { harness.pass(name) }
+
+            val status = harness.status(name).shouldNotBeNull()
+            status.failure.shouldNotBeNull().failureClass shouldBe FailureClass.PERMANENT
+            // Nothing was drained, nothing was saved, and above all nothing was
+            // stopped without one.
+            harness.node.saves shouldHaveSize 0
+            harness.node.stops shouldHaveSize 0
+            harness.node.removals shouldHaveSize 0
+            harness.node.creates shouldHaveSize 1
+            harness.node.workload
+                .shouldBeInstanceOf<WorkloadObservation.Present>()
+                .state shouldBe WorkloadState.RUNNING
+
+            // Reverting the edit puts the server back where it was.
+            harness.store.putDefinition(definition)
+            harness.settle(name).shouldBeInstanceOf<ReconcileOutcome.Settled>()
+            harness.node.stops shouldHaveSize 0
+        }
+
+    @Test
+    fun `a rejected observation still records that a save request went out`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            // An image change, so the drain is a replacement and the definition
+            // is still writable while it runs.
+            harness.store.putDefinition(paperDefinition(image = "docker.io/itzg/minecraft-server:2026.7.0"))
+            // Up to the pass that requests the save.
+            repeat(5) { harness.pass(name) }
+            harness.node.saves shouldHaveSize 0
+
+            // The operator edits the definition again while the saving pass
+            // runs, so the observation carrying the save record is rejected.
+            harness.store.beforeStatusWrite = {
+                harness.store.putDefinition(paperDefinition(maxPlayers = 41))
+            }
+            harness.pass(name).shouldBeInstanceOf<ReconcileOutcome.Retry>()
+            harness.node.saves shouldHaveSize 1
+
+            // The record of the request has to have survived the rejection, or
+            // the next pass asks a live server to save all over again.
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .saveRequestedAt
+                .shouldNotBeNull()
+            repeat(4) { harness.pass(name) }
+            harness.node.saves shouldHaveSize 1
         }
 
     @Test

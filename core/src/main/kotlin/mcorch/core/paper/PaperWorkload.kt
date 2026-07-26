@@ -83,7 +83,15 @@ internal object PaperWorkloadPlanner {
             env = environment,
             secretEnv = secretEnvironment,
             ports = ports,
-            labels = Labels.forServer(name, definition.kind),
+            labels =
+                Labels.forServer(name, definition.kind) +
+                    mapOf(
+                        // What a later drain has to know about *this* container,
+                        // recorded on the container itself. A definition that
+                        // changes underneath it does not change these.
+                        Labels.WORLD_DATA to Labels.booleanLabel(storage is StorageRequest.Persistent),
+                        Labels.SAVE_CONFIRMABLE to Labels.booleanLabel(spec.network.rcon is RconSpec.Enabled),
+                    ),
         )
     }
 

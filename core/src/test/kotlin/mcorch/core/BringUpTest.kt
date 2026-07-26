@@ -177,6 +177,17 @@ internal class BringUpTest {
             harness.node.creates
                 .single()
                 .server shouldBe name
+            // The container that was just created is what gets recorded, not the
+            // sandbox-only observation the pass started from. Recording the
+            // older one leaves `containerId` null for a container that exists
+            // and costs a pass rediscovering it.
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .runtime
+                .shouldNotBeNull()
+                .containerId
+                .shouldNotBeNull()
         }
 
     @Test
