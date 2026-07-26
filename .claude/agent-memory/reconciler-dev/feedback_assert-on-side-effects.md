@@ -34,6 +34,12 @@ passes, count the `@Test` annotations and compare against the reported total.
 `Fixtures.kt` contains the string `@Test` inside a KDoc block, so a raw grep
 count is one higher than the real number.
 
+**4. Never `git checkout --` a file with uncommitted work in it.** I lost a
+round of edits to `DrainController.kt` reverting a deliberate one-line sabotage
+that way, and the new file next to it was untracked so the same command silently
+left *its* sabotage in place. Commit first, then sabotage, then restore — or copy
+the file to the scratchpad.
+
 **3. Hold the fakes to the contract, not to what the loop happens to use.**
 `TestStore` ignored `deletedAt`, preconditions and kind mismatches, so the
 loop's store assumptions were being validated against something more permissive
