@@ -29,7 +29,10 @@ merged are the ones below, which pass every check in that list.
    which is decided by the gRPC status code containerd returns for an `ExecSync`
    that outran its own timeout. If containerd answers `UNKNOWN` rather than
    `DEADLINE_EXCEEDED`, the "never re-send a save" rule silently does not hold.
-   Verify against a real containerd, not against the type names.
+   Verify against a real containerd, not against the type names. (Round 5: it
+   answers `DEADLINE_EXCEEDED`, promptly, with `failed to exec in container:
+   timeout Ns exceeded` — the *same code* as a transport deadline. `:cri` now
+   separates them by elapsed time, never message text.)
 3. **A failed command is not a delivered request.** `rcon-cli` exiting non-zero
    because it could not connect is classified the same as a save that was
    accepted and never confirmed. The first must be retryable; treating it as
@@ -63,10 +66,10 @@ merged are the ones below, which pass every check in that list.
    stopping on a confirmation from before an unobserved play session is not.
 8. **A retry backoff is only a cap if the retries are consecutive.**
    `WorkQueue.succeeded` clears the attempt counter, and `ReconcileOutcome.Progressed`
-   calls it. A failure loop that alternates `Progressed` (the `DRAIN_FAILED`
-   resume moves state, so it counts as progress) with `Retry` (the step then
-   fails) resets the counter every other pass and never leaves attempt 1. What
-   reads as "retries at the 5-minute cap forever" is a ~2-second hot loop
+   calls it — as does `Waiting`. A failure loop that alternates `Progressed` (the
+   `DRAIN_FAILED` resume moves state, so it counts as progress) with `Retry` (the
+   step then fails) resets the counter every other pass and never leaves attempt 1.
+   What reads as "retries at the 5-minute cap forever" is a ~2-second hot loop
    issuing an exec and a store write every pass, for ever. Before accepting any
    "it backs off" argument, check whether a state change is interleaved with the
    failure. (Closed as of round 4: the `DRAIN_FAILED` resume runs the resumed
@@ -138,5 +141,34 @@ merged are the ones below, which pass every check in that list.
    `DRAIN_SAVE_TIMEOUT` posture without a human. Check every call site of an
    evidence-voider against the *specific* justification in its doc comment, not
    against its name.
+   **Status as of round 5: half fixed.** `forgetSaveConfirmation` was added and
+   the `SANDBOX_ONLY` abort uses it, but *both* failed-probe branches of
+   `requireEmpty` still call `forgetSaveEvidence`, so any single unanswerable
+   probe still lifts the wedge. Raised as a warning, not critical: the drain
+   that follows still needs a freshly confirmed save and a fresh zero-player
+   probe before it can stop, so the re-send costs an extra `save-all flush`
+   rather than a world. The doc comment on `forgetSaveEvidence` claiming it is
+   "called only from a pass that has just observed somebody" is simply false —
+   read the call sites, not the comment.
+15. **A reclassification that splits one phase into two can restart a timer.**
+   Mapping a previously-single failure onto two `ServerPhase`s makes a flapping
+   input alternate phases, and `draftStatus` restamps `lastTransitionAt` on every
+   phase change. Anything measured from `lastTransitionAt` — here the startup
+   timeout in `Reconciler.awaitJoinable` — then never elapses. Narrow in this
+   repo because the timer prefers `observation.startedAt`, which containerd does
+   report, but the shape generalises: whenever a change adds a second phase for
+   an existing condition, grep for every deadline anchored on
+   `lastTransitionAt`. It also turns a settled status into a store write per
+   pass, which defeats the unchanged-status skip.
+16. **Mapping a skill-doc row onto actors this deployment does not have.**
+   `failure-modes.md` is written for proxy + in-container agent. When an
+   implementer maps "the agent" onto containerd's `ExecSync` and "the server does
+   not respond" onto the SLP probe, rows land on the wrong side of the state
+   machine. Resolve the roles first: here the agent-equivalent is
+   `mc-monitor`/`rcon-cli` *reaching* the server, and each row keys on a
+   different one. Before accepting a "we diverge from the skill" flag, check
+   whether the row is actually implemented somewhere else in the machine under a
+   different trigger. See [[standalone-paper-drain-shape]] for the round-5
+   ruling on "agent responds but the server does not".
 
 Related: [[standalone-paper-drain-shape]]
