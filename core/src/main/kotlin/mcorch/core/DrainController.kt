@@ -10,10 +10,15 @@ import mcorch.schema.FailureClass
 import mcorch.schema.FailureReason
 import mcorch.schema.PaperServerDefinition
 import mcorch.schema.PlayerOccupancy
+import mcorch.schema.ResourceName
 import org.slf4j.LoggerFactory
 import java.time.Clock
 import java.time.Instant
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.toKotlinDuration
+import java.time.Duration as JavaDuration
 
 /**
  * The drain protocol, one step per reconcile pass.
@@ -59,13 +64,30 @@ import kotlin.time.Duration.Companion.seconds
  */
 internal class DrainController(
     private val clock: Clock,
+    /**
+     * The longest gap between two recorded observations that still counts as
+     * having watched the server.
+     *
+     * A confirmed save is only worth anything while the loop has been looking
+     * the whole time since. Nothing else notices a gap: a probe reports what is
+     * online *now*, so half an hour of play between two passes leaves no trace
+     * anywhere, and the zero-player reading that follows it is true and
+     * worthless. The loop's own heartbeat is the only witness that it was
+     * watching at all.
+     */
+    private val evidenceGap: Duration = DEFAULT_EVIDENCE_GAP,
+    private val attentionAfter: Duration = DEFAULT_ATTENTION_AFTER,
 ) {
     /**
      * Advances the drain by at most one step, performing at most one side
      * effect.
      *
      * @param current the drain recorded last pass, or null to start one.
+     * @param lastObservedAt when the last observation of this server was
+     *   recorded, or null if there is none. The evidence chain is measured
+     *   against it.
      */
+    @Suppress("LongParameterList")
     suspend fun advance(
         definition: PaperServerDefinition,
         agent: PaperServerAgent,
@@ -73,6 +95,8 @@ internal class DrainController(
         observation: WorkloadObservation,
         current: DrainStatus?,
         cause: DrainCause,
+        lastObservedAt: Instant?,
+        storageWasPersistent: Boolean?,
     ): DrainProgress {
         val now = clock.instant()
         val recorded = current ?: started(now)
@@ -108,19 +132,18 @@ internal class DrainController(
             return DrainProgress(drain = recorded, outcome = ReconcileOutcome.Waiting(UNKNOWN_STATE, POLL))
         }
 
-        // A confirmation the loop recorded before the process now running
-        // started is not evidence about that process. Dropped here, once, so
-        // that every state below sees a drain whose evidence is about the
-        // container in front of it — and so that the drain can go and get a
-        // fresh confirmation rather than reporting a save it cannot vouch for.
-        val drain = recorded.dropStaleSaveEvidence(observation.startedAt)
+        // Two ways a confirmation stops describing the world, neither of which
+        // any probe can report, both dropped here so that every state below
+        // sees a drain whose evidence is about the container in front of it.
+        val drain = recorded.dropUnusableSaveEvidence(observation.startedAt, lastObservedAt, now, evidenceGap)
         if (drain !== recorded) {
             LOG.warn(
-                "server={} has a world save confirmed at {}, before the container now running started at {}; " +
-                    "it is not evidence about this process and the drain will save again",
+                "server={} has a world save confirmed at {} that is no longer evidence: the container now " +
+                    "running started at {} and the last recorded observation was at {}. The drain will save again",
                 definition.metadata.name,
                 recorded.saveRequestedAt,
                 observation.startedAt,
+                lastObservedAt,
             )
         }
 
@@ -131,9 +154,45 @@ internal class DrainController(
         val probe = agent.probe(node, observation.handle)
         val occupancy = (probe as? ProbeOutcome.Joinable)?.let { PlayerOccupancy(it.online, it.max, now) }
 
-        // Read once per pass, off the running container rather than off the
-        // definition, and threaded through every decision below.
-        val contract = agent.contractOf(observation)
+        val pass =
+            DrainPass(
+                definition = definition,
+                agent = agent,
+                node = node,
+                observation = observation,
+                probe = probe,
+                occupancy = occupancy,
+                // Read once per pass, off the running container rather than off
+                // the definition, and threaded through every decision below.
+                contract = agent.contractOf(observation, storageWasPersistent),
+                now = now,
+            )
+        return step(pass, drain)
+    }
+
+    /**
+     * One state's worth of work.
+     *
+     * Separate from [advance] so that a drain re-entered after a failure can run
+     * the state it resumes into *in the same pass*. Re-entering used to cost a
+     * pass of its own, reported as [ReconcileOutcome.Progressed] — which told
+     * the loop the server had made progress and reset its backoff, so a drain
+     * whose save kept failing alternated resume/fail about once a second for
+     * ever instead of backing off. Nothing here performs more than one side
+     * effect: the resume itself does none.
+     */
+    private suspend fun step(
+        pass: DrainPass,
+        drain: DrainStatus,
+    ): DrainProgress {
+        val definition = pass.definition
+        val agent = pass.agent
+        val node = pass.node
+        val observation = pass.observation
+        val probe = pass.probe
+        val occupancy = pass.occupancy
+        val contract = pass.contract
+        val now = pass.now
 
         return when (drain.state) {
             DrainState.DRAIN_REQUESTED -> {
@@ -178,7 +237,7 @@ internal class DrainController(
             // Step 5: save the world and wait for completion.
             DrainState.SAVING -> {
                 requireEmpty(definition, drain, probe, occupancy, now) {
-                    save(agent, node, observation, contract, drain, occupancy, now)
+                    save(pass, drain)
                 }
             }
 
@@ -187,8 +246,8 @@ internal class DrainController(
             // `sealRequestedAt` does.
             DrainState.DEREGISTERED -> {
                 requireEmpty(definition, drain, probe, occupancy, now) {
-                    if (drain.mayStop(contract, observation.startedAt)) {
-                        stop(definition, node, observation, contract, drain, occupancy, now)
+                    if (drain.mayStop(contract, observation.startedAt, now, evidenceGap)) {
+                        stop(pass, drain)
                     } else {
                         // The evidence that got this drain here is gone — a
                         // player was seen since, or the container restarted —
@@ -213,7 +272,7 @@ internal class DrainController(
             // Step 7 was issued on the way into this state. The container has
             // not been observed down yet, so watch for it.
             DrainState.STOPPING -> {
-                awaitStopped(definition, node, observation, probe, contract, drain, occupancy, now)
+                awaitStopped(pass, drain)
             }
 
             // Re-entered after a backoff.
@@ -246,18 +305,32 @@ internal class DrainController(
                     // keeps failing.
                     val resume =
                         when {
-                            drain.saveIsCurrent(observation.startedAt) -> DrainState.DEREGISTERED
+                            drain.saveIsCurrent(observation.startedAt, now, evidenceGap) -> DrainState.DEREGISTERED
                             drain.playersEvacuated -> DrainState.SAVING
                             else -> DrainState.SEALED
                         }
-                    DrainProgress(
-                        drain = drain.moveTo(resume, now).copy(failure = null),
-                        occupancy = occupancy,
-                        outcome = ReconcileOutcome.Progressed("the drain resumes at $resume"),
-                    )
+                    // Straight into that state, in this pass, against the probe
+                    // just taken. Returning here instead would report progress
+                    // for a pass that did nothing, and the loop reads that as a
+                    // reason to forget how long this has been failing.
+                    step(pass, drain.moveTo(resume, now).copy(failure = null))
                 }
             }
         }
+    }
+
+    /** Everything one pass established before it looked at the drain's state. */
+    private class DrainPass(
+        val definition: PaperServerDefinition,
+        val agent: PaperServerAgent,
+        val node: Node,
+        val observation: WorkloadObservation.Present,
+        val probe: ProbeOutcome,
+        val occupancy: PlayerOccupancy?,
+        val contract: WorkloadContract,
+        val now: Instant,
+    ) {
+        val server: ResourceName get() = definition.metadata.name
     }
 
     /**
@@ -313,6 +386,7 @@ internal class DrainController(
                     )
                     val resaves = drain.worldSaved
                     abort(
+                        server = definition.metadata.name,
                         // Somebody is on the server. Anything it had saved is
                         // now behind whatever they are doing, so the evidence
                         // goes and a later pass has to save again before it can
@@ -334,9 +408,19 @@ internal class DrainController(
             // The server did not answer. That is not a zero-player report, and
             // treating it as one is how a drain stops a server with people on
             // it.
+            //
+            // The evidence goes for the same reason it goes when a player *is*
+            // seen. A drain can sit here for as long as the exec path is
+            // unhealthy, and nothing seals joins meanwhile: players can arrive,
+            // play and leave entirely inside the blind window, and the zero-
+            // player probe that eventually succeeds is silent about all of it.
+            // So a confirmed save survives only while the chain of zero-player
+            // observations behind it is unbroken. The cost of breaking it is one
+            // more `save-all flush` on an empty server.
             is ProbeOutcome.NotJoinable -> {
                 abort(
-                    drain = drain,
+                    server = definition.metadata.name,
+                    drain = drain.forgetSaveEvidence(),
                     occupancy = occupancy,
                     now = now,
                     reason = FailureReason.DRAIN_STALLED,
@@ -347,7 +431,8 @@ internal class DrainController(
 
             is ProbeOutcome.Unavailable -> {
                 abort(
-                    drain = drain,
+                    server = definition.metadata.name,
+                    drain = drain.forgetSaveEvidence(),
                     occupancy = occupancy,
                     now = now,
                     reason = FailureReason.DRAIN_STALLED,
@@ -359,16 +444,15 @@ internal class DrainController(
         }
 
     /** Step 5. Requests a save at most once, and only proceeds on a confirmed completion. */
-    @Suppress("LongParameterList")
     private suspend fun save(
-        agent: PaperServerAgent,
-        node: Node,
-        observation: WorkloadObservation.Present,
-        contract: WorkloadContract,
+        pass: DrainPass,
         drain: DrainStatus,
-        occupancy: PlayerOccupancy?,
-        now: Instant,
     ): DrainProgress {
+        val observation = pass.observation
+        val contract = pass.contract
+        val occupancy = pass.occupancy
+        val now = pass.now
+        val server = pass.server
         if (!contract.holdsWorldData) {
             // Ephemeral storage: the operator asked for a disposable instance
             // by name, and there is no world to flush. `worldSaved` stays false
@@ -384,7 +468,7 @@ internal class DrainController(
                 outcome = ReconcileOutcome.Progressed("ephemeral storage: no world to save"),
             )
         }
-        if (drain.saveIsCurrent(observation.startedAt)) {
+        if (drain.saveIsCurrent(observation.startedAt, now, evidenceGap)) {
             return DrainProgress(
                 drain = drain.moveTo(DrainState.DEREGISTERED, now),
                 occupancy = occupancy,
@@ -397,6 +481,7 @@ internal class DrainController(
             // is not the answer: this drain has no evidence the world is on
             // disk, and only a human can supply that.
             return abort(
+                server = server,
                 drain = drain,
                 occupancy = occupancy,
                 now = now,
@@ -409,7 +494,7 @@ internal class DrainController(
             )
         }
 
-        return when (val outcome = agent.requestSave(node, observation, contract)) {
+        return when (val outcome = pass.agent.requestSave(pass.node, observation, contract)) {
             SaveOutcome.Confirmed -> {
                 DrainProgress(
                     drain =
@@ -432,6 +517,7 @@ internal class DrainController(
                 // you the save has not finished, never that it is now fine to
                 // stop the container (`failure-modes.md` item 1).
                 abort(
+                    server = server,
                     drain = drain.copy(saveRequestedAt = now),
                     occupancy = occupancy,
                     now = now,
@@ -446,6 +532,7 @@ internal class DrainController(
                 // The request never went out, so trying again later is safe and
                 // `saveRequestedAt` stays null.
                 abort(
+                    server = server,
                     drain = drain,
                     occupancy = occupancy,
                     now = now,
@@ -458,6 +545,7 @@ internal class DrainController(
 
             is SaveOutcome.Unconfirmable -> {
                 abort(
+                    server = server,
                     drain = drain,
                     occupancy = occupancy,
                     now = now,
@@ -478,23 +566,24 @@ internal class DrainController(
      * period comes from the definition, where the schema has already guaranteed
      * it exceeds the save timeout.
      */
-    @Suppress("LongParameterList")
     private suspend fun stop(
-        definition: PaperServerDefinition,
-        node: Node,
-        observation: WorkloadObservation.Present,
-        contract: WorkloadContract,
+        pass: DrainPass,
         drain: DrainStatus,
-        occupancy: PlayerOccupancy?,
-        now: Instant,
     ): DrainProgress {
-        if (!drain.mayStop(contract, observation.startedAt)) {
+        val definition = pass.definition
+        val observation = pass.observation
+        val contract = pass.contract
+        val occupancy = pass.occupancy
+        val now = pass.now
+        val server = pass.server
+        if (!drain.mayStop(contract, observation.startedAt, now, evidenceGap)) {
             // Unreachable through the state machine: `DEREGISTERED` checks the
             // same thing and goes back to `SAVING` instead of calling this. Kept
             // as the last line of defence — if a future edit ever routes into
             // the stop without a current save, it aborts instead of losing a
             // world.
             return abort(
+                server = server,
                 drain = drain,
                 occupancy = occupancy,
                 now = now,
@@ -508,12 +597,12 @@ internal class DrainController(
         LOG.info(
             "stopping server={} node={} gracePeriod={}s worldSaved={} worldData={}",
             definition.metadata.name,
-            node.name,
+            pass.node.name,
             grace.inWholeSeconds,
             drain.worldSaved,
             contract.holdsWorldData,
         )
-        node.stopWorkload(observation.handle, grace)
+        pass.node.stopWorkload(observation.handle, grace)
         return DrainProgress(
             drain = drain.moveTo(DrainState.STOPPING, now),
             occupancy = occupancy,
@@ -539,17 +628,17 @@ internal class DrainController(
      * requiring an answer would leave the drain unable to finish exactly when it
      * is working correctly.
      */
-    @Suppress("LongParameterList")
     private suspend fun awaitStopped(
-        definition: PaperServerDefinition,
-        node: Node,
-        observation: WorkloadObservation.Present,
-        probe: ProbeOutcome,
-        contract: WorkloadContract,
+        pass: DrainPass,
         drain: DrainStatus,
-        occupancy: PlayerOccupancy?,
-        now: Instant,
     ): DrainProgress {
+        val definition = pass.definition
+        val observation = pass.observation
+        val probe = pass.probe
+        val contract = pass.contract
+        val occupancy = pass.occupancy
+        val now = pass.now
+        val server = pass.server
         if (observation.state == WorkloadState.RUNNING) {
             if (probe is ProbeOutcome.Joinable && probe.online > 0) {
                 LOG.warn(
@@ -557,6 +646,7 @@ internal class DrainController(
                     definition.metadata.name,
                 )
                 return abort(
+                    server = server,
                     drain = drain.forgetSaveEvidence(),
                     occupancy = occupancy,
                     now = now,
@@ -568,7 +658,7 @@ internal class DrainController(
                             "saved again before it is",
                 )
             }
-            if (!drain.mayStop(contract, observation.startedAt)) {
+            if (!drain.mayStop(contract, observation.startedAt, now, evidenceGap)) {
                 // The same rule as in `stop`, and the same answer as in
                 // `DEREGISTERED`: re-issuing a stop is only safe *because* a
                 // save that is still current is on disk, so if it is not, the
@@ -587,7 +677,7 @@ internal class DrainController(
                 "server={} is still running after a stop was issued; re-issuing with the same grace period",
                 definition.metadata.name,
             )
-            node.stopWorkload(observation.handle, definition.spec.lifecycle.stopGracePeriod)
+            pass.node.stopWorkload(observation.handle, definition.spec.lifecycle.stopGracePeriod)
             return DrainProgress(
                 drain = drain,
                 occupancy = occupancy,
@@ -602,8 +692,23 @@ internal class DrainController(
         )
     }
 
+    /**
+     * Records a failure, leaves the container alone, and says how long this has
+     * been going on.
+     *
+     * Once a drain has been failing for [attentionAfter], the *report* changes:
+     * the message leads with a marker an operator can grep for and the log line
+     * goes to error. Nothing else does. The failure class is untouched, so the
+     * loop keeps retrying and a transient fault cannot make a server
+     * undeletable; the grace period, the stop and the player count are not
+     * consulted here at all. `failure-modes.md` item 7 forbids changing what
+     * happens to the *container* at a limit — a drain that has been stuck for
+     * twenty minutes still must not be stopped — and this changes only what a
+     * human is told, which is the thing the system was missing.
+     */
     @Suppress("LongParameterList")
     private fun abort(
+        server: ResourceName,
         drain: DrainStatus,
         occupancy: PlayerOccupancy?,
         now: Instant,
@@ -612,20 +717,40 @@ internal class DrainController(
         message: String,
         sideEffectIssued: Boolean = false,
     ): DrainProgress {
-        val failure = recordFailure(reason, failureClass, message, now, drain.failure)
+        val stuckFor = JavaDuration.between(drain.startedAt, now).toKotlinDuration()
+        val needsAttention = failureClass == FailureClass.RETRYABLE && stuckFor >= attentionAfter
+        val reported =
+            if (needsAttention) {
+                "$ATTENTION this drain has been unable to finish for ${stuckFor.inWholeMinutes} minutes and is " +
+                    "not going to fix itself. The server keeps running and the loop keeps trying. $message"
+            } else {
+                message
+            }
+        val failure = recordFailure(reason, failureClass, reported, now, drain.failure)
+        if (needsAttention) {
+            LOG.error(
+                "server={} has been unable to finish a drain for {} minutes ({} attempts); it keeps running and " +
+                    "the loop keeps trying, but this needs a human: {}",
+                server,
+                stuckFor.inWholeMinutes,
+                failure.attempts,
+                message,
+            )
+        }
         val aborted =
             drain
                 .moveTo(DrainState.DRAIN_FAILED, now)
                 .copy(failure = failure)
         val outcome =
             if (failureClass == FailureClass.RETRYABLE) {
-                ReconcileOutcome.Retry(message)
+                ReconcileOutcome.Retry(reported)
             } else {
-                ReconcileOutcome.Failed(message)
+                ReconcileOutcome.Failed(reported)
             }
         return DrainProgress(
             drain = aborted,
             occupancy = occupancy,
+            needsAttention = needsAttention,
             sideEffectIssued = sideEffectIssued,
             outcome = outcome,
         )
@@ -645,8 +770,33 @@ internal class DrainController(
             "the runtime did not report a usable container state; not acting on it"
         private const val NO_PROXY_SEAL =
             "no proxy to seal: a standalone server accepts joins until it stops"
+
+        /**
+         * How long a drain may keep failing before it is reported as needing a
+         * human. Long enough that an ordinary blocked drain — players online,
+         * a node restarting — never trips it.
+         */
+        private val DEFAULT_ATTENTION_AFTER = 15.minutes
+
+        /**
+         * The default evidence gap. Comfortably longer than the interval
+         * between passes of a drain that is getting anywhere, and far shorter
+         * than a session anybody would notice losing.
+         */
+        private val DEFAULT_EVIDENCE_GAP = 30.seconds
     }
 }
+
+/**
+ * The marker a long-failing drain's message leads with.
+ *
+ * A greppable constant rather than prose, because it is the only
+ * machine-readable escalation signal available without a new
+ * [mcorch.schema.FailureReason] or [mcorch.schema.ConditionType] — and both of
+ * those live in `:schema`. A `NEEDS_ATTENTION` condition type is where this
+ * belongs; this is the stand-in until there is one.
+ */
+internal const val ATTENTION: String = "[needs attention]"
 
 /** Why a drain is happening. It changes nothing about the procedure, only the message. */
 internal enum class DrainCause(
@@ -663,6 +813,12 @@ internal data class DrainProgress(
     val occupancy: PlayerOccupancy? = null,
     /** Set on the pass that confirmed a save completed, never on the pass that requested one. */
     val saveConfirmedAt: Instant? = null,
+    /**
+     * True once this drain has been failing long enough that it will not fix
+     * itself. Carried out to the status so the report can say so; it changes
+     * nothing about what is done to the container.
+     */
+    val needsAttention: Boolean = false,
     /**
      * True when this step did something to the server that the runtime cannot
      * be asked about later — in practice, sent a save request.
@@ -696,7 +852,7 @@ internal data class DrainProgress(
  * `:schema`. Worth adding there, and the only thing that would change here is
  * this one accessor.
  */
-private fun DrainStatus.saveConfirmedAt(): Instant? = if (worldSaved) saveRequestedAt else null
+internal fun DrainStatus.saveConfirmedAt(): Instant? = if (worldSaved) saveRequestedAt else null
 
 /**
  * Whether this drain's save confirmation still describes what is on disk.
@@ -717,9 +873,23 @@ private fun DrainStatus.saveConfirmedAt(): Instant? = if (worldSaved) saveReques
  * started cannot be evidence about an earlier one, and a frozen clock must not
  * make a correct drain refuse to finish.
  */
-private fun DrainStatus.saveIsCurrent(containerStartedAt: Instant?): Boolean {
+internal fun DrainStatus.saveIsCurrent(
+    containerStartedAt: Instant?,
+    now: Instant,
+    maxAge: Duration,
+): Boolean {
     val confirmed = saveConfirmedAt() ?: return false
-    return containerStartedAt == null || !confirmed.isBefore(containerStartedAt)
+    if (containerStartedAt != null) return !confirmed.isBefore(containerStartedAt)
+    // No start time to compare against, so the container-restart half of the
+    // rule has nothing to say and only a *fresh* confirmation counts. Reading
+    // the unknown as "no restart" would trust a confirmation of any age from a
+    // runtime that has told us nothing; reading it as "restarted" would reject
+    // the confirmation this pass just took, and the drain would save, fail to
+    // stop, save again, for ever. Every runtime this talks to reports a start
+    // time for a running container, so this is the answer for one that does
+    // not — and the observation-gap rule is what covers the interval either
+    // way.
+    return JavaDuration.between(confirmed, now).toKotlinDuration().let { !it.isNegative() && it <= maxAge }
 }
 
 /**
@@ -732,28 +902,52 @@ private fun DrainStatus.saveIsCurrent(containerStartedAt: Instant?): Boolean {
 private fun DrainStatus.mayStop(
     contract: WorkloadContract,
     containerStartedAt: Instant?,
-): Boolean = !contract.holdsWorldData || saveIsCurrent(containerStartedAt)
+    now: Instant,
+    maxAge: Duration,
+): Boolean = !contract.holdsWorldData || saveIsCurrent(containerStartedAt, now, maxAge)
 
 /**
- * Drops a save confirmation that predates the process now running.
+ * Drops a save confirmation that nothing observed can vouch for any more.
  *
- * Applied once per pass, before any state acts on the drain. A drain record
- * outlives containers — it is read back from the store after a restart of the
- * loop, and it survives a container being restarted underneath it — so this is
- * the point at which "the world was saved" stops being true without anybody
- * having observed anything contradicting it.
+ * Applied once per pass, before any state acts on the drain, and it is the half
+ * of the evidence rule that no probe can supply. A probe reports who is online
+ * *now*; the two things below are true of the *interval* since the
+ * confirmation, and nothing in a later reading of zero players contradicts
+ * either of them:
  *
- * `saveRequestedAt` goes with it, because it doubles as the confirmation
+ * - **The container restarted.** A drain record outlives containers — read back
+ *   from the store after the loop restarts, or simply left behind when somebody
+ *   restarts the container underneath it — so a confirmation can describe a
+ *   process that no longer exists.
+ * - **The loop stopped watching.** If the last recorded observation is older
+ *   than [maxGap], nobody was looking, and a whole play session fits in the
+ *   window. This is the only witness there is that the chain of zero-player
+ *   readings behind the confirmation is unbroken: it costs one extra
+ *   `save-all flush` whenever the loop is interrupted mid-drain, and it is what
+ *   stops a restarted loop stopping a server on a confirmation from before it
+ *   went down.
+ *
+ * `saveRequestedAt` goes with the flag, because it doubles as the confirmation
  * instant: leaving it behind would make the re-entered save read as "a request
  * went out and was never confirmed" and abort permanently on a save that
  * actually completed.
  */
-private fun DrainStatus.dropStaleSaveEvidence(containerStartedAt: Instant?): DrainStatus =
-    if (worldSaved && !saveIsCurrent(containerStartedAt)) {
-        copy(worldSaved = false, saveRequestedAt = null)
-    } else {
+internal fun DrainStatus.dropUnusableSaveEvidence(
+    containerStartedAt: Instant?,
+    lastObservedAt: Instant?,
+    now: Instant,
+    maxGap: Duration,
+): DrainStatus {
+    if (!worldSaved) return this
+    val watched =
+        lastObservedAt != null &&
+            !JavaDuration.between(lastObservedAt, now).toKotlinDuration().let { it > maxGap || it.isNegative() }
+    return if (saveIsCurrent(containerStartedAt, now, maxGap) && watched) {
         this
+    } else {
+        copy(worldSaved = false, saveRequestedAt = null)
     }
+}
 
 /** Why the save evidence is not good enough to stop on, for an operator-facing message. */
 private fun DrainStatus.saveEvidenceProblem(containerStartedAt: Instant?): String {
@@ -778,11 +972,15 @@ private fun DrainStatus.saveEvidenceProblem(containerStartedAt: Instant?): Strin
  * `playersEvacuated` goes with them: it is the claim that this server was
  * confirmed empty, and somebody just joined it.
  *
- * Note what this does *not* undo: an unconfirmed save that was genuinely
- * delivered. That state is a permanent abort, and the reconciler stops before a
- * pass can reach this function with it.
+ * Note what this does *not* undo on its own: an unconfirmed save that was
+ * genuinely delivered is never re-sent by any path that does not come through
+ * here. A pass *can* reach this function holding one — a delete that is
+ * outstanding lifts the permanent-failure gate — and clearing it then is
+ * deliberate rather than incidental: it only happens because a player was just
+ * observed, which is exactly what makes the old request worth nothing, and the
+ * fresh save that follows is what lets the drain finish at all.
  */
-private fun DrainStatus.forgetSaveEvidence(): DrainStatus =
+internal fun DrainStatus.forgetSaveEvidence(): DrainStatus =
     if (!worldSaved && saveRequestedAt == null && !playersEvacuated) {
         this
     } else {

@@ -362,12 +362,47 @@ public class LocalNode internal constructor(
                 client.removeContainer(containerId)
             }
             val sandboxId = SandboxId(handle.sandboxId)
+            // Everything still inside, not just the container this workload
+            // knows about. `StopPodSandbox` kills whatever is in there with no
+            // grace and no save, so "my container is gone" is not the question —
+            // "is the sandbox empty" is. A container that this orchestrator did
+            // not create, or one left by a create that raced, is somebody's
+            // running process either way.
+            val occupants =
+                remainingContainers(sandboxId).filterNot { it.value == handle.containerId }
+            if (occupants.isNotEmpty()) {
+                throw NodeException.Rejected(
+                    name,
+                    NodeOperation.REMOVE,
+                    "refusing to tear down sandbox ${sandboxId.value}: ${occupants.size} container(s) are still " +
+                        "running inside it, and removing the sandbox would kill them with no grace period and " +
+                        "no save. Drain and stop them first",
+                )
+            }
             // Safe now, and only now: there is nothing left inside to kill.
             client.stopSandbox(sandboxId)
             client.removeSandbox(sandboxId)
             // The persistent volume directory is deliberately untouched.
         }
     }
+
+    /**
+     * The containers still running in a sandbox, whoever created them.
+     *
+     * A sandbox that has already gone reports none: there is then nothing left
+     * to protect, and the teardown below is a no-op on both objects.
+     */
+    private suspend fun remainingContainers(sandbox: SandboxId): List<ContainerId> =
+        try {
+            client
+                .sandboxStatus(sandbox)
+                .containerStatuses
+                .filter { it.state == ContainerState.RUNNING }
+                .map { it.id }
+        } catch (gone: CriException.NotFound) {
+            LOG.debug("sandbox {} is already gone", sandbox, gone)
+            emptyList()
+        }
 
     private suspend fun containerStateOf(id: ContainerId): ContainerState? =
         try {

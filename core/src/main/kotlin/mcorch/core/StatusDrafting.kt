@@ -104,7 +104,7 @@ private fun deriveConditions(
             condition(
                 ConditionType.DRAINING,
                 draining.toConditionStatus(),
-                drain?.let { "drain state ${it.state}" }.orEmpty(),
+                drain?.let { drainMessage(it) }.orEmpty(),
             ),
             condition(
                 ConditionType.PLAYERS_EVACUATED,
@@ -135,6 +135,25 @@ private fun deriveConditions(
             message = entry.third,
             lastTransitionAt = transitionedAt,
         )
+    }
+}
+
+/**
+ * The drain's state, plus the escalation marker once it has been failing long
+ * enough to need a human.
+ *
+ * The marker is read back off the failure message because [DrainStatus] has
+ * nowhere else to carry it — a `NEEDS_ATTENTION` [ConditionType] is what this
+ * wants and that lives in `:schema`. It is a report only: nothing branches on
+ * it, and a drain that needs attention is still retried and still leaves its
+ * container running.
+ */
+private fun drainMessage(drain: DrainStatus): String {
+    val state = "drain state ${drain.state}"
+    return if (drain.failure?.message?.startsWith(ATTENTION) == true) {
+        "$ATTENTION $state, failing since ${drain.startedAt} and not recovering on its own"
+    } else {
+        state
     }
 }
 
