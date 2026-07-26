@@ -31,4 +31,8 @@ The `:store` module's shape was decided in one pass on 2026-07-26 (commit `feat(
 **Why:** a migration written today has to keep producing the same result years from now, and it cannot if it depends on today's object model.
 **How to apply:** in a data migration, use `PropertyDocument.parse(...).string("some.key")`, not `StatusCodec.decode(...)`.
 
+**A `SecretValue` is shared and destroyed on the reconcile hot path.**
+**Why:** `:core` resolves a secret, uses it, and destroys it in a `finally` (added 2026-07-26). So `use` and `destroy` overlap on different threads as a matter of course, and the type owns that — callers are not expected to coordinate.
+**How to apply:** any new accessor on it has to hold the same guarantee: a caller gets whole material or an exception, never a partly wiped buffer. That is why copying and wiping share a lock rather than relying on a flag.
+
 **Deliberately left out** (see [[store-open-questions]]): pushed-down work-finding queries, a `Flow`-based watch, leases/sharding, at-rest encryption, and any purge guard based on drain state.
