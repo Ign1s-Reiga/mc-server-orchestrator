@@ -138,14 +138,24 @@ public sealed class CriException(
     /** The status code containerd replied with. */
     public val code: CriStatusCode,
     /**
-     * The runtime's own account of what went wrong, undecorated.
+     * The account of what went wrong, undecorated.
      *
-     * [message] is this with the operation and classification prefixed, which is
-     * the right thing to log or record. This is here for a caller that wants to
-     * quote containerd without also quoting us.
+     * Usually the runtime's own words, and therefore **unredacted**: it may quote
+     * the request that failed. Use [safeDescription] anywhere the result is
+     * logged, stored or served, and reach for this one only inside this module.
      */
     public val description: String,
     cause: Throwable?,
+    /**
+     * Whether [description] is the runtime's own words rather than this client's.
+     *
+     * Only the runtime's text can quote a request, so only the runtime's text is
+     * ever withheld. A message this client wrote itself — "containerd returned a
+     * successful response with an empty container_id" — contains nothing but our
+     * own prose, and suppressing it would replace a precise report of a broken
+     * runtime with a warning about secrets that are not in it.
+     */
+    internal val describedByRuntime: Boolean = true,
 ) : Exception(description, cause) {
     /** `true` when requeueing with backoff can plausibly succeed; `false` when the request itself is wrong. */
     public abstract val retryable: Boolean
@@ -217,12 +227,20 @@ public sealed class CriException(
      * type: a caller that wants a tighter retry budget for "we do not know what
      * went wrong" can match on it specifically.
      */
-    public class RuntimeFailure(
+    public class RuntimeFailure internal constructor(
         operation: CriOperation,
         code: CriStatusCode,
         description: String,
-        cause: Throwable? = null,
-    ) : CriException(operation, code, description, cause) {
+        cause: Throwable?,
+        describedByRuntime: Boolean,
+    ) : CriException(operation, code, description, cause, describedByRuntime) {
+        public constructor(
+            operation: CriOperation,
+            code: CriStatusCode,
+            description: String,
+            cause: Throwable? = null,
+        ) : this(operation, code, description, cause, describedByRuntime = true)
+
         override val retryable: Boolean get() = true
     }
 
@@ -312,8 +330,58 @@ public sealed class CriException(
     }
 
     override val message: String
-        get() {
-            val classification = if (retryable) "retryable" else "permanent"
-            return "${operation.name} failed (${code.name}, $classification): $description"
-        }
+        get() = decorate(description)
+
+    /**
+     * [description], or a stand-in when repeating it might repeat a secret.
+     *
+     * **This is the only place the withholding decision is made**, and
+     * [safeMessage] and this client's own logging are both derived from it.
+     * That is deliberate: the previous shape handed callers the raw text plus
+     * [CriOperation.requestMayCarrySecrets] and trusted each of them to combine
+     * the two correctly, which put a one-token security decision in a module
+     * that cannot test it. There is nothing left to combine.
+     *
+     * Withheld only when the operation's request carries secret material *and*
+     * the text is the runtime's — see [CriOperation.requestMayCarrySecrets] for
+     * the list and the reasoning, and [describedByRuntime] for why our own
+     * messages are exempt.
+     *
+     * Not truncated. A caller that needs a bound must apply its own, and must
+     * apply it to this rather than to [description]: Go renders a rejected
+     * request from the front, so a prefix of a failed `CreateContainer` error is
+     * a prefix of the container's environment.
+     */
+    public val safeDescription: String
+        get() = if (describedByRuntime && operation.requestMayCarrySecrets) WITHHELD_DESCRIPTION else description
+
+    /**
+     * [message] built from [safeDescription] instead of [description].
+     *
+     * This is what to log, store, serve over an API, or put on a server's
+     * observed status. [message] is the unredacted form and stays that way so a
+     * stack trace inside this module still says everything.
+     */
+    public val safeMessage: String
+        get() = decorate(safeDescription)
+
+    private fun decorate(detail: String): String {
+        val classification = if (retryable) "retryable" else "permanent"
+        return "${operation.name} failed (${code.name}, $classification): $detail"
+    }
+
+    public companion object {
+        /**
+         * Stands in for a description that might quote a request holding secret
+         * material.
+         *
+         * It names the runtime's own log as where the text does exist, because
+         * that is true and the two obvious guesses are not: this client's log
+         * and the server's observed status both withhold it, by design and for
+         * the same reason.
+         */
+        public const val WITHHELD_DESCRIPTION: String =
+            "<withheld: this operation's request carries secret material and the runtime's error may quote it. " +
+                "The runtime logged its own error on the node; read it there>"
+    }
 }
