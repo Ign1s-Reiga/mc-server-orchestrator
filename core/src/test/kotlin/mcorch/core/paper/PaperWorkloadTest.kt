@@ -8,7 +8,11 @@ import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.types.shouldBeInstanceOf
 import mcorch.core.Labels
 import mcorch.core.StorageRequest
+import mcorch.core.WorkloadHandle
+import mcorch.core.WorkloadObservation
+import mcorch.core.WorkloadState
 import mcorch.core.memory
+import mcorch.core.nodeName
 import mcorch.core.paperDefinition
 import mcorch.core.resourceName
 import mcorch.schema.MemoryQuantity
@@ -76,6 +80,54 @@ internal class PaperWorkloadTest {
         val disabled = PaperWorkloadPlanner.plan(paperDefinition(rcon = RconSpec.Disabled))
         disabled.ports.none { it.name == PaperWorkloadPlanner.RCON_PORT_NAME }.shouldBeTrue()
         disabled.env[PaperImageContract.ENABLE_RCON] shouldBe "false"
+    }
+
+    @Test
+    fun `the workload records what a later drain has to know about it`() {
+        val persistent = PaperWorkloadPlanner.plan(paperDefinition())
+        persistent.labels[Labels.WORLD_DATA] shouldBe "true"
+        persistent.labels[Labels.SAVE_CONFIRMABLE] shouldBe "true"
+
+        val disposable =
+            PaperWorkloadPlanner.plan(
+                paperDefinition(storage = StorageSpec.Ephemeral(), rcon = RconSpec.Disabled),
+            )
+        disposable.labels[Labels.WORLD_DATA] shouldBe "false"
+        disposable.labels[Labels.SAVE_CONFIRMABLE] shouldBe "false"
+    }
+
+    @Test
+    fun `a workload that records nothing is read as holding a world, never as the definition says`() {
+        val agent = PaperServerAgent(paperDefinition(storage = StorageSpec.Ephemeral()))
+
+        fun observationWith(labels: Map<String, String>) =
+            WorkloadObservation.Present(
+                handle = WorkloadHandle(nodeName("node-a"), "sandbox-1", "container-1"),
+                state = WorkloadState.RUNNING,
+                labels = labels,
+            )
+
+        // The label is the container's own word and always wins.
+        agent
+            .contractOf(observationWith(mapOf(Labels.WORLD_DATA to "false")))
+            .holdsWorldData
+            .shouldBeFalse()
+        agent
+            .contractOf(observationWith(mapOf(Labels.WORLD_DATA to "true")))
+            .holdsWorldData
+            .shouldBeTrue()
+
+        // With no label, the definition is exactly the wrong thing to ask: this
+        // one says `ephemeral`, and the question is being asked *because* it may
+        // have just been edited to say that. The last observation written before
+        // the edit is better, and the safe side is better than nothing —
+        // CLAUDE.md invariant 2.
+        agent.contractOf(observationWith(emptyMap()), storageWasPersistent = true).holdsWorldData.shouldBeTrue()
+        agent.contractOf(observationWith(emptyMap()), storageWasPersistent = null).holdsWorldData.shouldBeTrue()
+        agent.contractOf(observationWith(emptyMap()), storageWasPersistent = false).holdsWorldData.shouldBeFalse()
+
+        // Nothing derived from a guess is reported as observed.
+        agent.contractOf(observationWith(emptyMap())).observed.shouldBeFalse()
     }
 
     @Test
