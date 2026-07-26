@@ -605,15 +605,17 @@ public class Reconciler(
                 observation = observation,
                 current = pass.previous?.drain,
                 cause = cause,
-                // When the loop last recorded anything about this server. A
-                // save confirmation is only worth something while the chain of
-                // observations behind it is unbroken, and this is the only
-                // record that it was watching at all.
-                lastObservedAt = pass.previous?.observedAt,
-                // What the last observation said about storage, for a workload
-                // that carries no label of its own. Written before whatever
-                // edit is being applied now, which is the point of using it.
-                storageWasPersistent = pass.previous?.storage?.persistent,
+                // When a probe last answered. Occupancy is only ever recorded
+                // from a probe that did, so this stops advancing the moment the
+                // server stops answering — which is exactly when the chain of
+                // zero-player observations behind a save confirmation breaks.
+                // `observedAt` would not do: a pass that never reached the node
+                // also writes one.
+                lastProbedAt = pass.previous?.players?.observedAt,
+                // Whether a container has ever been seen for this server, which
+                // is what separates "never created" from "the runtime did not
+                // tell us about it".
+                hadContainer = pass.previous?.runtime?.containerId != null,
             )
         val storage =
             pass.storageStatus(observation).let { base ->
@@ -687,11 +689,18 @@ public class Reconciler(
         // Absent means the workload predates the label, which is not the same as
         // "it holds no world data" — and guessing either way from an edited
         // definition is exactly the mistake being guarded against.
-        // Unknown counts as "may hold a world". A workload that does not say
-        // what it was built with is the one case where the only other source is
-        // the definition that has just been edited, so this refuses on `null`
-        // as well as on `true`.
-        val heldWorldData = Labels.booleanValue(present.labels, Labels.WORLD_DATA) ?: true
+        // Only a workload that positively says it holds a world. Unknown is
+        // deliberately *not* refused here, and the two guards differ on purpose
+        // because they answer different questions. This one asks "is this edit a
+        // transition away from persistent storage" — and on a workload carrying
+        // no label there is no way to tell a transition from a lobby that has
+        // always been ephemeral, so refusing would make every replacement of
+        // such a lobby a permanent, unclearable failure advising an edit that
+        // does not apply to it. The drain asks the other question, "might this
+        // container hold a world", and answers unknown with yes: it demands a
+        // confirmed save before any stop. The edit still gets applied; nothing
+        // gets discarded to apply it.
+        val heldWorldData = Labels.booleanValue(present.labels, Labels.WORLD_DATA) ?: return null
         if (!heldWorldData) return null
         if (pass.definition.spec.storage !is StorageSpec.Ephemeral) return null
 
@@ -1050,7 +1059,15 @@ public class Reconciler(
             RuntimeIdentity(
                 node = observation.handle.node,
                 sandboxId = observation.handle.sandboxId,
-                containerId = observation.handle.containerId,
+                // A container this loop has seen is not un-seen by a pass that
+                // does not see it. The runtime can stop reporting a container
+                // that is still running — the field a sandbox status carries
+                // them in is optional — and the drain uses "has this server ever
+                // had a container" to tell that apart from one that was never
+                // created. Letting a single unreported pass clear the record
+                // would hand the drain the wrong answer on the next one.
+                // Teardown clears it explicitly instead.
+                containerId = observation.handle.containerId ?: previous?.runtime?.containerId,
                 createdAt = observation.createdAt,
                 startedAt = observation.startedAt,
                 finishedAt = observation.finishedAt,

@@ -117,14 +117,15 @@ internal class PaperWorkloadTest {
             .holdsWorldData
             .shouldBeTrue()
 
-        // With no label, the definition is exactly the wrong thing to ask: this
-        // one says `ephemeral`, and the question is being asked *because* it may
-        // have just been edited to say that. The last observation written before
-        // the edit is better, and the safe side is better than nothing —
-        // CLAUDE.md invariant 2.
-        agent.contractOf(observationWith(emptyMap()), storageWasPersistent = true).holdsWorldData.shouldBeTrue()
-        agent.contractOf(observationWith(emptyMap()), storageWasPersistent = null).holdsWorldData.shouldBeTrue()
-        agent.contractOf(observationWith(emptyMap()), storageWasPersistent = false).holdsWorldData.shouldBeFalse()
+        // With no label there is no second source worth asking. The definition
+        // is the thing being edited — this one says `ephemeral`, and the
+        // question is being asked *because* it may have just been changed to say
+        // that — and the last observed storage status is computed from the
+        // definition every pass, so it agrees with the edit a pass later. Both
+        // would answer "nothing to save" for a container holding a world, so
+        // neither is consulted: unknown means the safe side, per CLAUDE.md
+        // invariant 2.
+        agent.contractOf(observationWith(emptyMap())).holdsWorldData.shouldBeTrue()
 
         // Nothing derived from a guess is reported as observed.
         agent.contractOf(observationWith(emptyMap())).observed.shouldBeFalse()
