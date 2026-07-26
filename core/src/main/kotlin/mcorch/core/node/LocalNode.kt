@@ -36,9 +36,10 @@ import mcorch.schema.NodeName
 import mcorch.schema.ResourceName
 import mcorch.schema.SecretRef
 import mcorch.store.SecretStore
+import mcorch.store.StoreException
 import org.slf4j.LoggerFactory
-import java.nio.file.Files
 import java.nio.file.Path
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.time.Duration
 
 /**
@@ -131,11 +132,16 @@ public class LocalNode internal constructor(
                 containerId = container?.id?.value,
             )
         val specHash = container?.labels?.get(Labels.SPEC_HASH) ?: status.labels[Labels.SPEC_HASH]
+        // The container's labels, falling back to the sandbox's. They are what a
+        // drain reads to find out what this workload was built with, so they are
+        // reported as the runtime holds them and nothing here interprets them.
+        val labels = if (container != null) status.labels + container.labels else status.labels
         if (container == null) {
             return WorkloadObservation.Present(
                 handle = handle,
                 state = WorkloadState.SANDBOX_ONLY,
                 specHash = specHash,
+                labels = labels,
                 createdAt = status.createdAt,
             )
         }
@@ -143,6 +149,7 @@ public class LocalNode internal constructor(
             handle = handle,
             state = container.state.toWorkloadState(),
             specHash = specHash,
+            labels = labels,
             imageId = container.imageId.value,
             createdAt = container.createdAt,
             startedAt = container.startedAt,
@@ -218,7 +225,17 @@ public class LocalNode internal constructor(
                     existing
                 } else {
                     prepareHostPaths(spec)
-                    client.runSandbox(sandboxSpec)
+                    try {
+                        client.runSandbox(sandboxSpec)
+                    } catch (exists: CriException.AlreadyExists) {
+                        // Something created it between the list and the create.
+                        // Adopt it here rather than reporting "busy, try again":
+                        // if the second look cannot find it either, the object
+                        // exists under a name this build cannot see, and every
+                        // future pass would repeat the same find-create-collide
+                        // cycle for ever without anyone being asked to look.
+                        adoptAfterCollision(spec.server, exists)
+                    }
                 }
 
             val containerSpec = containerSpecFor(spec)
@@ -226,14 +243,47 @@ public class LocalNode internal constructor(
             // requires it back here, and a reconstructed near-copy misbehaves.
             // It is derived from the workload spec alone, so an adopted sandbox
             // rebuilds an identical one.
-            val containerId = client.createContainer(sandboxId, sandboxSpec, containerSpec)
+            val containerId =
+                try {
+                    client.createContainer(sandboxId, sandboxSpec, containerSpec)
+                } catch (exists: CriException.AlreadyExists) {
+                    val adopted = observationOf(spec.server, client.sandboxStatus(sandboxId))
+                    if (adopted.state == WorkloadState.SANDBOX_ONLY) {
+                        throw unadoptable(NodeOperation.CREATE, "container for `${spec.server}`", exists)
+                    }
+                    return@translating adopted
+                }
             WorkloadObservation.Present(
                 handle = WorkloadHandle(name, sandboxId.value, containerId.value),
                 state = WorkloadState.CREATED,
                 specHash = spec.specHash,
+                labels = spec.labels + (Labels.SPEC_HASH to spec.specHash),
                 createdAt = null,
             )
         }
+
+    /**
+     * Re-reads after a create lost a race, and refuses rather than looping when
+     * the object still cannot be found.
+     */
+    private suspend fun adoptAfterCollision(
+        server: ResourceName,
+        cause: CriException.AlreadyExists,
+    ): SandboxId = findSandbox(server) ?: throw unadoptable(NodeOperation.CREATE, "sandbox for `$server`", cause)
+
+    private fun unadoptable(
+        operation: NodeOperation,
+        what: String,
+        cause: CriException,
+    ): NodeException =
+        NodeException.Rejected(
+            name,
+            operation,
+            "the runtime says the $what already exists, and listing by label does not find it. Something on " +
+                "this node holds the name without carrying this orchestrator's labels; retrying cannot resolve " +
+                "that. Find it with `ctr`/`crictl` and either label it or remove it: ${cause.message}",
+            cause,
+        )
 
     override suspend fun startWorkload(handle: WorkloadHandle) {
         val containerId = handle.requireContainer(NodeOperation.START)
@@ -269,9 +319,17 @@ public class LocalNode internal constructor(
         handle: WorkloadHandle,
         gracePeriod: Duration,
     ) {
-        require(gracePeriod.isPositive()) {
-            "the stop grace period must be positive; it comes from spec.lifecycle.stopGracePeriod, which the " +
-                "schema already guarantees exceeds the save timeout"
+        if (!gracePeriod.isPositive()) {
+            // Refused rather than asserted: [Node] promises callers see nothing
+            // but a [NodeException], and an `IllegalArgumentException` from here
+            // would be the one thing a caller cannot classify. The refusal is
+            // just as absolute — no stop is issued either way.
+            throw NodeException.Rejected(
+                name,
+                NodeOperation.STOP,
+                "the stop grace period must be positive; it comes from spec.lifecycle.stopGracePeriod, which " +
+                    "the schema already guarantees exceeds the save timeout",
+            )
         }
         val containerId =
             handle.containerId?.let(::ContainerId) ?: run {
@@ -392,17 +450,28 @@ public class LocalNode internal constructor(
      * it in a [ContainerSpec], whose `toString` redacts environment values.
      * Nothing here logs, wraps or returns it, and the reference — not the value
      * — is what travels through the rest of the system.
+     *
+     * The `String` is unavoidable: the CRI environment is a proto field of
+     * strings, so somewhere between the store and the wire the material has to
+     * become one. What is avoidable is the [SecretValue] outliving the call that
+     * needed it — `use` hands out a copy and wipes the copy, but the original
+     * lives on in whatever the store handed back — so it is destroyed here,
+     * whatever happens next.
      */
     private suspend fun resolveSecrets(refs: Map<String, SecretRef>): Map<String, String> {
         if (refs.isEmpty()) return emptyMap()
         return refs.mapValues { (variable, ref) ->
-            val value =
+            val secret =
                 secrets.resolve(ref) ?: throw NodeException.Rejected(
                     name,
                     NodeOperation.CREATE,
                     "the secret `${ref.name}/${ref.key}` needed for `$variable` is not in the secret store",
                 )
-            value.use { material -> String(material) }
+            try {
+                secret.use { material -> String(material) }
+            } finally {
+                secret.destroy()
+            }
         }
     }
 
@@ -414,30 +483,34 @@ public class LocalNode internal constructor(
      * and this is the code path a restart goes through.
      */
     private fun prepareHostPaths(spec: WorkloadSpec) {
-        Files.createDirectories(logDirectoryFor(spec.server))
-        val storage = spec.storage
-        if (storage is StorageRequest.Persistent) {
-            val path = volumePathFor(storage.volume)
-            if (Files.notExists(path)) {
-                Files.createDirectories(path)
-                LOG.info("created persistent volume directory for volume={} on node={}", storage.volume, name)
-            }
-        }
+        // A full disk, a read-only mount, the wrong owner. None of it is a CRI
+        // failure, so nothing above would translate it — see [HostPaths], which
+        // owns that translation and is testable without a containerd.
+        HostPaths.prepare(name, volumeRoot, logRoot, spec)
     }
 
-    private fun volumePathFor(volume: ResourceName): Path = volumeRoot.resolve(volume.value)
+    private fun volumePathFor(volume: ResourceName): Path = HostPaths.volumePath(volumeRoot, volume)
 
-    private fun logDirectoryFor(server: ResourceName): Path = logRoot.resolve(server.value)
+    private fun logDirectoryFor(server: ResourceName): Path = HostPaths.logDirectory(logRoot, server)
 
     // ── failure translation ──────────────────────────────────────────────────
 
     /**
-     * Runs a CRI call and converts anything it throws into a [NodeException].
+     * Runs a call and converts anything it throws into a [NodeException].
      *
-     * The classification is not re-derived: [CriException.retryable] has
-     * already decided, and this maps the subclass onto the node's own
-     * vocabulary. `CancellationException` is not a [CriException] and passes
-     * through untouched, as structured concurrency requires.
+     * The classification of a CRI failure is not re-derived:
+     * [CriException.retryable] has already decided, and this maps the subclass
+     * onto the node's own vocabulary. `CancellationException` is rethrown
+     * untouched, as structured concurrency requires.
+     *
+     * The last two clauses are what make this a boundary rather than a mapper.
+     * [Node] promises that nothing but a [NodeException] comes out, and callers
+     * rely on it hard: the reconcile loop's worker catches [NodeException] and
+     * [mcorch.store.StoreException], and anything else escaping cancels the
+     * scope that owns *every* worker. A node that reaches a full disk, a secret
+     * store that is down, or a bug in this class must therefore surface as a
+     * failure of one server rather than as the end of the loop. Nothing is
+     * swallowed — the original is the cause of what is thrown.
      */
     private suspend fun <T> translating(
         operation: NodeOperation,
@@ -445,8 +518,28 @@ public class LocalNode internal constructor(
     ): T =
         try {
             block()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (failure: CriException) {
             throw failure.asNodeException(operation)
+        } catch (failure: NodeException) {
+            throw failure
+        } catch (failure: StoreException) {
+            // Secret resolution is the only store call a node makes. A remote
+            // node would resolve it on the far side, so its failure is a node
+            // failure from here.
+            throw if (failure.retryable) {
+                NodeException.Busy(name, operation, "the secret store is unavailable: ${failure.message}", failure)
+            } else {
+                NodeException.Rejected(name, operation, "the secret store rejected a read: ${failure.message}", failure)
+            }
+        } catch (failure: RuntimeException) {
+            throw NodeException.Rejected(
+                name,
+                operation,
+                "the node failed in a way it does not classify: ${failure::class.simpleName}: ${failure.message}",
+                failure,
+            )
         }
 
     private fun CriException.asNodeException(operation: NodeOperation): NodeException =
@@ -461,10 +554,12 @@ public class LocalNode internal constructor(
 
             is CriException.RuntimeFailure -> NodeException.Busy(name, operation, describe(), this)
 
-            // A create that races another create resolves itself: the next pass
-            // lists, finds it, and adopts it. So this is retryable rather than
-            // a failure to report.
-            is CriException.AlreadyExists -> NodeException.Busy(name, operation, describe(), this)
+            // Both create paths adopt after a collision before this is reached,
+            // so an `AlreadyExists` that gets here has already survived a second
+            // lookup that found nothing. Retrying repeats that for ever and
+            // shows `RETRYABLE` while never asking anyone to look, so it is
+            // reported instead.
+            is CriException.AlreadyExists -> NodeException.Rejected(name, operation, describe(), this)
 
             is CriException.NotFound -> NodeException.NotFound(name, operation, describe(), this)
 

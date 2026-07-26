@@ -4,6 +4,8 @@ import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.types.shouldBeInstanceOf
+import mcorch.schema.ConditionStatus
+import mcorch.schema.ConditionType
 import mcorch.schema.DrainState
 import mcorch.schema.MemoryQuantity
 import org.junit.jupiter.api.Test
@@ -84,6 +86,36 @@ internal class ReplacementTest {
             harness.node.creates shouldHaveSize 1
             harness.node.stops shouldHaveSize 0
             harness.status(name).shouldNotBeNull().observedGeneration shouldBe 2L
+        }
+
+    @Test
+    fun `a world saved during a drain does not keep the WORLD_SAVED condition true afterwards`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.declare(paperDefinition(image = "docker.io/itzg/minecraft-server:2026.7.0"))
+            harness.settle(name, limit = 16)
+
+            // A week of play on the replacement container. Nothing has been
+            // saved since the drain that replaced the old one.
+            harness.clock.advance((7 * 24 * 60).minutes)
+            harness.settle(name, limit = 6)
+
+            val status = harness.status(name).shouldNotBeNull()
+            // The audit record of the last confirmed save is kept…
+            status.storage
+                .shouldNotBeNull()
+                .lastSaveConfirmedAt
+                .shouldNotBeNull()
+            // …and it is not evidence that the world *now* is on disk. Reading
+            // the condition off that timestamp made a server that has been
+            // running untouched for a week report itself saved.
+            status.conditions
+                .single { it.type == ConditionType.WORLD_SAVED }
+                .status shouldBe ConditionStatus.FALSE
         }
 
     @Test

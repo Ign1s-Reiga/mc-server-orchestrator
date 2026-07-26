@@ -102,6 +102,13 @@ public class SingleNodeScheduler(
     private val registry: NodeRegistry,
 ) : Scheduler {
     override suspend fun schedule(request: PlacementRequest): PlacementDecision {
+        // One readiness answer per node per decision. Without this a node is
+        // asked twice on the ordinary path — once as the server's current node,
+        // once as a candidate — and a real registry would multiply that by the
+        // number of nodes on every pass of every server. The cache is scoped to
+        // this call on purpose: readiness is exactly the thing that must not be
+        // remembered between passes.
+        val readiness = HashMap<NodeName, Boolean>()
         val nodes = registry.nodes()
         if (nodes.isEmpty()) {
             return PlacementDecision.Unschedulable(
@@ -118,7 +125,7 @@ public class SingleNodeScheduler(
                         PlacementProblem.PINNED_NODE_UNKNOWN,
                         "spec.placement.node pins this server to `$pin`, which is not a known node",
                     )
-            return if (ready(pinned)) {
+            return if (ready(pinned, readiness)) {
                 PlacementDecision.Scheduled(pinned.name, "pinned by spec.placement.node")
             } else {
                 PlacementDecision.Unschedulable(
@@ -134,13 +141,13 @@ public class SingleNodeScheduler(
         val current = request.currentNode
         if (current != null) {
             val existing = registry.node(current)
-            if (existing != null && ready(existing)) {
+            if (existing != null && ready(existing, readiness)) {
                 return PlacementDecision.Scheduled(existing.name, "already running here")
             }
         }
 
         val candidate =
-            nodes.firstOrNull { ready(it) }
+            nodes.firstOrNull { ready(it, readiness) }
                 ?: return PlacementDecision.Unschedulable(
                     PlacementProblem.INSUFFICIENT_CAPACITY,
                     "no registered node is accepting work",
@@ -154,12 +161,17 @@ public class SingleNodeScheduler(
      * question being asked, and the loop reports the answer as an
      * unschedulable placement rather than as a node error.
      */
-    private suspend fun ready(node: Node): Boolean =
-        try {
-            node.status().ready
-        } catch (failure: NodeException) {
-            LOG.debug("node {} is not accepting work: {}", node.name, failure.message)
-            false
+    private suspend fun ready(
+        node: Node,
+        cache: MutableMap<NodeName, Boolean>,
+    ): Boolean =
+        cache.getOrPut(node.name) {
+            try {
+                node.status().ready
+            } catch (failure: NodeException) {
+                LOG.debug("node {} is not accepting work: {}", node.name, failure.message)
+                false
+            }
         }
 
     private companion object {
