@@ -1,6 +1,7 @@
 package mcorch.app.it
 
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.runBlocking
 import mcorch.schema.DrainSpec
 import mcorch.schema.HeapSpec
@@ -26,13 +27,36 @@ import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 
 /**
- * Pins the enclosing test method's return type to `Unit`.
+ * Pins the enclosing test method's return type to `Unit`, and stops the loop the
+ * body started.
  *
  * JUnit Jupiter silently drops a `@Test` method whose return type is not void —
  * it disappears at discovery with a warning nobody reads, and the suite goes
  * green having run nothing. This has already cost this repo 54 tests once.
+ *
+ * **The `cancelChildren` is why this suite terminates.** `runBlocking` returns
+ * when its body has finished *and every coroutine launched in its scope has
+ * finished too*, and [ContainerdHarness.start] launches the reconcile loop in
+ * exactly that scope — a loop whose whole job is never to return. So a body that
+ * passed all its assertions and fell off the end left `runBlocking` parked for
+ * ever on a coroutine that was working perfectly, and the only thing that ever
+ * ended the test was the eight-minute `@Timeout` watchdog. It looked from the
+ * outside exactly like a hang in the code under test: output stopped mid-run,
+ * `@AfterEach` never ran because the test method could not return, and the loop
+ * went on reconciling into a store nobody was reading. It reported as
+ * `TimeoutException` on a test whose every assertion had already passed.
+ *
+ * A failing body needs no help — the failure cancels the scope on its way out.
+ * It is the *passing* one that has to say when it is done.
  */
-internal fun integrationTest(body: suspend CoroutineScope.() -> Unit): Unit = runBlocking(block = body)
+internal fun integrationTest(body: suspend CoroutineScope.() -> Unit): Unit =
+    runBlocking {
+        try {
+            body()
+        } finally {
+            coroutineContext.cancelChildren()
+        }
+    }
 
 internal fun resourceName(raw: String): ResourceName = ResourceName.of(raw).getOrThrow()
 

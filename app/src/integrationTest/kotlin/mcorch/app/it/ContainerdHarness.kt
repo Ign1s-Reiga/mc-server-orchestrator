@@ -138,7 +138,19 @@ internal class ContainerdHarness(
         checkNotNull(reached) { "timed out after $timeout waiting for: $what — ${snapshot()}" }
     }
 
-    /** What every server the store knows about looks like right now, for a wait message. */
+    /**
+     * What every server the store knows about looks like right now, for a wait
+     * message.
+     *
+     * **Including the recorded failure, in full.** This used to print the phase
+     * and the drain state and nothing else, so a pass that failed showed up as a
+     * bare `phase=UNKNOWN` — which reads as "something broke and nobody knows
+     * what". The reconciler records the whole message, right down to the
+     * runtime's own words; it was only ever this line that threw it away, and a
+     * run diagnosed from this output alone blamed the wrong component for it.
+     * There is no logging binding on this classpath, so this is the only place an
+     * integration run says anything at all.
+     */
     private suspend fun snapshot(): String =
         runCatching {
             store
@@ -147,7 +159,11 @@ internal class ContainerdHarness(
                     val status = server.status?.status as? PaperServerStatus
                     val drain = status?.drain
                     "${server.name}: phase=${status?.phase} ready=${status?.ready} " +
-                        "drain=${drain?.state}${drain?.failure?.let { " (${it.reason})" } ?: ""}"
+                        "drain=${drain?.state}${drain?.failure?.let { " (${it.reason})" } ?: ""}" +
+                        status
+                            ?.failure
+                            ?.let { " failure=${it.reason}/${it.failureClass} x${it.attempts}: ${it.message}" }
+                            .orEmpty()
                 }.ifEmpty { "no servers are stored" }
         }.getOrElse { "the store did not answer: ${it.message}" }
 
