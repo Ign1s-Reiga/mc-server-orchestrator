@@ -645,22 +645,39 @@ public class LocalNode internal constructor(
             )
         }
 
+    /**
+     * Translates a CRI failure into this module's vocabulary.
+     *
+     * Every branch takes [CriException.safeMessage], never `message`. That is
+     * the form with the runtime's own words withheld where they might quote a
+     * request holding secret material, and it is the only form allowed out of
+     * here: this string becomes `FailureStatus.message`, which is written to
+     * SQLite and served through the API.
+     *
+     * **The decision is not repeated here, and must not be.** `:cri` makes it
+     * once, in `safeDescription`, against a list it keeps as an exhaustive
+     * `when`. This module briefly consulted that list itself and combined the
+     * two halves — which put a one-token security decision in a module whose
+     * tests cannot name a `mcorch.cri` type, so nothing could cover it.
+     * Reaching for `description` or `message` here, or re-testing the operation,
+     * rebuilds exactly that gap.
+     */
     private fun CriException.asNodeException(operation: NodeOperation): NodeException =
         when (this) {
-            is CriException.Unavailable -> NodeException.Unreachable(name, operation, describe(), this)
+            is CriException.Unavailable -> NodeException.Unreachable(name, operation, safeMessage, this)
 
             // The trailing argument is `commandTimeout`, carried across rather
             // than re-derived: :cri decides it by elapsed time against its own
             // deadline, and that deadline is not visible from anywhere above
             // this line. Nothing above may look at a gRPC code either, so this
             // is the only place the two kinds of timeout can be told apart.
-            is CriException.Timeout -> NodeException.Timeout(name, operation, describe(), this, commandTimeout)
+            is CriException.Timeout -> NodeException.Timeout(name, operation, safeMessage, this, commandTimeout)
 
-            is CriException.ResourceExhausted -> NodeException.Busy(name, operation, describe(), this)
+            is CriException.ResourceExhausted -> NodeException.Busy(name, operation, safeMessage, this)
 
-            is CriException.Aborted -> NodeException.Busy(name, operation, describe(), this)
+            is CriException.Aborted -> NodeException.Busy(name, operation, safeMessage, this)
 
-            is CriException.RuntimeFailure -> NodeException.Busy(name, operation, describe(), this)
+            is CriException.RuntimeFailure -> NodeException.Busy(name, operation, safeMessage, this)
 
             // A name collision from either create path has already been through
             // `adoptAfterCollision` and survived a second lookup that found
@@ -669,36 +686,20 @@ public class LocalNode internal constructor(
             // arrives as, retrying repeats the same find-create-collide cycle
             // for ever and shows `RETRYABLE` while never asking anyone to look,
             // so it is reported instead.
-            is CriException.AlreadyExists -> NodeException.Rejected(name, operation, describe(), this)
+            is CriException.AlreadyExists -> NodeException.Rejected(name, operation, safeMessage, this)
 
-            is CriException.NotFound -> NodeException.NotFound(name, operation, describe(), this)
+            is CriException.NotFound -> NodeException.NotFound(name, operation, safeMessage, this)
 
-            is CriException.InvalidArgument -> NodeException.Rejected(name, operation, describe(), this)
+            is CriException.InvalidArgument -> NodeException.Rejected(name, operation, safeMessage, this)
 
-            is CriException.FailedPrecondition -> NodeException.Rejected(name, operation, describe(), this)
+            is CriException.FailedPrecondition -> NodeException.Rejected(name, operation, safeMessage, this)
 
-            is CriException.PermissionDenied -> NodeException.Rejected(name, operation, describe(), this)
+            is CriException.PermissionDenied -> NodeException.Rejected(name, operation, safeMessage, this)
 
-            is CriException.Unimplemented -> NodeException.Rejected(name, operation, describe(), this)
+            is CriException.Unimplemented -> NodeException.Rejected(name, operation, safeMessage, this)
 
-            is CriException.Cancelled -> NodeException.Rejected(name, operation, describe(), this)
+            is CriException.Cancelled -> NodeException.Rejected(name, operation, safeMessage, this)
         }
-
-    /**
-     * The runtime's account of a failure, as much of it as may be recorded.
-     *
-     * This is the one place a `mcorch.cri` string crosses into a
-     * [NodeException], and from there into `FailureStatus.message`, SQLite and
-     * the API. See [runtimeDetail] for what is withheld and why — and note that
-     * the *list* is `:cri`'s, consulted here rather than copied.
-     */
-    private fun CriException.describe(): String =
-        runtimeDetail(
-            operation = operation.name,
-            code = code.name,
-            rendered = message,
-            requestMayCarrySecrets = operation.requestMayCarrySecrets,
-        )
 
     private fun WorkloadHandle.requireContainer(operation: NodeOperation): ContainerId =
         containerId?.let(::ContainerId)
