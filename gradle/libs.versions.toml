@@ -25,7 +25,13 @@ grpcKotlin = "1.5.0"
 # core fails at runtime, not at build time.
 netty = "4.1.133.Final"
 
-# API only, no binding. :cri logs through it; :app picks the implementation.
+# The API is what library modules depend on; the binding is :app's alone, and
+# both ship from the same slf4j release at the same version, so there is no skew
+# question to get wrong. `slf4j-simple` rather than logback because it adds no
+# transitive dependency of its own and needs no XML: this program's log output
+# is a dozen structured lines per server lifecycle, not something anybody routes
+# or filters at the appender. Swapping in logback later changes one runtimeOnly
+# line and one properties file — nothing that logs.
 slf4j = "2.0.17"
 
 # YAML 1.2 parser for :schema. Chosen over kaml/Jackson because the schema
@@ -79,6 +85,9 @@ grpc-kotlin-stub = { module = "io.grpc:grpc-kotlin-stub", version.ref = "grpcKot
 grpc-inprocess = { module = "io.grpc:grpc-inprocess", version.ref = "grpc" }
 
 slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
+# The one binding, and only :app may depend on it. A library module that pulls a
+# binding onto the classpath decides logging for every consumer it ever has.
+slf4j-simple = { module = "org.slf4j:slf4j-simple", version.ref = "slf4j" }
 
 snakeyaml-engine ={ module = "org.snakeyaml:snakeyaml-engine", version.ref = "snakeyamlEngine" }
 
