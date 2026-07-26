@@ -217,6 +217,16 @@ internal class DrainTest {
             unanswerableProbeNeverReadsAsEmpty { node -> node.commandTimedOut(NodeOperation.EXEC) }
         }
 
+    /**
+     * Drives a whole drain against a probe that never answers, and pins every
+     * part of the verdict rather than just the state.
+     *
+     * The two callers pass the two failures that used to take *different*
+     * branches of `requireEmpty` and now take one. Asserting the reason and the
+     * class here, not only `DRAIN_FAILED`, is what makes this a test of the
+     * merge: two branches could both reach `DRAIN_FAILED` while disagreeing
+     * about whether a human needs to look.
+     */
     private suspend fun unanswerableProbeNeverReadsAsEmpty(failure: (FakeNode) -> NodeException) {
         val harness = Harness()
         val definition = paperDefinition()
@@ -228,12 +238,16 @@ internal class DrainTest {
 
         repeat(6) { harness.pass(name) }
 
-        harness
-            .status(name)
-            .shouldNotBeNull()
-            .drain
-            .shouldNotBeNull()
-            .state shouldBe DrainState.DRAIN_FAILED
+        val drain =
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+        drain.state shouldBe DrainState.DRAIN_FAILED
+        val drainFailure = drain.failure.shouldNotBeNull()
+        drainFailure.reason shouldBe FailureReason.DRAIN_STALLED
+        drainFailure.failureClass shouldBe FailureClass.RETRYABLE
         harness.node.stops shouldHaveSize 0
         harness.node.saves shouldHaveSize 0
         harness.node.removals shouldHaveSize 0
@@ -241,6 +255,83 @@ internal class DrainTest {
             .shouldBeInstanceOf<WorkloadObservation.Present>()
             .state shouldBe WorkloadState.RUNNING
     }
+
+    /**
+     * The wedge that keeps a second `save-all flush` off a live server must
+     * survive a probe that fails, because a pass which observed nothing has no
+     * grounds to lift it.
+     *
+     * Fails against the old code: `forgetSaveEvidence()` cleared
+     * `saveRequestedAt` along with the confirmation, which demoted the permanent
+     * abort to retryable and let the next healthy pass re-send the save. Only
+     * seeing a *player* may lift it — that is what makes the earlier request
+     * worthless — and a flickering exec channel is not that.
+     */
+    @Test
+    fun `a delivered save request survives a failed probe and is still never re-sent`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+
+            // The save goes out and never reports completion, so the request is
+            // recorded as delivered and the drain wedges permanently.
+            harness.node.onExec = { command ->
+                if (command == PaperCommands.saveAll()) {
+                    throw harness.node.unanswered(NodeOperation.EXEC)
+                } else {
+                    harness.node.defaultExec(command)
+                }
+            }
+            harness.store.deleteDefinition(name)
+            repeat(6) { harness.pass(name) }
+
+            harness.node.saves shouldHaveSize 1
+            val wedged =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            wedged.saveRequestedAt.shouldNotBeNull()
+            wedged.failure.shouldNotBeNull().failureClass shouldBe FailureClass.PERMANENT
+
+            // Now the probe fails — the exec channel flickers. This observes
+            // nobody, so it must change nothing about what was already sent.
+            harness.node.failAlways(NodeOperation.EXEC, harness.node.commandTimedOut(NodeOperation.EXEC))
+            repeat(4) { harness.pass(name) }
+
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .saveRequestedAt
+                .shouldNotBeNull()
+
+            // The channel recovers and the server would now save cleanly. The
+            // drain must still refuse to send a second request.
+            harness.node.stopFailing(NodeOperation.EXEC)
+            harness.node.onExec = { command -> harness.node.defaultExec(command) }
+            repeat(6) { harness.pass(name) }
+
+            harness.node.saves shouldHaveSize 1
+            harness.node.stops shouldHaveSize 0
+            harness.node.removals shouldHaveSize 0
+            harness.node.workload
+                .shouldBeInstanceOf<WorkloadObservation.Present>()
+                .state shouldBe WorkloadState.RUNNING
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .failure
+                .shouldNotBeNull()
+                .failureClass shouldBe FailureClass.PERMANENT
+        }
 
     @Test
     fun `a server with world data and no RCON cannot be drained and is not stopped`() =

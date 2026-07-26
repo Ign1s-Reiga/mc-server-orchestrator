@@ -126,6 +126,46 @@ internal class SaveEvidenceTest {
         nothing.forgetSaveEvidence() shouldBe nothing
     }
 
+    /**
+     * `saveRequestedAt` means two different things and only `worldSaved` says
+     * which, so the pass that cannot vouch for the world any more has to answer
+     * differently for each. Both errors are silent:
+     *
+     * - keeping the timestamp of a *confirmed* save wedges a healthy drain,
+     *   because the next `SAVING` reads it as a request that never came back and
+     *   aborts permanently on a save that actually completed;
+     * - dropping the timestamp of an *unconfirmed* one lifts the wedge that
+     *   keeps a second `save-all flush` off a live server.
+     */
+    @Test
+    fun `forgetting a confirmation keeps an unconfirmed request and discards a completed one`() {
+        // Delivered, never confirmed: the wedge. It must survive, because this
+        // pass observed nobody and so has no grounds to lift it.
+        val requested = start.plusSeconds(60)
+        val delivered = drain(null).copy(saveRequestedAt = requested)
+
+        val afterFailedProbe = delivered.forgetSaveConfirmation()
+
+        afterFailedProbe.saveRequestedAt shouldBe requested
+        afterFailedProbe.worldSaved.shouldBeFalse()
+        afterFailedProbe.playersEvacuated.shouldBeFalse()
+
+        // Confirmed, then outlived: the request finished, so there is no
+        // outstanding side effect to protect and the drain simply saves again.
+        val confirmed = drain(start.plusSeconds(60))
+
+        val afterExpiry = confirmed.forgetSaveConfirmation()
+
+        afterExpiry.worldSaved.shouldBeFalse()
+        afterExpiry.saveRequestedAt shouldBe null
+        afterExpiry.playersEvacuated.shouldBeFalse()
+
+        // Nothing to forget is left untouched, so an unchanged status does not
+        // become a store write.
+        val nothing = drain(null).copy(playersEvacuated = false)
+        nothing.forgetSaveConfirmation() shouldBe nothing
+    }
+
     @Test
     fun `an unconfirmed request is not evidence and is not cleared by the passage of time`() {
         val requested = start.plusSeconds(60)
