@@ -2,9 +2,11 @@ package mcorch.core.paper
 
 import mcorch.core.ExecOutcome
 import mcorch.core.ExecRequest
+import mcorch.core.Labels
 import mcorch.core.Node
 import mcorch.core.NodeException
 import mcorch.core.WorkloadHandle
+import mcorch.core.WorkloadObservation
 import mcorch.schema.PaperServerDefinition
 import mcorch.schema.RconSpec
 import mcorch.schema.StorageSpec
@@ -37,15 +39,18 @@ internal class PaperServerAgent(
     private val spec get() = definition.spec
 
     /**
-     * Whether this server holds world data that must be saved before it stops.
+     * Whether the *declared* server holds world data that must be saved before
+     * it stops.
      *
      * False only for `ephemeral` storage, which the operator has to ask for by
-     * name and which by definition has nothing worth flushing.
+     * name and which by definition has nothing worth flushing. This describes
+     * the definition, not whatever is running — use [contractOf] for that.
      */
-    val savePersistsWorld: Boolean get() = spec.storage is StorageSpec.Persistent
+    val declaresWorldData: Boolean get() = spec.storage is StorageSpec.Persistent
 
     /**
-     * Whether there is any channel through which a save can be *confirmed*.
+     * Whether the *declared* server has any channel through which a save can be
+     * *confirmed*.
      *
      * Confirmation needs a reply, and the only thing that replies is RCON.
      * Without it the loop can push a save request into the console and learn
@@ -53,7 +58,33 @@ internal class PaperServerAgent(
      * drain protocol forbids. A server with world data and no RCON therefore
      * cannot be drained, and the loop says so rather than stopping it anyway.
      */
-    val saveConfirmable: Boolean get() = spec.network.rcon is RconSpec.Enabled
+    val declaresSaveChannel: Boolean get() = spec.network.rcon is RconSpec.Enabled
+
+    /**
+     * What the container that is actually running was built with.
+     *
+     * A drain is conducted against the container, never against the definition
+     * as it reads today. Two edits make the difference load-bearing:
+     *
+     * - `storage.mode: persistent` → `ephemeral` would otherwise make the drain
+     *   believe there is no world to flush and stop a container that holds one.
+     * - enabling `network.rcon` would otherwise make the drain believe it can
+     *   confirm a save through a listener the running container never started.
+     *
+     * Both are recreate-level changes, so the drain that applies them runs
+     * against the *old* container. The facts come off the workload's own labels;
+     * a workload created before those labels existed reports none, and the
+     * definition is the only thing left to go on.
+     */
+    fun contractOf(observation: WorkloadObservation.Present): WorkloadContract {
+        val worldData = Labels.booleanValue(observation.labels, Labels.WORLD_DATA)
+        val saveChannel = Labels.booleanValue(observation.labels, Labels.SAVE_CONFIRMABLE)
+        return WorkloadContract(
+            holdsWorldData = worldData ?: declaresWorldData,
+            saveConfirmable = saveChannel ?: declaresSaveChannel,
+            observed = worldData != null && saveChannel != null,
+        )
+    }
 
     /** Asks the server whether it is accepting players, and how many it has. */
     suspend fun probe(
@@ -76,13 +107,13 @@ internal class PaperServerAgent(
             }
         if (!result.exitedCleanly) {
             return ProbeOutcome.NotJoinable(
-                "the server did not answer a Server List Ping (exit ${result.exitCode}): ${result.summary()}",
+                "the server did not answer a Server List Ping (${result.diagnose()})",
             )
         }
         val occupancy =
             PaperCommands.parseOccupancy(result.output)
                 ?: return ProbeOutcome.NotJoinable(
-                    "the Server List Ping reply could not be read: ${result.summary()}",
+                    "the Server List Ping reply carried no occupancy report (${result.diagnose()})",
                 )
         return ProbeOutcome.Joinable(online = occupancy.online, max = occupancy.max)
     }
@@ -96,13 +127,11 @@ internal class PaperServerAgent(
      */
     suspend fun requestSave(
         node: Node,
-        handle: WorkloadHandle,
+        observation: WorkloadObservation.Present,
+        contract: WorkloadContract = contractOf(observation),
     ): SaveOutcome {
-        if (!saveConfirmable) {
-            return SaveOutcome.Unconfirmable(
-                "this server has persistent world data but RCON is disabled, so a completed save cannot be " +
-                    "confirmed. Enable spec.network.rcon to allow this server to be drained",
-            )
+        if (!contract.saveConfirmable) {
+            return SaveOutcome.Unconfirmable(noSaveChannel(contract))
         }
         val request =
             ExecRequest(
@@ -111,7 +140,7 @@ internal class PaperServerAgent(
             )
         val result =
             try {
-                node.exec(handle, request)
+                node.exec(observation.handle, request)
             } catch (failure: NodeException) {
                 return when (failure) {
                     // The command outran its timeout. It may well have reached
@@ -131,20 +160,78 @@ internal class PaperServerAgent(
                 }
             }
         if (!result.exitedCleanly) {
-            return SaveOutcome.Unconfirmed(
-                "the save command exited ${result.exitCode}: ${result.summary()}",
-            )
+            // A non-zero exit is the RCON client's verdict, not the server's.
+            // It is "unconfirmed" — the bucket that is never retried — only if
+            // something in the output shows the request actually reached the
+            // server. A client that could not connect, was reset, or was
+            // refused never delivered anything, and refusing to try that again
+            // wedges the server for good over what is usually a hiccup.
+            return if (PaperCommands.reachedServer(result.output)) {
+                SaveOutcome.Unconfirmed(
+                    "the server acknowledged the save and the save command then exited ${result.exitCode} " +
+                        "(${result.diagnose()})",
+                )
+            } else {
+                SaveOutcome.NotDelivered(
+                    detail =
+                        "the RCON client exited ${result.exitCode} without reaching the server " +
+                            "(${result.diagnose()}); no save request was delivered" + rconHint(contract),
+                    retryable = true,
+                )
+            }
         }
         return if (PaperCommands.confirmsSave(result.output)) {
             SaveOutcome.Confirmed
         } else {
-            // Exit code zero on its own proves only that the command ran.
+            // Exit code zero on its own proves only that the command ran. The
+            // client connected and got *something* back, so the request did
+            // reach the server: this one stays unconfirmed rather than
+            // undelivered.
             SaveOutcome.Unconfirmed(
-                "the save command exited cleanly but the server did not confirm a completed save: " +
-                    result.summary(),
+                "the save command exited cleanly but the server did not confirm a completed save " +
+                    "(${result.diagnose()})",
             )
         }
     }
+
+    /**
+     * Why this container cannot report a completed save, and what an operator
+     * can actually do about it.
+     *
+     * The honest part is the second half. Enabling `spec.network.rcon` changes
+     * the *next* container; it does nothing for the one that is running, and
+     * that container cannot be recreated without a drain, which is the thing
+     * that needs the save channel. So the way out is not an edit — it is a human
+     * saving and stopping the server themselves, after which the loop observes a
+     * stopped container and finishes the teardown on its own.
+     */
+    private fun noSaveChannel(contract: WorkloadContract): String {
+        val cause =
+            if (contract.observed && declaresSaveChannel) {
+                "the running container was created with RCON disabled, so enabling spec.network.rcon has not " +
+                    "reached it — that setting applies to the next container, and this one cannot be replaced " +
+                    "until it has been drained"
+            } else {
+                "this server has persistent world data and RCON is disabled, so nothing can reply that a save " +
+                    "completed"
+            }
+        return "$cause. The container keeps running and will not be stopped by the orchestrator. To retire it, " +
+            "save the world and stop the container yourself; the teardown completes on its own once a stopped " +
+            "container is observed. To keep it, revert spec.network.rcon and the server returns to running"
+    }
+
+    /**
+     * The one case a connection failure cannot be told apart from a missing
+     * listener: a workload that carries no record of what it was built with.
+     */
+    private fun rconHint(contract: WorkloadContract): String =
+        if (contract.observed) {
+            ""
+        } else {
+            ". This container carries no record of its save channel, so it may have been created before " +
+                "spec.network.rcon was enabled — in which case no edit can drain it and it has to be saved " +
+                "and stopped by hand"
+        }
 
     private companion object {
         /**
@@ -155,6 +242,20 @@ internal class PaperServerAgent(
         private val PROBE_TIMEOUT: Duration = 10.seconds
     }
 }
+
+/**
+ * What the running container was built with, which is what a drain must act on.
+ *
+ * [observed] says where the facts came from: true when the workload carried them
+ * itself, false when the definition was the only thing left to ask. The
+ * difference matters for what an operator is told — a guess derived from an
+ * edited definition should not be reported as an observation.
+ */
+internal data class WorkloadContract(
+    val holdsWorldData: Boolean,
+    val saveConfirmable: Boolean,
+    val observed: Boolean,
+)
 
 /** What a readiness probe found. */
 internal sealed interface ProbeOutcome {
@@ -233,6 +334,42 @@ internal object PaperCommands {
      */
     private val SAVE_CONFIRMED = Regex("""(?i)\bsaved the (game|world)\b""")
 
+    /**
+     * Either of the server's two replies. This is not evidence the save
+     * finished — that is [SAVE_CONFIRMED] — it is evidence the request got as
+     * far as the server at all, which is what decides whether re-sending it
+     * later is safe.
+     */
+    private val SAVE_ACKNOWLEDGED = Regex("""(?i)\bsav(ing|ed) the (game|world)\b""")
+
+    /**
+     * Client-side failures worth telling an operator about, matched as whole
+     * phrases against the output.
+     *
+     * A whitelist rather than a truncation of whatever came back. Output from a
+     * Minecraft server can carry player names — an SLP reply has a
+     * `players.sample` block of names and UUIDs, and any console reply is the
+     * server's text — and CLAUDE.md bans those from logs and from status. So
+     * nothing here is ever echoed: a recognised phrase is reported by name and
+     * everything else is reported as a byte count.
+     */
+    private val DIAGNOSTICS =
+        listOf(
+            "connection refused",
+            "connection reset",
+            "no route to host",
+            "network is unreachable",
+            "no such host",
+            "i/o timeout",
+            "context deadline exceeded",
+            "broken pipe",
+            "authentication failed",
+            "invalid password",
+            "unknown command",
+            "permission denied",
+            "unexpected eof",
+        )
+
     data class Occupancy(
         val online: Int,
         val max: Int,
@@ -256,17 +393,34 @@ internal object PaperCommands {
     }
 
     fun confirmsSave(output: String): Boolean = SAVE_CONFIRMED.containsMatchIn(output)
+
+    /** Whether the request got as far as the server, whatever the client then did. */
+    fun reachedServer(output: String): Boolean = SAVE_ACKNOWLEDGED.containsMatchIn(output)
+
+    /** The recognised phrases in [output], in the order they are listed. Never any of the output itself. */
+    fun diagnostics(output: String): List<String> {
+        val haystack = output.lowercase()
+        return DIAGNOSTICS.filter { it in haystack }
+    }
 }
 
 /**
- * A bounded, single-line rendering of a command's output for an operator-facing
- * message. Server output cannot contain a player name here — a Server List Ping
- * reply and a save confirmation carry none — but it can be long, and a status
- * field is not a log sink.
+ * What went wrong with a command, said without repeating what it printed.
+ *
+ * Nothing an operator sees here comes out of the container. Recognised failure
+ * phrases are reported by name and everything else is reported as a size,
+ * because output from a Minecraft server can carry player names, UUIDs and
+ * addresses — an SLP reply carries a `players.sample` block of exactly that —
+ * and this string ends up on observed status, in the API, and in a log line.
  */
-internal fun ExecOutcome.summary(): String {
-    val collapsed = output.replace(Regex("""\s+"""), " ").trim()
-    return if (collapsed.length <= SUMMARY_LIMIT) collapsed else collapsed.take(SUMMARY_LIMIT) + "…"
+internal fun ExecOutcome.diagnose(): String {
+    val recognised = PaperCommands.diagnostics(output)
+    val detail =
+        if (recognised.isEmpty()) {
+            "no recognised diagnostic; ${stdout.length} bytes on stdout, ${stderr.length} on stderr, " +
+                "not repeated here"
+        } else {
+            recognised.joinToString("; ")
+        }
+    return "exit $exitCode: $detail"
 }
-
-private const val SUMMARY_LIMIT = 200

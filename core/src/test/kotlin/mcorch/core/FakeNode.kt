@@ -64,8 +64,18 @@ internal class FakeNode(
     var joinable: Boolean = true
     var savesCleanly: Boolean = true
 
+    /**
+     * What a stop does to the workload. The default is what a healthy runtime
+     * does; returning the workload unchanged simulates a stop that does not
+     * take, which is the state `awaitStopped` exists for.
+     */
+    var onStop: (WorkloadObservation.Present) -> WorkloadObservation.Present = { present ->
+        present.copy(state = WorkloadState.EXITED, finishedAt = clock.instant(), exitCode = 0)
+    }
+
     private val onceFailures = mutableMapOf<NodeOperation, ArrayDeque<NodeException>>()
     private val alwaysFailures = mutableMapOf<NodeOperation, NodeException>()
+    private val rawFailures = mutableMapOf<NodeOperation, Throwable>()
 
     fun failOnce(
         operation: NodeOperation,
@@ -81,9 +91,26 @@ internal class FakeNode(
         alwaysFailures[operation] = failure
     }
 
+    /**
+     * Throws something that is *not* a [NodeException], the way a node
+     * implementation does when a failure escapes its own translation — an
+     * `IOException` from creating a host directory, say.
+     *
+     * A real [Node] must never do this, which is exactly why the loop is tested
+     * against one that does: the promise is enforced in one implementation and
+     * relied on by every worker.
+     */
+    fun throwRaw(
+        operation: NodeOperation,
+        failure: Throwable,
+    ) {
+        rawFailures[operation] = failure
+    }
+
     fun stopFailing(operation: NodeOperation) {
         alwaysFailures.remove(operation)
         onceFailures.remove(operation)
+        rawFailures.remove(operation)
     }
 
     fun unreachable(operation: NodeOperation): NodeException =
@@ -128,6 +155,11 @@ internal class FakeNode(
                 handle = WorkloadHandle(name, "sandbox-${spec.server}", "container-${spec.server}"),
                 state = WorkloadState.CREATED,
                 specHash = spec.specHash,
+                // The workload keeps the labels it was created with, the way a
+                // real runtime does. This is what makes a later drain able to
+                // read what the *container* was built with rather than what the
+                // definition says after an edit.
+                labels = spec.labels + (Labels.SPEC_HASH to spec.specHash),
                 createdAt = clock.instant(),
             )
         workload = created
@@ -162,12 +194,7 @@ internal class FakeNode(
         check(NodeOperation.STOP)
         stops += handle to gracePeriod
         val present = workload as? WorkloadObservation.Present ?: return
-        workload =
-            present.copy(
-                state = WorkloadState.EXITED,
-                finishedAt = clock.instant(),
-                exitCode = 0,
-            )
+        workload = onStop(present)
     }
 
     override suspend fun removeWorkload(handle: WorkloadHandle) {
@@ -186,6 +213,7 @@ internal class FakeNode(
 
     private fun check(operation: NodeOperation) {
         calls += operation
+        rawFailures[operation]?.let { throw it }
         alwaysFailures[operation]?.let { throw it }
         onceFailures[operation]?.removeFirstOrNull()?.let { throw it }
     }

@@ -111,10 +111,17 @@ private fun deriveConditions(
                 drain?.playersEvacuated.toConditionStatus(),
                 "",
             ),
+            // Deliberately *not* derived from `storage.lastSaveConfirmedAt`.
+            // That field is a historical fact — the last time a save was ever
+            // confirmed — and it is carried forward, so reading the condition
+            // off it makes a server that has been running untouched for a week
+            // report that its world is saved. The condition means "the world as
+            // it is now is on disk", and the only thing that can say so is a
+            // drain holding a confirmation it has not since voided.
             condition(
                 ConditionType.WORLD_SAVED,
-                (storage?.lastSaveConfirmedAt != null || drain?.worldSaved == true).toConditionStatus(),
-                "",
+                (drain?.worldSaved == true).toConditionStatus(),
+                worldSavedMessage(storage, drain),
             ),
         )
     return entries.map { entry ->
@@ -130,6 +137,29 @@ private fun deriveConditions(
         )
     }
 }
+
+private fun worldSavedMessage(
+    storage: StorageStatus?,
+    drain: DrainStatus?,
+): String =
+    when {
+        drain?.worldSaved == true -> {
+            ""
+        }
+
+        storage?.persistent == false -> {
+            "ephemeral storage: there is no world to save"
+        }
+
+        storage?.lastSaveConfirmedAt != null -> {
+            "no save is confirmed for the world as it is now; the last confirmed save was at " +
+                "${storage.lastSaveConfirmedAt}"
+        }
+
+        else -> {
+            "no save has ever been confirmed for this server"
+        }
+    }
 
 private fun condition(
     type: ConditionType,
