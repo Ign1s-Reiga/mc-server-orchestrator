@@ -21,14 +21,40 @@ import java.security.SecureRandom
  *
  * Material is held as a [CharArray] rather than a [String] so it can be wiped;
  * secrets in this system are text.
+ *
+ * A value is shared: the reconcile loop resolves one, hands it to whatever needs
+ * it, and destroys it in a `finally`. So [use] and [destroy] can run at the same
+ * time on different threads, and all of this is safe to call from any of them.
  */
 public class SecretValue private constructor(
     private val material: CharArray,
 ) {
+    /**
+     * Held for exactly as long as it takes to copy the material or to wipe it, and
+     * never across [use]'s block.
+     *
+     * A flag alone — even an atomically compare-and-set one — would make the wipe
+     * happen exactly once but would not stop a [use] that had already passed the
+     * check from copying a buffer that [destroy] is part-way through zeroing. The
+     * caller would then be handed material that is half real and half wipe
+     * characters, which is worse than either: an RCON login built from it fails in a
+     * way nothing here explains. Copying and wiping have to exclude each other, so
+     * they take a lock.
+     */
+    private val lock = Any()
+
+    /**
+     * Written only under [lock]; volatile so [isDestroyed] can be read from any
+     * thread without taking it.
+     */
+    @Volatile
     private var destroyed: Boolean = false
 
     /** Characters of material. Not secret in itself, and useful for validation. */
     public val length: Int get() = material.size
+
+    /** Whether [destroy] has already run. A later [use] will fail. */
+    public val isDestroyed: Boolean get() = destroyed
 
     /**
      * Runs [block] on a private copy of the material and wipes the copy afterwards.
@@ -37,10 +63,13 @@ public class SecretValue private constructor(
      * not return the material itself — build the thing that needs it (an env var, a
      * config line, an auth frame) inside the block and hand the value straight to
      * its consumer.
+     *
+     * Racing a [destroy] either gives an intact copy or throws, never a partly wiped
+     * one. [block] runs outside the lock, so a slow consumer does not hold up a
+     * destroy on another thread — it just keeps working from its own copy.
      */
     public fun <T> use(block: (CharArray) -> T): T {
-        check(!destroyed) { "secret value has been destroyed" }
-        val copy = material.copyOf()
+        val copy = copyMaterial()
         try {
             return block(copy)
         } finally {
@@ -48,13 +77,34 @@ public class SecretValue private constructor(
         }
     }
 
-    /** Wipes the material. Any later [use] fails. Idempotent. */
+    private fun copyMaterial(): CharArray =
+        synchronized(lock) {
+            check(!destroyed) { "secret value has been destroyed" }
+            material.copyOf()
+        }
+
+    /**
+     * Wipes the material. Any later [use] fails.
+     *
+     * Idempotent and safe from any thread: the wipe happens exactly once, and calls
+     * that arrive after it return without touching anything.
+     */
     public fun destroy() {
-        material.fill(WIPE)
-        destroyed = true
+        synchronized(lock) {
+            if (destroyed) return
+            material.fill(WIPE)
+            destroyed = true
+        }
     }
 
-    /** Constant-time content equality. Two destroyed values of the same length compare equal; that is harmless. */
+    /**
+     * Constant-time content equality. Two destroyed values of the same length compare equal; that is harmless.
+     *
+     * Not synchronised, on purpose: locking two values here would let `a == b` and
+     * `b == a` on different threads deadlock. Comparing against a value that is being
+     * destroyed can therefore report unequal — the answer a caller deserves for
+     * racing a destroy, and the only thing that leaks out is that boolean.
+     */
     override fun equals(other: Any?): Boolean {
         if (other !is SecretValue) return false
         if (material.size != other.material.size) return false
