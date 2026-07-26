@@ -15,6 +15,7 @@ import mcorch.schema.StorageSpec
 import mcorch.schema.VolumeSpec
 import org.junit.jupiter.api.Test
 import kotlin.time.Duration.Companion.minutes
+import kotlin.time.Duration.Companion.seconds
 
 /** Bringing a declared Paper server up to actually joinable. */
 internal class BringUpTest {
@@ -189,6 +190,61 @@ internal class BringUpTest {
             harness.node.workload
                 .shouldBeInstanceOf<WorkloadObservation.Present>()
                 .state shouldBe WorkloadState.RUNNING
+        }
+
+    /**
+     * A flapping exec channel must not stop the startup timeout from elapsing.
+     *
+     * The two probe failures land in different phases — a cut-short probe reads
+     * as `STARTING`, a node that never answered as `UNKNOWN` — so alternating
+     * them restamps `lastTransitionAt` every pass. A runtime that reports no
+     * start time for a running container used to anchor the elapsed-time check
+     * on exactly that field, so the budget reset every other pass and
+     * `READINESS_TIMEOUT` could never fire: a wedged server that never surfaces.
+     */
+    @Test
+    fun `a flapping probe does not stop the startup timeout from elapsing`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition(startupTimeout = 1.minutes)
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.pass(name)
+            harness.pass(name)
+
+            // A runtime that does not report a start time for a running
+            // container. containerd does; this is the case the fallback exists
+            // for, and the only case in which it is reached at all.
+            val running = harness.node.workload.shouldBeInstanceOf<WorkloadObservation.Present>()
+            running.createdAt.shouldNotBeNull()
+            harness.node.workload = running.copy(startedAt = null)
+
+            repeat(4) {
+                harness.node.failOnce(NodeOperation.EXEC, harness.node.commandTimedOut(NodeOperation.EXEC))
+                harness.pass(name)
+                harness.clock.advance(20.seconds)
+                harness.node.failOnce(NodeOperation.EXEC, harness.node.unanswered(NodeOperation.EXEC))
+                harness.pass(name)
+                harness.clock.advance(20.seconds)
+            }
+
+            // Well past the one-minute startup timeout, and the last pass has to
+            // be the cut-short one so the elapsed check is the branch reached.
+            harness.node.failOnce(NodeOperation.EXEC, harness.node.commandTimedOut(NodeOperation.EXEC))
+            val outcome = harness.pass(name)
+
+            outcome.shouldBeInstanceOf<ReconcileOutcome.Retry>()
+            val failure =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .failure
+                    .shouldNotBeNull()
+            failure.reason shouldBe FailureReason.READINESS_TIMEOUT
+            failure.failureClass shouldBe FailureClass.RETRYABLE
+            // Still nothing restarted: surfacing is the whole remedy.
+            harness.node.stops shouldHaveSize 0
+            harness.node.removals shouldHaveSize 0
         }
 
     @Test
