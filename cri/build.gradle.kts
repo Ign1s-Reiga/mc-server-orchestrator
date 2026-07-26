@@ -62,6 +62,12 @@ protobuf {
     }
 }
 
+// Everything here is `implementation`, never `api`. Downstream modules see the
+// wrapper in mcorch.cri and nothing else — no grpc, protobuf or netty type is
+// allowed to appear on :core's compile classpath. Prove it from the consumer
+// side after any change here:
+//
+//   ./gradlew :core:dependencies --configuration compileClasspath
 dependencies {
     implementation(libs.grpc.stub)
     implementation(libs.grpc.protobuf)
@@ -70,9 +76,23 @@ dependencies {
     implementation(libs.protobuf.java)
     implementation(libs.protobuf.kotlin)
     implementation(libs.kotlinx.coroutines.core)
+    implementation(libs.slf4j.api)
+
+    // The Java classes (EpollEventLoopGroup, EpollDomainSocketChannel,
+    // DomainSocketAddress) are in the plain artifact and are referenced
+    // directly: grpc-java's Utils picks EpollSocketChannel for TCP but never
+    // selects EpollDomainSocketChannel on its own, so the UDS channel type and
+    // event loop group have to be set explicitly. Verified against grpc-java
+    // v1.82.x io/grpc/netty/Utils.java.
+    implementation(libs.netty.transportNativeEpoll)
 
     // Native epoll, required for the Unix-domain-socket CRI endpoint on Linux.
     runtimeOnly(
         variantOf(libs.netty.transportNativeEpoll) { classifier("linux-x86_64") },
     )
+
+    // The wrapper's tests run the real client against a fake CRI server over
+    // grpc's in-process transport. No socket, no netty, no containerd, so
+    // `./gradlew build` stays runnable with no container runtime present.
+    testImplementation(libs.grpc.inprocess)
 }
