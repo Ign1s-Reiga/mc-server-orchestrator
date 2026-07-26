@@ -44,7 +44,18 @@ into a socket nobody is listening on.
 **How to apply:** the same shape works for any future recreate-level field —
 record the fact on the workload at plan time, read it back through the
 observation. Absent means "created before this label existed", which is not the
-same as `false`.
+same as `false`, and there is **no second source worth asking**: the definition
+is the thing being edited, and anything on observed status that is *derived* from
+the definition (`storage.persistent`, say) agrees with the edit within one pass.
+Unknown means the safe side, full stop.
+
+**3. Ask a source the runtime is obliged to fill.** The container-level view came
+from `PodSandboxStatusResponse.containers_statuses`, which is optional and
+runtime-dependent; an empty one is indistinguishable from an empty sandbox, so a
+live server read as "never created" and was torn down. `ListContainers` is
+mandatory — prefer a mandatory call over an optional field that saves a round
+trip, and when a reading would authorise destruction, ask what a runtime that
+simply declines to answer would produce.
 
 See [[standalone-drain-decision]] for what is still open, and
 [[assert-on-side-effects]] for how these are tested.
