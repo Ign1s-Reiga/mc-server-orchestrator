@@ -94,6 +94,40 @@ internal class FailureClassificationTest {
         }
 
     @Test
+    fun `a create that collides with something the node cannot find asks for a human`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            // The node's contract after a collision: look again, adopt what is
+            // there, and if the second look still finds nothing, say so. It used
+            // to report this as "busy", which made every pass repeat
+            // find-create-collide for ever while the dashboard showed a
+            // retryable failure and nobody was ever asked to look at the host.
+            harness.node.failAlways(
+                NodeOperation.CREATE,
+                NodeException.Rejected(
+                    harness.node.name,
+                    NodeOperation.CREATE,
+                    "the runtime says the sandbox already exists, and listing by label does not find it",
+                ),
+            )
+
+            harness.pass(name).shouldBeInstanceOf<ReconcileOutcome.Failed>()
+
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .failure
+                .shouldNotBeNull()
+                .failureClass shouldBe FailureClass.PERMANENT
+            val attempts = harness.node.calls.count { it == NodeOperation.CREATE }
+            repeat(5) { harness.pass(name) }
+            harness.node.calls.count { it == NodeOperation.CREATE } shouldBe attempts
+        }
+
+    @Test
     fun `changing the definition lifts a permanent failure`() =
         coreTest {
             val harness = Harness()

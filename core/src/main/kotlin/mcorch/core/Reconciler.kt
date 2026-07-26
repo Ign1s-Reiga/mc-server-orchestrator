@@ -97,11 +97,31 @@ public class Reconciler(
         // Exhaustive on purpose: a new server kind must not compile until the
         // loop has been taught what to do with it.
         return when (val definition = stored.definition.definition) {
-            is PaperServerDefinition -> reconcilePaper(Pass(stored, definition, clock.instant()))
+            is PaperServerDefinition -> reconcilePaper(stored, definition)
         }
     }
 
-    private suspend fun reconcilePaper(pass: Pass): ReconcileOutcome {
+    private suspend fun reconcilePaper(
+        stored: StoredServer,
+        definition: PaperServerDefinition,
+    ): ReconcileOutcome {
+        val now = clock.instant()
+
+        // Deriving the workload can reject the definition — the workload types
+        // enforce their own invariants — and that has to become an observation
+        // rather than an exception thrown out of a pass. Built here, inside a
+        // guard, rather than at the call site, because an escape from this
+        // function cancels the worker that called it and every other worker with
+        // it.
+        val pass =
+            try {
+                Pass(stored, definition, now)
+            } catch (rejected: IllegalArgumentException) {
+                return rejectDefinition(stored, now, rejected)
+            } catch (rejected: IllegalStateException) {
+                return rejectDefinition(stored, now, rejected)
+            }
+
         // A permanent failure is a request to stop trying, not a request to
         // keep trying more slowly. The gate lifts when the operator changes the
         // definition (the generation moves) or asks for a delete that has not
@@ -132,6 +152,46 @@ public class Reconciler(
             nodeFailure(pass, failure)
         } catch (failure: StoreException) {
             storeOutcome(pass.name, failure)
+        }
+    }
+
+    /**
+     * Records a definition that cannot be turned into a workload at all.
+     *
+     * Permanent by construction: nothing the loop does will make the same
+     * definition derivable next pass, so it surfaces and waits for an edit. It
+     * writes the observation without a [Pass], because building one is what
+     * failed.
+     */
+    private suspend fun rejectDefinition(
+        stored: StoredServer,
+        now: Instant,
+        failure: RuntimeException,
+    ): ReconcileOutcome {
+        val message = "the definition cannot be turned into a workload: ${failure.message}"
+        LOG.warn("server={} was rejected: {}", stored.name, message)
+        val previous = stored.status?.status as? PaperServerStatus
+        val status =
+            draftStatus(
+                previous = previous,
+                name = stored.name,
+                generation = stored.definition.generation,
+                now = now,
+                phase = ServerPhase.FAILED,
+                failure =
+                    recordFailure(
+                        reason = FailureReason.CONTAINER_CREATE_FAILED,
+                        failureClass = FailureClass.PERMANENT,
+                        message = message,
+                        now = now,
+                        previous = previous?.failure,
+                    ),
+            )
+        return try {
+            store.putStatus(status, observedDefinition = stored.definition.resourceVersion)
+            ReconcileOutcome.Failed(message)
+        } catch (storeFailure: StoreException) {
+            storeOutcome(stored.name, storeFailure)
         }
     }
 
@@ -176,10 +236,25 @@ public class Reconciler(
                 if (currentNode != null && currentNode != decision.node) {
                     val source = registry.node(currentNode)
                     if (source != null) return Placement.On(source, DrainCause.RELOCATION)
+                    // The workload is on a node this orchestrator can no longer
+                    // talk to. It is not gone — an unreachable node is not a
+                    // stopped container — so scheduling elsewhere would leave
+                    // two live workloads for one server, which is
+                    // `failure-modes.md` item 5 stretched across two machines.
+                    // Nobody can drain the old one from here, so this is a
+                    // human's problem and it says so.
                     LOG.warn(
                         "server={} was last seen on node={}, which is no longer registered",
                         pass.name,
                         currentNode,
+                    )
+                    return Placement.Refused(
+                        null,
+                        "this server's workload was last observed on node `$currentNode`, which is no longer " +
+                            "registered. It is not being scheduled onto `${decision.node}`: that would run a " +
+                            "second copy while the first may still have players on it. Bring `$currentNode` " +
+                            "back so it can be drained, or confirm its workload is gone and clear this " +
+                            "server's recorded placement",
                     )
                 }
                 val node =
@@ -284,8 +359,21 @@ public class Reconciler(
                     // the sandbox and creating the container into it is exactly
                     // what `ensureWorkload` does — it is never a second create.
                     WorkloadState.SANDBOX_ONLY -> {
-                        node.ensureWorkload(pass.desired)
-                        write(pass, status(ServerPhase.CREATING)) {
+                        // The returned observation, not the one this pass
+                        // started from: it carries the container that was just
+                        // created, and recording the sandbox-only one instead
+                        // would leave `containerId` null for a container that
+                        // exists and cost a pass rediscovering it.
+                        val created = node.ensureWorkload(pass.desired)
+                        val drafted =
+                            pass.draft(
+                                phase = ServerPhase.CREATING,
+                                image = image,
+                                runtime = pass.runtimeIdentity(created),
+                                storage = storage,
+                                drain = null,
+                            )
+                        write(pass, drafted) {
                             ReconcileOutcome.Progressed("container created in the existing sandbox")
                         }
                     }
@@ -502,6 +590,7 @@ public class Reconciler(
         observation: WorkloadObservation,
         cause: DrainCause,
     ): ReconcileOutcome {
+        forbiddenTransition(pass, observation, cause)?.let { return it }
         val progress =
             drainController.advance(
                 definition = pass.definition,
@@ -545,9 +634,74 @@ public class Reconciler(
             )
 
         if (!progress.containerDown) {
-            return write(pass, status) { progress.outcome }
+            return write(pass, status, mustRecord = progress.sideEffectIssued) { progress.outcome }
         }
         return teardown(pass, node, observation, status, cause)
+    }
+
+    /**
+     * Definition edits that must not be applied by draining the running
+     * container, because the drain would be conducted under rules the container
+     * never ran under.
+     *
+     * There is one today: `storage.mode` from `persistent` to `ephemeral`. It is
+     * in the spec hash, so the edit asks for a recreate, and the recreate drains
+     * the container that is holding the world right now. Everything downstream
+     * of that drain would read the *new* spec and conclude there is nothing to
+     * flush.
+     *
+     * The drain controller does not conclude that any more — it reads the
+     * container's own labels — so this is the second of two guards rather than
+     * the only one. It is here because it is the one place stored and desired
+     * state are both in hand, and because refusing the edit outright is a better
+     * answer than performing it correctly: an operator who wanted the world gone
+     * would delete the server, and an operator who wanted a lobby would create
+     * one.
+     *
+     * A delete is never refused. Whatever else is true, an operator who asked
+     * for a server to go away must be able to have it drained.
+     */
+    private suspend fun forbiddenTransition(
+        pass: Pass,
+        observation: WorkloadObservation,
+        cause: DrainCause,
+    ): ReconcileOutcome? {
+        if (cause != DrainCause.REPLACEMENT) return null
+        val present = observation as? WorkloadObservation.Present ?: return null
+        if (present.state != WorkloadState.RUNNING) return null
+        // Absent means the workload predates the label, which is not the same as
+        // "it holds no world data" — and guessing either way from an edited
+        // definition is exactly the mistake being guarded against.
+        val heldWorldData = Labels.booleanValue(present.labels, Labels.WORLD_DATA) ?: return null
+        if (!heldWorldData) return null
+        if (pass.definition.spec.storage !is StorageSpec.Ephemeral) return null
+
+        val message =
+            "refusing to change storage.mode to `ephemeral` on a running server: the container now running was " +
+                "created with persistent world data, and applying this edit means draining and replacing it. " +
+                "Whatever is in memory would be discarded rather than flushed. Revert spec.storage.mode; to " +
+                "retire this server instead, delete it — that drains and saves it first"
+        LOG.warn("server={} refused a storage mode change: {}", pass.name, message)
+        val failure =
+            recordFailure(
+                // The drain that would apply this edit is refused before it
+                // starts. There is no reason code for "this transition is not
+                // allowed" in the closed set; this is the nearest true one.
+                reason = FailureReason.DRAIN_STALLED,
+                failureClass = FailureClass.PERMANENT,
+                message = message,
+                now = pass.now,
+                previous = pass.previous?.failure,
+            )
+        val status =
+            pass.draft(
+                phase = ServerPhase.RUNNING,
+                runtime = pass.runtimeIdentity(present),
+                storage = pass.storageStatus(observation),
+                drain = null,
+                failure = failure,
+            )
+        return write(pass, status) { ReconcileOutcome.Failed(message) }
     }
 
     /**
@@ -625,15 +779,68 @@ public class Reconciler(
 
     // ── status writing ───────────────────────────────────────────────────────
 
+    /**
+     * Records [status] and turns the verdict into an outcome.
+     *
+     * [mustRecord] is for a pass that has already done something to the server
+     * which the runtime cannot be asked about afterwards. The guarded write can
+     * legitimately be rejected — the operator replaced the definition while the
+     * pass ran — and dropping the observation is the right answer for
+     * *observations*. It is the wrong answer for the record of a save request:
+     * that record is the only thing stopping the next pass sending a second one
+     * to a live server, and it must outlive a rejected write.
+     */
     private suspend inline fun write(
         pass: Pass,
         status: PaperServerStatus,
+        mustRecord: Boolean = false,
         outcome: () -> ReconcileOutcome,
     ): ReconcileOutcome =
         when (val verdict = writeStatus(pass, status)) {
-            is WriteVerdict.Conflicted -> verdict.outcome
-            WriteVerdict.Written, WriteVerdict.Unchanged -> outcome()
+            is WriteVerdict.Conflicted -> {
+                if (mustRecord) forceRecord(pass, status)
+                verdict.outcome
+            }
+
+            WriteVerdict.Written, WriteVerdict.Unchanged -> {
+                outcome()
+            }
         }
+
+    /**
+     * Writes an observation without the anti-lost-update guard, after that guard
+     * has already rejected it.
+     *
+     * The guard exists so a server cannot *look settled* at a generation nobody
+     * asked for. What is being written here does not look settled — it is a
+     * drain part-way through, carrying the fact that a save request went out —
+     * and the next pass re-reads the new definition and moves the observation on
+     * anyway. Losing the record instead would cost a second save on a live
+     * server, so this is the lesser of the two.
+     */
+    private suspend fun forceRecord(
+        pass: Pass,
+        status: PaperServerStatus,
+    ) {
+        LOG.warn(
+            "server={} had its observation rejected after a side effect was issued; recording it unguarded so " +
+                "the side effect is not repeated",
+            pass.name,
+        )
+        when (val outcome = store.putStatus(status)) {
+            is WriteOutcome.Applied -> {
+                Unit
+            }
+
+            is WriteOutcome.Conflict -> {
+                LOG.warn(
+                    "server={} could not record an issued side effect ({}); the next pass may repeat it",
+                    pass.name,
+                    outcome.reason,
+                )
+            }
+        }
+    }
 
     /**
      * Records an observation, unless it says exactly what the stored one
@@ -766,11 +973,20 @@ public class Reconciler(
                 previous != null &&
                     previous.observedGeneration == stored.definition.generation &&
                     previous.failure?.failureClass == FailureClass.PERMANENT
-            // A delete request is a human intervening, so it lifts the gate —
-            // but only until the drain it asks for has itself failed
-            // permanently, which is a state that needs a human again.
-            val deleteNotStarted = stored.definition.terminating && previous?.drain == null
-            return failed && !deleteNotStarted
+            // A delete request is a human intervening, and it lifts the gate for
+            // as long as the delete is outstanding — not just until the drain
+            // starts.
+            //
+            // A permanently stalled drain is the case that matters. The server
+            // keeps running, the operator is told to save and stop it by hand,
+            // and the loop has to be able to *notice* that they did. A gate that
+            // returns before the pass observes anything can never notice, so the
+            // container would sit stopped with its definition tombstoned for
+            // ever and the advice on its status would be a lie. Re-entering
+            // costs one observation per resync and issues nothing: a drain that
+            // has already recorded a delivered save does not re-send it, and one
+            // with no save channel aborts again without touching the server.
+            return failed && !stored.definition.terminating
         }
 
         @Suppress("LongParameterList")

@@ -28,11 +28,19 @@ import java.time.Instant
  *
  * `:store` has its own in-memory implementation, but it lives in that module's
  * test sources and is not visible here — so this is a second one, written
- * against the same documented contract. It implements only what the loop
- * actually depends on, and it implements those parts exactly: generations move
- * on a spec change and not otherwise, an identical status write is a no-op, a
- * stale `observedDefinition` conflicts, and a purge of a live definition is
- * refused.
+ * against the same documented contract.
+ *
+ * It implements the *whole* documented contract rather than the parts the loop
+ * happens to exercise today, and that is deliberate. A fake that is more
+ * permissive than the real store is a test suite that agrees with the code by
+ * construction: the loop's assumptions about conflicts, preconditions and
+ * no-op writes would be validated against something nobody checked. So:
+ * generations move on a spec change and not otherwise, a write that changes
+ * nothing at all moves no version and produces no change-feed entry, a
+ * tombstoned name conflicts with `TERMINATING`, a name held by another kind
+ * conflicts with `KIND_MISMATCH`, every [Precondition] is honoured, an
+ * identical status write is a no-op, a stale `observedDefinition` conflicts,
+ * and a purge of a live definition is refused.
  *
  * [statusWrites] is what the idempotency test asserts on: a settled server must
  * not produce store traffic.
@@ -71,6 +79,22 @@ internal class TestStore(
             val name = definition.metadata.name
             val now = clock.instant()
             val existing = definitions[name]
+            // Integrity rules first: they are not about races, so they apply
+            // whatever the precondition says.
+            if (existing != null && existing.definition.kind != definition.kind) {
+                return@guarded WriteOutcome.Conflict(name, ConflictReason.KIND_MISMATCH, existing.resourceVersion)
+            }
+            if (existing?.deletedAt != null) {
+                return@guarded WriteOutcome.Conflict(name, ConflictReason.TERMINATING, existing.resourceVersion)
+            }
+            conflict(name, precondition, existing?.resourceVersion)?.let { return@guarded it }
+
+            // Nothing changed at all — same spec, same metadata. No version
+            // move, no change-feed entry. A loop that re-applied a definition
+            // must not see the server as having been written.
+            if (existing != null && existing.definition == definition) {
+                return@guarded WriteOutcome.Applied(existing)
+            }
             val stored =
                 if (existing == null) {
                     StoredDefinition(definition, 1L, nextVersion(), now, now)
@@ -95,6 +119,7 @@ internal class TestStore(
         guarded {
             val existing =
                 definitions[name] ?: return@guarded WriteOutcome.Conflict(name, ConflictReason.NOT_FOUND, null)
+            conflict(name, precondition, existing.resourceVersion)?.let { return@guarded it }
             if (existing.deletedAt != null) return@guarded WriteOutcome.Applied(existing)
             val now = clock.instant()
             val stored = existing.copy(resourceVersion = nextVersion(), updatedAt = now, deletedAt = now)
@@ -108,14 +133,10 @@ internal class TestStore(
         precondition: Precondition,
     ): WriteOutcome<Unit> =
         guarded {
-            val existing = definitions[name] ?: return@guarded WriteOutcome.Applied(Unit)
-            if (precondition is Precondition.AtVersion && precondition.resourceVersion != existing.resourceVersion) {
-                return@guarded WriteOutcome.Conflict(
-                    name,
-                    ConflictReason.VERSION_MISMATCH,
-                    existing.resourceVersion,
-                )
-            }
+            val existing =
+                definitions[name] ?: return@guarded conflict(name, precondition, null)
+                    ?: WriteOutcome.Applied(Unit)
+            conflict(name, precondition, existing.resourceVersion)?.let { return@guarded it }
             // The only guard the store offers: a live definition must not be
             // purged. Whether the *container* is gone is the reconciler's
             // check, because the store never sees one.
@@ -143,6 +164,13 @@ internal class TestStore(
             val name = status.name
             val definition =
                 definitions[name] ?: return@guarded WriteOutcome.Conflict(name, ConflictReason.NOT_FOUND, null)
+            if (status.kind != definition.definition.kind) {
+                return@guarded WriteOutcome.Conflict(name, ConflictReason.KIND_MISMATCH, definition.resourceVersion)
+            }
+            val existing = statuses[name]
+            // The precondition is about the *status* row; `observedDefinition`
+            // is a separate guard about the definition the pass acted on.
+            conflict(name, precondition, existing?.resourceVersion)?.let { return@guarded it }
             if (observedDefinition != null && observedDefinition != definition.resourceVersion) {
                 return@guarded WriteOutcome.Conflict(
                     name,
@@ -150,7 +178,6 @@ internal class TestStore(
                     definition.resourceVersion,
                 )
             }
-            val existing = statuses[name]
             if (existing != null && existing.status == status) return@guarded WriteOutcome.Applied(existing)
             val stored = StoredStatus(status, nextVersion(), clock.instant())
             statuses[name] = stored
@@ -201,6 +228,38 @@ internal class TestStore(
         guarded { statuses[name]?.status as? PaperServerStatus }
 
     suspend fun recordedAt(name: ResourceName): Instant? = guarded { statuses[name]?.recordedAt }
+
+    /** The conflict a [Precondition] produces against [current], or null if the write may land. */
+    private fun conflict(
+        name: ResourceName,
+        precondition: Precondition,
+        current: ResourceVersion?,
+    ): WriteOutcome.Conflict? =
+        when (precondition) {
+            Precondition.None -> {
+                null
+            }
+
+            Precondition.Absent -> {
+                if (current == null) null else WriteOutcome.Conflict(name, ConflictReason.ALREADY_EXISTS, current)
+            }
+
+            is Precondition.AtVersion -> {
+                when {
+                    current == null -> {
+                        WriteOutcome.Conflict(name, ConflictReason.NOT_FOUND, null)
+                    }
+
+                    current != precondition.resourceVersion -> {
+                        WriteOutcome.Conflict(name, ConflictReason.VERSION_MISMATCH, current)
+                    }
+
+                    else -> {
+                        null
+                    }
+                }
+            }
+        }
 
     private suspend fun <T> guarded(block: () -> T): T {
         nextFailure?.let {
