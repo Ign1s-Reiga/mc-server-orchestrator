@@ -87,9 +87,25 @@ internal class WorkQueue(
         }
     }
 
-    /** Suspends until a server needs a pass. */
-    suspend fun take(): ResourceName {
-        val name = ready.receive()
+    /**
+     * Suspends until a server needs a pass, or returns null once the queue is
+     * closed and drained.
+     *
+     * **Null is a termination signal, not a failure.** A worker parked here when
+     * [close] lands has to be told to stop taking work, and the obvious
+     * alternative — letting the receive resume with
+     * `ClosedReceiveChannelException` — makes an orderly shutdown throw. It did:
+     * `close()` runs in the loop's `finally` while cancellation is still
+     * propagating to the workers, so whichever arrives first decides whether the
+     * process exits cleanly or reports a channel error it can do nothing about.
+     * Racing the two is not something a caller can be asked to get right, so
+     * closure is answered rather than thrown.
+     *
+     * Cancellation still propagates unchanged, as structured concurrency
+     * requires: only channel closure is turned into a value.
+     */
+    suspend fun take(): ResourceName? {
+        val name = ready.receiveCatching().getOrNull() ?: return null
         mutex.withLock {
             queued.remove(name)
             processing.add(name)

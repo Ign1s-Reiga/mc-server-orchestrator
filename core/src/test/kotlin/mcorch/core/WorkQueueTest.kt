@@ -102,7 +102,40 @@ internal class WorkQueueTest {
             // until the scope got round to them.
             advanceTimeBy(10.seconds)
 
-            shouldThrow<ClosedReceiveChannelException> { queue.take() }
+            // Answered, not thrown. This assertion used to be
+            // `shouldThrow<ClosedReceiveChannelException>`, which pinned the
+            // behaviour that made an orderly shutdown fail — see the test below.
+            queue.take() shouldBe null
+        }
+
+    /**
+     * The regression. A worker parked in [WorkQueue.take] when [WorkQueue.close]
+     * lands must be told to stop, not thrown at.
+     *
+     * In production the two are racing: the loop's `finally` closes the queue
+     * while cancellation is still propagating to the workers, so whichever
+     * arrives first decided whether the process exited cleanly or reported a
+     * `ClosedReceiveChannelException` nobody could act on. It failed roughly one
+     * integration run in six, which is exactly the frequency that reads as
+     * "flaky test" rather than "bug".
+     *
+     * Deterministic here because the park is forced: `taken` is suspended in
+     * `receive()` before `close()` is called, so this is the losing side of that
+     * race every time.
+     */
+    @Test
+    fun `a worker parked in take is told to stop when the queue closes`() =
+        runTest {
+            val queue = WorkQueue(this)
+            val taken = async { queue.take() }
+            // Let the receive actually park. Without this the close could land
+            // first and the test would prove nothing about a parked worker.
+            advanceTimeBy(1.milliseconds)
+            taken.isActive shouldBe true
+
+            queue.close()
+
+            taken.await() shouldBe null
         }
 
     @Test
