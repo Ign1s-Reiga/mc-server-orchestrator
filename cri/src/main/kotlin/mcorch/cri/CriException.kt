@@ -25,6 +25,64 @@ public enum class CriOperation {
 
     EXEC_SYNC,
     EXEC,
+    ;
+
+    /**
+     * Whether this operation's **request** carries secret material, so that a
+     * failure description from the runtime must not be repeated anywhere.
+     *
+     * This is about the request, not the reply. A runtime's error text is
+     * free-form, and Go's `fmt.Errorf("...: %+v", config)` habit means a
+     * rejected request can come back with the request in it. That is a promise
+     * about a third party's error strings, which is not a promise anyone can
+     * make — so the operations whose requests hold a secret are enumerated here
+     * and their descriptions are simply never logged.
+     *
+     * - [PULL_IMAGE] carries `AuthConfig`, whose `password`, `auth`,
+     *   `identity_token` and `registry_token` the CRI proto *itself* marks
+     *   `debug_redact = true`. Upstream has already said this must not appear in
+     *   debug output.
+     * - [CREATE_CONTAINER] carries `ContainerConfig.envs`. That is where the
+     *   RCON password is put, and it is the only route by which the Velocity
+     *   forwarding secret ever reaches a container (CLAUDE.md invariant 4).
+     * - [RUN_SANDBOX] carries the `PodSandboxConfig` that `CreateContainer` is
+     *   then required to hand back verbatim, so it is on the same footing.
+     *
+     * **[EXEC_SYNC] and [EXEC] are deliberately absent.** Their requests carry
+     * an argv, and no call site puts a credential in one — the RCON password
+     * reaches `rcon-cli` through the container's environment, not its arguments.
+     * Their descriptions are also the single most useful diagnostic this client
+     * produces: `failed to exec in container: timeout 10s exceeded` is what
+     * distinguishes a slow command from a sick node. Add them here the day a
+     * call site passes a secret as an argument, and not before.
+     *
+     * Kept as one exhaustive `when` rather than a set so that adding an RPC to
+     * this enum will not compile until someone has decided which side of the
+     * line it falls on.
+     */
+    public val requestMayCarrySecrets: Boolean
+        get() =
+            when (this) {
+                PULL_IMAGE, CREATE_CONTAINER, RUN_SANDBOX -> true
+
+                VERSION,
+                RUNTIME_STATUS,
+                IMAGE_STATUS,
+                LIST_IMAGES,
+                REMOVE_IMAGE,
+                STOP_SANDBOX,
+                REMOVE_SANDBOX,
+                SANDBOX_STATUS,
+                LIST_SANDBOXES,
+                START_CONTAINER,
+                STOP_CONTAINER,
+                REMOVE_CONTAINER,
+                CONTAINER_STATUS,
+                LIST_CONTAINERS,
+                EXEC_SYNC,
+                EXEC,
+                -> false
+            }
 }
 
 /**
