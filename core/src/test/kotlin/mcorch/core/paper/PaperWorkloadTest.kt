@@ -153,6 +153,37 @@ internal class PaperWorkloadTest {
     }
 
     @Test
+    fun `the save command sends flush, and that argument is the safety`() {
+        // Pinned as an exact list, not as "it contains save-all". Verified
+        // against a real Paper server: `save-all flush` blocks until the write
+        // completes, while plain `save-all` replies `Saved the game` — the same
+        // bytes — about six seconds before the write finishes. Nothing
+        // downstream can tell those two replies apart, so dropping this argument
+        // would let a container stop mid-write while the loop believed the
+        // world was on disk.
+        PaperCommands.saveAll() shouldBe listOf("rcon-cli", "save-all", "flush")
+
+        // The confirmation pattern cannot save you here: it matches the early
+        // reply exactly as well as the real one. That is why the argument is
+        // pinned rather than the reply.
+        PaperCommands.confirmsSave("Saved the game").shouldBeTrue()
+    }
+
+    @Test
+    fun `a Server List Ping summary is read without depending on its shape`() {
+        // Real `mc-monitor status` output. Note `version=Paper 1.21.4` contains
+        // a space, so nothing may split this positionally.
+        val real = "127.0.0.1:25565 : version=Paper 1.21.4 online=0 max=20 motd='mcorch probe'"
+
+        val occupancy = PaperCommands.parseOccupancy(real).shouldNotBeNull()
+
+        occupancy.online shouldBe 0
+        occupancy.max shouldBe 20
+        // And nothing operator-supplied in the line is treated as a diagnostic.
+        PaperCommands.diagnostics(real) shouldBe emptyList()
+    }
+
+    @Test
     fun `only a completed save counts as a completed save`() {
         PaperCommands.confirmsSave("Saved the game").shouldBeTrue()
         PaperCommands.confirmsSave("Saved the world").shouldBeTrue()
