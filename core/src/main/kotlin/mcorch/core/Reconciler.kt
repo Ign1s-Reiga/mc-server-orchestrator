@@ -27,6 +27,7 @@ import org.slf4j.LoggerFactory
 import java.time.Clock
 import java.time.Instant
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.toKotlinDuration
 import java.time.Duration as JavaDuration
@@ -77,7 +78,12 @@ public class Reconciler(
     private val config: ReconcilerConfig = ReconcilerConfig(),
     private val clock: Clock = Clock.systemUTC(),
 ) {
-    private val drainController = DrainController(clock)
+    private val drainController =
+        DrainController(
+            clock = clock,
+            evidenceGap = config.saveEvidenceMaxGap,
+            attentionAfter = config.drainAttentionAfter,
+        )
 
     /**
      * Converges [name] one step toward its desired state.
@@ -599,6 +605,15 @@ public class Reconciler(
                 observation = observation,
                 current = pass.previous?.drain,
                 cause = cause,
+                // When the loop last recorded anything about this server. A
+                // save confirmation is only worth something while the chain of
+                // observations behind it is unbroken, and this is the only
+                // record that it was watching at all.
+                lastObservedAt = pass.previous?.observedAt,
+                // What the last observation said about storage, for a workload
+                // that carries no label of its own. Written before whatever
+                // edit is being applied now, which is the point of using it.
+                storageWasPersistent = pass.previous?.storage?.persistent,
             )
         val storage =
             pass.storageStatus(observation).let { base ->
@@ -672,7 +687,11 @@ public class Reconciler(
         // Absent means the workload predates the label, which is not the same as
         // "it holds no world data" — and guessing either way from an edited
         // definition is exactly the mistake being guarded against.
-        val heldWorldData = Labels.booleanValue(present.labels, Labels.WORLD_DATA) ?: return null
+        // Unknown counts as "may hold a world". A workload that does not say
+        // what it was built with is the one case where the only other source is
+        // the definition that has just been edited, so this refuses on `null`
+        // as well as on `true`.
+        val heldWorldData = Labels.booleanValue(present.labels, Labels.WORLD_DATA) ?: true
         if (!heldWorldData) return null
         if (pass.definition.spec.storage !is StorageSpec.Ephemeral) return null
 
@@ -1058,10 +1077,33 @@ public data class ReconcilerConfig(
     val readinessPollInterval: Duration = 5.seconds,
     /** How often to re-read a container state the runtime could not report. */
     val containerPollInterval: Duration = 2.seconds,
+    /**
+     * How long a gap between two recorded observations voids a drain's world
+     * save.
+     *
+     * The one timing here that is a safety property rather than a cadence. A
+     * confirmed save says the world was on disk at that instant; it stays
+     * evidence only while the loop keeps watching, because a player can join,
+     * play and leave between two passes without either of them noticing. Must
+     * comfortably exceed the interval between passes of a drain that is making
+     * progress; shorter than a session anybody would mind losing. Erring short
+     * costs an extra `save-all flush` on an empty server.
+     */
+    val saveEvidenceMaxGap: Duration = 30.seconds,
+    /**
+     * How long a drain may keep failing before it is *reported* as needing a
+     * human.
+     *
+     * Changes nothing about what happens to the container: it keeps running and
+     * the loop keeps retrying, which is what `failure-modes.md` item 7 requires.
+     */
+    val drainAttentionAfter: Duration = 15.minutes,
 ) {
     init {
         require(statusHeartbeat.isPositive()) { "statusHeartbeat must be positive" }
         require(readinessPollInterval.isPositive()) { "readinessPollInterval must be positive" }
         require(containerPollInterval.isPositive()) { "containerPollInterval must be positive" }
+        require(saveEvidenceMaxGap.isPositive()) { "saveEvidenceMaxGap must be positive" }
+        require(drainAttentionAfter.isPositive()) { "drainAttentionAfter must be positive" }
     }
 }

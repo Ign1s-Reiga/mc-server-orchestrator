@@ -3,12 +3,14 @@ package mcorch.core
 import io.kotest.matchers.booleans.shouldBeTrue
 import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.ints.shouldBeGreaterThan
+import io.kotest.matchers.ints.shouldBeLessThan
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runTest
+import mcorch.core.paper.PaperCommands
 import mcorch.schema.DrainState
 import mcorch.schema.PlacementSpec
 import mcorch.schema.ServerPhase
@@ -170,6 +172,41 @@ internal class ReconcileLoopTest {
             advanceTimeBy(1.minutes)
             harness.node.creates shouldHaveSize 1
             harness.status(broken.metadata.name).shouldNotBeNull().phase shouldBe ServerPhase.RUNNING
+            job.cancel()
+        }
+
+    @Test
+    fun `a drain whose save keeps failing backs off instead of spinning`() =
+        runTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            // A permanent misconfiguration that the loop cannot tell from a
+            // hiccup: the wrong RCON password. Classified retryable, correctly,
+            // so it retries for ever — the question is how fast.
+            harness.node.onExec = { command ->
+                if (command == PaperCommands.saveAll()) {
+                    ExecOutcome(1, "", "authentication failed")
+                } else {
+                    harness.node.defaultExec(command)
+                }
+            }
+            harness.store.deleteDefinition(name)
+
+            val job = launch { loopFor(harness).run() }
+            advanceTimeBy(5.minutes)
+
+            // With a 10s base doubling to a 1m cap, five minutes is under a
+            // dozen attempts. The failure used to alternate with a resume pass
+            // that reported progress and reset the counter, so the backoff
+            // never applied and this was a save request every couple of seconds
+            // against a live server — about 150 of them.
+            val attempts = harness.node.saves.size
+            attempts shouldBeGreaterThan 1
+            attempts shouldBeLessThan 15
+            harness.node.stops shouldHaveSize 0
             job.cancel()
         }
 

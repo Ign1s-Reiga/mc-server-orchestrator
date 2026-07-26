@@ -7,6 +7,7 @@ import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.types.shouldBeInstanceOf
 import mcorch.core.paper.PaperCommands
+import mcorch.schema.ConditionType
 import mcorch.schema.DrainState
 import mcorch.schema.FailureClass
 import mcorch.schema.FailureReason
@@ -15,6 +16,7 @@ import mcorch.schema.StorageSpec
 import org.junit.jupiter.api.Test
 import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.minutes
+import kotlin.time.Duration.Companion.seconds
 
 /**
  * The drain protocol.
@@ -389,6 +391,141 @@ internal class DrainTest {
             harness.store.getServer(name) shouldBe null
         }
 
+    /** Runs [body] when the stop is issued, so a test can assert on the order of side effects. */
+    private fun Harness.recordingStops(body: () -> Unit) {
+        val runtime = node.onStop
+        node.onStop = { present ->
+            body()
+            runtime(present)
+        }
+    }
+
+    @Test
+    fun `a save does not survive a window in which the loop could not see who was online`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.store.deleteDefinition(name)
+
+            repeat(6) { harness.pass(name) }
+            harness.node.saves shouldHaveSize 1
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .state shouldBe DrainState.DEREGISTERED
+
+            // The exec path goes unhealthy. The loop keeps running and keeps
+            // asking — the gap between observations never grows — but every
+            // answer is "cannot tell", which is not a zero-player report and
+            // must not be treated as one in either direction. Ten minutes of
+            // this is ten minutes in which players can arrive, play and log off
+            // without a single pass seeing them: nothing seals joins on a
+            // standalone server.
+            harness.node.failAlways(NodeOperation.EXEC, harness.node.unreachable(NodeOperation.EXEC))
+            repeat(30) {
+                harness.clock.advance(20.seconds)
+                harness.pass(name)
+            }
+            harness.node.stops shouldHaveSize 0
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .worldSaved
+                .shouldBeFalse()
+
+            // The exec path recovers and the server is empty again — true, and
+            // silent about the last ten minutes.
+            harness.node.stopFailing(NodeOperation.EXEC)
+            var savedBeforeStopping = 0
+            harness.recordingStops { savedBeforeStopping = harness.node.saves.size }
+
+            harness.settle(name, limit = 16)
+
+            // The stop was allowed only after a save taken since the blind
+            // window, not on the one confirmed before it.
+            harness.node.saves shouldHaveSize 2
+            harness.node.stops shouldHaveSize 1
+            savedBeforeStopping shouldBe 2
+        }
+
+    @Test
+    fun `a save does not survive a window in which the loop was not running at all`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.store.deleteDefinition(name)
+
+            repeat(6) { harness.pass(name) }
+            harness.node.saves shouldHaveSize 1
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .worldSaved
+                .shouldBeTrue()
+
+            // The orchestrator stops. The container carries on serving, players
+            // play and log off, and half an hour later the loop comes back,
+            // reads the drain out of the store, and resumes it at DEREGISTERED
+            // with a confirmed save. The container never restarted, so nothing
+            // about the workload says anything happened — the only witness that
+            // nobody was watching is the gap in the loop's own observations.
+            harness.clock.advance(30.minutes)
+
+            var savedBeforeStopping = 0
+            harness.recordingStops { savedBeforeStopping = harness.node.saves.size }
+            harness.pass(name)
+
+            harness.node.stops shouldHaveSize 0
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .worldSaved
+                .shouldBeFalse()
+
+            harness.settle(name, limit = 16)
+
+            harness.node.saves shouldHaveSize 2
+            harness.node.stops shouldHaveSize 1
+            savedBeforeStopping shouldBe 2
+        }
+
+    @Test
+    fun `a runtime that reports no container start time does not send the drain round in circles`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            // No start time to compare a confirmation against. Rejecting every
+            // confirmation on that basis is the tempting reading, and it makes
+            // the drain save, decline to stop, save again — asking a live
+            // server to flush its world for ever.
+            val present = harness.node.workload.shouldBeInstanceOf<WorkloadObservation.Present>()
+            harness.node.workload = present.copy(startedAt = null)
+            harness.store.deleteDefinition(name)
+
+            harness.settle(name, limit = 16)
+
+            harness.node.saves shouldHaveSize 1
+            harness.node.stops shouldHaveSize 1
+            harness.store.getServer(name) shouldBe null
+        }
+
     @Test
     fun `a drain resumed from the store does not stop on a save from the previous container`() =
         coreTest {
@@ -721,6 +858,96 @@ internal class DrainTest {
                 .shouldNotBeNull()
             repeat(4) { harness.pass(name) }
             harness.node.saves shouldHaveSize 1
+        }
+
+    @Test
+    fun `a drain that has been stuck for long enough says so, and still does not stop anything`() =
+        coreTest {
+            val harness = Harness(config = ReconcilerConfig(drainAttentionAfter = 10.minutes))
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.node.online = 2
+            harness.store.deleteDefinition(name)
+
+            repeat(3) { harness.pass(name) }
+            val early =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+                    .failure
+                    .shouldNotBeNull()
+            early.message.startsWith(ATTENTION).shouldBeFalse()
+
+            // Long enough that this is not a busy evening, it is a drain that
+            // is not going to finish without somebody looking at it.
+            harness.clock.advance(11.minutes)
+            val outcome = harness.pass(name)
+
+            val status = harness.status(name).shouldNotBeNull()
+            val failure =
+                status.drain
+                    .shouldNotBeNull()
+                    .failure
+                    .shouldNotBeNull()
+            failure.message.startsWith(ATTENTION).shouldBeTrue()
+            status.conditions
+                .single { it.type == ConditionType.DRAINING }
+                .message
+                .startsWith(ATTENTION)
+                .shouldBeTrue()
+
+            // Everything else is exactly as it was. `failure-modes.md` item 7:
+            // at a limit you stop trying, you do not stop the container — and
+            // this does not even stop trying.
+            failure.failureClass shouldBe FailureClass.RETRYABLE
+            outcome.shouldBeInstanceOf<ReconcileOutcome.Retry>()
+            harness.node.stops shouldHaveSize 0
+            harness.node.saves shouldHaveSize 0
+            harness.node.workload
+                .shouldBeInstanceOf<WorkloadObservation.Present>()
+                .state shouldBe WorkloadState.RUNNING
+
+            // And it is still a drain: the players leave, it finishes on its
+            // own, and the marker goes with the failure.
+            harness.node.online = 0
+            harness.settle(name, limit = 16)
+            harness.node.stops shouldHaveSize 1
+            harness.store.getServer(name) shouldBe null
+        }
+
+    @Test
+    fun `a workload that does not say what it holds is treated as holding a world`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            // A container carrying none of this orchestrator's facts about
+            // itself: created by an older build, or by hand. Absent is not
+            // `false`, and the only other source is the definition — which is
+            // the thing being edited.
+            val present = harness.node.workload.shouldBeInstanceOf<WorkloadObservation.Present>()
+            harness.node.workload = present.copy(labels = emptyMap())
+
+            harness.store.putDefinition(paperDefinition(storage = StorageSpec.Ephemeral()))
+            repeat(8) { harness.pass(name) }
+
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .failure
+                .shouldNotBeNull()
+                .failureClass shouldBe FailureClass.PERMANENT
+            harness.node.stops shouldHaveSize 0
+            harness.node.removals shouldHaveSize 0
+            harness.node.workload
+                .shouldBeInstanceOf<WorkloadObservation.Present>()
+                .state shouldBe WorkloadState.RUNNING
         }
 
     @Test
