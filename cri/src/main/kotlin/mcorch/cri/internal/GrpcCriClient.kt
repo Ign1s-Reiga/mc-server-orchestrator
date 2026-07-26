@@ -314,7 +314,7 @@ internal class GrpcCriClient private constructor(
                     ).toWrapper()
             }
         } catch (timedOut: CriException.Timeout) {
-            throw attribute(timedOut, commandSeconds, deadline, System.nanoTime() - startedAt)
+            throw attributeExecTimeout(timedOut, commandSeconds, deadline, System.nanoTime() - startedAt)
         }
     }
 
@@ -339,7 +339,7 @@ internal class GrpcCriClient private constructor(
      * separate — a [CriTimeouts.deadlineSlack] configured down to nothing — this
      * reports the ordinary transport timeout, which is the cautious answer.
      */
-    private fun attribute(
+    private fun attributeExecTimeout(
         failure: CriException.Timeout,
         commandSeconds: Long,
         deadline: Duration,
