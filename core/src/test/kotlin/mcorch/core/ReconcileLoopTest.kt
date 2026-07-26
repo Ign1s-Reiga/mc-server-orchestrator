@@ -2,6 +2,7 @@ package mcorch.core
 
 import io.kotest.matchers.booleans.shouldBeTrue
 import io.kotest.matchers.collections.shouldHaveSize
+import io.kotest.matchers.ints.shouldBeGreaterThan
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -9,6 +10,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runTest
 import mcorch.schema.DrainState
+import mcorch.schema.PlacementSpec
 import mcorch.schema.ServerPhase
 import org.junit.jupiter.api.Test
 import kotlin.time.Duration.Companion.milliseconds
@@ -121,6 +123,53 @@ internal class ReconcileLoopTest {
             advanceTimeBy(2.minutes)
 
             harness.node.calls.count { it == NodeOperation.CREATE } shouldBe attempts
+            job.cancel()
+        }
+
+    @Test
+    fun `an exception a node did not translate does not stop the loop serving other servers`() =
+        runTest {
+            val other = FakeNode(name = nodeName("node-b"))
+            val harness = Harness(additionalNodes = listOf(other))
+            val broken = paperDefinition(name = "survival-01")
+            val healthy =
+                paperDefinition(
+                    name = "lobby-01",
+                    hostPort = 30002,
+                    placement = PlacementSpec(node = nodeName("node-b")),
+                )
+            harness.declare(broken)
+            harness.declare(healthy)
+            // The node fails the way a node must not: an `IOException` from
+            // creating a host directory on a full disk, escaping without being
+            // translated. It used to escape `launch` too, cancel the scope, and
+            // take the resync ticker, the change feed and every other worker
+            // with it.
+            harness.node.throwRaw(
+                NodeOperation.OBSERVE,
+                java.io.IOException("No space left on device"),
+            )
+
+            val job = launch { loopFor(harness).run() }
+            advanceTimeBy(3.seconds)
+
+            // The other server was brought all the way up while the first one
+            // was failing.
+            other.creates shouldHaveSize 1
+            other.starts shouldHaveSize 1
+            harness.status(healthy.metadata.name).shouldNotBeNull().phase shouldBe ServerPhase.RUNNING
+
+            // And the broken one is still being retried on the backoff rather
+            // than forgotten.
+            advanceTimeBy(20.seconds)
+            harness.node.calls.count { it == NodeOperation.OBSERVE } shouldBeGreaterThan 1
+
+            // The loop is still alive all the way through: once the node stops
+            // misbehaving the server it could not touch is brought up.
+            harness.node.stopFailing(NodeOperation.OBSERVE)
+            advanceTimeBy(1.minutes)
+            harness.node.creates shouldHaveSize 1
+            harness.status(broken.metadata.name).shouldNotBeNull().phase shouldBe ServerPhase.RUNNING
             job.cancel()
         }
 

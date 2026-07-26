@@ -1,9 +1,11 @@
 package mcorch.core
 
+import io.kotest.assertions.throwables.shouldThrow
 import io.kotest.matchers.collections.shouldContainExactly
 import io.kotest.matchers.shouldBe
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
+import kotlinx.coroutines.channels.ClosedReceiveChannelException
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withTimeoutOrNull
@@ -85,6 +87,22 @@ internal class WorkQueueTest {
             advanceTimeBy(1.milliseconds)
             after.await() shouldBe survival
             queue.close()
+        }
+
+    @Test
+    fun `closing cancels the delayed re-adds the queue owns`() =
+        runTest {
+            val queue = WorkQueue(this)
+            queue.addAfter(survival, 5.seconds)
+
+            queue.close()
+            // Nothing is left ticking: `runTest` fails a test that ends with a
+            // live child coroutine, and the pending re-add is one. The loop
+            // never called this, so every shutdown left its timers running
+            // until the scope got round to them.
+            advanceTimeBy(10.seconds)
+
+            shouldThrow<ClosedReceiveChannelException> { queue.take() }
         }
 
     @Test
