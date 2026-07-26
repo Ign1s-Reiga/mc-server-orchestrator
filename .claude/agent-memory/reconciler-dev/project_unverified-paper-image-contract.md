@@ -10,7 +10,22 @@ against `itzg/minecraft-server` (the image the schema's own examples use) and ha
 never been executed. It is deliberately confined to two objects,
 `PaperImageContract` and `PaperCommands`, so a correction is a one-file change.
 
-Unverified, in rough order of how badly a wrong guess hurts:
+**Much of this is now verified** against containerd 2.3.3 and
+`itzg/minecraft-server`, by `integration-tester` and by the suite in
+`app/src/integrationTest`:
+
+- `mc-monitor status` prints one summary line —
+  `127.0.0.1:25565 : version=Paper 1.21.4 online=0 max=20 motd='...'` — and
+  `PaperCommands.parseOccupancy` reads it correctly. No `players.sample` block.
+  Note `version=Paper 1.21.4` contains a space: never parse it positionally.
+- `save-all flush` blocks until the write completes; **plain `save-all` replies
+  with the byte-identical `Saved the game` about six seconds early**. The
+  `flush` argument is the entire safety margin, and is now pinned by a test.
+- `ExecSync` outrunning its own timeout does surface as `DEADLINE_EXCEEDED`.
+- A duplicate create returns `FAILED_PRECONDITION`, not `ALREADY_EXISTS`.
+- Sandboxes need a systemd-slice `cgroup_parent` or nothing starts at all.
+
+Still unverified, in rough order of how badly a wrong guess hurts:
 
 - `rcon-cli save-all flush` and the reply text that counts as a *completed* save
   (`Saved the game` / `Saved the world`). If the real reply differs, every drain
