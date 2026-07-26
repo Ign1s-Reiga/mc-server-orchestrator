@@ -126,13 +126,19 @@ also pre-authenticate in that terminal with:
 invoking_uid() { echo "${SUDO_UID:-$(id -u)}"; }
 invoking_gid() { echo "${SUDO_GID:-$(id -g)}"; }
 
-# Is our instance actually up? Checks the socket rather than the PID, because
-# the socket existing and accepting a connection is what callers care about.
+# Is our instance actually up? The socket has to exist AND be backed by a live
+# process running our config.
+#
+# Deliberately no `kill -0` here. containerd runs as root while this script is
+# normally invoked as the dev user, so `kill -0` fails with EPERM on a perfectly
+# healthy daemon — which made this always return false, so the "already up, exit
+# 0" fast path never fired and every run fell through to a sudo prompt (fatal
+# without a TTY). read_pid already establishes liveness more strongly than
+# `kill -0` does: it reads /proc/<pid>/cmdline, which only succeeds for a live
+# process, and confirms that process is a containerd running OUR config.
 containerd_running() {
     [ -S "${SOCKET}" ] || return 1
-    local pid
-    pid="$(read_pid)" || return 1
-    [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null
+    read_pid >/dev/null
 }
 
 # Read the PID of OUR containerd, verifying it really is ours before returning
