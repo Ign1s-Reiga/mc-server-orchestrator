@@ -14,9 +14,12 @@ import mcorch.core.WorkloadHandle
 import mcorch.core.WorkloadObservation
 import mcorch.core.WorkloadSpec
 import mcorch.core.WorkloadState
+import mcorch.cri.ContainerFilter
 import mcorch.cri.ContainerId
 import mcorch.cri.ContainerSpec
 import mcorch.cri.ContainerState
+import mcorch.cri.ContainerStatus
+import mcorch.cri.ContainerSummary
 import mcorch.cri.CriClient
 import mcorch.cri.CriClientConfig
 import mcorch.cri.CriEndpoint
@@ -117,48 +120,69 @@ public class LocalNode internal constructor(
             observationOf(server, status)
         }
 
-    private fun observationOf(
+    private suspend fun observationOf(
         server: ResourceName,
         status: SandboxStatus,
-    ): WorkloadObservation.Present {
-        val container =
-            status.containerStatuses
-                .filter { it.labels[Labels.SERVER] == server.value }
-                .maxByOrNull { it.createdAt }
-        val handle =
-            WorkloadHandle(
-                node = name,
-                sandboxId = status.id.value,
-                containerId = container?.id?.value,
-            )
-        val specHash = container?.labels?.get(Labels.SPEC_HASH) ?: status.labels[Labels.SPEC_HASH]
-        // The container's labels, falling back to the sandbox's. They are what a
-        // drain reads to find out what this workload was built with, so they are
-        // reported as the runtime holds them and nothing here interprets them.
-        val labels = if (container != null) status.labels + container.labels else status.labels
-        if (container == null) {
-            return WorkloadObservation.Present(
-                handle = handle,
-                state = WorkloadState.SANDBOX_ONLY,
-                specHash = specHash,
-                labels = labels,
-                createdAt = status.createdAt,
-            )
-        }
-        return WorkloadObservation.Present(
-            handle = handle,
-            state = container.state.toWorkloadState(),
-            specHash = specHash,
-            labels = labels,
-            imageId = container.imageId.value,
-            createdAt = container.createdAt,
-            startedAt = container.startedAt,
-            finishedAt = container.finishedAt,
-            exitCode = container.exitCode,
-            reason = container.reason,
-            message = container.message,
+    ): WorkloadObservation.Present =
+        WorkloadView.observe(
+            node = name,
+            server = server,
+            sandboxId = status.id.value,
+            sandboxLabels = status.labels,
+            sandboxCreatedAt = status.createdAt,
+            containers = containersIn(status.id, server, status.containerStatuses),
         )
+
+    /**
+     * Every container in the sandbox, enumerated by `ListContainers`.
+     *
+     * **Not** from `PodSandboxStatusResponse.containers_statuses.** That field
+     * is optional and runtime-version-dependent — it was added for evented PLEG
+     * and no runtime is obliged to fill it — so an empty one cannot be told
+     * apart from an empty sandbox. Believing it costs a running Paper server:
+     * the workload reads as [WorkloadState.SANDBOX_ONLY], which a drain treats
+     * as "nothing is running, nothing to save", and the teardown guard reads
+     * the same empty list and sees nobody to protect. `ListContainers` is a
+     * mandatory CRI call, so it is the one asked.
+     *
+     * The optional field is still used, for what it is good for: the per-status
+     * detail a summary does not carry — start and finish times, exit code — for
+     * the containers belonging to this server. When it is absent, that detail
+     * is fetched for those containers only, which is at most one round trip and
+     * only on a runtime that does not populate it. `startedAt` in particular is
+     * load-bearing: the drain's save evidence is measured against it.
+     */
+    private suspend fun containersIn(
+        sandbox: SandboxId,
+        server: ResourceName?,
+        reported: List<ContainerStatus>,
+    ): List<ContainerView> {
+        val detail = reported.associateBy { it.id.value }
+        return client.listContainers(ContainerFilter.inSandbox(sandbox)).map { summary ->
+            val known = detail[summary.id.value]
+            when {
+                known != null -> {
+                    known.toView()
+                }
+
+                server != null && summary.labels[Labels.SERVER] == server.value -> {
+                    statusOrNull(summary.id)?.toView() ?: summary.toView()
+                }
+
+                else -> {
+                    summary.toView()
+                }
+            }
+        }
     }
+
+    private suspend fun statusOrNull(id: ContainerId): ContainerStatus? =
+        try {
+            client.containerStatus(id)
+        } catch (gone: CriException.NotFound) {
+            LOG.debug("container {} disappeared between the list and the status read", id, gone)
+            null
+        }
 
     /**
      * Finds this server's sandbox by label.
@@ -348,15 +372,17 @@ public class LocalNode internal constructor(
             val containerId = handle.containerId?.let(::ContainerId)
             if (containerId != null) {
                 val state = containerStateOf(containerId)
-                if (state == ContainerState.RUNNING) {
-                    // Removing a running container forcibly kills it, with no
-                    // grace and no save. Whoever asked for this has skipped the
-                    // drain.
+                // Anything but a container that has provably exited or gone.
+                // Removing a running one forcibly kills it, with no grace and no
+                // save, and a state the runtime cannot classify is not evidence
+                // that nothing is inside it — the reconcile loop refuses to act
+                // on that same signal.
+                if (state == ContainerState.RUNNING || state == ContainerState.UNKNOWN) {
                     throw NodeException.Rejected(
                         name,
                         NodeOperation.REMOVE,
-                        "refusing to remove container ${containerId.value} while it is running: it must be " +
-                            "drained and stopped first",
+                        "refusing to remove container ${containerId.value}: the runtime reports it as " +
+                            "$state, not stopped. It must be drained and stopped first",
                     )
                 }
                 client.removeContainer(containerId)
@@ -369,14 +395,19 @@ public class LocalNode internal constructor(
             // not create, or one left by a create that raced, is somebody's
             // running process either way.
             val occupants =
-                remainingContainers(sandboxId).filterNot { it.value == handle.containerId }
+                WorkloadView.occupants(
+                    // No server, so no per-status detail is fetched: the guard
+                    // needs an id and a state, and both are in the summary.
+                    containers = containersIn(sandboxId, server = null, reported = emptyList()),
+                    own = handle.containerId,
+                )
             if (occupants.isNotEmpty()) {
                 throw NodeException.Rejected(
                     name,
                     NodeOperation.REMOVE,
-                    "refusing to tear down sandbox ${sandboxId.value}: ${occupants.size} container(s) are still " +
-                        "running inside it, and removing the sandbox would kill them with no grace period and " +
-                        "no save. Drain and stop them first",
+                    "refusing to tear down sandbox ${sandboxId.value}: ${occupants.size} container(s) inside it " +
+                        "are not stopped (${occupants.joinToString { it.state.name }}), and removing the sandbox " +
+                        "would kill them with no grace period and no save. Drain and stop them first",
                 )
             }
             // Safe now, and only now: there is nothing left inside to kill.
@@ -385,24 +416,6 @@ public class LocalNode internal constructor(
             // The persistent volume directory is deliberately untouched.
         }
     }
-
-    /**
-     * The containers still running in a sandbox, whoever created them.
-     *
-     * A sandbox that has already gone reports none: there is then nothing left
-     * to protect, and the teardown below is a no-op on both objects.
-     */
-    private suspend fun remainingContainers(sandbox: SandboxId): List<ContainerId> =
-        try {
-            client
-                .sandboxStatus(sandbox)
-                .containerStatuses
-                .filter { it.state == ContainerState.RUNNING }
-                .map { it.id }
-        } catch (gone: CriException.NotFound) {
-            LOG.debug("sandbox {} is already gone", sandbox, gone)
-            emptyList()
-        }
 
     private suspend fun containerStateOf(id: ContainerId): ContainerState? =
         try {
@@ -679,6 +692,33 @@ public data class LocalNodeConfig(
         require(sandboxNamespace.isNotBlank()) { "sandboxNamespace must not be blank" }
     }
 }
+
+/**
+ * The detail view. `ListContainers` does not carry timings or exit information,
+ * so a summary-derived view leaves them null rather than guessing.
+ */
+private fun ContainerStatus.toView(): ContainerView =
+    ContainerView(
+        id = id.value,
+        labels = labels,
+        state = state.toWorkloadState(),
+        createdAt = createdAt,
+        startedAt = startedAt,
+        finishedAt = finishedAt,
+        exitCode = exitCode,
+        reason = reason,
+        message = message,
+        imageId = imageId.value,
+    )
+
+private fun ContainerSummary.toView(): ContainerView =
+    ContainerView(
+        id = id.value,
+        labels = labels,
+        state = state.toWorkloadState(),
+        createdAt = createdAt,
+        imageId = imageId.value,
+    )
 
 private fun ContainerState.toWorkloadState(): WorkloadState =
     when (this) {
