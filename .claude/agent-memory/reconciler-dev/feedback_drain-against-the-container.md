@@ -8,11 +8,17 @@ metadata:
 Two rules the `drain-auditor` blocked a merge over, both of which I got wrong by
 reading the *definition* instead of the *world in front of me*.
 
-**1. Evidence about a container expires; scope it to one evacuation.** A
-`worldSaved` flag that is set once and never invalidated will authorise a stop on
-a save confirmed a play session — or a container lifetime — earlier. Any probe
-reporting players online voids it, and a confirmation older than
-`observation.startedAt` is not evidence about the process now running.
+**1. Evidence about a container expires, and the test is the *interval*, not the
+observation.** The property is not "no player has been seen since the save" but
+**"the confirmation is backed by an unbroken chain of positive zero-player
+observations."** I failed this twice by keying on things the loop had *seen* — a
+player, a container restart — when the danger is the windows where it saw
+nothing: a probe that could not answer, or a loop that was not running. A
+session fits in either, and the `online=0` reading that follows is true and
+worthless. So: a probe that cannot answer voids the evidence exactly as a probe
+reporting players does, and a confirmation is only usable while the gap since the
+last recorded observation stays under `saveEvidenceMaxGap`. The loop's own
+heartbeat is the only witness that it was watching.
 
 **Why:** a blocked drain has no attempt limit by design (`failure-modes.md`
 item 7 and the standalone-drain decision), so it can legitimately sit for hours
@@ -20,11 +26,12 @@ while people play. Everything built in that time would then be protected only by
 Paper's SIGTERM save inside the grace period, which is forbidden item 6.
 
 **How to apply:** when adding any new evidence to `DrainStatus`, ask what
-invalidates it and where that is noticed. `requireEmpty` is the single place a
-positive player count is observed, so it is the single place evidence can be
-voided; `advance` drops confirmations older than the container. And prefer going
-*back* a state to get fresh evidence over aborting: an abort that needs a human
-to clear leaves a server nobody can retire.
+invalidates it, where that is noticed, and *what the loop would see if it were
+simply absent for an hour*. Prefer going **back** a state to get fresh evidence
+over aborting: an abort that needs a human to clear leaves a server nobody can
+retire. And check that a conservative rule can still satisfy itself — "reject
+every confirmation with no container start time" is safe-looking and makes the
+drain save, decline to stop and save again for ever, hammering a live server.
 
 **2. Read the container's own labels, not the edited definition.** `storage.mode`
 and `network.rcon` are both in the spec hash, so editing them starts a drain of
