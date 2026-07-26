@@ -60,6 +60,24 @@ Structurally, keep servers with persistent worlds off hosts prone to abrupt term
 | The proxy goes down | Destination lost; abort the drain and wait for proxy recovery |
 | Container stop fails after a completed save | Save is done, so retrying the stop is safe. This is the one place a force stop is acceptable |
 
+### Which "agent" the rows above mean
+
+The two agent rows are written for a deployment with an in-container agent process that answers independently of the game server's main thread. A standalone Paper server has no such process. Map the rows onto the two channels that actually exist, because they sit on **opposite sides of a freeze**:
+
+- **Server List Ping** (`mc-monitor`) is served from the Netty IO thread off a cached status object, so it still answers while the main thread is wedged.
+- **RCON** (`rcon-cli`) dispatches onto the main thread and blocks until it replies.
+
+So for a standalone server:
+
+| Row | Means here |
+|---|---|
+| "The server-side agent stops responding" | SLP does not answer. Nothing can be concluded about players or the world → `DrainFailed`, container left running |
+| "Agent responds but the server does not" | **SLP answers, RCON does not.** Attempt the save and wait the full save timeout, then abort unconfirmed with the container still running |
+
+"The agent responds" never means *containerd answered the exec*. A probe that could not run at all — the runtime cut it short, or did not answer — is the **first** row, not the second: it reports nothing about occupancy, so it cannot license a save attempt.
+
+Do not attempt a save on the strength of a probe that failed. Two things go wrong. A server that cannot answer a cached-status SLP handshake cannot answer RCON either, so there is no reachable upside; and a save request that is delivered but unconfirmed is never re-sent, so a server deleted during ordinary world generation — when RCON is up but the main thread is busy for a minute or more — becomes permanently undeletable. A confirmation obtained on a pass that could not confirm zero players is also a confirmation with no zero-player observation behind it, which is exactly what the evidence-chain rule exists to prevent.
+
 ## Scenarios to verify
 
 Cover at least these with `integration-tester`:

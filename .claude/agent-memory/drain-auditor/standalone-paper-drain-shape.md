@@ -54,6 +54,23 @@ A standalone Paper server has no Velocity proxy, so drain steps 2 (seal), 4
   saves again against a live server for ever. Verified as real — do not re-propose
   the "unknown startedAt → save again" fix.
 
+- **A probe that cannot run aborts the drain; the save is not attempted.** Ruled
+  at the fifth audit against `failure-modes.md`'s "agent responds but the server
+  does not → attempt the save and wait the full grace period". That row assumes
+  an in-container agent separate from the game server. Here the two channels are
+  `mc-monitor` (SLP) and `rcon-cli` (RCON), and RCON needs the same main thread a
+  frozen server is not running — so a server that cannot answer SLP cannot
+  confirm a save either. The row's real trigger in this codebase is *SLP answers,
+  RCON does not*, and that case **is** implemented: `requireEmpty` passes on
+  `Joinable(0)`, `requestSave` runs the full `saveTimeout`, and the unconfirmed
+  result is a permanent abort with the container left running. Attempting the
+  save on a *failed probe* instead would fire `save-all flush` at a server whose
+  occupancy is unknown, and on the real trigger for this — a Paper server taking
+  60-95s to generate its world — it would time out and wedge the drain
+  permanently, making a server deleted during world generation undeletable. Code
+  is right; the skill doc needs the actor mapping spelled out, not a change of
+  rule. Do not re-propose "attempt the save anyway".
+
 **Why:** these are human decisions, not accidents — do not report the missing
 seal/transfer/deregister bodies as skipped steps, and do not propose a timeout
 that stops anyway.
