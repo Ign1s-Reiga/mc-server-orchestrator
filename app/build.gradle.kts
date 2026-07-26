@@ -13,10 +13,19 @@ dependencies {
     implementation(project(":store"))
     implementation(project(":api"))
     implementation(libs.kotlinx.coroutines.core)
-    // API only, as everywhere else. No binding is on the classpath yet, so
-    // slf4j falls back to its no-op logger and says so at startup — the loop's
-    // structured logging is written and going nowhere until one is chosen.
+    // API to compile against, as everywhere else.
     implementation(libs.slf4j.api)
+    // The binding, and this is the only module in the repo allowed to declare
+    // one. `runtimeOnly` so that no code here can accidentally compile against
+    // an implementation type. Levels are in
+    // src/main/resources/simplelogger.properties — read the note there before
+    // raising any of them, because one of them keeps an RCON password out of
+    // the log.
+    //
+    // Inherited by the integrationTest source set through the standard
+    // implementation -> testImplementation -> integrationTestImplementation
+    // chain, so an integration run gets the same output a real run does.
+    runtimeOnly(libs.slf4j.simple)
 }
 
 application {
@@ -44,4 +53,13 @@ tasks.register<Test>("integrationTest") {
     classpath = integrationTest.runtimeClasspath
     useJUnitPlatform()
     shouldRunAfter(tasks.named("test"))
+    // A binding is on this classpath now, but Gradle swallows a test's output
+    // unless asked. These runs take ten minutes against a real runtime and the
+    // whole reason for the binding is to be able to see what the loop did while
+    // they ran, so the output is shown by default rather than behind --info.
+    testLogging {
+        showStandardStreams = true
+        events("failed")
+        exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+    }
 }
