@@ -13,6 +13,10 @@ dependencies {
     implementation(project(":store"))
     implementation(project(":api"))
     implementation(libs.kotlinx.coroutines.core)
+    // API only, as everywhere else. No binding is on the classpath yet, so
+    // slf4j falls back to its no-op logger and says so at startup — the loop's
+    // structured logging is written and going nowhere until one is chosen.
+    implementation(libs.slf4j.api)
 }
 
 application {
