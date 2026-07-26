@@ -8,3 +8,4 @@
 - [Integration freeze that never was](project_integration-freeze.md) — runBlocking parented the loop, so only *passing* tests hung. Resolved; keep for the diagnosis method.
 - [LocalNode test gap](project_localnode-test-gap.md) — why decisions keep moving out of LocalNode, and when to escalate for a fake CriClient.
 - [Classify narrowly, contain broadly](feedback_classify-narrowly-and-contain-broadly.md) — keep the never-retry bucket small; let no exception escape a worker.
+- [Audit remedies are hypotheses](feedback_audit-remedies-are-hypotheses.md) — the finding is established, the prescribed helper may itself be wrong; the suite arbitrates.
