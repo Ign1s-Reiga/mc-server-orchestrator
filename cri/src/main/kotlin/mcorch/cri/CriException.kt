@@ -79,51 +79,72 @@ public sealed class CriException(
     public val operation: CriOperation,
     /** The status code containerd replied with. */
     public val code: CriStatusCode,
-    message: String,
+    /**
+     * The runtime's own account of what went wrong, undecorated.
+     *
+     * [message] is this with the operation and classification prefixed, which is
+     * the right thing to log or record. This is here for a caller that wants to
+     * quote containerd without also quoting us.
+     */
+    public val description: String,
     cause: Throwable?,
-) : Exception(message, cause) {
+) : Exception(description, cause) {
     /** `true` when requeueing with backoff can plausibly succeed; `false` when the request itself is wrong. */
     public abstract val retryable: Boolean
 
     /** containerd is unreachable — not started, socket missing, connection refused, shutting down. Retryable. */
     public class Unavailable(
         operation: CriOperation,
-        message: String,
+        description: String,
         cause: Throwable? = null,
-    ) : CriException(operation, CriStatusCode.UNAVAILABLE, message, cause) {
+    ) : CriException(operation, CriStatusCode.UNAVAILABLE, description, cause) {
         override val retryable: Boolean get() = true
     }
 
     /**
-     * The per-call deadline elapsed before containerd answered. Retryable.
+     * A deadline elapsed before the call produced a result. Retryable.
      *
-     * Note this is the *transport* deadline, not a container stop grace period
-     * and not an `ExecSync` command timeout — those are separate parameters and
-     * a command that outruns its own timeout also lands here.
+     * **Two very different things arrive here, and [commandTimeout] is what tells
+     * them apart.** Either this client gave up on a runtime that was not
+     * answering, or the runtime answered promptly to say that a timeout the
+     * *caller* asked for had run out. The gRPC code is `DEADLINE_EXCEEDED` in
+     * both cases, so nothing downstream can tell them apart from the code alone —
+     * and the difference is the difference between "the node may be sick" and
+     * "the node is fine, the command was slow".
      */
     public class Timeout(
         operation: CriOperation,
-        message: String,
+        description: String,
         cause: Throwable? = null,
-    ) : CriException(operation, CriStatusCode.DEADLINE_EXCEEDED, message, cause) {
+        /**
+         * True when the runtime itself stopped the operation at a timeout the
+         * caller supplied, and false when this client's transport deadline
+         * elapsed.
+         *
+         * Only [CriOperation.EXEC_SYNC] can set it: that is the one call that
+         * carries a caller-supplied timeout the runtime enforces and reports as
+         * an error. A true here says nothing whatever about the node's health.
+         */
+        public val commandTimeout: Boolean = false,
+    ) : CriException(operation, CriStatusCode.DEADLINE_EXCEEDED, description, cause) {
         override val retryable: Boolean get() = true
     }
 
     /** The runtime is out of some resource (disk, inodes, memory, gRPC quota). Retryable. */
     public class ResourceExhausted(
         operation: CriOperation,
-        message: String,
+        description: String,
         cause: Throwable? = null,
-    ) : CriException(operation, CriStatusCode.RESOURCE_EXHAUSTED, message, cause) {
+    ) : CriException(operation, CriStatusCode.RESOURCE_EXHAUSTED, description, cause) {
         override val retryable: Boolean get() = true
     }
 
     /** Concurrency conflict inside the runtime — a lock, or a competing operation on the same object. Retryable. */
     public class Aborted(
         operation: CriOperation,
-        message: String,
+        description: String,
         cause: Throwable? = null,
-    ) : CriException(operation, CriStatusCode.ABORTED, message, cause) {
+    ) : CriException(operation, CriStatusCode.ABORTED, description, cause) {
         override val retryable: Boolean get() = true
     }
 
@@ -141,9 +162,9 @@ public sealed class CriException(
     public class RuntimeFailure(
         operation: CriOperation,
         code: CriStatusCode,
-        message: String,
+        description: String,
         cause: Throwable? = null,
-    ) : CriException(operation, code, message, cause) {
+    ) : CriException(operation, code, description, cause) {
         override val retryable: Boolean get() = true
     }
 
@@ -156,9 +177,9 @@ public sealed class CriException(
      */
     public class NotFound(
         operation: CriOperation,
-        message: String,
+        description: String,
         cause: Throwable? = null,
-    ) : CriException(operation, CriStatusCode.NOT_FOUND, message, cause) {
+    ) : CriException(operation, CriStatusCode.NOT_FOUND, description, cause) {
         override val retryable: Boolean get() = false
     }
 
@@ -169,9 +190,9 @@ public sealed class CriException(
      */
     public class AlreadyExists(
         operation: CriOperation,
-        message: String,
+        description: String,
         cause: Throwable? = null,
-    ) : CriException(operation, CriStatusCode.ALREADY_EXISTS, message, cause) {
+    ) : CriException(operation, CriStatusCode.ALREADY_EXISTS, description, cause) {
         override val retryable: Boolean get() = false
     }
 
@@ -179,9 +200,9 @@ public sealed class CriException(
     public class InvalidArgument(
         operation: CriOperation,
         code: CriStatusCode,
-        message: String,
+        description: String,
         cause: Throwable? = null,
-    ) : CriException(operation, code, message, cause) {
+    ) : CriException(operation, code, description, cause) {
         override val retryable: Boolean get() = false
     }
 
@@ -192,9 +213,9 @@ public sealed class CriException(
      */
     public class FailedPrecondition(
         operation: CriOperation,
-        message: String,
+        description: String,
         cause: Throwable? = null,
-    ) : CriException(operation, CriStatusCode.FAILED_PRECONDITION, message, cause) {
+    ) : CriException(operation, CriStatusCode.FAILED_PRECONDITION, description, cause) {
         override val retryable: Boolean get() = false
     }
 
@@ -202,18 +223,18 @@ public sealed class CriException(
     public class PermissionDenied(
         operation: CriOperation,
         code: CriStatusCode,
-        message: String,
+        description: String,
         cause: Throwable? = null,
-    ) : CriException(operation, code, message, cause) {
+    ) : CriException(operation, code, description, cause) {
         override val retryable: Boolean get() = false
     }
 
     /** The runtime does not implement this RPC — a CRI/containerd version mismatch. Not retryable. */
     public class Unimplemented(
         operation: CriOperation,
-        message: String,
+        description: String,
         cause: Throwable? = null,
-    ) : CriException(operation, CriStatusCode.UNIMPLEMENTED, message, cause) {
+    ) : CriException(operation, CriStatusCode.UNIMPLEMENTED, description, cause) {
         override val retryable: Boolean get() = false
     }
 
@@ -226,15 +247,15 @@ public sealed class CriException(
      */
     public class Cancelled(
         operation: CriOperation,
-        message: String,
+        description: String,
         cause: Throwable? = null,
-    ) : CriException(operation, CriStatusCode.CANCELLED, message, cause) {
+    ) : CriException(operation, CriStatusCode.CANCELLED, description, cause) {
         override val retryable: Boolean get() = false
     }
 
     override val message: String
         get() {
             val classification = if (retryable) "retryable" else "permanent"
-            return "${operation.name} failed (${code.name}, $classification): ${super.message}"
+            return "${operation.name} failed (${code.name}, $classification): $description"
         }
 }
