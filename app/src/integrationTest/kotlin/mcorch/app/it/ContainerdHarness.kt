@@ -118,13 +118,40 @@ internal class ContainerdHarness(
         timeout: Duration = READY_TIMEOUT,
         condition: suspend () -> Boolean,
     ) {
+        val startedAt = System.nanoTime()
+        var lastReport = startedAt
         val reached =
             withTimeoutOrNull(timeout) {
-                while (!condition()) delay(POLL)
+                while (!condition()) {
+                    // Says what it is waiting on while it waits. A suite that
+                    // goes quiet for five minutes and then says "timed out"
+                    // tells you nothing about which of the twenty things in
+                    // flight was the one that never happened.
+                    if (System.nanoTime() - lastReport > REPORT_EVERY_NANOS) {
+                        lastReport = System.nanoTime()
+                        println("waiting ${elapsed(startedAt)}s for $what — ${snapshot()}")
+                    }
+                    delay(POLL)
+                }
                 true
             }
-        checkNotNull(reached) { "timed out after $timeout waiting for: $what" }
+        checkNotNull(reached) { "timed out after $timeout waiting for: $what — ${snapshot()}" }
     }
+
+    /** What every server the store knows about looks like right now, for a wait message. */
+    private suspend fun snapshot(): String =
+        runCatching {
+            store
+                .listServers()
+                .joinToString("; ") { server ->
+                    val status = server.status?.status as? PaperServerStatus
+                    val drain = status?.drain
+                    "${server.name}: phase=${status?.phase} ready=${status?.ready} " +
+                        "drain=${drain?.state}${drain?.failure?.let { " (${it.reason})" } ?: ""}"
+                }.ifEmpty { "no servers are stored" }
+        }.getOrElse { "the store did not answer: ${it.message}" }
+
+    private fun elapsed(fromNanos: Long): Long = (System.nanoTime() - fromNanos) / 1_000_000_000
 
     /**
      * Removes everything this harness created, whatever state the test left it
@@ -209,6 +236,7 @@ internal class ContainerdHarness(
         val DRAIN_TIMEOUT: Duration = 3.minutes
 
         private val POLL = 500.milliseconds
+        private const val REPORT_EVERY_NANOS = 10_000_000_000L
         private val CLEANUP_GRACE = 20.seconds
         private const val CLEANUP_ATTEMPTS = 30
 

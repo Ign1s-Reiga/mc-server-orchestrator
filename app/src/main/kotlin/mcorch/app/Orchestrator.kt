@@ -1,5 +1,7 @@
 package mcorch.app
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import mcorch.core.NodeRegistry
 import mcorch.core.ReconcileLoop
 import mcorch.core.ReconcileLoopConfig
@@ -49,8 +51,19 @@ public class Orchestrator private constructor(
      * it stops the workers, the resync ticker and the change-feed poller
      * together — and the loop's own shutdown cancels its pending requeues on the
      * way out.
+     *
+     * **On a multi-threaded dispatcher, and not the caller's.** The loop runs
+     * four workers, a resync ticker and a change-feed poller, and every one of
+     * them crosses a gRPC boundary into containerd. `runBlocking` — which is
+     * what `main` and any test naturally provide — is a *single-threaded* event
+     * loop: on it the workers cannot run concurrently at all, and a call that
+     * blocks its thread rather than suspending freezes the ticker, the poller,
+     * every other server's pass, and every `delay` and timeout scheduled on that
+     * loop. This was not theoretical: it stalled the whole process about a
+     * minute into an integration run and made a five-minute timeout in the test
+     * never fire, because the timer had no thread to fire on.
      */
-    public suspend fun run(): Unit = loop.run()
+    public suspend fun run(): Unit = withContext(Dispatchers.Default) { loop.run() }
 
     /**
      * Closes the node and then the store.
