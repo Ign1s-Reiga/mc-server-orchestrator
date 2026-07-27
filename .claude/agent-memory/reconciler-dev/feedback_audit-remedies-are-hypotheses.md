@@ -42,3 +42,20 @@ not that the test is stale. Write the regression test first and confirm it fails
 against the old code, so a green suite afterwards means something. See
 [[assert-on-side-effects]] for why the assertions have to be about what was
 *done*.
+
+## Arguing to leave something open
+
+When escalating a known hole rather than fixing it, **argue from what is at
+stake, not from how narrow the window is.** Round 7 accepted a decision to leave
+the teardown's partial-removal record unshielded and explicitly rejected the
+reasoning I gave for it — "a vanishing fraction of the window" is unfalsifiable
+at review and reviewers discount it on principle. What carried it was that the
+container was already gone, so nothing playable was stranded. The reusable test
+is *what is left behind and is anything playable in it*: an undeletable sandbox
+with no process in it is acceptable, an undeletable server with a running
+container is not, because the operator has no reason to suspect they caused it.
+
+Rulings to leave something open can also carry an **expiry condition** — round
+7's held only while every side effect the drain issues is idempotent game-side.
+Record the condition with the ruling ([[cancellation-exposure]]), or a later
+change quietly invalidates it.
