@@ -2,6 +2,7 @@ package mcorch.core
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.runBlocking
+import mcorch.schema.ConditionType
 import mcorch.schema.DrainSpec
 import mcorch.schema.HeapSpec
 import mcorch.schema.ImageRef
@@ -13,6 +14,7 @@ import mcorch.schema.NodeName
 import mcorch.schema.ObjectMetadata
 import mcorch.schema.PaperServerDefinition
 import mcorch.schema.PaperServerSpec
+import mcorch.schema.PaperServerStatus
 import mcorch.schema.PaperVersionSpec
 import mcorch.schema.PlacementSpec
 import mcorch.schema.RconSpec
@@ -20,6 +22,7 @@ import mcorch.schema.ResourceName
 import mcorch.schema.ResourceSpec
 import mcorch.schema.SchemaVersion
 import mcorch.schema.SecretRef
+import mcorch.schema.StatusCondition
 import mcorch.schema.StorageSpec
 import mcorch.schema.VolumeSpec
 import java.time.Clock
@@ -65,6 +68,18 @@ internal class MutableClock(
         current = current.plus(by.toJavaDuration())
     }
 }
+
+/**
+ * The escalation condition, which must always be present.
+ *
+ * `single` rather than `firstOrNull`: a condition that is simply absent from a
+ * status is indistinguishable, to anything asserting on it, from one that is
+ * present and false — and "no alert fired" passing because the condition was
+ * never derived at all is exactly the green-for-the-wrong-reason this suite has
+ * been bitten by. Absence fails here.
+ */
+internal fun PaperServerStatus.attention(): StatusCondition =
+    conditions.single { it.type == ConditionType.NEEDS_ATTENTION }
 
 internal fun resourceName(raw: String): ResourceName = ResourceName.of(raw).getOrThrow()
 

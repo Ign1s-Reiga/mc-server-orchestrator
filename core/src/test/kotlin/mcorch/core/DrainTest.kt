@@ -6,8 +6,12 @@ import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.ints.shouldBeGreaterThan
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.shouldNotBe
+import io.kotest.matchers.string.shouldContain
+import io.kotest.matchers.string.shouldNotContain
 import io.kotest.matchers.types.shouldBeInstanceOf
 import mcorch.core.paper.PaperCommands
+import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
 import mcorch.schema.DrainState
 import mcorch.schema.FailureClass
@@ -1208,16 +1212,9 @@ internal class DrainTest {
             harness.store.deleteDefinition(name)
 
             repeat(6) { harness.pass(name) }
-            harness
-                .status(name)
-                .shouldNotBeNull()
-                .drain
-                .shouldNotBeNull()
-                .failure
-                .shouldNotBeNull()
-                .message
-                .startsWith(ATTENTION)
-                .shouldBeFalse()
+            val early = harness.status(name).shouldNotBeNull()
+            early.attention().status shouldBe ConditionStatus.FALSE
+            val quietSince = early.attention().lastTransitionAt
 
             harness.clock.advance(11.minutes)
             val outcome = harness.pass(name)
@@ -1228,12 +1225,22 @@ internal class DrainTest {
                     .shouldNotBeNull()
                     .failure
                     .shouldNotBeNull()
-            failure.message.startsWith(ATTENTION).shouldBeTrue()
+            // The escalation is a condition now, not a marker at the front of a
+            // message. `lastTransitionAt` moving is the half a string could never
+            // carry: it says *when* this started needing a human, which is what an
+            // alert fires on.
+            val attention = status.attention()
+            attention.status shouldBe ConditionStatus.TRUE
+            attention.lastTransitionAt shouldNotBe quietSince
+            attention.lastTransitionAt shouldBe harness.clock.instant()
+            // The message tells an operator the two things they would otherwise
+            // get wrong: the loop has not given up, and it is not going to stop
+            // the server to unblock itself.
+            attention.message shouldContain "keeps retrying"
+            attention.message shouldContain "will not be stopped"
             status.conditions
                 .single { it.type == ConditionType.DRAINING }
-                .message
-                .startsWith(ATTENTION)
-                .shouldBeTrue()
+                .message shouldContain "not recovering on its own"
             // The count an operator is shown has to be the count. A resume that
             // threw away the failure it was retrying made every pass of a
             // failing drain report its first attempt, occurring now.
@@ -1275,19 +1282,112 @@ internal class DrainTest {
                     .shouldNotBeNull()
             failure.reason shouldBe FailureReason.DRAIN_NO_DESTINATION
             // Crying wolf on a busy evening every backoff interval is how an
-            // operator learns the marker means nothing, and it is the only
+            // operator learns the signal means nothing, and it is the only
             // escalation signal there is.
-            failure.message.startsWith(ATTENTION).shouldBeFalse()
+            status.attention().status shouldBe ConditionStatus.FALSE
             status.conditions
                 .single { it.type == ConditionType.DRAINING }
-                .message
-                .startsWith(ATTENTION)
-                .shouldBeFalse()
+                .message shouldNotContain "not recovering on its own"
 
             harness.node.online = 0
             harness.settle(name, limit = 16)
             harness.node.stops shouldHaveSize 1
             harness.store.getServer(name) shouldBe null
+        }
+
+    /**
+     * The escalation withdraws itself when the drain gets somewhere.
+     *
+     * It is derived from the drain's recorded failure rather than latched, and a
+     * pass that makes progress clears that failure — so there is no second thing
+     * to remember to reset. A latched escalation would leave a finished drain
+     * telling an operator to go and look at a server that no longer exists.
+     */
+    @Test
+    fun `an escalated drain stops asking for a human once it can finish`() =
+        coreTest {
+            val harness = Harness(config = ReconcilerConfig(drainAttentionAfter = 10.minutes))
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.node.onExec = { command ->
+                if (command == PaperCommands.saveAll()) {
+                    ExecOutcome(1, "", "authentication failed")
+                } else {
+                    harness.node.defaultExec(command)
+                }
+            }
+            harness.store.deleteDefinition(name)
+            repeat(6) { harness.pass(name) }
+            harness.clock.advance(11.minutes)
+            harness.pass(name)
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .attention()
+                .status shouldBe ConditionStatus.TRUE
+
+            // Somebody fixes the RCON password.
+            harness.node.onExec = { command -> harness.node.defaultExec(command) }
+            harness.pass(name)
+
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .attention()
+                .status shouldBe ConditionStatus.FALSE
+            // And the drain goes on to finish normally, having saved exactly once
+            // after the fix.
+            harness.settle(name, limit = 12)
+            harness.node.stops shouldHaveSize 1
+            harness.store.getServer(name) shouldBe null
+        }
+
+    /**
+     * A pass that never reaches the drain does not withdraw the escalation.
+     *
+     * This is the reason the condition is derived from the drain record rather
+     * than handed to the status draft by the pass that decided it. A node failure
+     * drafts a status carrying the drain forward untouched and knows nothing
+     * about escalation, so a caller-supplied fact would be absent there and the
+     * condition would flap off and on again between two passes of one stuck
+     * drain — every backoff interval, for as long as the node was sick.
+     */
+    @Test
+    fun `an escalation survives a pass that could not reach the node at all`() =
+        coreTest {
+            val harness = Harness(config = ReconcilerConfig(drainAttentionAfter = 10.minutes))
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.node.onExec = { command ->
+                if (command == PaperCommands.saveAll()) {
+                    ExecOutcome(1, "", "authentication failed")
+                } else {
+                    harness.node.defaultExec(command)
+                }
+            }
+            harness.store.deleteDefinition(name)
+            repeat(6) { harness.pass(name) }
+            harness.clock.advance(11.minutes)
+            harness.pass(name)
+            val escalatedAt = harness.status(name).shouldNotBeNull().attention()
+            escalatedAt.status shouldBe ConditionStatus.TRUE
+
+            // The node goes away entirely: this pass observes nothing and writes
+            // a status from the previous one.
+            harness.node.failAlways(NodeOperation.OBSERVE, harness.node.unreachable(NodeOperation.OBSERVE))
+            harness.clock.advance(1.minutes)
+            harness.pass(name)
+
+            val during = harness.status(name).shouldNotBeNull().attention()
+            during.status shouldBe ConditionStatus.TRUE
+            // Still the same escalation, not a new one: an alert keyed on the
+            // transition time must not re-fire because the node hiccupped.
+            during.lastTransitionAt shouldBe escalatedAt.lastTransitionAt
+            harness.node.stops shouldHaveSize 0
         }
 
     @Test

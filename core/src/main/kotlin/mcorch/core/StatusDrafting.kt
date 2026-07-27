@@ -15,6 +15,7 @@ import mcorch.schema.ServerPhase
 import mcorch.schema.StatusCondition
 import mcorch.schema.StorageStatus
 import java.time.Instant
+import kotlin.time.Duration
 
 /**
  * Builds the observation a pass will record, carrying forward everything it did
@@ -36,6 +37,12 @@ internal fun draftStatus(
     generation: Long,
     now: Instant,
     phase: ServerPhase,
+    /**
+     * How long a drain may keep failing before its condition says a human is
+     * needed. Passed in rather than defaulted, because a default here would be a
+     * second copy of a threshold the operator configures once.
+     */
+    attentionAfter: Duration,
     ready: Boolean = false,
     image: ImageStatus? = previous?.image,
     runtime: RuntimeIdentity? = previous?.runtime,
@@ -69,10 +76,12 @@ internal fun draftStatus(
                 image = image,
                 storage = storage,
                 drain = drain,
+                attentionAfter = attentionAfter,
             ),
     )
 }
 
+@Suppress("LongParameterList")
 private fun deriveConditions(
     previous: List<StatusCondition>,
     now: Instant,
@@ -81,8 +90,16 @@ private fun deriveConditions(
     image: ImageStatus?,
     storage: StorageStatus?,
     drain: DrainStatus?,
+    attentionAfter: Duration,
 ): List<StatusCondition> {
     val draining = drain != null && drain.state != DrainState.DRAIN_FAILED
+    // Asked of the drain rather than passed in from the pass that aborted it,
+    // and the difference matters: a status is also drafted by passes that never
+    // reached the drain at all — a node failure carries the drain forward
+    // untouched — and a fact supplied by the caller would be absent on those,
+    // flapping the condition off and on again between two passes of the same
+    // stuck drain.
+    val needsAttention = drain?.escalated(now, attentionAfter) == true
     val entries =
         listOf(
             condition(
@@ -104,7 +121,16 @@ private fun deriveConditions(
             condition(
                 ConditionType.DRAINING,
                 draining.toConditionStatus(),
-                drain?.let { drainMessage(it) }.orEmpty(),
+                drain?.let { drainMessage(it, needsAttention) }.orEmpty(),
+            ),
+            // False rather than unknown on a server with nothing wrong with it:
+            // "no escalation is outstanding" is something the loop positively
+            // knows, and an alert that has to treat UNKNOWN as quiet is an alert
+            // that treats a genuinely unreadable status as quiet too.
+            condition(
+                ConditionType.NEEDS_ATTENTION,
+                needsAttention.toConditionStatus(),
+                if (needsAttention) attentionMessage(drain) else "",
             ),
             condition(
                 ConditionType.PLAYERS_EVACUATED,
@@ -139,22 +165,42 @@ private fun deriveConditions(
 }
 
 /**
- * The drain's state, plus the escalation marker once it has been failing long
- * enough to need a human.
+ * The drain's state, and whether it has stopped being able to reach the end on
+ * its own.
  *
- * The marker is read back off the failure message because [DrainStatus] has
- * nowhere else to carry it — a `NEEDS_ATTENTION` [ConditionType] is what this
- * wants and that lives in `:schema`. It is a report only: nothing branches on
- * it, and a drain that needs attention is still retried and still leaves its
- * container running.
+ * This used to decide the second half by looking for a marker string at the
+ * front of the failure message, because [DrainStatus] had nowhere to carry the
+ * fact and a `NEEDS_ATTENTION` [ConditionType] did not exist. It does now, so
+ * the escalation is a condition with its own transition time and this is only a
+ * message. It remains a report either way: nothing branches on it, and a drain
+ * that needs attention is still retried and still leaves its container running.
  */
-private fun drainMessage(drain: DrainStatus): String {
+private fun drainMessage(
+    drain: DrainStatus,
+    needsAttention: Boolean,
+): String {
     val state = "drain state ${drain.state}"
-    return if (drain.failure?.message?.startsWith(ATTENTION) == true) {
-        "$ATTENTION $state, failing since ${drain.startedAt} and not recovering on its own"
+    return if (needsAttention) {
+        "$state, failing since ${drain.startedAt} and not recovering on its own"
     } else {
         state
     }
+}
+
+/**
+ * What a human is being called about.
+ *
+ * Says what will and will not happen next, because the honest answer is
+ * unintuitive: the loop has *not* given up, and it is not going to stop the
+ * server to unblock itself. Without that, "needs attention" reads as "the
+ * orchestrator has stopped trying", and an operator who believes that may go and
+ * stop the container by hand.
+ */
+private fun attentionMessage(drain: DrainStatus?): String {
+    val since = drain?.startedAt?.let { " This drain has been running since $it." }.orEmpty()
+    return "this server needs a human: the drain cannot finish on its own.$since The loop keeps retrying and " +
+        "the container keeps running — it will not be stopped until a save is confirmed. " +
+        (drain?.failure?.message ?: "")
 }
 
 private fun worldSavedMessage(

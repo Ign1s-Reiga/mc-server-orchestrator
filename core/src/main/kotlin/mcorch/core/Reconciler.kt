@@ -186,6 +186,7 @@ public class Reconciler(
                 generation = stored.definition.generation,
                 now = now,
                 phase = ServerPhase.FAILED,
+                attentionAfter = config.drainAttentionAfter,
                 failure =
                     recordFailure(
                         reason = FailureReason.CONTAINER_CREATE_FAILED,
@@ -1147,6 +1148,7 @@ public class Reconciler(
                 generation = stored.definition.generation,
                 now = now,
                 phase = phase,
+                attentionAfter = config.drainAttentionAfter,
                 ready = ready,
                 image = image,
                 runtime = runtime,

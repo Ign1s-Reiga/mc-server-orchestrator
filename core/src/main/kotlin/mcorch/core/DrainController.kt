@@ -792,20 +792,18 @@ internal class DrainController(
         sideEffectIssued: Boolean = false,
     ): DrainProgress {
         val stuckFor = JavaDuration.between(drain.startedAt, now).toKotlinDuration()
-        // `DRAIN_NO_DESTINATION` is excluded on purpose: it means somebody is
-        // playing on a server that was asked to go away, which is the protocol
-        // working exactly as designed and resolves itself when they log off. An
-        // escalation that fires on a busy evening every backoff interval teaches
-        // operators that the marker means nothing, and it is the only escalation
-        // signal there is.
         val needsAttention =
-            failureClass == FailureClass.RETRYABLE &&
-                reason != FailureReason.DRAIN_NO_DESTINATION &&
-                stuckFor >= attentionAfter
+            escalates(
+                startedAt = drain.startedAt,
+                failureClass = failureClass,
+                reason = reason,
+                now = now,
+                after = attentionAfter,
+            )
         val reported =
             if (needsAttention) {
-                "$ATTENTION this drain has been unable to finish for ${stuckFor.inWholeMinutes} minutes and is " +
-                    "not going to fix itself. The server keeps running and the loop keeps trying. $message"
+                "this drain has been unable to finish for ${stuckFor.inWholeMinutes} minutes and is not going " +
+                    "to fix itself. The server keeps running and the loop keeps trying. $message"
             } else {
                 message
             }
@@ -833,7 +831,6 @@ internal class DrainController(
         return DrainProgress(
             drain = aborted,
             occupancy = occupancy,
-            needsAttention = needsAttention,
             sideEffectIssued = sideEffectIssued,
             outcome = outcome,
         )
@@ -871,15 +868,58 @@ internal class DrainController(
 }
 
 /**
- * The marker a long-failing drain's message leads with.
+ * Whether a drain failure has gone on long enough to need a human, and is the
+ * kind of failure a human could do anything about.
  *
- * A greppable constant rather than prose, because it is the only
- * machine-readable escalation signal available without a new
- * [mcorch.schema.FailureReason] or [mcorch.schema.ConditionType] — and both of
- * those live in `:schema`. A `NEEDS_ATTENTION` condition type is where this
- * belongs; this is the stand-in until there is one.
+ * **The one implementation of the escalation rule.** It is asked from two
+ * places — [DrainController.abort], which has the failure it is about to record
+ * but has not built it yet, and [deriveConditions], which has a drain carrying
+ * one — and a rule maintained in two branches is a rule that eventually
+ * disagrees with itself. The overload below unpacks a recorded failure into
+ * this; nothing else decides.
+ *
+ * `DRAIN_NO_DESTINATION` is excluded on purpose: it means somebody is playing on
+ * a server that was asked to go away, which is the protocol working exactly as
+ * designed and resolves itself when they log off. An escalation that fires on a
+ * busy evening every backoff interval teaches operators that the signal means
+ * nothing.
+ *
+ * A permanent failure is excluded for the opposite reason: it is already
+ * surfaced as permanent and the loop has already stopped acting on it, so
+ * escalating it says nothing new.
  */
-internal const val ATTENTION: String = "[needs attention]"
+internal fun escalates(
+    startedAt: Instant,
+    failureClass: FailureClass,
+    reason: FailureReason,
+    now: Instant,
+    after: Duration,
+): Boolean =
+    failureClass == FailureClass.RETRYABLE &&
+        reason != FailureReason.DRAIN_NO_DESTINATION &&
+        JavaDuration.between(startedAt, now).toKotlinDuration() >= after
+
+/**
+ * The same rule, asked of a drain that has already recorded its failure.
+ *
+ * A drain with no recorded failure is not escalated, whatever its age — and that
+ * is what makes the condition self-clearing. A pass that gets somewhere clears
+ * `DrainStatus.failure` (see the `DRAIN_FAILED` resume), so the escalation goes
+ * with it rather than being a second thing to remember to reset.
+ */
+internal fun DrainStatus.escalated(
+    now: Instant,
+    after: Duration,
+): Boolean =
+    failure?.let {
+        escalates(
+            startedAt = startedAt,
+            failureClass = it.failureClass,
+            reason = it.reason,
+            now = now,
+            after = after,
+        )
+    } ?: false
 
 /** Why a drain is happening. It changes nothing about the procedure, only the message. */
 internal enum class DrainCause(
@@ -896,12 +936,6 @@ internal data class DrainProgress(
     val occupancy: PlayerOccupancy? = null,
     /** Set on the pass that confirmed a save completed, never on the pass that requested one. */
     val saveConfirmedAt: Instant? = null,
-    /**
-     * True once this drain has been failing long enough that it will not fix
-     * itself. Carried out to the status so the report can say so; it changes
-     * nothing about what is done to the container.
-     */
-    val needsAttention: Boolean = false,
     /**
      * True when this step did something to the server that the runtime cannot
      * be asked about later — in practice, sent a save request.
