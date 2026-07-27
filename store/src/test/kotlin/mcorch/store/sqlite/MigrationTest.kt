@@ -318,6 +318,147 @@ class MigrationTest {
             }
         }
 
+    /**
+     * The documented degradation: `worldSaved=true` with no instant beside it.
+     *
+     * There is no timestamp to carry, so the confirmation is dropped rather than
+     * invented. The drain saves again, which costs one `save-all flush` on a
+     * server it has already confirmed empty — the safe direction. Inventing a
+     * `worldSavedAt` here would date the evidence to whenever the upgrade
+     * happened and let a stop proceed on it, which is invariant 3 broken by a
+     * migration.
+     *
+     * No combination of the code that wrote these rows produces this shape, so
+     * the fixture is hand-built like the others. That is exactly why it needs a
+     * test: nothing else exercises the branch, and the file it lives in may
+     * never be edited again.
+     */
+    @Test
+    fun `a version 2 confirmation with no timestamp is dropped rather than dated by the migration`() =
+        runTest {
+            val directory = stores.directory()
+            writeVersion2Database(directory) { legacy ->
+                legacy.definition(Fixtures.definitionNamed("survival-a"), generation = 1L, revision = 1L)
+                legacy.legacyStatus(
+                    name = "survival-a",
+                    revision = 2L,
+                    drainState = DrainState.SAVING,
+                    worldSaved = true,
+                    saveRequestedAt = null,
+                )
+            }
+            appliedVersions(directory) shouldBe listOf(1, 2)
+
+            stores.open(directory).use { migrated ->
+                appliedVersions(directory) shouldBe listOf(1, 2, 3)
+                val drain = drainOf(migrated, "survival-a")
+
+                // Undated evidence is no evidence. Nothing may appear here.
+                drain.worldSavedAt.shouldBeNull()
+                drain.worldSaved shouldBe false
+                // Nor may it reappear one field over as a request that was never
+                // issued: that would wedge the drain instead of re-saving it.
+                drain.saveRequestedAt.shouldBeNull()
+
+                // Degrading toward saving again means the drain is still where it
+                // was, with everything it needs to run the save once more.
+                drain.state shouldBe DrainState.SAVING
+                drain.startedAt shouldBe LEGACY_DRAIN_STARTED_AT
+                drain.playersEvacuated shouldBe true
+            }
+        }
+
+    /**
+     * The unrecognised-encoding refusal, the other branch nothing reaches by
+     * accident.
+     *
+     * Skipping a row it could not read would leave that drain's confirmed save
+     * looking like an outstanding request — the whole inversion version 3 exists
+     * to prevent, reintroduced quietly for the rows the migration understood
+     * least. So it refuses, before writing anything.
+     */
+    @Test
+    fun `a status document at an encoding version 3 does not understand is refused, and nothing is rewritten`() {
+        val directory = stores.directory()
+        val confirmedAt = Instant.parse("2026-07-20T08:30:00Z")
+        writeVersion2Database(directory) { legacy ->
+            legacy.definition(Fixtures.definitionNamed("survival-a"), generation = 1L, revision = 1L)
+            legacy.legacyStatus(
+                name = "survival-a",
+                revision = 2L,
+                drainState = DrainState.DEREGISTERED,
+                worldSaved = true,
+                saveRequestedAt = confirmedAt,
+                encoding = UNREADABLE_ENCODING,
+            )
+        }
+
+        val failure =
+            runCatching { stores.open(directory) }
+                .exceptionOrNull()
+                .shouldBeInstanceOf<StoreException.MigrationFailed>()
+
+        failure.retryable shouldBe false
+        failure.cause
+            .shouldBeInstanceOf<StoreException.Corrupt>()
+            .message
+            .shouldNotBeNull()
+            .shouldContain("survival-a")
+
+        // Refusing has to be free. One transaction per migration means the store
+        // is still at version 2 with the row exactly as it was, so the operator
+        // can downgrade the binary and open it again.
+        appliedVersions(directory) shouldBe listOf(1, 2)
+        val document = statusDocument(directory, "survival-a")
+        document shouldContain "drain.worldSaved=true"
+        document shouldContain "drain.saveRequestedAt=$confirmedAt"
+    }
+
+    /**
+     * A hand-edited row carrying the old flag *and* a new `worldSavedAt`.
+     *
+     * Nothing that wrote these rows produces it, so it is only reachable from a
+     * database somebody edited. The migration refuses either way — but it has to
+     * refuse in the store's own vocabulary. `:core` classifies failures by
+     * [StoreException.retryable] and has nothing to do with a raw
+     * `IllegalArgumentException` escaping from a `require` inside the document
+     * writer, which is the "classify failures, do not let them leak" rule.
+     */
+    @Test
+    fun `a hand-edited row holding both the old flag and a confirmation fails as a store error`() {
+        val directory = stores.directory()
+        val requestedAt = Instant.parse("2026-07-20T08:30:00Z")
+        writeVersion2Database(directory) { legacy ->
+            legacy.definition(Fixtures.definitionNamed("survival-a"), generation = 1L, revision = 1L)
+            legacy.legacyStatus(
+                name = "survival-a",
+                revision = 2L,
+                drainState = DrainState.DEREGISTERED,
+                worldSaved = true,
+                saveRequestedAt = requestedAt,
+                worldSavedAt = Instant.parse("2026-07-20T08:45:00Z"),
+            )
+        }
+
+        val failure =
+            runCatching { stores.open(directory) }
+                .exceptionOrNull()
+                .shouldBeInstanceOf<StoreException.MigrationFailed>()
+
+        failure.retryable shouldBe false
+        // Enough to find the row and to know which two keys disagree.
+        val corrupt =
+            failure.cause
+                .shouldBeInstanceOf<StoreException.Corrupt>()
+                .message
+                .shouldNotBeNull()
+        corrupt shouldContain "survival-a"
+        corrupt shouldContain "drain.worldSaved"
+        corrupt shouldContain "drain.worldSavedAt"
+
+        appliedVersions(directory) shouldBe listOf(1, 2)
+    }
+
     private suspend fun drainOf(
         store: EmbeddedStore,
         name: String,
@@ -433,6 +574,11 @@ class MigrationTest {
          * `drain.worldSavedAt` and no `drain.worldSaved` at all, so a test built
          * on it would migrate a document that never needed migrating and would
          * pass whatever version 3 did.
+         *
+         * [worldSavedAt] and [encoding] exist only to build rows version 2 could
+         * never have written — a hand-edited database and an unrecognised
+         * encoding. Both are refusals, so a fixture that cannot occur naturally
+         * is the only way to reach them.
          */
         fun legacyStatus(
             name: String,
@@ -440,6 +586,8 @@ class MigrationTest {
             drainState: DrainState,
             worldSaved: Boolean,
             saveRequestedAt: Instant?,
+            worldSavedAt: Instant? = null,
+            encoding: Int = PropertyDocument.ENCODING_VERSION,
         ) {
             val fields =
                 buildList {
@@ -458,6 +606,7 @@ class MigrationTest {
                     add("drain.worldSaved" to worldSaved.toString())
                     add("drain.sealRequestedAt" to LEGACY_SEAL_REQUESTED_AT.toString())
                     saveRequestedAt?.let { add("drain.saveRequestedAt" to it.toString()) }
+                    worldSavedAt?.let { add("drain.worldSavedAt" to it.toString()) }
                     add("drain.transferAttempts" to "4")
                     add("drain.destination" to "lobby-01")
                 }
@@ -475,7 +624,7 @@ class MigrationTest {
                 setLong(4, revision)
                 setString(5, CREATED_AT.toString())
                 setString(6, document)
-                setInt(7, PropertyDocument.ENCODING_VERSION)
+                setInt(7, encoding)
                 setString(8, drainState.name)
             }
             highest = maxOf(highest, revision)
@@ -505,11 +654,37 @@ class MigrationTest {
             }
         }
 
+    /** The raw stored bytes, so "nothing was rewritten" is checked on disk rather than through a decode. */
+    private fun statusDocument(
+        directory: Path,
+        name: String,
+    ): String =
+        rawConnection(directory).use { connection ->
+            connection.query(
+                sql = "SELECT status_doc FROM server_status WHERE name = ?",
+                bind = { setString(1, name) },
+            ) { rows -> if (rows.next()) rows.getString("status_doc") else "" }
+        }
+
     private fun jdbcUrl(directory: Path): String = "jdbc:sqlite:${directory.resolve("state.db").toAbsolutePath()}"
 
     private companion object {
         val LEGACY_DRAIN_STARTED_AT: Instant = Instant.parse("2026-07-20T08:10:00Z")
         val LEGACY_DRAIN_ENTERED_AT: Instant = Instant.parse("2026-07-20T08:20:00Z")
         val LEGACY_SEAL_REQUESTED_AT: Instant = Instant.parse("2026-07-20T08:12:00Z")
+
+        /**
+         * A `doc_encoding` version 3 was not written against — the *next* one,
+         * pinned as a literal for the same reason version 3 pins the encoding it
+         * understands.
+         *
+         * That choice is what makes this a guard on the pin and not just on the
+         * refusal. If the literal in version 3 is ever replaced by the live
+         * `PropertyDocument.ENCODING_VERSION`, then the day that constant is
+         * bumped to 2 the migration starts accepting this document and the test
+         * fails here — rather than the change of meaning surfacing on an
+         * operator's disk as a store that will not open.
+         */
+        const val UNREADABLE_ENCODING = 2
     }
 }
