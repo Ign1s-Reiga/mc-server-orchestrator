@@ -4,6 +4,8 @@ import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.types.shouldBeInstanceOf
+import kotlinx.coroutines.job
+import kotlinx.coroutines.launch
 import mcorch.store.ChangeFeed
 import mcorch.store.ConflictReason
 import mcorch.store.Precondition
@@ -177,6 +179,40 @@ internal class TestStoreContractTest {
                 .putStatus(mcorch.schema.PaperServerStatus.pending(resourceName("nobody"), 1L, clock.instant()))
                 .shouldBeInstanceOf<WriteOutcome.Conflict>()
                 .reason shouldBe ConflictReason.NOT_FOUND
+        }
+
+    /**
+     * A write from a cancelled coroutine does not land.
+     *
+     * The real store runs every call as `withContext(dispatcher) { … }`, and a
+     * dispatch from a cancelled coroutine never runs the block — so a pass
+     * cancelled before its write reaches the store loses it. That is the fact the
+     * whole save-record durability argument rests on, and a fake that quietly
+     * wrote anyway would make `SaveRecordDurabilityTest` pass against code with
+     * no shield in it at all: an *uncontended* [kotlinx.coroutines.sync.Mutex] is
+     * taken on a fast path that never suspends and never notices cancellation.
+     */
+    @Test
+    fun `a call from a cancelled coroutine does not reach the store`() =
+        coreTest {
+            val clock = MutableClock()
+            val store = TestStore(clock)
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            store.putDefinition(definition).getOrThrow()
+            val writes = store.statusWrites
+
+            val job =
+                launch {
+                    coroutineContext.job.cancel()
+                    runCatching {
+                        store.putStatus(mcorch.schema.PaperServerStatus.pending(name, 1L, clock.instant()))
+                    }
+                }
+            job.join()
+
+            store.statusWrites shouldBe writes
+            store.getServer(name).shouldNotBeNull().status shouldBe null
         }
 }
 

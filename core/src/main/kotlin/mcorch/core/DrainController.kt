@@ -907,14 +907,21 @@ internal data class DrainProgress(
      * be asked about later — in practice, sent a save request.
      *
      * A stop does not count: a stopped container is observable, so a lost record
-     * of one costs a pass rather than a repeat. A save request is not
+     * of one costs a pass rather than a repeat, and re-issuing a stop is safe on
+     * a drain that has already confirmed a save. A save request is not
      * observable, so the record of one is the only thing standing between a lost
      * write and a second save on a live server. Which field holds that record
      * depends on how the save ended — [mcorch.schema.DrainStatus.saveRequestedAt]
      * when it was delivered but never confirmed, and
      * [mcorch.schema.DrainStatus.worldSavedAt] once the server reported it
-     * completed. Either way the caller has to make it durable, even when the
-     * observation it belongs to is rejected.
+     * completed. Both are records of something that has already happened, so
+     * neither may be lost, and the milder of the two is still a repeat.
+     *
+     * The caller therefore has to make the record durable against **both** ways
+     * a pass can fail to write it: an observation the store rejects, and a pass
+     * cancelled before it reaches the store. Cancellation is the likelier of the
+     * two — it is what an ordinary shutdown does — and it is invisible from
+     * here, so this flag is what a caller with a store in hand acts on.
      */
     val sideEffectIssued: Boolean = false,
     /**

@@ -1,5 +1,7 @@
 package mcorch.core
 
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import mcorch.schema.DrainState
@@ -261,7 +263,21 @@ internal class TestStore(
             }
         }
 
+    /**
+     * Every call goes through here, and it refuses to do anything on behalf of a
+     * cancelled coroutine.
+     *
+     * That check is not defensive tidying, it is the contract. The real store
+     * runs every call as `withContext(dispatcher) { mutex.withLock { … } }`, and
+     * a dispatch from a cancelled coroutine never runs the block at all: a
+     * cancelled pass's write is dropped before it reaches SQLite. This fake
+     * would otherwise land it, because an *uncontended* [Mutex] is taken on a
+     * fast path that never suspends and so never notices cancellation — so a
+     * write the real store loses would look durable here, and the whole point of
+     * a durability test is that the losing case is reachable.
+     */
     private suspend fun <T> guarded(block: () -> T): T {
+        currentCoroutineContext().ensureActive()
         nextFailure?.let {
             nextFailure = null
             throw it

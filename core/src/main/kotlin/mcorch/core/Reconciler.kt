@@ -1,5 +1,7 @@
 package mcorch.core
 
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import mcorch.core.paper.PaperServerAgent
 import mcorch.core.paper.PaperWorkloadPlanner
 import mcorch.core.paper.ProbeOutcome
@@ -853,28 +855,96 @@ public class Reconciler(
      * Records [status] and turns the verdict into an outcome.
      *
      * [mustRecord] is for a pass that has already done something to the server
-     * which the runtime cannot be asked about afterwards. The guarded write can
-     * legitimately be rejected — the operator replaced the definition while the
-     * pass ran — and dropping the observation is the right answer for
-     * *observations*. It is the wrong answer for the record of a save request:
-     * that record is the only thing stopping the next pass sending a second one
-     * to a live server, and it must outlive a rejected write.
+     * which the runtime cannot be asked about afterwards. Such a record has two
+     * ways of being lost, and both have to be closed or the survivor decides
+     * nothing:
+     *
+     * - **The write is rejected.** The guarded write can legitimately be refused
+     *   — the operator replaced the definition while the pass ran — and dropping
+     *   the observation is the right answer for *observations*. It is the wrong
+     *   answer for the record of a save request: that record is the only thing
+     *   stopping the next pass sending a second one to a live server.
+     * - **The pass is cancelled.** The orchestrator shutting down cancels a pass
+     *   at its next suspension point, and the first one after a save request
+     *   comes back is the store write itself. A cancelled coroutine does not
+     *   reach the store at all — every call dispatches, and a dispatch from a
+     *   cancelled coroutine never runs — so the record is dropped just as
+     *   thoroughly as by a rejection, and by a far more ordinary event than an
+     *   operator editing mid-pass.
+     *
+     * [recordIssuedSideEffect] closes the second; [forceRecord] closes the
+     * first.
      */
     private suspend inline fun write(
         pass: Pass,
         status: PaperServerStatus,
         mustRecord: Boolean = false,
         outcome: () -> ReconcileOutcome,
-    ): ReconcileOutcome =
-        when (val verdict = writeStatus(pass, status)) {
+    ): ReconcileOutcome {
+        val verdict =
+            if (mustRecord) {
+                recordIssuedSideEffect(pass, status)
+            } else {
+                writeStatus(pass, status)
+            }
+        return when (verdict) {
             is WriteVerdict.Conflicted -> {
-                if (mustRecord) forceRecord(pass, status)
                 verdict.outcome
             }
 
             WriteVerdict.Written, WriteVerdict.Unchanged -> {
                 outcome()
             }
+        }
+    }
+
+    /**
+     * Writes the record of a side effect this pass has already performed, so
+     * that cancelling the pass cannot lose it.
+     *
+     * ## Why the shield is here and not around the pass
+     *
+     * The region is deliberately as small as it can be while still being
+     * useful: the store write, plus the unguarded retry that follows a
+     * rejection. Widening it to the pass would put a container operation inside
+     * it — an exec bounded by `spec.lifecycle.drain.saveTimeout`, minutes long —
+     * and shutting the orchestrator down would then wait out a save timeout,
+     * which is exactly what `Main` says it does not do. Narrowing it to a single
+     * `putStatus` would leave the [forceRecord] fallback cancellable, so a
+     * pass unlucky enough to be both rejected *and* cancelled would still lose
+     * the record.
+     *
+     * ## Why there is no timeout on it
+     *
+     * A [NonCancellable] store write can hold a shutdown open for as long as the
+     * store takes, so the question is whether the store can take unboundedly
+     * long. The embedded one cannot in the way that matters: it is one
+     * transaction on a local file, serialised through a mutex behind an IO
+     * dispatcher, and lock contention — the one wait that is not bounded by the
+     * work itself — is bounded by `PRAGMA busy_timeout`, after which the write
+     * fails rather than waiting.
+     *
+     * A `withTimeout` here would not add a bound anyway. JDBC calls block a
+     * thread rather than suspending, so a genuinely wedged filesystem is not
+     * interruptible by cancellation at all: the timeout would fire, the
+     * coroutine would still be waiting for the blocking call underneath it, and
+     * the only thing it would reliably achieve is abandoning the write this
+     * function exists to guarantee. A store that can wedge indefinitely is a
+     * problem for `:store` to bound at the JDBC level, where the bound can
+     * actually be enforced.
+     *
+     * `ReconcileLoop` already takes the same exposure for `queue.done`, and for
+     * the same reason: a lock taken from a cancelled coroutine throws instead of
+     * waiting, so the work simply does not happen.
+     */
+    private suspend fun recordIssuedSideEffect(
+        pass: Pass,
+        status: PaperServerStatus,
+    ): WriteVerdict =
+        withContext(NonCancellable) {
+            val verdict = writeStatus(pass, status)
+            if (verdict is WriteVerdict.Conflicted) forceRecord(pass, status)
+            verdict
         }
 
     /**
