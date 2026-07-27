@@ -678,12 +678,16 @@ class MigrationTest {
          * pinned as a literal for the same reason version 3 pins the encoding it
          * understands.
          *
-         * That choice is what makes this a guard on the pin and not just on the
-         * refusal. If the literal in version 3 is ever replaced by the live
-         * `PropertyDocument.ENCODING_VERSION`, then the day that constant is
-         * bumped to 2 the migration starts accepting this document and the test
-         * fails here — rather than the change of meaning surfacing on an
-         * operator's disk as a store that will not open.
+         * That choice is what will make this a guard on the pin and not only on
+         * the refusal — but not yet. While `PropertyDocument.ENCODING_VERSION` is
+         * still 1, replacing version 3's literal with it fails nothing, here or
+         * anywhere else, so from inside the test suite the pin reads as untested.
+         * It is not untested so much as not yet testable: the day the constant is
+         * bumped to 2, an un-pinned version 3 starts accepting this document and
+         * the test fails here, instead of the change of meaning surfacing on an
+         * operator's disk as a store that will not open. Neither literal is dead
+         * for looking unused — see `PropertyDocument.ENCODING_VERSION`, which
+         * carries what a bump is expected to break.
          */
         const val UNREADABLE_ENCODING = 2
     }
