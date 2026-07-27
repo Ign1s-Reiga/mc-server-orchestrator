@@ -937,13 +937,41 @@ public class Reconciler(
      * `ReconcileLoop` already takes the same exposure for `queue.done`, and for
      * the same reason: a lock taken from a cancelled coroutine throws instead of
      * waiting, so the work simply does not happen.
+     *
+     * ## What the shield still depends on
+     *
+     * That the store is *open*. Being uncancellable is worth nothing against a
+     * store that has already been closed, and closing it is the last thing an
+     * orchestrator does — so this is only durable while the store outlives the
+     * loop. `mcorch.app.Main` is what arranges that, by joining the loop before
+     * `Orchestrator.close`, and `ReconcileLoop`'s own shutdown is what makes the
+     * join mean something (`ReconcileLoopTest` pins it).
+     *
+     * If that ordering is ever broken the loss is silent — a closed store throws
+     * a [StoreException], which every other write treats as an ordinary
+     * hiccup — so this one is reported at error before it is rethrown. Reporting
+     * is all there is: the store is the only durable place there is, and a
+     * record that cannot be written there is gone.
      */
     private suspend fun recordIssuedSideEffect(
         pass: Pass,
         status: PaperServerStatus,
     ): WriteVerdict =
         withContext(NonCancellable) {
-            val verdict = writeStatus(pass, status)
+            val verdict =
+                try {
+                    writeStatus(pass, status)
+                } catch (failure: StoreException) {
+                    LOG.error(
+                        "server={} could not record a side effect it had already performed, because the store " +
+                            "refused the write ({}). The record is lost and the next pass may repeat it — for a " +
+                            "drain that means a second world save against a running server. If the orchestrator " +
+                            "was shutting down, the store was closed before the loop finished unwinding",
+                        pass.name,
+                        failure.message,
+                    )
+                    throw failure
+                }
             if (verdict is WriteVerdict.Conflicted) forceRecord(pass, status)
             verdict
         }

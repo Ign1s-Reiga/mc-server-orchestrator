@@ -6,11 +6,18 @@ import io.kotest.matchers.ints.shouldBeGreaterThan
 import io.kotest.matchers.ints.shouldBeLessThan
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
 import mcorch.core.paper.PaperCommands
 import mcorch.schema.DrainState
 import mcorch.schema.PlacementSpec
@@ -276,6 +283,67 @@ internal class ReconcileLoopTest {
             job.cancelAndJoin()
 
             job.isCancelled shouldBe true
+        }
+
+    /**
+     * The loop does not finish unwinding until an issued save has been recorded.
+     *
+     * This is the half of the save-record shield that lives here rather than in
+     * `Reconciler`. `NonCancellable` makes the write happen; it is worth nothing
+     * unless the *store is still open* when it does, and what keeps the store
+     * open is `mcorch.app.Main` closing the `Orchestrator` only after
+     * `loop.join()` returns. That join is only meaningful if `run()` waits for a
+     * cancelled worker to finish its shielded write — so this asserts the record
+     * is already on the store the instant the loop's job completes, with no
+     * polling and no second chance.
+     *
+     * Written against a real dispatcher and a real `Job`, not virtual time: the
+     * thing being pinned is an ordering between a cancellation and a write, and
+     * `runTest`'s single-threaded scheduler is exactly where such an ordering
+     * looks fine whatever the code does. The cancellation is still deterministic
+     * — it is issued from inside the save exec — so this is a pin rather than a
+     * probe.
+     */
+    @Test
+    fun `the loop does not finish unwinding until an issued save is recorded`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.store.deleteDefinition(name)
+            repeat(5) { harness.pass(name) }
+            harness.node.saves shouldHaveSize 0
+
+            val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+            try {
+                val loop =
+                    scope.launch(start = CoroutineStart.LAZY) {
+                        loopFor(harness).run()
+                    }
+                harness.node.onExec = { command ->
+                    if (command == PaperCommands.saveAll()) {
+                        loop.cancel(CancellationException("the orchestrator is shutting down"))
+                    }
+                    harness.node.defaultExec(command)
+                }
+                loop.start()
+                // A generous ceiling on a fast operation: it exists so a loop that
+                // never unwinds fails the test instead of hanging the suite.
+                withTimeout(30.seconds) { loop.join() }
+
+                harness.node.saves shouldHaveSize 1
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+                    .worldSavedAt
+                    .shouldNotBeNull()
+            } finally {
+                scope.cancel()
+            }
         }
 
     /**

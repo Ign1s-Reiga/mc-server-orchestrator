@@ -4,6 +4,7 @@ import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.ints.shouldBeGreaterThan
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.types.shouldBeInstanceOf
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -12,6 +13,7 @@ import mcorch.core.paper.PaperCommands
 import mcorch.schema.DrainState
 import mcorch.schema.PaperServerStatus
 import mcorch.schema.ResourceName
+import mcorch.store.StoreException
 import mcorch.store.getOrThrow
 import mcorch.store.sqlite.EmbeddedStore
 import mcorch.store.sqlite.EmbeddedStoreConfig
@@ -253,6 +255,48 @@ internal class SaveRecordDurabilityTest {
                 recovered.shouldNotBeNull().worldSavedAt.shouldNotBeNull()
                 recovered.saveRequestedAt shouldBe null
             }
+        }
+
+    /**
+     * The shield is worth nothing against a store that is not there, and that
+     * failure must not look like an ordinary one.
+     *
+     * `NonCancellable` keeps the coroutine alive to do the write; it cannot make
+     * the write succeed. The realistic way it fails is a store closed while the
+     * loop was still unwinding — the one ordering `mcorch.app.Main` has to get
+     * right — and `forceRecord` does not cover it, because that handles a write
+     * the store *rejected* rather than one it could not accept at all.
+     *
+     * Nothing can recover the record: the store is the only durable place there
+     * is. So the requirement is that it is reported and classified rather than
+     * swallowed — this pass must surface a failure, not report progress it did
+     * not make.
+     */
+    @Test
+    fun `a store that cannot take the record surfaces it instead of reporting progress`() =
+        coreTest {
+            val harness = Harness()
+            val name = drainAtSaving(harness)
+
+            // Fired from inside the store, so it lands on the write that carries
+            // the save record rather than on the read at the top of the pass.
+            harness.store.beforeStatusWrite = {
+                harness.store.nextFailure = StoreException.Closed("the store has been closed")
+            }
+            val outcome = harness.pass(name)
+
+            // The save went out and the record did not land: this is the loss,
+            // reproduced deliberately.
+            harness.node.saves shouldHaveSize 1
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .worldSavedAt shouldBe null
+            // What must not happen is it passing quietly. A pass that issued a
+            // side effect and could not record it has failed, and says so.
+            outcome.shouldBeInstanceOf<ReconcileOutcome.Failed>()
         }
 
     /**

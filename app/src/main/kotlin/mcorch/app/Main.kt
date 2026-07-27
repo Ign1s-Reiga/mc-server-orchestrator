@@ -40,6 +40,18 @@ private val LOG = LoggerFactory.getLogger("mcorch.app.Main")
  * container operation. Both halves of the record are covered:
  * `DrainStatus.saveRequestedAt` for a save that was delivered and never
  * confirmed, `DrainStatus.worldSavedAt` for one the server reported completed.
+ *
+ * ## The ordering below is load-bearing, not stylistic
+ *
+ * `loop.join()` runs inside `use`, so the store is closed **after** the loop has
+ * finished unwinding. That is what makes the shield above worth anything: an
+ * uncancellable write into a store that has already been closed throws, and the
+ * record is lost exactly as it was before. Two things hold it up, and both are
+ * pinned by tests rather than by this comment —
+ * `ReconcileLoopTest` asserts the loop does not finish unwinding until an issued
+ * save is recorded, and `Orchestrator.close` reports it at error if it is called
+ * while the loop is still running. Anything that moves the close earlier, or
+ * adds a second shutdown hook that closes the store, breaks it.
  */
 public fun main() {
     val config =
