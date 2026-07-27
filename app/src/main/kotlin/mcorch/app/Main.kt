@@ -29,13 +29,17 @@ private val LOG = LoggerFactory.getLogger("mcorch.app.Main")
  * It does **not** wait for a pass in flight to finish, and this comment used to
  * claim it did. Cancellation reaches a running pass at its next suspension
  * point and the pass unwinds from there. That is deliberate — waiting would
- * mean waiting out a save timeout, minutes long, on every restart — but it
- * leaves one narrow window worth knowing about: a pass cancelled between
- * issuing a side effect and recording it loses the record, and the only side
- * effect that cannot be re-derived by observing the runtime is a save request
- * (`DrainStatus.saveRequestedAt`). Closing that window means making the write
- * that follows an issued side effect non-cancellable, which is drain-protocol
- * territory and has not been done.
+ * mean waiting out a save timeout, minutes long, on every restart.
+ *
+ * What it does wait for is the *record* of anything that pass has already done.
+ * A pass cancelled between issuing a side effect and recording it used to lose
+ * the record, and the only side effect that cannot be re-derived by observing
+ * the runtime is a save request — so the next process would send a second one.
+ * `Reconciler.recordIssuedSideEffect` now writes that record under
+ * `NonCancellable`, which bounds a shutdown by one store write rather than by a
+ * container operation. Both halves of the record are covered:
+ * `DrainStatus.saveRequestedAt` for a save that was delivered and never
+ * confirmed, `DrainStatus.worldSavedAt` for one the server reported completed.
  */
 public fun main() {
     val config =

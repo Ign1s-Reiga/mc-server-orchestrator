@@ -1,5 +1,7 @@
 package mcorch.core
 
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import mcorch.core.paper.PaperCommands
 import mcorch.schema.ImageRef
 import mcorch.schema.NodeName
@@ -265,7 +267,20 @@ internal class FakeNode(
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
-    private fun check(operation: NodeOperation) {
+    /**
+     * The gate every operation goes through, and the one place cancellation is
+     * honoured.
+     *
+     * A real [Node] crosses a gRPC boundary on every call, so a cancelled
+     * coroutine never reaches the runtime — CLAUDE.md requires exactly that of
+     * anything crossing the `:cri` boundary. Nothing in this fake suspends, so
+     * without this check a cancelled pass would keep driving the "runtime",
+     * issuing execs and stops that a real node would have refused. That is the
+     * difference between a test that pins where a shield ends and one that
+     * cannot see cancellation at all.
+     */
+    private suspend fun check(operation: NodeOperation) {
+        currentCoroutineContext().ensureActive()
         calls += operation
         rawFailures[operation]?.let { throw it }
         alwaysFailures[operation]?.let { throw it }
