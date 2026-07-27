@@ -10,3 +10,4 @@
 - [Classify narrowly, contain broadly](feedback_classify-narrowly-and-contain-broadly.md) — keep the never-retry bucket small; let no exception escape a worker.
 - [Audit remedies are hypotheses](feedback_audit-remedies-are-hypotheses.md) — the finding is established, the prescribed helper may itself be wrong; the suite arbitrates.
 - [Prove the test can fail](feedback_prove-the-test-can-fail.md) — `--rerun` or it never ran; virtual time hides races; a control assertion can be unfindable.
+- [Cancellation exposure](project_cancellation-exposure.md) — what the save-record shield covers, the two windows left open on purpose, and why write-ahead was rejected on its merits.
