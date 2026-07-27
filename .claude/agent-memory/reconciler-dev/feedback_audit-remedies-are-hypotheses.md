@@ -27,6 +27,14 @@ meaning depends on a flag must have the flag consulted at every site that clears
 it.** `dropUnusableSaveEvidence` already documented this exact trap; the two
 helpers next to it did not.
 
+**That specific instance is gone** — `worldSavedAt` was added to `DrainStatus`
+(2026-07-27, store schema V3), so the two facts are two fields, `worldSaved` is
+derived, and both voiders are unconditional. Do not go looking for the bug; look
+for the *shape*. The better ending is the one worth copying: the fix was not to
+get the branch right at three call sites, it was to delete the thing they were
+branching on. A flag beside its own timestamp is the same smell as a raw value
+beside a predicate about it — see [[localnode-test-gap]] for the other instance.
+
 **How to apply:** never commit a drain change on the strength of the audit alone
 — the existing suite is what arbitrates, and a pre-existing test failing right
 after a prescribed one-line change is evidence the prescription is incomplete,
