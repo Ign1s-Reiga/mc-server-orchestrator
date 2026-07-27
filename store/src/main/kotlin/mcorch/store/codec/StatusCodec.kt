@@ -225,10 +225,13 @@ internal object StatusCodec {
         scope.put("startedAt", drain.startedAt)
         scope.put("enteredStateAt", drain.enteredStateAt)
         scope.put("playersEvacuated", drain.playersEvacuated)
-        scope.put("worldSaved", drain.worldSaved)
         // Each of these is "the side effect went out". Losing one re-issues it.
         scope.put("sealRequestedAt", drain.sealRequestedAt)
         scope.put("saveRequestedAt", drain.saveRequestedAt)
+        // Not `worldSaved`: the flag is derived from this instant and storing
+        // both would let a document say two things. V3 rewrote the rows that
+        // carried the flag — see `V3SplitWorldSavedInstant`.
+        scope.put("worldSavedAt", drain.worldSavedAt)
         scope.put("deregisteredAt", drain.deregisteredAt)
         scope.put("transferAttempts", drain.transferAttempts)
         scope.put("destination", drain.destination?.value)
@@ -245,9 +248,9 @@ internal object StatusCodec {
             startedAt = reader.requireInstant("$prefix.startedAt"),
             enteredStateAt = reader.requireInstant("$prefix.enteredStateAt"),
             playersEvacuated = reader.requireBoolean("$prefix.playersEvacuated"),
-            worldSaved = reader.requireBoolean("$prefix.worldSaved"),
             sealRequestedAt = reader.instant("$prefix.sealRequestedAt"),
             saveRequestedAt = reader.instant("$prefix.saveRequestedAt"),
+            worldSavedAt = reader.instant("$prefix.worldSavedAt"),
             deregisteredAt = reader.instant("$prefix.deregisteredAt"),
             transferAttempts = reader.requireInt("$prefix.transferAttempts"),
             destination = reader.value("$prefix.destination", ResourceName::of),

@@ -143,6 +143,14 @@ internal object Fixtures {
                 ),
         )
 
+    /**
+     * A drain with every field populated that can be populated at once.
+     *
+     * [saveRequestedAt] and [worldSavedAt] are disjoint by design — a confirmed
+     * save has no outstanding request — so one fixture cannot carry both. This
+     * one is the *unconfirmed* case, which is the wedge that must never be lost
+     * in a round trip. [confirmedDrain] covers the other.
+     */
     fun fullDrain(
         state: DrainState,
         at: Instant = T0,
@@ -152,7 +160,6 @@ internal object Fixtures {
             startedAt = at.minusSeconds(120),
             enteredStateAt = at.minusSeconds(20),
             playersEvacuated = true,
-            worldSaved = false,
             sealRequestedAt = at.minusSeconds(115),
             saveRequestedAt = at.minusSeconds(20),
             deregisteredAt = null,
@@ -166,5 +173,25 @@ internal object Fixtures {
                     occurredAt = at.minusSeconds(60),
                     attempts = 4,
                 ),
+        )
+
+    /**
+     * A drain holding a *confirmed* save: the server reported the write
+     * completed, so there is no outstanding request.
+     *
+     * The pair with [fullDrain] is what makes the round trip meaningful. These
+     * two records differ by one timestamp moving between two keys, and reading
+     * one back as the other is the difference between a container that may stop
+     * and a drain that needs a human.
+     */
+    fun confirmedDrain(
+        state: DrainState = DrainState.DEREGISTERED,
+        at: Instant = T0,
+    ): DrainStatus =
+        fullDrain(state, at).copy(
+            saveRequestedAt = null,
+            worldSavedAt = at.minusSeconds(20),
+            deregisteredAt = at.minusSeconds(10),
+            failure = null,
         )
 }

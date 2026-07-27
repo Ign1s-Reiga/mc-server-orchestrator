@@ -1096,8 +1096,19 @@ internal class DrainTest {
             harness.node.stops shouldHaveSize 0
         }
 
+    /**
+     * The save in this one *completes*, so what has to survive a rejected write
+     * is `worldSavedAt`. The assertion used to name `saveRequestedAt`, because
+     * both facts lived in that one field; splitting them moved this case to the
+     * other one. The behaviour is unchanged and the closing assertion — one save
+     * after four more passes — is the same one it always was.
+     *
+     * `a delivered save request survives a rejected observation too` is the
+     * other half, where the save is *not* confirmed and `saveRequestedAt` is
+     * what must survive.
+     */
     @Test
-    fun `a rejected observation still records that a save request went out`() =
+    fun `a rejected observation still records that a save completed`() =
         coreTest {
             val harness = Harness()
             val definition = paperDefinition()
@@ -1119,17 +1130,61 @@ internal class DrainTest {
             harness.pass(name).shouldBeInstanceOf<ReconcileOutcome.Retry>()
             harness.node.saves shouldHaveSize 1
 
-            // The record of the request has to have survived the rejection, or
-            // the next pass asks a live server to save all over again.
-            harness
-                .status(name)
-                .shouldNotBeNull()
-                .drain
-                .shouldNotBeNull()
-                .saveRequestedAt
-                .shouldNotBeNull()
+            // The record has to have survived the rejection, or the next pass
+            // asks a live server to save all over again.
+            val drain =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            drain.worldSavedAt.shouldNotBeNull()
+            // And the request is not *also* outstanding: a confirmation beside a
+            // live request is what used to wedge the next `SAVING`.
+            drain.saveRequestedAt shouldBe null
             repeat(4) { harness.pass(name) }
             harness.node.saves shouldHaveSize 1
+        }
+
+    /**
+     * The same rejected write, with a save the server never confirmed. Here
+     * `saveRequestedAt` is the durable record — the wedge — and losing it sends
+     * a second `save-all flush` to a live server.
+     */
+    @Test
+    fun `a delivered save request survives a rejected observation too`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            // Exit zero, no completion reported: delivered, never confirmed.
+            harness.node.savesCleanly = false
+            harness.store.putDefinition(paperDefinition(image = "docker.io/itzg/minecraft-server:2026.7.0"))
+            repeat(5) { harness.pass(name) }
+            harness.node.saves shouldHaveSize 0
+
+            harness.store.beforeStatusWrite = {
+                harness.store.putDefinition(paperDefinition(maxPlayers = 41))
+            }
+            harness.pass(name)
+            harness.node.saves shouldHaveSize 1
+
+            val drain =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            drain.saveRequestedAt.shouldNotBeNull()
+            drain.worldSavedAt shouldBe null
+
+            // Never a second one, and the container keeps running.
+            harness.node.savesCleanly = true
+            repeat(4) { harness.pass(name) }
+            harness.node.saves shouldHaveSize 1
+            harness.node.stops shouldHaveSize 0
         }
 
     @Test

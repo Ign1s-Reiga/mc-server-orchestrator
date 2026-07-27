@@ -105,13 +105,57 @@ abstract class StoreConformanceSuite {
             drain.startedAt shouldBe expected.startedAt
             drain.enteredStateAt shouldBe expected.enteredStateAt
             drain.playersEvacuated shouldBe expected.playersEvacuated
-            drain.worldSaved shouldBe expected.worldSaved
             drain.sealRequestedAt shouldBe expected.sealRequestedAt
             drain.saveRequestedAt shouldBe expected.saveRequestedAt
+            drain.worldSavedAt shouldBe expected.worldSavedAt
+            drain.worldSaved shouldBe expected.worldSaved
             drain.deregisteredAt.shouldBeNull()
             drain.transferAttempts shouldBe expected.transferAttempts
             drain.destination shouldBe expected.destination
             drain.failure shouldBe expected.failure
+
+            // The wedge, spelled out. This record says a request went out and
+            // never came back; reading it as a confirmation would authorise a
+            // stop on a save nobody has seen finish.
+            drain.saveRequestedAt.shouldNotBeNull()
+            drain.worldSavedAt.shouldBeNull()
+            drain.worldSaved shouldBe false
+        }
+
+    /**
+     * The other half of the same round trip, and the one an upgrade can invert.
+     *
+     * A confirmed save and an unconfirmed request differ by which key carries
+     * the timestamp. If a store loses `worldSavedAt`, or writes it back into
+     * `saveRequestedAt`, a drain that had finished its save comes back believing
+     * a request went out and never returned — it wedges permanently and asks a
+     * human to verify a world that is already on disk.
+     */
+    @Test
+    fun `a confirmed world save comes back as a confirmation, not as an outstanding request`() =
+        withStore { store ->
+            store.putDefinition(Fixtures.definitionNamed("survival-03")).getOrThrow()
+            val expected = Fixtures.confirmedDrain()
+            val status = Fixtures.fullStatus("survival-03").copy(drain = expected)
+
+            store.putStatus(status).getOrThrow()
+
+            val drain =
+                store
+                    .getServer(Fixtures.resourceName("survival-03"))
+                    .shouldNotBeNull()
+                    .status
+                    .shouldNotBeNull()
+                    .status
+                    .shouldBeInstanceOf<PaperServerStatus>()
+                    .drain
+                    .shouldNotBeNull()
+            drain shouldBe expected
+            drain.worldSavedAt shouldBe expected.worldSavedAt
+            drain.worldSaved shouldBe true
+            // Disjoint: a confirmed save has no request outstanding, and a store
+            // that resurrected one would wedge the drain on the next pass.
+            drain.saveRequestedAt.shouldBeNull()
         }
 
     @Test

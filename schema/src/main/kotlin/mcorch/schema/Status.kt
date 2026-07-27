@@ -179,21 +179,56 @@ public data class StorageStatus(
  * state any number of times, and re-sending a save request costs the server
  * real work. If the timestamp is set, the request went out; wait for the
  * confirmation instead of asking again.
+ *
+ * ## [saveRequestedAt] and [worldSavedAt] are disjoint, and that is the point
+ *
+ * A world save has exactly two states worth recording and they mean opposite
+ * things to a drain, so they are two fields:
+ *
+ * - [saveRequestedAt] — a request went out and **has not been confirmed**. It is
+ *   the wedge that stops a second `save-all flush` reaching a live server, and
+ *   only a human, or a pass that has *observed a player*, may clear it.
+ * - [worldSavedAt] — the server itself reported a **completed** save, at that
+ *   instant. This is the only thing that may authorise a container stop.
+ *
+ * Confirming a save clears [saveRequestedAt] and sets [worldSavedAt]; at most
+ * one of them is ever set. They used to be one field discriminated by a
+ * `worldSaved` flag, and two separate bugs came from a site clearing it without
+ * consulting the flag — in one direction a healthy drain wedged for ever, in the
+ * other a delivered save was silently re-sent to a live server. Splitting them
+ * is what makes both voiders unconditional.
+ *
+ * Should a stored record ever carry both — a hand-repaired row, a document from
+ * a build that did not know the rule — the reader is not made to fail. The drain
+ * treats an unconfirmed request as the stronger signal and refuses to re-send,
+ * which is the safe direction.
  */
 public data class DrainStatus(
     val state: DrainState,
     val startedAt: Instant,
     val enteredStateAt: Instant,
     val playersEvacuated: Boolean = false,
-    val worldSaved: Boolean = false,
     val sealRequestedAt: Instant? = null,
+    /** A save request that went out and was never confirmed. See the note above. */
     val saveRequestedAt: Instant? = null,
+    /** When the server confirmed a *completed* save. Never when one was merely asked for. */
+    val worldSavedAt: Instant? = null,
     val deregisteredAt: Instant? = null,
     val transferAttempts: Int = 0,
     /** Where players were sent. A server name, never a player. */
     val destination: ResourceName? = null,
     val failure: FailureStatus? = null,
-)
+) {
+    /**
+     * Whether a completed save has been confirmed for this drain.
+     *
+     * Derived, never stored: a flag beside its own timestamp is two fields for
+     * one fact, and keeping them in step by hand is exactly the mistake this
+     * type used to make. Nothing can set this to something [worldSavedAt] does
+     * not say, including `copy`.
+     */
+    public val worldSaved: Boolean get() = worldSavedAt != null
+}
 
 public enum class ConditionType {
     IMAGE_AVAILABLE,
