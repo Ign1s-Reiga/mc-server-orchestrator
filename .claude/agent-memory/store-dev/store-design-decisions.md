@@ -27,9 +27,9 @@ The `:store` module's shape was decided in one pass on 2026-07-26 (commit `feat(
 **Why:** storing YAML and re-reading it through `ServerDefinitionParser` would make already-accepted rows unloadable the moment `:schema` tightens a validation rule — the store would lose data because of an unrelated change. A column per field ties the disk layout to `:schema`'s Kotlin field list and is unusable by a non-SQL backend. The document is canonical (sorted keys) because `putDefinition` compares encoded specs to decide whether the generation moves.
 **How to apply:** keep values in their most primitive exact form (bytes, millicores, whole nanoseconds, ISO-8601 instants). Never store a *rendered* form that rounds.
 
-**Migrations read stored documents by key, never through the current `:schema` types.**
-**Why:** a migration written today has to keep producing the same result years from now, and it cannot if it depends on today's object model.
-**How to apply:** in a data migration, use `PropertyDocument.parse(...).string("some.key")`, not `StatusCodec.decode(...)`.
+**Migrations read stored documents by key, never through the current `:schema` types — and compare against frozen literals, never live constants.**
+**Why:** a migration written today has to keep producing the same result years from now, and it cannot if it depends on today's object model. The subtler half was found by the sixth drain audit: V3 checked `encoding != PropertyDocument.ENCODING_VERSION`, so the day that constant is bumped V3 starts refusing exactly the rows it was written to rewrite and every store still at v2 refuses to open. Loud and lossless, but stranded — and it evades the never-edit-a-shipped-migration rule because nobody edits anything, the meaning changes underneath.
+**How to apply:** in a data migration use `PropertyDocument.parse(...).string("some.key")`, not `StatusCodec.decode(...)`; and inline any constant it compares against as a literal with a comment saying the magic number is deliberate. Pin the test fixture's counterpart to a literal too, so the test keeps meaning the same thing after the live constant moves. Handling a later encoding is the job of the migration that introduces it.
 
 **A `SecretValue` is shared and destroyed on the reconcile hot path.**
 **Why:** `:core` resolves a secret, uses it, and destroys it in a `finally` (added 2026-07-26). So `use` and `destroy` overlap on different threads as a matter of course, and the type owns that — callers are not expected to coordinate.
