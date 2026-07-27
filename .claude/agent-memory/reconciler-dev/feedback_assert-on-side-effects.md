@@ -49,13 +49,18 @@ when `:store` publishes its `StoreConformanceSuite` as a test fixture and run
 that instead. Same for `FakeNode`: it carries the labels it was created with,
 because a fake that forgets them cannot catch a drain reading the wrong facts.
 
-**The clause that is easiest to miss is cancellation.** The real store runs every
-call as `withContext(dispatcher) { … }` and a real node crosses gRPC, so neither
-does anything for a cancelled coroutine — that is the entire premise of the
+**The clause that is easiest to miss is cancellation**, and the drain auditor
+called this the important result of its round. The real store runs every call as
+`withContext(dispatcher) { … }` and a real node crosses gRPC, so neither does
+anything for a cancelled coroutine — that is the entire premise of the
 save-record durability work. Both fakes used to do the work anyway: nothing in
 `FakeNode` suspends, and `TestStore` only took an *uncontended* `Mutex`, whose
 fast path never suspends and so never checks. A durability test written against
 them passed against code with no shield in it at all. Both now
-`currentCoroutineContext().ensureActive()` on entry. Generalise it: when a fix
-turns on a property of a suspension point, check the fake actually *has* that
-suspension point.
+`currentCoroutineContext().ensureActive()` on entry.
+
+The consequence the auditor spelled out: **round 6's durability reasoning on that
+path was unverified**, because the suite that "confirmed" it could not observe
+cancellation. Generalise it — when a fix turns on a property of a suspension
+point, check the fake actually *has* that suspension point before believing any
+result about it.
