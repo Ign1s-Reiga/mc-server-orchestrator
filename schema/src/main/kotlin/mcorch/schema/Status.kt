@@ -198,10 +198,24 @@ public data class StorageStatus(
  * other a delivered save was silently re-sent to a live server. Splitting them
  * is what makes both voiders unconditional.
  *
- * Should a stored record ever carry both — a hand-repaired row, a document from
- * a build that did not know the rule — the reader is not made to fail. The drain
- * treats an unconfirmed request as the stronger signal and refuses to re-send,
- * which is the safe direction.
+ * No code path in this repository can produce a record with both set: the only
+ * writer of [worldSavedAt] is the branch that confirms a save, and it is only
+ * reachable when [saveRequestedAt] is already null. Disjointness is enforced by
+ * construction rather than by convention, which is the point of the split.
+ *
+ * Should a stored record carry both anyway — a hand-repaired row, a document
+ * from a build that did not know the rule — the reader is deliberately not made
+ * to fail. Refusing to decode would make the row unreconcilable, which is worse
+ * than reading it. What the drain then does depends on the state, and is worth
+ * knowing exactly rather than approximately:
+ *
+ * - In `SAVING` the unconfirmed request wins. The save is not re-sent, and the
+ *   drain aborts permanently for a human to resolve.
+ * - In `DEREGISTERED` and `STOPPING` the confirmation wins, because those states
+ *   consult [worldSavedAt] alone. A stop may follow — but only behind a current
+ *   confirmation, an unbroken chain of zero-player observations, and a fresh
+ *   zero-player probe taken on that same pass, so it is not a stop taken on the
+ *   strength of the contradictory row by itself.
  */
 public data class DrainStatus(
     val state: DrainState,

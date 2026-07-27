@@ -908,10 +908,13 @@ internal data class DrainProgress(
      *
      * A stop does not count: a stopped container is observable, so a lost record
      * of one costs a pass rather than a repeat. A save request is not
-     * observable, so [mcorch.schema.DrainStatus.saveRequestedAt] is the only
-     * thing standing between a lost write and a second save on a live server.
-     * The caller has to make that record durable even when the observation it
-     * belongs to is rejected.
+     * observable, so the record of one is the only thing standing between a lost
+     * write and a second save on a live server. Which field holds that record
+     * depends on how the save ended — [mcorch.schema.DrainStatus.saveRequestedAt]
+     * when it was delivered but never confirmed, and
+     * [mcorch.schema.DrainStatus.worldSavedAt] once the server reported it
+     * completed. Either way the caller has to make it durable, even when the
+     * observation it belongs to is rejected.
      */
     val sideEffectIssued: Boolean = false,
     /**
@@ -1034,9 +1037,13 @@ private fun DrainStatus.saveEvidenceProblem(containerStartedAt: Instant?): Strin
  * Voids everything this drain had established about getting the server empty and
  * on disk, **including the record of a save request that was delivered**.
  *
- * Called only from a pass that has just *observed* somebody on the server: the
- * three `requireEmpty` branches and the players-online branch of `awaitStopped`.
- * That observation is what justifies the last part. Clearing `saveRequestedAt`
+ * Called only from a pass that has just *observed* somebody on the server. There
+ * are exactly two such call sites — the players-online branch of `requireEmpty`
+ * and the players-online branch of `awaitStopped` — and the count is stated
+ * exactly on purpose: an earlier version of this comment claimed a set of
+ * callers it did not have, and a drain audit had to find that out the hard way.
+ * If you add a caller, it must be one that saw a player, and this sentence must
+ * change with it. That observation is what justifies the last part. Clearing `saveRequestedAt`
  * lifts the wedge that stops a delivered-but-unconfirmed save from ever being
  * re-sent — deliberately, because a player has been on the server since, which
  * makes the old request worth nothing, and because the fresh save that follows
