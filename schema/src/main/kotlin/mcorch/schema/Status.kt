@@ -254,6 +254,31 @@ public enum class ConditionType {
     DRAINING,
     PLAYERS_EVACUATED,
     WORLD_SAVED,
+
+    /**
+     * This server is not going to fix itself and a human has to look at it.
+     *
+     * A condition rather than a [FailureReason] on purpose. A reason answers
+     * *why*, and the why is unchanged by the passage of time: a drain blocked on
+     * an unreachable RCON listener is `DRAIN_STALLED` at minute one and at
+     * minute twenty, so spending the reason on the escalation would throw away
+     * the only field that says what to actually fix. What changes is how long it
+     * has been true, and [StatusCondition.lastTransitionAt] records exactly that
+     * — which is what an alert wants to fire on.
+     *
+     * **It reports; it never authorises anything.** Nothing branches on it. A
+     * drain that needs attention keeps its failure class, keeps being retried,
+     * and keeps its container running: at a limit you stop trying, you do not
+     * stop a Minecraft server (`failure-modes.md` item 7).
+     *
+     * Set today only by a drain that has been failing retryably for longer than
+     * `ReconcilerConfig.drainAttentionAfter`, and never by one blocked on
+     * players being online — that is the protocol working, and an escalation
+     * that fires on a busy evening teaches operators to ignore the signal. The
+     * name is deliberately general: a permanently failed bring-up is the obvious
+     * next thing to raise it, and doing so needs no schema change.
+     */
+    NEEDS_ATTENTION,
 }
 
 public enum class ConditionStatus {
