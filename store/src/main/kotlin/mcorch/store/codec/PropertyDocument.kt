@@ -44,6 +44,30 @@ internal object PropertyDocument {
     /**
      * Bumped only if this encoding changes shape. Stored next to every document so
      * an older binary refuses a newer document instead of misreading it.
+     *
+     * ## Before bumping this
+     *
+     * A bump needs a plan for the documents already on disk — a migration that
+     * reads the old encoding and rewrites it — because nothing else converts them.
+     * Until that plan exists `MigrationTest` fails wholesale, and **the failure is
+     * the point rather than a bug in the tests**: its fixtures label legacy rows
+     * with this constant, while schema version 3 is pinned to the literal `1`, so a
+     * bump makes every legacy fixture a row that migration refuses to read. Do not
+     * chase those failures one at a time. Note the asymmetry a bump has to keep:
+     * the read path checks this live constant, because a binary should read only
+     * what it understands, while a migration pins the literal it was written
+     * against, because a shipped migration must keep asking the same question.
+     *
+     * One test will *not* fail and has to be moved by hand — the "an encoding
+     * version 3 does not understand" fixture is pinned to `2`, which a bump to 2
+     * turns into the current encoding rather than an unknown one. It keeps passing,
+     * having quietly stopped testing what its name says. Move it to the next unused
+     * value.
+     *
+     * That pin is only half-testable while this stays at 1: un-pinning version 3
+     * today fails nothing, so the test suite read on its own suggests the pin is
+     * untested and safe to delete. It is the bump that makes it bite, which is why
+     * this is recorded here rather than left to the tests to say.
      */
     const val ENCODING_VERSION: Int = 1
 

@@ -48,7 +48,13 @@ internal data class MigrationReport(
  *
  * 1. Write a `V4Something : Migration` below with `version = 4`.
  * 2. Append it to [ALL]. Do not renumber, do not reorder, do not touch V1, V2 or V3.
- * 3. Add a case to the migration test: write data through the store at the previous
+ * 3. If it reads a stored document, it must check `doc_encoding` against a frozen
+ *    literal and refuse anything else, rather than parse whatever is on disk.
+ *    [V3SplitWorldSavedInstant] is the worked example, down to why the literal is
+ *    not `PropertyDocument.ENCODING_VERSION`. [V2StatusDrainProjection] has no such
+ *    check because it shipped before the rule, which is a grandfathered gap and not
+ *    a precedent.
+ * 4. Add a case to the migration test: write data through the store at the previous
  *    version, migrate, assert every field is still there and anything new is
  *    correctly derived from the data that was already on disk.
  *
@@ -244,6 +250,16 @@ private object V1BaseSchema : Migration {
  * `PaperServerStatus`: this migration has to keep producing the same result years
  * from now, and that is only true if it depends on the `drain.state` key rather
  * than on whatever `:schema` looks like at the time it runs.
+ *
+ * **It has no encoding guard, and is deliberately not being given one.** It parses
+ * `status_doc` with today's parser whatever `doc_encoding` says, where
+ * [V3SplitWorldSavedInstant] refuses a row at an encoding it was not written
+ * against. This one predates that guard, and retrofitting it would turn a
+ * migration that has already succeeded on real disks into one that refuses —
+ * exactly the change "never edited once shipped" exists to prevent. The gap stays
+ * theoretical while encoding 1 is the only one ever written, and a store past
+ * version 2 never runs this again. So: do not "fix" it. New migrations carry the
+ * guard instead; see [Migrations].
  */
 private object V2StatusDrainProjection : Migration {
     override val version: Int = 2
