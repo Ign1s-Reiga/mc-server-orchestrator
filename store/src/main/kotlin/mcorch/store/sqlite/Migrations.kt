@@ -306,6 +306,10 @@ private object V2StatusDrainProjection : Migration {
  * The key is removed in every case, so nothing downstream can read the flag by
  * accident.
  *
+ * A row carrying the old flag *and* a `worldSavedAt` is refused, because no code
+ * that wrote these rows could produce one and this migration cannot tell which of
+ * the two confirmations an operator meant.
+ *
  * Like [V2StatusDrainProjection] this works at the key level and never builds a
  * `:schema` object — it has to keep producing the same result after `DrainStatus`
  * moves again. It does use the document codec to re-render, so it asserts the
@@ -320,6 +324,22 @@ private object V3SplitWorldSavedInstant : Migration {
     private const val REQUESTED = "drain.saveRequestedAt"
     private const val CONFIRMED = "drain.worldSavedAt"
 
+    /**
+     * The document encoding this migration was written against, pinned as a
+     * literal on purpose rather than read from [PropertyDocument.ENCODING_VERSION].
+     *
+     * It reads like a magic number, so: a shipped migration is history and the
+     * question it asks has to stay the same question for ever. Asked against the
+     * live constant it becomes *today's* question instead, and the day the
+     * encoding is bumped this migration starts refusing exactly the rows it was
+     * written to rewrite — every store still at version 2 stops opening, on an
+     * upgrade path nobody edited. Loud and lossless, but stranded. That is the
+     * "never edit a shipped migration" rule broken without anyone editing
+     * anything. Handling a later encoding is the job of the migration that
+     * introduces it.
+     */
+    private const val ENCODING_WRITTEN_AGAINST = 1
+
     override fun apply(connection: Connection) {
         val rewritten = mutableListOf<Pair<String, String>>()
         connection.query("SELECT name, status_doc, doc_encoding FROM server_status") { rows ->
@@ -327,19 +347,19 @@ private object V3SplitWorldSavedInstant : Migration {
                 val name = rows.getString("name")
                 val encoding = rows.getInt("doc_encoding")
                 val what = "status of `$name`"
-                if (encoding != PropertyDocument.ENCODING_VERSION) {
+                if (encoding != ENCODING_WRITTEN_AGAINST) {
                     // Loudly, and before anything is written: a migration that
                     // skipped rows it did not recognise would leave some drains
                     // reading a confirmed save as an outstanding request, which
                     // is the whole failure this exists to prevent.
                     throw StoreException.Corrupt(
                         "$what is encoded at version $encoding, but this migration only understands " +
-                            "${PropertyDocument.ENCODING_VERSION}",
+                            "$ENCODING_WRITTEN_AGAINST",
                     )
                 }
                 val document = PropertyDocument.parse(rows.getString("status_doc"), what)
                 if (!document.has(FLAG)) continue
-                rewritten += name to rewrite(document)
+                rewritten += name to rewrite(document, what)
             }
         }
         for ((name, document) in rewritten) {
@@ -350,13 +370,33 @@ private object V3SplitWorldSavedInstant : Migration {
         }
     }
 
-    private fun rewrite(document: DocumentReader): String {
+    private fun rewrite(
+        document: DocumentReader,
+        what: String,
+    ): String {
         val confirmed = document.string(FLAG) == true.toString()
         val requestedAt = document.string(REQUESTED)
         val writer = DocumentWriter()
         for (key in document.keys()) {
             if (key == FLAG || key == REQUESTED) continue
             writer.put(key, document.string(key))
+        }
+        // The copy loop above already carried any existing `CONFIRMED` across, so
+        // the branch below would write a second one on top of it and trip
+        // `DocumentWriter`'s duplicate-key guard — leaving an
+        // `IllegalArgumentException` to cross the store boundary, where `:core`
+        // has only `StoreException.retryable` to classify a failure by. Refuse in
+        // the store's own vocabulary instead, on exactly the condition that would
+        // have collided so the decision table below keeps its behaviour, and name
+        // the row: a store that will not open is the moment an operator most
+        // needs to be told which row to go and look at.
+        if (confirmed && requestedAt != null && document.has(CONFIRMED)) {
+            throw StoreException.Corrupt(
+                "$what carries both `$FLAG` and `$CONFIRMED`. Nothing that wrote these rows could " +
+                    "produce that combination, so the row has been edited by hand and this migration " +
+                    "cannot tell which of the two confirmations is the real one. Refusing to guess: " +
+                    "remove one of the two keys and open the store again",
+            )
         }
         when {
             confirmed && requestedAt != null -> writer.put(CONFIRMED, requestedAt)
