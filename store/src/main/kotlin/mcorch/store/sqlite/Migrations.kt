@@ -1,6 +1,8 @@
 package mcorch.store.sqlite
 
 import mcorch.store.StoreException
+import mcorch.store.codec.DocumentReader
+import mcorch.store.codec.DocumentWriter
 import mcorch.store.codec.PropertyDocument
 import org.slf4j.LoggerFactory
 import java.sql.Connection
@@ -42,13 +44,13 @@ internal data class MigrationReport(
 /**
  * The ordered migration list and the runner that applies it.
  *
- * ## Adding version 3
+ * ## Adding version 4
  *
- * 1. Write a `V3Something : Migration` below with `version = 3`.
- * 2. Append it to [ALL]. Do not renumber, do not reorder, do not touch V1 or V2.
- * 3. Add a case to the migration test: write data through the store at version 2,
- *    migrate, assert every field is still there and any new column is correctly
- *    derived from the data that was already on disk.
+ * 1. Write a `V4Something : Migration` below with `version = 4`.
+ * 2. Append it to [ALL]. Do not renumber, do not reorder, do not touch V1, V2 or V3.
+ * 3. Add a case to the migration test: write data through the store at the previous
+ *    version, migrate, assert every field is still there and anything new is
+ *    correctly derived from the data that was already on disk.
  *
  * A store whose recorded version is *higher* than [latest] is refused outright.
  * An older binary that reinterpreted a newer layout would be the one failure mode
@@ -57,7 +59,7 @@ internal data class MigrationReport(
 internal object Migrations {
     private val logger = LoggerFactory.getLogger(Migrations::class.java)
 
-    val ALL: List<Migration> = listOf(V1BaseSchema, V2StatusDrainProjection)
+    val ALL: List<Migration> = listOf(V1BaseSchema, V2StatusDrainProjection, V3SplitWorldSavedInstant)
 
     val latest: Int = ALL.maxOf { it.version }
 
@@ -267,5 +269,100 @@ private object V2StatusDrainProjection : Migration {
         connection.execute(
             "CREATE INDEX server_status_drain_state ON server_status (drain_state) WHERE drain_state IS NOT NULL",
         )
+    }
+}
+
+/**
+ * Splits `drain.saveRequestedAt` into "a request is outstanding" and "a save
+ * completed at", which used to be the same key discriminated by
+ * `drain.worldSaved`.
+ *
+ * **This needs a migration even though no column changes.** The document format
+ * treats an absent key as null, so a new key is free on disk — but the *meaning*
+ * of an existing key changed, and that is not free. A row written before this
+ * with `worldSaved=true, saveRequestedAt=T` says *a save completed at T*. Read
+ * by the new code, which no longer looks at the flag, the same bytes say *a
+ * request went out at T and was never confirmed* — the drain's permanent-wedge
+ * condition. Every in-flight drain holding a confirmed save would come back from
+ * an upgrade needing a human, and the operator would be told to go and verify a
+ * world that was already on disk.
+ *
+ * So each status document is rewritten:
+ *
+ * - `worldSaved=true` → `worldSavedAt` takes the old `saveRequestedAt` value and
+ *   `saveRequestedAt` is dropped. The two are disjoint now: a confirmed save has
+ *   no outstanding request, and leaving the old key would re-create the same
+ *   inversion one field over.
+ * - `worldSaved=false` → `saveRequestedAt` is left exactly as it is. That is the
+ *   wedge, and it must survive an upgrade or a delivered-but-unconfirmed save
+ *   gets re-sent to a live server on the next pass.
+ * - `worldSaved=true` with no `saveRequestedAt` — no instant to carry, so the
+ *   confirmation is dropped rather than invented. The drain saves again, which
+ *   costs one `save-all flush` on a server it has already confirmed empty. No
+ *   combination of the code that wrote these rows produces this; it is here so
+ *   that a hand-repaired row degrades toward saving again rather than toward
+ *   stopping on evidence nobody can date.
+ *
+ * The key is removed in every case, so nothing downstream can read the flag by
+ * accident.
+ *
+ * Like [V2StatusDrainProjection] this works at the key level and never builds a
+ * `:schema` object — it has to keep producing the same result after `DrainStatus`
+ * moves again. It does use the document codec to re-render, so it asserts the
+ * encoding it was written against rather than silently rewriting a shape it does
+ * not understand.
+ */
+private object V3SplitWorldSavedInstant : Migration {
+    override val version: Int = 3
+    override val description: String = "split a confirmed world save out of the save-request timestamp"
+
+    private const val FLAG = "drain.worldSaved"
+    private const val REQUESTED = "drain.saveRequestedAt"
+    private const val CONFIRMED = "drain.worldSavedAt"
+
+    override fun apply(connection: Connection) {
+        val rewritten = mutableListOf<Pair<String, String>>()
+        connection.query("SELECT name, status_doc, doc_encoding FROM server_status") { rows ->
+            while (rows.next()) {
+                val name = rows.getString("name")
+                val encoding = rows.getInt("doc_encoding")
+                val what = "status of `$name`"
+                if (encoding != PropertyDocument.ENCODING_VERSION) {
+                    // Loudly, and before anything is written: a migration that
+                    // skipped rows it did not recognise would leave some drains
+                    // reading a confirmed save as an outstanding request, which
+                    // is the whole failure this exists to prevent.
+                    throw StoreException.Corrupt(
+                        "$what is encoded at version $encoding, but this migration only understands " +
+                            "${PropertyDocument.ENCODING_VERSION}",
+                    )
+                }
+                val document = PropertyDocument.parse(rows.getString("status_doc"), what)
+                if (!document.has(FLAG)) continue
+                rewritten += name to rewrite(document)
+            }
+        }
+        for ((name, document) in rewritten) {
+            connection.update("UPDATE server_status SET status_doc = ? WHERE name = ?") {
+                setString(1, document)
+                setString(2, name)
+            }
+        }
+    }
+
+    private fun rewrite(document: DocumentReader): String {
+        val confirmed = document.string(FLAG) == true.toString()
+        val requestedAt = document.string(REQUESTED)
+        val writer = DocumentWriter()
+        for (key in document.keys()) {
+            if (key == FLAG || key == REQUESTED) continue
+            writer.put(key, document.string(key))
+        }
+        when {
+            confirmed && requestedAt != null -> writer.put(CONFIRMED, requestedAt)
+            !confirmed && requestedAt != null -> writer.put(REQUESTED, requestedAt)
+            else -> Unit
+        }
+        return writer.render()
     }
 }

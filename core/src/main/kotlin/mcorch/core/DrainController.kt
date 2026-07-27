@@ -154,7 +154,7 @@ internal class DrainController(
                 "server={} has a world save confirmed at {} that is no longer evidence: the container now " +
                     "running started at {} and a probe last answered at {}. The drain will save again",
                 definition.metadata.name,
-                recorded.saveRequestedAt,
+                recorded.worldSavedAt,
                 observation.startedAt,
                 lastProbedAt,
             )
@@ -515,9 +515,11 @@ internal class DrainController(
         val server = pass.server
         if (!contract.holdsWorldData) {
             // Ephemeral storage: the operator asked for a disposable instance
-            // by name, and there is no world to flush. `worldSaved` stays false
-            // because nothing was saved — saying otherwise would make a status
-            // read claim evidence that does not exist.
+            // by name, and there is no world to flush. `worldSavedAt` stays
+            // null because nothing was saved — stamping it would make a status
+            // read claim evidence that does not exist, and `mayStop` lets this
+            // container through on `holdsWorldData` alone rather than on a
+            // confirmation it never got.
             //
             // Read off the container, not off the definition: an edit from
             // `persistent` to `ephemeral` must not turn the drain of a container
@@ -560,10 +562,14 @@ internal class DrainController(
                     drain =
                         drain
                             .moveTo(DrainState.DEREGISTERED, now)
-                            // `saveRequestedAt` doubles as *when* the completion
-                            // was confirmed — see [saveConfirmedAt]. Both are
-                            // stamped with this pass's instant, together.
-                            .copy(saveRequestedAt = now, worldSaved = true),
+                            // The request is no longer outstanding — it came
+                            // back, and the server said the save finished — so
+                            // the wedge is released and the confirmation takes
+                            // its place. The two are disjoint on purpose: a
+                            // confirmation left sitting beside its own request
+                            // timestamp is what used to make the next `SAVING`
+                            // read a completed save as one that never returned.
+                            .copy(saveRequestedAt = null, worldSavedAt = now),
                     occupancy = occupancy,
                     saveConfirmedAt = now,
                     sideEffectIssued = true,
@@ -918,20 +924,6 @@ internal data class DrainProgress(
 )
 
 /**
- * When this drain's completed save was confirmed, or null if it has no
- * confirmation.
- *
- * `worldSaved` is set only when the server itself reported a *completed* save,
- * never when one was merely requested — and it is stamped together with
- * `saveRequestedAt`, so that field carries the confirmation instant whenever
- * `worldSaved` is true. Reading a time out of a field named for a request is not
- * lovely; the alternative is a `worldSavedAt` on [DrainStatus], which lives in
- * `:schema`. Worth adding there, and the only thing that would change here is
- * this one accessor.
- */
-internal fun DrainStatus.saveConfirmedAt(): Instant? = if (worldSaved) saveRequestedAt else null
-
-/**
  * Whether this drain's save confirmation still describes what is on disk.
  *
  * Two ways it stops describing it, and both have to be checked because they fail
@@ -955,7 +947,7 @@ internal fun DrainStatus.saveIsCurrent(
     now: Instant,
     maxAge: Duration,
 ): Boolean {
-    val confirmed = saveConfirmedAt() ?: return false
+    val confirmed = worldSavedAt ?: return false
     if (containerStartedAt != null) return !confirmed.isBefore(containerStartedAt)
     // No start time to compare against, so the container-restart half of the
     // rule has nothing to say and only a *fresh* confirmation counts. Reading
@@ -1004,10 +996,10 @@ private fun DrainStatus.mayStop(
  *   stops a restarted loop stopping a server on a confirmation from before it
  *   went down.
  *
- * `saveRequestedAt` goes with the flag, because it doubles as the confirmation
- * instant: leaving it behind would make the re-entered save read as "a request
- * went out and was never confirmed" and abort permanently on a save that
- * actually completed.
+ * Only the confirmation goes. `saveRequestedAt` is not touched and does not need
+ * to be: the two are disjoint, so a drain holding a confirmation has no
+ * outstanding request to leave behind. That used to be one field, and clearing
+ * it here was load-bearing for exactly the reason it no longer is.
  */
 internal fun DrainStatus.dropUnusableSaveEvidence(
     containerStartedAt: Instant?,
@@ -1015,20 +1007,20 @@ internal fun DrainStatus.dropUnusableSaveEvidence(
     now: Instant,
     maxGap: Duration,
 ): DrainStatus {
-    if (!worldSaved) return this
+    if (worldSavedAt == null) return this
     val watched =
         lastProbedAt != null &&
             !JavaDuration.between(lastProbedAt, now).toKotlinDuration().let { it > maxGap || it.isNegative() }
     return if (saveIsCurrent(containerStartedAt, now, maxGap) && watched) {
         this
     } else {
-        copy(worldSaved = false, saveRequestedAt = null)
+        copy(worldSavedAt = null)
     }
 }
 
 /** Why the save evidence is not good enough to stop on, for an operator-facing message. */
 private fun DrainStatus.saveEvidenceProblem(containerStartedAt: Instant?): String {
-    val confirmed = saveConfirmedAt()
+    val confirmed = worldSavedAt
     return if (confirmed == null) {
         "no completed world save has been confirmed for the container that has been running since " +
             "$containerStartedAt"
@@ -1057,11 +1049,7 @@ private fun DrainStatus.saveEvidenceProblem(containerStartedAt: Instant?): Strin
  * second `save-all flush` to a live server. Use [forgetSaveConfirmation].
  */
 internal fun DrainStatus.forgetSaveEvidence(): DrainStatus =
-    if (!worldSaved && saveRequestedAt == null && !playersEvacuated) {
-        this
-    } else {
-        copy(worldSaved = false, saveRequestedAt = null, playersEvacuated = false)
-    }
+    copy(worldSavedAt = null, saveRequestedAt = null, playersEvacuated = false)
 
 /**
  * Voids what this drain had established, and keeps the record of a request whose
@@ -1071,30 +1059,19 @@ internal fun DrainStatus.forgetSaveEvidence(): DrainStatus =
  * that would make a delivered save request worthless — a probe that did not
  * answer, or a runtime that has stopped reporting a container.
  *
- * **`saveRequestedAt` carries two different facts, and only [worldSaved] says
- * which.** Getting this wrong wedges a healthy drain or repeats a side effect,
- * so the two are separated here rather than at either call site:
+ * The difference from [forgetSaveEvidence] is one field: `saveRequestedAt`
+ * survives here. That is the wedge keeping a second `save-all flush` off a live
+ * server (CLAUDE.md invariant 5), and only *observing a player* may lift it,
+ * because only that makes the old request worthless. A pass that saw nothing has
+ * no grounds.
  *
- * - [worldSaved] **true** — the field is the instant a *completed* save was
- *   confirmed (see [saveConfirmedAt]). What expired is the confirmation, not the
- *   request: the save finished, so asking for another one is an ordinary step
- *   and not a repeat of an outstanding side effect. Both go, exactly as
- *   [dropUnusableSaveEvidence] does and for the reason documented there —
- *   leaving the timestamp behind would make the re-entered save read as "a
- *   request went out and was never confirmed" and abort permanently on a save
- *   that actually completed.
- * - [worldSaved] **false** — the field is the record of a request that was
- *   delivered and never confirmed. That is the wedge keeping a second
- *   `save-all flush` off a live server (CLAUDE.md invariant 5), and only
- *   observing a *player* may lift it, because only that makes the old request
- *   worthless. It stays, and the drain still needs a human.
+ * Both are unconditional now. They used to have to ask `worldSaved` which fact
+ * `saveRequestedAt` was carrying before they could decide what to clear, and
+ * each of them got that question wrong once: this one wedged a healthy drain by
+ * keeping a confirmation's timestamp, and the other lifted the wedge on a
+ * delivered save. Neither can ask any more, because there is nothing to ask.
  */
-internal fun DrainStatus.forgetSaveConfirmation(): DrainStatus =
-    when {
-        worldSaved -> copy(worldSaved = false, saveRequestedAt = null, playersEvacuated = false)
-        playersEvacuated -> copy(playersEvacuated = false)
-        else -> this
-    }
+internal fun DrainStatus.forgetSaveConfirmation(): DrainStatus = copy(worldSavedAt = null, playersEvacuated = false)
 
 /** Moves to a new state, stamping the transition. Re-entering the same state does not restamp. */
 private fun DrainStatus.moveTo(

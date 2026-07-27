@@ -3,6 +3,7 @@ package mcorch.core
 import io.kotest.matchers.booleans.shouldBeFalse
 import io.kotest.matchers.booleans.shouldBeTrue
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.shouldNotBe
 import mcorch.schema.DrainState
 import mcorch.schema.DrainStatus
 import org.junit.jupiter.api.Test
@@ -27,6 +28,13 @@ internal class SaveEvidenceTest {
     private val start = Instant.parse("2026-07-26T10:00:00Z")
     private val gap = 30.seconds
 
+    /**
+     * A drain holding a confirmed save, or none.
+     *
+     * `saveRequestedAt` stays null throughout: a confirmed save has no
+     * outstanding request. That used to be the same field as this one, which is
+     * what these tests exist to stop happening again.
+     */
     private fun drain(
         confirmedAt: Instant?,
         state: DrainState = DrainState.DEREGISTERED,
@@ -35,10 +43,7 @@ internal class SaveEvidenceTest {
         startedAt = start,
         enteredStateAt = start,
         playersEvacuated = true,
-        worldSaved = confirmedAt != null,
-        // Stamped together with the flag, which is what makes it the
-        // confirmation instant. See `saveConfirmedAt`.
-        saveRequestedAt = confirmedAt,
+        worldSavedAt = confirmedAt,
     )
 
     @Test
@@ -96,9 +101,11 @@ internal class SaveEvidenceTest {
                 confirmed,
             ).dropUnusableSaveEvidence(containerStarted, watching, watching.plus(java.time.Duration.ofMinutes(30)), gap)
         afterOutage.worldSaved.shouldBeFalse()
-        // The request stamp goes with the flag, or the re-entered save would
-        // read as "requested once, never confirmed" and abort permanently on a
-        // save that actually completed.
+        // And no outstanding request is left behind for the re-entered save to
+        // trip over. It does not have to be cleared here any more — a confirmed
+        // save never had one — but the property is what matters: a drain that
+        // has lost its confirmation must be able to save again, and one holding
+        // a request stamp cannot.
         afterOutage.saveRequestedAt shouldBe null
 
         // Nothing was ever observed, so there is no chain to speak of.
@@ -127,43 +134,56 @@ internal class SaveEvidenceTest {
     }
 
     /**
-     * `saveRequestedAt` means two different things and only `worldSaved` says
-     * which, so the pass that cannot vouch for the world any more has to answer
-     * differently for each. Both errors are silent:
+     * The two voiders differ by exactly one field, and by nothing else.
      *
-     * - keeping the timestamp of a *confirmed* save wedges a healthy drain,
-     *   because the next `SAVING` reads it as a request that never came back and
-     *   aborts permanently on a save that actually completed;
-     * - dropping the timestamp of an *unconfirmed* one lifts the wedge that
-     *   keeps a second `save-all flush` off a live server.
+     * This replaces a test that pinned which fact `saveRequestedAt` was carrying
+     * and how each voider had to branch on `worldSaved` to find out. There is no
+     * branch left to test — that is the point of splitting the fields — so what
+     * is worth pinning now is the *difference*, because it is the whole safety
+     * argument:
+     *
+     * - a pass that observed **nobody** may drop the confirmation but must leave
+     *   the outstanding request alone, or a delivered `save-all flush` is sent a
+     *   second time to a live server;
+     * - a pass that observed **a player** drops both, because whatever they did
+     *   makes the old request worth nothing and the drain has to save again
+     *   before it can reach a stop.
+     *
+     * Applied to both kinds of drain, so neither voider can quietly acquire a
+     * dependency on which field happens to be set.
      */
     @Test
-    fun `forgetting a confirmation keeps an unconfirmed request and discards a completed one`() {
-        // Delivered, never confirmed: the wedge. It must survive, because this
-        // pass observed nobody and so has no grounds to lift it.
+    fun `only a pass that saw a player may clear an outstanding save request`() {
         val requested = start.plusSeconds(60)
         val delivered = drain(null).copy(saveRequestedAt = requested)
-
-        val afterFailedProbe = delivered.forgetSaveConfirmation()
-
-        afterFailedProbe.saveRequestedAt shouldBe requested
-        afterFailedProbe.worldSaved.shouldBeFalse()
-        afterFailedProbe.playersEvacuated.shouldBeFalse()
-
-        // Confirmed, then outlived: the request finished, so there is no
-        // outstanding side effect to protect and the drain simply saves again.
         val confirmed = drain(start.plusSeconds(60))
 
-        val afterExpiry = confirmed.forgetSaveConfirmation()
+        // Observed nobody: the request survives, whichever kind of drain it is.
+        delivered.forgetSaveConfirmation().saveRequestedAt shouldBe requested
+        delivered.forgetSaveConfirmation().worldSaved.shouldBeFalse()
+        confirmed.forgetSaveConfirmation().saveRequestedAt shouldBe null
+        confirmed.forgetSaveConfirmation().worldSaved.shouldBeFalse()
 
-        afterExpiry.worldSaved.shouldBeFalse()
-        afterExpiry.saveRequestedAt shouldBe null
-        afterExpiry.playersEvacuated.shouldBeFalse()
+        // Observed a player: everything goes, whichever kind of drain it is.
+        delivered.forgetSaveEvidence().saveRequestedAt shouldBe null
+        delivered.forgetSaveEvidence().worldSaved.shouldBeFalse()
+        confirmed.forgetSaveEvidence().saveRequestedAt shouldBe null
+        confirmed.forgetSaveEvidence().worldSaved.shouldBeFalse()
 
-        // Nothing to forget is left untouched, so an unchanged status does not
-        // become a store write.
+        // The claim that the server was empty goes either way: it was only ever
+        // true of the moment it was taken.
+        delivered.forgetSaveConfirmation().playersEvacuated.shouldBeFalse()
+        confirmed.forgetSaveEvidence().playersEvacuated.shouldBeFalse()
+
+        // The one field they disagree about, stated as such.
+        confirmed.forgetSaveConfirmation() shouldBe confirmed.forgetSaveEvidence()
+        delivered.forgetSaveConfirmation() shouldNotBe delivered.forgetSaveEvidence()
+
+        // Nothing to forget still compares equal, so an unchanged status does
+        // not become a store write.
         val nothing = drain(null).copy(playersEvacuated = false)
         nothing.forgetSaveConfirmation() shouldBe nothing
+        nothing.forgetSaveEvidence() shouldBe nothing
     }
 
     @Test

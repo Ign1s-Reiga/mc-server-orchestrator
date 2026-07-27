@@ -1,6 +1,7 @@
 package mcorch.store.sqlite
 
 import io.kotest.matchers.collections.shouldContainExactly
+import io.kotest.matchers.nulls.shouldBeNull
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
@@ -9,6 +10,8 @@ import kotlinx.coroutines.test.runTest
 import mcorch.schema.DrainState
 import mcorch.schema.PaperServerDefinition
 import mcorch.schema.PaperServerStatus
+import mcorch.schema.SchemaVersion
+import mcorch.schema.ServerKind
 import mcorch.schema.ServerPhase
 import mcorch.store.ChangeFeed
 import mcorch.store.ChangeKind
@@ -68,7 +71,7 @@ class MigrationTest {
             appliedVersions(directory) shouldBe listOf(1)
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3)
 
                 val servers = migrated.state.listServers().associateBy { it.name.value }
                 servers.keys shouldBe setOf("survival-a", "survival-b", "survival-c")
@@ -173,7 +176,7 @@ class MigrationTest {
             }
 
             stores.open(directory).use { second ->
-                appliedVersions(directory) shouldBe listOf(1, 2)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3)
                 second.state.listServers().map { it.name.value } shouldBe listOf("survival-a")
             }
         }
@@ -222,6 +225,112 @@ class MigrationTest {
             }
         }
 
+    /**
+     * The inversion version 3 exists to prevent.
+     *
+     * Before it, a completed save was recorded as `worldSaved=true` plus
+     * `saveRequestedAt=T`. The new code does not look at the flag, so the same
+     * bytes read as *a request went out at T and was never confirmed* — the
+     * drain's permanent-wedge condition. Every in-flight drain holding a
+     * confirmed save would come back from the upgrade needing a human, and the
+     * operator would be told to go and verify a world already on disk.
+     *
+     * The old document is written **by hand**, key by key, not by today's codec.
+     * Round-tripping through the current encoder would write `worldSavedAt` and
+     * the test could not see the inversion at all.
+     */
+    @Test
+    fun `a save confirmed before version 3 still reads as confirmed, not as an outstanding request`() =
+        runTest {
+            val directory = stores.directory()
+            val confirmedAt = Instant.parse("2026-07-20T08:30:00Z")
+
+            writeVersion2Database(directory) { legacy ->
+                legacy.definition(Fixtures.definitionNamed("survival-a"), generation = 1L, revision = 1L)
+                legacy.definition(Fixtures.definitionNamed("survival-b"), generation = 1L, revision = 2L)
+                legacy.legacyStatus(
+                    name = "survival-a",
+                    revision = 3L,
+                    drainState = DrainState.DEREGISTERED,
+                    worldSaved = true,
+                    saveRequestedAt = confirmedAt,
+                )
+                // The wedge: a request that went out and never came back. It has
+                // to survive untouched, or the next pass sends a second
+                // `save-all flush` to a live server.
+                legacy.legacyStatus(
+                    name = "survival-b",
+                    revision = 4L,
+                    drainState = DrainState.SAVING,
+                    worldSaved = false,
+                    saveRequestedAt = confirmedAt,
+                )
+            }
+            appliedVersions(directory) shouldBe listOf(1, 2)
+
+            stores.open(directory).use { migrated ->
+                appliedVersions(directory) shouldBe listOf(1, 2, 3)
+
+                val confirmed = drainOf(migrated, "survival-a")
+                confirmed.worldSavedAt shouldBe confirmedAt
+                confirmed.worldSaved shouldBe true
+                // The old key must not linger as an outstanding request beside
+                // the confirmation, or the next `SAVING` wedges on it.
+                confirmed.saveRequestedAt.shouldBeNull()
+                confirmed.state shouldBe DrainState.DEREGISTERED
+
+                val wedged = drainOf(migrated, "survival-b")
+                wedged.saveRequestedAt shouldBe confirmedAt
+                wedged.worldSavedAt.shouldBeNull()
+                wedged.worldSaved shouldBe false
+                wedged.state shouldBe DrainState.SAVING
+            }
+        }
+
+    @Test
+    fun `version 3 leaves every other field of a drain alone`() =
+        runTest {
+            val directory = stores.directory()
+            writeVersion2Database(directory) { legacy ->
+                legacy.definition(Fixtures.definitionNamed("survival-a"), generation = 1L, revision = 1L)
+                legacy.legacyStatus(
+                    name = "survival-a",
+                    revision = 2L,
+                    drainState = DrainState.SAVING,
+                    worldSaved = false,
+                    saveRequestedAt = null,
+                )
+            }
+
+            stores.open(directory).use { migrated ->
+                val drain = drainOf(migrated, "survival-a")
+
+                // Everything the hand-written document carried, still there. A
+                // rewrite that dropped unrelated keys would be silent otherwise.
+                drain.startedAt shouldBe LEGACY_DRAIN_STARTED_AT
+                drain.enteredStateAt shouldBe LEGACY_DRAIN_ENTERED_AT
+                drain.sealRequestedAt shouldBe LEGACY_SEAL_REQUESTED_AT
+                drain.playersEvacuated shouldBe true
+                drain.transferAttempts shouldBe 4
+                drain.destination.shouldNotBeNull().value shouldBe "lobby-01"
+                drain.saveRequestedAt.shouldBeNull()
+                drain.worldSavedAt.shouldBeNull()
+            }
+        }
+
+    private suspend fun drainOf(
+        store: EmbeddedStore,
+        name: String,
+    ) = store.state
+        .getServer(Fixtures.resourceName(name))
+        .shouldNotBeNull()
+        .status
+        .shouldNotBeNull()
+        .status
+        .shouldBeInstanceOf<PaperServerStatus>()
+        .drain
+        .shouldNotBeNull()
+
     // ---------------------------------------------------------------- the old disk
 
     private fun writeVersion1Database(
@@ -237,9 +346,23 @@ class MigrationTest {
         }
     }
 
-    /** Inserts rows shaped the way version 1 of the schema shaped them. */
+    private fun writeVersion2Database(
+        directory: Path,
+        block: (LegacyWriter) -> Unit,
+    ) {
+        rawConnection(directory).use { connection ->
+            Migrations.migrate(connection, stores.clock, upTo = 2)
+            val writer = LegacyWriter(connection, hasDrainStateColumn = true)
+            block(writer)
+            writer.finish()
+            connection.commit()
+        }
+    }
+
+    /** Inserts rows shaped the way an older version of the schema shaped them. */
     private class LegacyWriter(
         private val connection: Connection,
+        private val hasDrainStateColumn: Boolean = false,
     ) {
         private var highest = 0L
 
@@ -301,6 +424,63 @@ class MigrationTest {
             highest = maxOf(highest, revision)
         }
 
+        /**
+         * A status document written key by key, the way version 2 wrote it —
+         * `drain.worldSaved` as a boolean, and the confirmation instant sharing
+         * `drain.saveRequestedAt`.
+         *
+         * Deliberately not `StatusCodec.encode`. The current encoder writes
+         * `drain.worldSavedAt` and no `drain.worldSaved` at all, so a test built
+         * on it would migrate a document that never needed migrating and would
+         * pass whatever version 3 did.
+         */
+        fun legacyStatus(
+            name: String,
+            revision: Long,
+            drainState: DrainState,
+            worldSaved: Boolean,
+            saveRequestedAt: Instant?,
+        ) {
+            val fields =
+                buildList {
+                    add("apiVersion" to SchemaVersion.CURRENT.wireValue)
+                    add("kind" to ServerKind.PAPER_SERVER.wireValue)
+                    add("name" to name)
+                    add("observedGeneration" to "1")
+                    add("phase" to ServerPhase.DRAINING.name)
+                    add("observedAt" to CREATED_AT.toString())
+                    add("lastTransitionAt" to CREATED_AT.toString())
+                    add("ready" to "false")
+                    add("drain.state" to drainState.name)
+                    add("drain.startedAt" to LEGACY_DRAIN_STARTED_AT.toString())
+                    add("drain.enteredStateAt" to LEGACY_DRAIN_ENTERED_AT.toString())
+                    add("drain.playersEvacuated" to "true")
+                    add("drain.worldSaved" to worldSaved.toString())
+                    add("drain.sealRequestedAt" to LEGACY_SEAL_REQUESTED_AT.toString())
+                    saveRequestedAt?.let { add("drain.saveRequestedAt" to it.toString()) }
+                    add("drain.transferAttempts" to "4")
+                    add("drain.destination" to "lobby-01")
+                }
+            val document = fields.sortedBy { it.first }.joinToString("\n") { "${it.first}=${it.second}" }
+            connection.update(
+                """
+                INSERT INTO server_status (
+                    name, api_version, kind, resource_version, recorded_at, status_doc, doc_encoding, drain_state
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """.trimIndent(),
+            ) {
+                setString(1, name)
+                setString(2, SchemaVersion.CURRENT.wireValue)
+                setString(3, ServerKind.PAPER_SERVER.wireValue)
+                setLong(4, revision)
+                setString(5, CREATED_AT.toString())
+                setString(6, document)
+                setInt(7, PropertyDocument.ENCODING_VERSION)
+                setString(8, drainState.name)
+            }
+            highest = maxOf(highest, revision)
+        }
+
         fun finish() {
             connection.update("UPDATE store_sequence SET next_revision = ? WHERE id = 0") { setLong(1, highest) }
         }
@@ -326,4 +506,10 @@ class MigrationTest {
         }
 
     private fun jdbcUrl(directory: Path): String = "jdbc:sqlite:${directory.resolve("state.db").toAbsolutePath()}"
+
+    private companion object {
+        val LEGACY_DRAIN_STARTED_AT: Instant = Instant.parse("2026-07-20T08:10:00Z")
+        val LEGACY_DRAIN_ENTERED_AT: Instant = Instant.parse("2026-07-20T08:20:00Z")
+        val LEGACY_SEAL_REQUESTED_AT: Instant = Instant.parse("2026-07-20T08:12:00Z")
+    }
 }
