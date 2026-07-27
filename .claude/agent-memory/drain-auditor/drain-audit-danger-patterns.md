@@ -141,15 +141,11 @@ merged are the ones below, which pass every check in that list.
    `DRAIN_SAVE_TIMEOUT` posture without a human. Check every call site of an
    evidence-voider against the *specific* justification in its doc comment, not
    against its name.
-   **Status as of round 5: half fixed.** `forgetSaveConfirmation` was added and
-   the `SANDBOX_ONLY` abort uses it, but *both* failed-probe branches of
-   `requireEmpty` still call `forgetSaveEvidence`, so any single unanswerable
-   probe still lifts the wedge. Raised as a warning, not critical: the drain
-   that follows still needs a freshly confirmed save and a fresh zero-player
-   probe before it can stop, so the re-send costs an extra `save-all flush`
-   rather than a world. The doc comment on `forgetSaveEvidence` claiming it is
-   "called only from a pass that has just observed somebody" is simply false —
-   read the call sites, not the comment.
+   **Status: closed at round 6.** `requireEmpty`'s unanswered branch and the
+   `SANDBOX_ONLY` abort both use `forgetSaveConfirmation`; `forgetSaveEvidence`
+   is called only from the two `probe.online > 0` branches. The check itself
+   stays: re-run the call-site enumeration on every change, because the doc
+   comment has been wrong before and its *count* of call sites is still stale.
 15. **A reclassification that splits one phase into two can restart a timer.**
    Mapping a previously-single failure onto two `ServerPhase`s makes a flapping
    input alternate phases, and `draftStatus` restamps `lastTransitionAt` on every
@@ -170,5 +166,45 @@ merged are the ones below, which pass every check in that list.
    whether the row is actually implemented somewhere else in the machine under a
    different trigger. See [[standalone-paper-drain-shape]] for the round-5
    ruling on "agent responds but the server does not".
+
+17. **Splitting one field into two has an asymmetric safe direction, and the
+   migration must be checked in both.** Two facts sharing one field
+   discriminated by a flag (`saveRequestedAt` + `worldSaved`) split cleanly only
+   if you also ask what a *stored* row becomes. One direction — a completed save
+   read back as an outstanding request — wedges every in-flight drain across an
+   upgrade and is loud. The other — an unconfirmed request read back as a
+   confirmation — authorises a stop and is silent. Find the literal comparison
+   that decides which branch a row takes (`document.string(FLAG) == "true"`) and
+   prove that *every* value it does not recognise, including absent and
+   corrupted, falls to the loud side. Then walk the migrated row through every
+   state of the machine, not just the two the tests cover.
+18. **A migration guard keyed on a live constant is not frozen.** A data
+   migration that refuses rows whose encoding `!= PropertyDocument.ENCODING_VERSION`
+   silently changes meaning the day that constant is bumped, and then refuses to
+   open every store that skipped the upgrade. Migrations are history: their
+   guards must compare against the literal they were written against. Same
+   family as "never edited once shipped", but it evades that rule because
+   nobody edits the file.
+19. **Removing a field from `equals` is safe only if it cannot vary
+   independently.** `Reconciler`'s write-skip is `status.copy(observedAt = ...) == previous`,
+   so anything excluded from `equals` is invisible to "has this changed". A
+   derived `val` in the class body (`worldSaved get() = worldSavedAt != null`) is
+   excluded automatically and is fine *because* it is a function of a constructor
+   property that is included. Whenever a field leaves the constructor, ask
+   whether two materially different objects can now compare equal — and, in the
+   other direction, whether a voider that was conditional and is now an
+   unconditional `copy` turns an unchanged status into a store write per pass. It
+   does not here, because the comparison is structural, but an identity check
+   anywhere on that path would make it one.
+20. **"That combination is impossible" has to be enforced by construction, and
+   the doc saying where an impossible row *lands* has to be checked per state.**
+   The disjointness of `saveRequestedAt` and `worldSavedAt` is real — `save()`
+   returns early whenever a request is outstanding, so the one line that sets
+   `worldSavedAt` is unreachable with one — but the KDoc claiming a both-set row
+   "reaches the `saveRequestedAt` check and refuses to re-send" is only true in
+   `SAVING`. In `DEREGISTERED` and `STOPPING` the confirmation wins and the
+   container stops. Deliberately not `require`d, because a throwing decoder makes
+   the row unreconcilable; that is the right call, but it means the prose is the
+   only spec and the prose must be state-by-state.
 
 Related: [[standalone-paper-drain-shape]]
