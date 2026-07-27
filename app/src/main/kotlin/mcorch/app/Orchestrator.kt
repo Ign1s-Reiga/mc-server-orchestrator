@@ -16,6 +16,7 @@ import mcorch.store.Store
 import mcorch.store.sqlite.EmbeddedStore
 import mcorch.store.sqlite.EmbeddedStoreConfig
 import org.slf4j.LoggerFactory
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Everything wired together, and the only place that decides what "everything"
@@ -44,6 +45,9 @@ public class Orchestrator private constructor(
     public val reconciler: Reconciler,
     private val loop: ReconcileLoop,
 ) : AutoCloseable {
+    /** Whether [run] is between its first and last instruction. Read by [close]. */
+    private val running = AtomicBoolean(false)
+
     /**
      * Runs the reconcile loop until the calling coroutine is cancelled.
      *
@@ -63,7 +67,15 @@ public class Orchestrator private constructor(
      * minute into an integration run and made a five-minute timeout in the test
      * never fire, because the timer had no thread to fire on.
      */
-    public suspend fun run(): Unit = withContext(Dispatchers.Default) { loop.run() }
+    public suspend fun run(): Unit =
+        withContext(Dispatchers.Default) {
+            running.set(true)
+            try {
+                loop.run()
+            } finally {
+                running.set(false)
+            }
+        }
 
     /**
      * Closes the node and then the store.
@@ -73,12 +85,32 @@ public class Orchestrator private constructor(
      * Both are closed even if the first throws — a leaked SQLite handle leaves a
      * locked database behind, which is a worse morning than a leaked socket.
      *
+     * **It must not be called while [run] is still running**, and that is a
+     * correctness requirement rather than tidiness. A pass that has issued a save
+     * request records it under `NonCancellable` precisely so a shutdown cannot
+     * lose it; a store closed underneath that write loses it anyway, and the next
+     * process sends a second `save-all flush` to a running server. `main` gets
+     * this right by joining the loop first.
+     *
+     * The violation is *reported* rather than refused. Refusing would mean
+     * declining to close a SQLite handle, and a locked database left behind is a
+     * worse outcome than the one being guarded against — so this closes anyway
+     * and says loudly that a record may have been lost.
+     *
      * **Nothing here stops a container.** Shutting the orchestrator down is not
      * a request to stop the servers it manages: they keep running, and the next
      * process to start reconciles them back into its view of the world. A stop
      * only ever comes from the drain protocol.
      */
     override fun close() {
+        if (running.get()) {
+            LOG.error(
+                "the orchestrator is being closed while its reconcile loop is still running. Cancel the loop and " +
+                    "join it first: a pass that has just issued a world save records that fact through the " +
+                    "store, and closing it underneath that write means the next process saves the same world " +
+                    "again",
+            )
+        }
         try {
             node.close()
         } finally {
