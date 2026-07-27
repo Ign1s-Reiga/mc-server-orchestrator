@@ -1,5 +1,22 @@
 plugins {
     id("mcorch.kotlin-conventions")
+
+    // The example definitions under src/testFixtures/resources are shared: they
+    // are this module's test data *and* the only copy :store's round-trip tests
+    // read. They used to be reached by pointing :store's test resources at
+    // ../schema/src/test/resources, which worked but made another module's tests
+    // depend on this one's fixture layout with nothing at this end to say so.
+    //
+    // As test fixtures the sharing is declared instead. Consumers ask for the
+    // `schema-test-fixtures` capability explicitly; a reorganisation here is a
+    // change to a thing this module publishes, not an invisible break elsewhere.
+    //
+    // This does not widen :schema's API. The plugin adds source sets and two new
+    // variants; it puts nothing on the main compile classpath, and the fixture
+    // variant is only selected by `testFixtures(project(":schema"))`. A plain
+    // `project(":schema")` dependency — what :core, :api and :app have — resolves
+    // exactly as before.
+    id("java-test-fixtures")
 }
 
 // Server-definition types (the CRD equivalent) + YAML parsing and validation.

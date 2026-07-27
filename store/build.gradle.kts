@@ -27,14 +27,14 @@ dependencies {
     implementation(libs.sqlite.jdbc)
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.slf4j.api)
-}
 
-// The store's tests round-trip the very definitions the schema module's own
-// examples describe, so they read those files rather than keeping a second copy
-// that would drift. A plain directory reference, not a project dependency: it
-// pulls in no tasks and no cross-project model access.
-sourceSets {
-    test {
-        resources.srcDir(file("../schema/src/test/resources"))
-    }
+    // The store's tests round-trip the very definitions :schema's examples
+    // describe, so they read that single copy rather than a second one that
+    // would drift. This used to be `resources.srcDir("../schema/src/test/...")`:
+    // sound, but it made these tests depend on another module's fixture layout
+    // through the filesystem, with no signal at the :schema end and an empty
+    // resource set rather than a failure if the layout moved.
+    //
+    // Test scope only. :store's own consumers see nothing of this.
+    testImplementation(testFixtures(project(":schema")))
 }

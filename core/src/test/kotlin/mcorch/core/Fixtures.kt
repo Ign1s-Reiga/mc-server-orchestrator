@@ -78,7 +78,12 @@ internal fun secretRef(
 ): SecretRef = SecretRef.of(name, key).getOrThrow()
 
 /**
- * A deliberately boring definition, close to `schema/src/test/resources/examples`.
+ * A deliberately boring definition, close to `schema/src/testFixtures/resources/examples`.
+ *
+ * Built here rather than parsed from those files on purpose: the reconcile tests
+ * vary one field at a time, which a YAML fixture per variation cannot do
+ * readably. :core therefore reads no example file and takes no dependency on
+ * `:schema`'s test fixtures — only this sentence points at them.
  *
  * Nothing here carries a Velocity forwarding secret, a player name or a UUID; a
  * fixture is exactly the kind of file where such a value gets committed by
