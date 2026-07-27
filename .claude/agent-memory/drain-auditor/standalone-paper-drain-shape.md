@@ -71,6 +71,17 @@ A standalone Paper server has no Velocity proxy, so drain steps 2 (seal), 4
   is right; the skill doc needs the actor mapping spelled out, not a change of
   rule. Do not re-propose "attempt the save anyway".
 
+- **Two cancellation windows stay open on purpose (round 7).** (1) A cancellation
+  *inside* the save exec can leave `save-all flush` delivered with nothing
+  recorded; the next process re-probes, finds zero players, and sends a second
+  one. Accepted: the repeat is idempotent, lands on a server just confirmed
+  empty, and is still followed by a fresh confirmation before any stop. Neither
+  shielding the exec (a shutdown that waits out `drain.saveTimeout`) nor
+  write-ahead is an improvement. (2) Losing the teardown's `containerId = null`
+  record strands a sandbox and a store row, retryably and loudly, with the
+  container already gone. Both upheld as open; do not re-propose a wider
+  `NonCancellable`.
+
 **Why:** these are human decisions, not accidents — do not report the missing
 seal/transfer/deregister bodies as skipped steps, and do not propose a timeout
 that stops anyway.
