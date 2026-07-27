@@ -19,6 +19,7 @@ import mcorch.schema.ServerEndpoint
 import mcorch.schema.ServerPhase
 import mcorch.schema.StatusCondition
 import mcorch.schema.StorageStatus
+import mcorch.schema.fixtures.ExampleDefinitions
 import mcorch.schema.getOrThrow
 import mcorch.schema.yaml.ServerDefinitionParser
 import java.time.Instant
@@ -28,7 +29,9 @@ import java.time.Instant
  *
  * Definitions come from `:schema`'s own example files rather than from a second
  * copy written here — the store's job is to hold what the parser produces, and a
- * fixture that has drifted from the examples would test the drift.
+ * fixture that has drifted from the examples would test the drift. They arrive
+ * through [ExampleDefinitions], a declared dependency on `:schema`'s test
+ * fixtures; nothing here knows where on disk those files sit.
  *
  * Statuses are built here, because `:schema` has no reader for them on purpose.
  * [fullStatus] sets *every* field, including a [DrainStatus] with every timestamp
@@ -38,11 +41,7 @@ import java.time.Instant
 internal object Fixtures {
     val T0: Instant = Instant.parse("2026-07-26T10:15:30.123456789Z")
 
-    fun yaml(name: String): String =
-        Fixtures::class.java
-            .getResource("/examples/valid/$name")
-            ?.readText()
-            ?: error("missing example: examples/valid/$name")
+    fun yaml(name: String): String = ExampleDefinitions.valid(name)
 
     fun definition(name: String): PaperServerDefinition =
         ServerDefinitionParser.parse(yaml(name), name).getOrThrow() as PaperServerDefinition
