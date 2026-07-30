@@ -256,3 +256,69 @@ merged are the ones below, which pass every check in that list.
    is still *running* would not survive the same argument.
 
 Related: [[standalone-paper-drain-shape]]
+
+25. **A reason-keyed exclusion placed above a class check is a silent suppressor
+    in the other direction.** `escalates` returns false for
+    `DRAIN_NO_DESTINATION` *before* looking at the failure class, which is right
+    — it stops "somebody is playing" becoming an alert every backoff interval,
+    and it holds however a future call site classifies that reason. But the same
+    ordering means a `DRAIN_NO_DESTINATION` that was ever classified `PERMANENT`
+    would be a wedged, unretried drain that is never flagged, which is exactly
+    the state the flag exists for. An exclusion whose justification is "this
+    resolves itself" is only sound while the reason *cannot* be permanent, and
+    nothing enforces that: `FailureStatus` takes reason and class as independent
+    constructor args with no `init`. Whenever a reason-keyed exclusion outranks a
+    class check, ask for the construction-site guard that makes the exclusion's
+    premise true, rather than leaving the reporting rule to paper over it.
+26. **When a gate returns before observing, a threshold is not delayed — it is
+    deleted.** `Reconciler.Pass.isBlockedByPermanentFailure` returns
+    `ReconcileOutcome.Failed` with *no status write* for a non-terminating
+    server, so the pass that records a permanent abort writes the last status
+    that server will ever have. Any signal computed at status-draft time from
+    "has this been broken for N minutes" can therefore never appear: the resync
+    keeps calling `reconcile`, the gate keeps short-circuiting, and the frozen
+    status keeps whatever the threshold said at the instant it froze. Before
+    accepting or proposing any "after N minutes" *reporting* rule, find the path
+    that would cross the threshold and prove it still writes statuses. The
+    delete case is the exception — the gate lifts while a delete is outstanding
+    — and that asymmetry is what makes "immediate" the only correct answer for
+    the replacement and relocation cases.
+27. **Operator prose that asserts a runtime fact gets frozen with the status.**
+    The permanent escalation text leads with "the server is still running and
+    still joinable". True at the instant it is written for every path that
+    reached it through `requireEmpty`'s `Joinable(0)`, but *not* for the
+    permanently-unanswered-probe abort, which by definition never confirmed
+    joinability — and, once the gate freezes the status, the sentence keeps
+    asserting it for as long as the row exists. The direction happens to be
+    safe here (an operator told players may be connected is *less* likely to
+    kill the container by hand), which is the test to apply: for each path that
+    can reach a message, ask what the message asserts, whether that path
+    established it, and which way an operator errs if it has since stopped being
+    true. A message that over-states availability errs safe; one that
+    under-states it invites a manual force stop.
+
+28. **A decode-time invariant's blast radius is the widest read that decodes it,
+    not the row that carries it.** `FailureStatus.init` refusing a contradictory
+    pair becomes `StoreException.Corrupt` via `rebuilding`, which sounds like
+    "one server is unloadable". It is not: `SqliteStore.listServers` and
+    `listByDrainState` `mapAll(::readServer)`, so the *first* bad row aborts the
+    whole list. `ReconcileLoop.resync` and `resumeDrains` each catch
+    `StoreException`, warn, and queue **nothing** — so one hand-edited row stops
+    the loop finding any work at all, fleet-wide, and every in-flight drain
+    halts. `:api`'s list endpoint and the SSE `resync` read the same call, so the
+    operator loses the fleet view at the same moment. Before accepting any
+    "blast radius is one server" argument for a decode-time `require`, find the
+    list read and check whether it isolates per row. (Not a world-data path: a
+    halted loop cannot stop a container. Migrations are safe — they work at
+    `PropertyDocument` text level and never build the spec types, so the store
+    still opens.)
+29. **`ready` on a draining status is the freshness proof, and anything keyed on
+    it inherits that.** `Reconciler` drafts a drain status with
+    `ready = progress.occupancy != null && phase == RUNNING`, while
+    `players = progress.occupancy ?: previous.players` is carried forward. So
+    `players.online` is stale in general but **fresh exactly when `ready` is
+    true**. That coupling is what makes the round-9 conformance property sound.
+    It is undocumented and one line from breaking: change the drain path's
+    `ready` to carry forward from `previous`, and every consumer that reads
+    "still joinable" plus a player count starts reading a stale pair. Grep for
+    that assignment before trusting any dashboard-level rule about occupancy.

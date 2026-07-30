@@ -82,6 +82,27 @@ A standalone Paper server has no Velocity proxy, so drain steps 2 (seal), 4
   container already gone. Both upheld as open; do not re-propose a wider
   `NonCancellable`.
 
+- **A permanent drain failure raises `NEEDS_ATTENTION` immediately (round 8).**
+  It used to require `RETRYABLE` and `drainAttentionAfter`, which left the states
+  whose documented remedy is "a human resolves this" — unconfirmable save,
+  `DRAIN_SAVE_TIMEOUT`, no save channel — as the only ones never flagged. Two
+  things make immediacy forced rather than preferred: the gate writes no status
+  for a non-terminating server, so a timer would never be re-evaluated (see
+  [[drain-audit-danger-patterns]] item 26), and `:api` ranks `TERMINATING` above
+  everything for its badge, so an unflagged failed drain reads as "on its way
+  out" while it is still running and joinable. The flag reports; it never
+  authorises, and no failure class, grace period, stop or player count moves with
+  it. Nothing clears a permanent one on its own — only a delete or a definition
+  edit produces a pass that can — and that is correct: a flag that expired by
+  itself would stop the dashboard asking for help while the server is still
+  stuck. Do not re-propose a timer here, and do not propose expiry.
+- **The flag has now been wrong twice, and both times it was found from outside
+  `:core`.** Both defects were about what the flag *means to a consumer*, not
+  about the rule's arithmetic, and `:api` has no `:core` dependency (not even in
+  tests), so a conformance test has to live in `:app` or use a shared fixture
+  built by `:core`'s `draftStatus` — a hand-built conditions list in `:api` would
+  be vacuous.
+
 **Why:** these are human decisions, not accidents — do not report the missing
 seal/transfer/deregister bodies as skipped steps, and do not propose a timeout
 that stops anyway.
@@ -90,3 +111,26 @@ that stops anyway.
 "did it skip a proxy step" but "does the absence of a seal let the player count
 go stale, and does the permanent-abort posture create pressure toward a manual
 force stop". See [[drain-audit-danger-patterns]], especially items 7 and 8.
+
+- **`DRAIN_NO_DESTINATION` + `PERMANENT` is refused by `FailureStatus.init`, and
+  the refusal stands (round 9).** Ruled against the alternative of coercing a
+  contradictory stored row to `RETRYABLE` on read. Coercion would in fact be
+  semantically exact — that pair has only one legal class, the stored `failure`
+  gates nothing a stop depends on (`recordFailure` overwrites reason and class
+  from the current pass; the load-bearing drain fields are `saveRequestedAt`,
+  `worldSavedAt`, `playersEvacuated`, `state`) — but it launders a row that,
+  since no code path writes the pair, was edited by hand. Refusal is right; the
+  cost is bigger than it looks (see [[drain-audit-danger-patterns]] item 28), and
+  the fix for the cost is per-row isolation in the store's list reads, never a
+  weakening of the type. Enforcement is defensive, not load-bearing: both
+  `DRAIN_NO_DESTINATION` sites in `DrainController` pass a `RETRYABLE` literal.
+- **The dashboard conformance property carves out players-online, and that carve
+  -out is exactly right (round 9).** *Shown TERMINATING/DRAINING, still reported
+  joinable, drain given up, and nobody online ⇒ flagged.* The suspicion that it
+  hides a stuck-with-players case does not land: `ready` is true only when a
+  probe answered *this* pass, and the only failure the machine can record with a
+  fresh positive count is the deliberately-suppressed `DRAIN_NO_DESTINATION`
+  (`requireEmpty`'s and `awaitStopped`'s `online > 0` branches both write it).
+  So the carve-out is coextensive with the suppression. Do not re-propose the
+  stronger *progressing or flagged* form — it fails the players-online drain,
+  which is correct behaviour.
