@@ -322,3 +322,31 @@ Related: [[standalone-paper-drain-shape]]
     `ready` to carry forward from `previous`, and every consumer that reads
     "still joinable" plus a player count starts reading a stale pair. Grep for
     that assignment before trusting any dashboard-level rule about occupancy.
+30. **Making a read tolerant moves the failure from loud to quiet, and the
+    *presentation* layer has to be moved with it.** Round 10: `:store` learned to
+    charge an undecodable row to one server — an unreadable observation now
+    leaves `StoredServer.status = null` with `StoredServer.unreadable` set. But
+    `:api` draws its conclusions from `status == null`, so
+    `ServerJson.displayState` renders that server `PENDING`, `detail` says
+    "accepted; nothing observed yet", `needsAttention` is false, and the SSE
+    `Versions.of` (status resourceVersion → null) fires an `updated` event that
+    *animates* a draining server into "nothing observed yet". Before the change
+    the same row was a loud fleet-wide failure. Whenever a read stops raising and
+    starts annotating, enumerate every consumer that inferred something from the
+    absence the annotation now shares, and check the direction: under-stating
+    availability is what invites a manual `crictl stop` (item 27).
+31. **The fleet-read guards are keyed on `StoreException`; not every failure a
+    fleet read can produce is one.** `ReconcileLoop.resync` and `watchChanges`
+    catch `StoreException` only, and `resyncPeriodically` has no guard at all —
+    an escape there cancels the loop's `coroutineScope`, taking the workers and
+    the poller with it, and `Orchestrator.run` does not restart it. `SqliteStore`
+    converts JDBC failures in `Jdbc.query`, but a *column* read straight into a
+    non-null Kotlin parameter does not go through that: `readDefinitionRow` →
+    `resourceName(rows.getString("name"), …)` NPEs on a NULL name, and SQLite
+    permits NULL in a `TEXT PRIMARY KEY` (`server_definition.name` is declared
+    without `NOT NULL`). That turns the round-9 bug — a loop that retried
+    fruitlessly every 5 minutes — into a process that dies inside `seed` on every
+    start. Same hand-edited-row threat model as the decode failures the tolerant
+    read was built for. Whenever a decode path is hardened against one exception
+    type, ask what *else* that read can throw and whether the caller's catch is
+    wide enough.

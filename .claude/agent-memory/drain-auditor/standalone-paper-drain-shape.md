@@ -134,3 +134,33 @@ force stop". See [[drain-audit-danger-patterns]], especially items 7 and 8.
   So the carve-out is coextensive with the suppression. Do not re-propose the
   stronger *progressing or flagged* form — it fails the players-online drain,
   which is correct behaviour.
+
+- **A server whose stored observation cannot be read is held back from the queue,
+  not queued-and-refused, and that is right for a reason better than the one
+  given (round 10).** The implementer flagged it as trading latency for clarity.
+  There is no latency to trade: the queued-and-refused variant ends in
+  `Reconciler.storeOutcome` → `ReconcileOutcome.Failed` (the decode failures are
+  all permanent), and `ReconcileLoop.requeue`'s `Failed` branch calls
+  `queue.succeeded` and does **not** re-add — so that server also comes back only
+  at the next resync. Held-back is strictly cheaper and strictly clearer. Do not
+  re-open this. The residual: `ReconcileLoop.report` partitions on
+  `unreadable != null` and ignores `Unreadable.retryable`, which is correct only
+  while every decode failure is permanent.
+- **The safety of that case is load-bearing on `Store.getServer`'s strictness, in
+  another module, and it is not in the conformance suite (round 10).**
+  `Reconciler.Pass.previous` is `stored.status?.status as? PaperServerStatus`, so
+  a tolerant point read would silently present an unreadable observation as
+  never-observed: a mid-flight drain restarts at `DRAIN_REQUESTED`, re-issues
+  `save-all flush`, and the permanent `DRAIN_SAVE_TIMEOUT` wedge un-wedges itself
+  — danger-pattern 14's shape, arriving through the store instead of through a
+  new caller. `StoredServer.neverObserved` exists to name the distinction but has
+  **zero production call sites**; the refusal is pinned only in `CorruptStoreTest`
+  (SqliteStore-only). A guard in `Reconciler` is genuinely unreachable today, so
+  the right hardening is a conformance hook, not a guard.
+- **"The surfacing channel is itself the corrupt thing" is false for an
+  unreadable observation (round 10).** The corrupt thing is the status *row*; the
+  channel is `:api`, which reads the intact definition row and now receives
+  `StoredServer.unreadable` on the read it already makes. So the round-8 rule
+  stands unweakened — a server the loop has given up on must be surfaced, and
+  here it can be, without writing anything to the corrupt row. See
+  [[drain-audit-danger-patterns]] item 30 for what `:api` says instead today.
