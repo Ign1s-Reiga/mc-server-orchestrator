@@ -96,4 +96,17 @@ alerts — never would.
 **How to apply:** when adding a `display` value, ask separately what filters on
 it and what alerts on it. If those differ, it is a state *and* a flag.
 
+**Absence can only be derived when every row can be named.** `UnreadableServer.name`
+is nullable, and a nameless row may *be* any previously-seen server whose name
+column was nulled. While one exists, the stream suspends `removed` for every row.
+
+**Why:** the alternative is reporting a deletion that never happened on a server
+that may have players on it. A stale dashboard beats an operator believing a
+running server is stopped.
+
+**How to apply:** any derivation keyed on identity has this failure mode when
+identity is optional. Ask what happens when the key is null before writing the
+loop — and tell the client the derivation is suspended, because a dashboard that
+silently stopped reporting deletions is worse than one that never reported them.
+
 Related: [[api-module-decisions]], [[divergences-from-drain-audits]].
