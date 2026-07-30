@@ -428,6 +428,21 @@ A server whose **definition** will not decode answers `500 SERVER_UNREADABLE`,
 because there is no resource to send. Not `404`: that would say the server is
 gone when it may still be running.
 
+> **Recorded divergence.** The tenth drain audit specified that this endpoint
+> keep raising for either kind of bad row, on the principle that a read naming
+> one server wants the failure rather than a snapshot with a hole in it. That
+> principle is right, and it is why `:store`'s own `getServer` is strict — but it
+> is aimed at a caller with nowhere to put the fact, which would then silently
+> report "no observation". This API has somewhere to put it: `unreadable` and the
+> `UNREADABLE` badge say exactly what is missing and why. Raising as well would
+> mean the list shows a row that 500s when clicked, which teaches operators that
+> the dashboard is broken rather than that a row is.
+>
+> Where the principle bites, it is preserved: `/status` still raises, because it
+> exists to serve an observation and cannot serve one it cannot read; and the
+> failure is `SERVER_UNREADABLE`, never `NOT_FOUND`, so nothing ever claims a
+> possibly-running server is gone.
+
 ### `GET /api/v1/servers/{name}/status`
 
 The observation on its own, for a cheap poll of one server.
@@ -541,23 +556,42 @@ One derivation, served by the server, so every dashboard does not invent its own
 `RUNNING` vs `READY` is a real distinction: running is not joinable.
 
 **`UNREADABLE` is not `UNKNOWN`.** `UNKNOWN` means the node or runtime could not
-be reached — a fact about the world. `UNREADABLE` means the stored observation
-will not decode — a fact about our own record. The container is very probably
-running exactly as it was, and an operator sent to look at the wrong one of those
-two wastes an outage. It ranks below `TERMINATING` because a requested delete is
-a *readable* fact about desired state and the more actionable badge; the flag
-below carries the rest.
+be reached — a fact about the world, and the remedy is to go and look at the
+host. `UNREADABLE` means the stored observation will not decode — a fact about
+our own record, where the container is very probably running exactly as it was
+and the remedy is to repair a row. An operator sent to the wrong one of those
+wastes an outage. It ranks below `TERMINATING` because a requested delete is a
+*readable* fact about desired state and the more actionable badge; the flags
+below carry the rest.
 
 It was previously rendered as `PENDING`, which was wrong in the direction that
 matters: `PENDING` is a state you wait out, and a corrupt row waited out for ever.
 
+> **Recorded divergence.** The tenth drain audit specified reusing `UNKNOWN`
+> here, to avoid adding an enum value and forcing a frontend release. The second
+> half of that cost does not exist: `meta.enums.displayState` is served precisely
+> so a new badge reaches a dashboard's filter chips with no code change, and both
+> halves of that — the value is advertised, and `?state=UNREADABLE` selects on
+> it — are pinned by a test. What remains is one enum value against conflating a
+> broken *record* with an unreachable *host*, which are different problems with
+> different remedies.
+
 `needsAttention` and `unreadable` are **flags, not states** — and the flags are
-what you filter on, because `TERMINATING` outranks both. `needsAttention` is true
-when a `NEEDS_ATTENTION` condition is `TRUE`; it reports and never authorises, so
-a drain failing for an hour is still `DRAINING` with the flag beside it, and its
-`lastTransitionAt` in `status.conditions` is what an alert should fire on.
-`display.unreadable` is true whenever the resource carries an `unreadable` mark,
-including when the badge says `TERMINATING`.
+what you filter on, because `TERMINATING` outranks both.
+
+- `needsAttention` — **somebody must act.** True when a `NEEDS_ATTENTION`
+  condition is `TRUE`, *and* whenever `unreadable` is set. It reports and never
+  authorises, so a drain failing for an hour is still `DRAINING` with the flag
+  beside it, and `lastTransitionAt` on the condition is what an alert fires on.
+- `unreadable` — **what is wrong.** True whenever the resource carries an
+  `unreadable` mark, including when the badge says `TERMINATING`.
+
+**Both are set for an unreadable row, and they are not redundant.** A row the
+store cannot decode reads the same on every pass, so the loop cannot move it and
+only a person repairing it can — which is precisely what `needsAttention` is
+chartered to mean. Alert on `needsAttention`; filter and label with `unreadable`.
+A dashboard that only watched `needsAttention` would otherwise never see these
+servers, and that is the one audience that has to.
 
 `playersMax` falls back to `spec.maxPlayers` when nothing has been observed.
 
@@ -1089,7 +1123,11 @@ export interface ServerResource {
   neverObserved: boolean;
   display: {
     state: DisplayState; ready: boolean; needsAttention: boolean;
-    /** True whenever `unreadable` is set, including when the badge says TERMINATING. */
+    /**
+     * True whenever `unreadable` is set, including when the badge says
+     * TERMINATING. `needsAttention` is also true in that case — see §7: this one
+     * says what is wrong, that one says somebody must act.
+     */
     unreadable: boolean;
     drainState: DrainState | null;
     playersOnline: number | null; playersMax: number | null;
@@ -1189,8 +1227,9 @@ server is still running and needs an operator.
 - `unreadable` set on a resource → the *observation* is corrupt. The row is
   otherwise normal: definition, labels, spec all readable. Badge `UNREADABLE`,
   show `unreadable.reason`, and say that nothing under `status` reflects what the
-  server is doing. The reconcile loop will write a fresh observation over the
-  broken one on its own.
+  server is doing. `display.needsAttention` is set too, so it appears in whatever
+  the operator alerts on. The reconcile loop will write a fresh observation over
+  the broken one on its own.
 - an entry in `unreadable[]` (list or snapshot), or an `unreadable` event → the
   *definition* is corrupt. There is no resource. Keep whatever you last knew
   about the name, badge it, and offer the repair: `PUT` a valid definition with

@@ -12,8 +12,10 @@ import mcorch.schema.ServerDefinition
 import mcorch.schema.ServerStatus
 import mcorch.schema.fixtures.ExampleDefinitions
 import mcorch.store.ChangeFeed
+import mcorch.store.ChangeKind
 import mcorch.store.Precondition
 import mcorch.store.ResourceVersion
+import mcorch.store.ServerChange
 import mcorch.store.ServerListing
 import mcorch.store.StatePart
 import mcorch.store.Store
@@ -215,10 +217,46 @@ class StoreFailureTest {
 
         override suspend fun currentCursor(): StoreCursor = StoreCursor("1")
 
+        /** Every cursor the stream has fed back, in order. Proves the feed advances. */
+        val cursorsRead: MutableList<String> = java.util.concurrent.CopyOnWriteArrayList()
+
+        /**
+         * When set, the feed reports a change for a name whose row will not decode.
+         *
+         * That is the shape of the tenth audit's warning 4: the documented way to
+         * unwedge a stuck server is an operator editing its definition, which is
+         * precisely what puts a name into the change feed — so the poisoned entry
+         * arrives at the worst possible moment.
+         */
+        @Volatile
+        var poisonedName: String? = null
+
         override suspend fun changesSince(
             cursor: StoreCursor?,
             limit: Int,
-        ): ChangeFeed = ChangeFeed.Changes(emptyList(), StoreCursor("1"), more = false)
+        ): ChangeFeed {
+            val from = cursor?.token.orEmpty()
+            cursorsRead += from
+            val poisoned = poisonedName
+            // Reported once, from the cursor the stream opened on. If the stream
+            // fails to advance past it, it will be handed the same change for ever.
+            if (poisoned == null || from != "1") {
+                return ChangeFeed.Changes(emptyList(), StoreCursor(from.ifEmpty { "1" }), more = false)
+            }
+            return ChangeFeed.Changes(
+                changes =
+                    listOf(
+                        ServerChange(
+                            name = ResourceName.of(poisoned).getOrThrow(),
+                            kind = ChangeKind.WRITTEN,
+                            resourceVersion = ResourceVersion("2"),
+                            at = TestApi.CLOCK.instant(),
+                        ),
+                    ),
+                cursor = StoreCursor("2"),
+                more = false,
+            )
+        }
 
         override suspend fun putDefinition(
             definition: ServerDefinition,
@@ -425,6 +463,113 @@ class StoreFailureTest {
 
             // The assertion that matters.
             events.none { it.name == "removed" } shouldBe true
+        }
+    }
+
+    @Test
+    fun `a corrupt row named by the change feed does not kill the stream or wedge the cursor`() {
+        // The tenth audit's warning 4. `emit` reaches the store through the strict
+        // single-row read, and an uncaught failure there ends the stream — which
+        // would be recoverable if it ended there. It does not: the browser
+        // reconnects with the same Last-Event-ID, the feed replays the same change
+        // because the cursor never advanced past it, and the stream dies again.
+        // A fleet-wide blind loop, at the exact moment somebody is repairing.
+        //
+        // And the trigger is not exotic. The documented way to unwedge a stuck
+        // server is an operator editing its definition, which is exactly what puts
+        // its name into the change feed.
+        withPartlyUnreadableStore { api, store ->
+            store.definitionReadable = false
+            store.poisonedName = PartlyUnreadableStore.MARKED
+
+            val events = api.stream(limit = 5)
+
+            // Alive well past the poisoned change: hello and snapshot alone would
+            // be what a stream that died on the first poll produced.
+            events.size shouldBe 5
+            events[0].name shouldBe "hello"
+            events[1].name shouldBe "snapshot"
+
+            // And the cursor moved. Without this the stream could be "alive" and
+            // still re-reading the same poisoned entry for ever.
+            store.cursorsRead.any { it == "2" } shouldBe true
+
+            // Control: the poisoned entry really was delivered, so the assertions
+            // above are about surviving it rather than about it never arriving.
+            store.cursorsRead.first() shouldBe "1"
+        }
+    }
+
+    @Test
+    fun `a retryable failure on the change-feed path still ends the stream`() {
+        // The other half, and the reason the catch is narrow. A store that cannot
+        // be reached is not a corrupt row: the resync would fail the same way, so
+        // carrying on would mean a stream that silently stops reflecting reality.
+        // Ending it makes the client reconnect, which is the recovery.
+        withStore(StoreException.Unavailable("gone")) { api ->
+            val events = api.stream(limit = 5)
+            events.none { it.name == "snapshot" } shouldBe true
+        }
+    }
+
+    @Test
+    fun `an unreadable server is flagged for a human as well as described`() {
+        withPartlyUnreadableStore { api, store ->
+            store.definitionReadable = false
+
+            @Suppress("UNCHECKED_CAST")
+            val items = api.call("GET", "/api/v1/servers").json()["items"] as List<Map<String, Any?>>
+            val marked = (items.single { it["name"] == "survival-marked" }["display"]) as Map<*, *>
+
+            // Two flags, two audiences. `unreadable` says what is wrong and is what
+            // a dashboard filters on; `needsAttention` says somebody must act and
+            // is what an alert fires on. A row the store cannot decode reads the
+            // same on every pass, so the loop cannot move it and only a person
+            // can — which is the charter of NEEDS_ATTENTION exactly.
+            marked["unreadable"] shouldBe true
+            marked["needsAttention"] shouldBe true
+
+            // Control: the healthy server raises neither, so this is not a blanket
+            // true.
+            val fresh = items.single { it["name"] == "survival-01" }["display"] as Map<*, *>
+            fresh["unreadable"] shouldBe false
+            fresh["needsAttention"] shouldBe false
+        }
+    }
+
+    @Test
+    fun `a new badge value reaches a dashboard filter with no frontend release`() {
+        // The cost of UNREADABLE being its own state rather than a reuse of
+        // UNKNOWN is one new enum value. This is the mechanism that makes that
+        // cost nil, and it is the reason `/meta` serves `displayState` at all —
+        // so it is worth pinning rather than assuming.
+        //
+        // A dashboard that builds its filter chips from `meta.enums.displayState`
+        // and passes the chosen value straight to `?state=` gets a working
+        // UNREADABLE filter with no code change. Both halves are asserted, because
+        // advertising a value the filter would reject is the failure that would
+        // make the promise hollow.
+        withPartlyUnreadableStore { api, store ->
+            store.definitionReadable = false
+
+            val advertised = (api.call("GET", "/api/v1/meta").json()["enums"] as Map<*, *>)["displayState"] as List<*>
+            advertised.contains("UNREADABLE") shouldBe true
+
+            for (chip in advertised) {
+                val filtered = api.call("GET", "/api/v1/servers?state=$chip")
+                withClue("?state=$chip") { filtered.status shouldBe 200 }
+            }
+
+            @Suppress("UNCHECKED_CAST")
+            val marked = api.call("GET", "/api/v1/servers?state=UNREADABLE").json()["items"] as List<Map<String, Any?>>
+            marked.map { it["name"] } shouldBe listOf("survival-marked")
+
+            // Control: the chip selects, rather than every chip returning
+            // everything. The healthy server is PENDING and is not in the answer
+            // above; it is in this one.
+            @Suppress("UNCHECKED_CAST")
+            val pending = api.call("GET", "/api/v1/servers?state=PENDING").json()["items"] as List<Map<String, Any?>>
+            pending.map { it["name"] } shouldBe listOf("survival-01")
         }
     }
 

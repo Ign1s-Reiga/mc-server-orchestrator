@@ -81,4 +81,19 @@ reports a deletion that never happened on a server with players on it.
 copy will not decode) is distinct from `UNKNOWN` (the node could not be reached).
 Sending an operator to the wrong one of those wastes an outage.
 
-Related: [[api-module-decisions]].
+**A state and a flag answer different questions, so set both.** `display.state`
+is a single badge and something always outranks something else — `TERMINATING`
+outranks `UNREADABLE` — so any fact the badge can lose needs a flag beside it.
+`unreadable` says *what* is wrong and is what a dashboard filters on;
+`needsAttention` says *somebody must act* and is what an alert fires on.
+
+**Why:** the tenth drain audit caught `needsAttention` not being set for an
+unreadable row. Its charter is "the loop has stopped and only a person can move
+this", which a row that decodes identically on every pass satisfies exactly.
+Leaving it off meant the one audience that must see these servers — whoever
+alerts — never would.
+
+**How to apply:** when adding a `display` value, ask separately what filters on
+it and what alerts on it. If those differ, it is a state *and* a flag.
+
+Related: [[api-module-decisions]], [[divergences-from-drain-audits]].
