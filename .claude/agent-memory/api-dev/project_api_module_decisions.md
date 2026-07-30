@@ -54,4 +54,18 @@ machine-readable part.
 **How to apply:** treat `API.md` as the specification and the Kotlin as one
 implementation. If they disagree, say which is the bug.
 
+**Validated in practice.** A Next.js dashboard was built against `API.md` and
+came out with zero `any` and zero casts, drove a real Paper server to `READY`,
+and used the derived `display` badge as-is rather than recomputing it. The six
+findings it returned were all *contract* gaps, not implementation bugs: a
+declared-but-never-emitted enum variant, a loosely typed enum, an undocumented
+`retry:`, two closed sets missing from `/meta`, an over-broad promise in §10,
+and — the big one — §14 declaring the *output* type as the input type when the
+two genuinely differ. That is the failure mode to look for on a contract
+change: not "is it wrong" but "does it declare more, or less, than is true".
+
+**How to apply:** when adding to §14, ask separately what a client *sends* and
+what it *receives*. They are different types here and were conflated once
+already.
+
 Related: [[api-contract-subtleties]], [[repo-testing-discipline]].

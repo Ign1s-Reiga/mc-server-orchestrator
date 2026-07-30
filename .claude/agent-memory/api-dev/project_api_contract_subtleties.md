@@ -42,4 +42,24 @@ headers.
 **How to apply:** any new header the dispatcher adds globally has the same
 hazard. Ask whether the stream gets it.
 
+**The SSE keep-alive is a `ping` event, never a comment frame.** `EventSource`
+does not expose comment frames to script.
+
+**Why:** on an idle fleet the keep-alive is the only traffic between the opening
+snapshot and the lifetime cycle 30 minutes later, so with a comment a half-open
+socket left an `EventSource` client rendering stale state with
+`readyState === OPEN`. Found by the dashboard team, who worked around it by
+using `fetch` + `ReadableStream` instead.
+
+**How to apply:** keep every frame a named event so both transports see the same
+protocol. If something wants to be "out of band", it is not.
+
+**Anything the dashboard must render or offer belongs in `/api/v1/meta`.** Two
+spellings: observed-state enums by Kotlin name (`RUNNING`), definition enums by
+YAML wire value (`persistent`). A create form offering `PERSISTENT` builds a
+document the parser rejects.
+
+**Why:** `storageMode` and `drainPolicy` were missing and the dashboard
+hard-coded them, which is precisely what the endpoint exists to prevent.
+
 Related: [[api-module-decisions]].
