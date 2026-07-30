@@ -90,8 +90,12 @@ internal class ApiException(
     override val message: String,
     val violations: List<SchemaViolation> = emptyList(),
     val conflict: WriteOutcome.Conflict? = null,
-    /** Set on [ErrorCode.SERVER_UNREADABLE]: which half would not decode, and why. */
-    val unreadable: Pair<String, Unreadable>? = null,
+    /**
+     * Set on [ErrorCode.SERVER_UNREADABLE]: which row, which half would not
+     * decode, and why. The name is nullable because the store's is — a record
+     * with no name at all is one of the ways a row becomes unreadable.
+     */
+    val unreadable: Pair<String?, Unreadable>? = null,
     /** Response headers this failure needs — `Allow` on a 405, `ETag` on a conflict. */
     val headers: List<Pair<String, String>> = emptyList(),
     cause: Throwable? = null,
@@ -156,21 +160,31 @@ internal class ApiException(
          * bookkeeping problem into a player-facing one.
          */
         fun unreadable(
-            name: String,
+            name: String?,
             detail: Unreadable,
         ): ApiException =
             ApiException(
                 code = ErrorCode.SERVER_UNREADABLE,
                 message =
-                    when (detail.part) {
-                        StatePart.DESIRED -> {
+                    when {
+                        // Not reachable by naming a server — a nameless row cannot
+                        // match a path segment — but the type admits it, and a
+                        // message that pretended otherwise would be the placeholder
+                        // identity `:store` refuses to invent.
+                        name == null -> {
+                            "a stored row has no name at all and its definition could not be read. Nothing can " +
+                                "refer to it: it cannot be fetched, repaired or deleted through this API, " +
+                                "because every one of those names a server. It has to be repaired in the store"
+                        }
+
+                        detail.part == StatePart.DESIRED -> {
                             "`$name` is stored and its definition could not be read, so there is nothing to " +
                                 "serve for it. The server may still be running: this is a fault in the record, " +
                                 "not evidence about the container. Repair it by PUTting a valid definition with " +
                                 "`If-Match: *`, or fix the row in the store"
                         }
 
-                        StatePart.OBSERVED -> {
+                        else -> {
                             "`$name` is stored and its last observation could not be read, so what the server " +
                                 "is actually doing is not known. The definition is intact and the container is " +
                                 "very probably running as it was; the reconcile loop will record a fresh " +

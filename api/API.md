@@ -341,8 +341,14 @@ wrong in the second row; test `neverObserved` instead.
 `unreadable.reason` is operator-facing text on the same terms as
 `status.failure.message`: it names the server and what about the stored form was
 rejected, and it carries no stack trace, no class name and no storage-level
-detail. `retryable` is false for anything that failed to decode — the stored
-bytes will say the same thing next time.
+detail.
+
+`retryable` is false for anything that failed to decode — the stored bytes will
+say the same thing next time — and from the embedded store it is false *by
+construction*: a read that failed for a retryable reason is re-raised rather than
+attached to a row, because "the thing that reads this is unreachable" describes
+the read and not the record. Treat `true` as a possibility a networked backend
+could honestly report, not as something to expect today.
 
 #### Two null policies, and why
 
@@ -403,6 +409,28 @@ what keeps it out of `items` without hiding it.
 `name` is the raw stored string, not a validated resource name: the name can
 itself be why the row will not read, and a shape that could not hold an invalid
 one would throw away the only identifying thing left.
+
+##### `name` can be `null`, and such a row is the one you can least act on
+
+A record with **no name at all** is one of the ways a row becomes unreadable —
+SQLite permits `NULL` in a rowid table's primary key, so a hand-written or
+legacy row without one is possible. `null` is how the store genuinely holds it,
+and a placeholder here would invent an identity nothing could act on anyway.
+
+What a client must handle:
+
+- **Render it.** It is a real row and an operator has to be told. Show it as an
+  unidentifiable entry with its `reason`; it counts in `unreadableCount`.
+- **Key it by something other than `name`.** Two nameless rows are
+  indistinguishable to this API, so key your list by index or by `reason`.
+- **Offer no action on it.** Every repair path this API has names a server —
+  `PUT`, `DELETE`, `GET /{name}` — so a nameless row cannot be fetched, repaired
+  or deleted through the API at all. It has to be fixed in the store. Say that
+  rather than showing a button that cannot work.
+- **Expect removals to go quiet.** See §8.
+
+One nameless row does not affect any other row: the rest of `items` and
+`unreadable` are exactly as they would be.
 
 One bad row costs its own server and nothing else. This endpoint does not fail
 because of one.
@@ -700,6 +728,28 @@ again, an ordinary `updated` follows with the full resource.
 A row that is unreadable when you connect is in the snapshot's `unreadable`
 array, not in an event. The event is for a row that stops decoding while you are
 watching.
+
+#### A nameless row suspends `removed` until it is repaired
+
+While any `unreadable` row has `name: null`, **this stream stops emitting
+`removed` at all.** Not for that row — for every row.
+
+`removed` is derived from absence: a name this connection has sent that the
+listing no longer carries has been purged. A record with no name cannot be
+matched against anything, and it may *be* any server whose name column was
+nulled. Nothing here can tell which, so every name already sent becomes
+un-eliminable, and deriving absence anyway would report a deletion that never
+happened on a server that may have players on it.
+
+The cost is the other direction of wrongness, and it is the one to accept: a
+genuinely purged server lingers in your table until the nameless row is repaired
+or the connection cycles into a fresh `snapshot`, which re-states everything.
+A stale row is a stale dashboard; a running server reported gone is an operator
+who thinks a server is stopped when it has players on it.
+
+So: if you are showing a nameless row, also tell the operator that removals are
+paused. Everything else — `updated`, `unreadable`, `snapshot`, `ping` — carries
+on as normal.
 
 `ping` arrives every `keepAliveMillis` whether or not anything changed, and
 carries the cursor, so a watchdog that gives up and reconnects resumes from the
@@ -1151,7 +1201,9 @@ export interface Unreadable { part: StatePart; reason: string; retryable: boolea
  * can be why the row will not read.
  */
 export interface UnreadableServer {
-  name: string; part: StatePart; reason: string; retryable: boolean;
+  /** Null when the record has no name at all — see §6. Not a placeholder. */
+  name: string | null;
+  part: StatePart; reason: string; retryable: boolean;
 }
 
 export interface ServerList {
@@ -1187,7 +1239,7 @@ export interface ApiError {
       explanation: string;
     } | null;
     /** Set on SERVER_UNREADABLE. Not evidence about the container — see §3. */
-    unreadable: (Unreadable & { name: string }) | null;
+    unreadable: (Unreadable & { name: string | null }) | null;
   };
 }
 
@@ -1234,6 +1286,10 @@ server is still running and needs an operator.
   *definition* is corrupt. There is no resource. Keep whatever you last knew
   about the name, badge it, and offer the repair: `PUT` a valid definition with
   `If-Match: *`.
+- the same, with `name: null` → the record has no name either. Render it, key it
+  by index rather than by name, and offer **no** action: every repair path names
+  a server, so this one is fixable only in the store. While one exists, `removed`
+  events are suspended — say so.
 
 In both cases the container is very probably running exactly as it was. Do not
 render either as an outage, and never as a deletion.

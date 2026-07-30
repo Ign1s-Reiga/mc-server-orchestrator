@@ -298,7 +298,8 @@ internal class StreamRoutes(
         }
 
         for (row in listing.unreadable) {
-            present += row.name
+            val name = row.name ?: continue
+            present += name
             // Drop any resource previously sent for this name, so that if the row
             // becomes readable again the next resync re-sends it rather than
             // deduplicating against versions the client no longer has.
@@ -308,11 +309,40 @@ internal class StreamRoutes(
             }
         }
 
-        // Absence, and only real absence. A row that moved into `unreadable` is
-        // still present above, so it never reaches here — reporting it as `removed`
+        // Rows the store holds with no name at all. They cannot join `present`,
+        // so they are reported on their own terms and then taken account of below.
+        for (row in seen.newlyNameless(listing.unreadable)) {
+            connection.event("unreadable", cursor.token, ServerJson.unreadableServer(row))
+        }
+
+        // Absence, and only real absence. A row that moved into `unreadable` is in
+        // `present` above, so it never reaches here — reporting it as `removed`
         // would tell a dashboard the server was deleted when it is very probably
-        // still running with players on it. That is the whole reason the listing
-        // reports these rows rather than dropping them.
+        // still running with players on it.
+        //
+        // A nameless row breaks that reasoning outright, so the whole derivation
+        // is suspended while one exists. A record with no name may be *any*
+        // previously-seen server whose name column was nulled; nothing here can
+        // tell which, so every name this connection has sent is now un-eliminable.
+        // Deriving absence anyway would emit `removed` for a server that was never
+        // deleted, which is the exact hazard this correction exists for.
+        //
+        // The cost is the other direction of wrongness and it is the acceptable
+        // one: a genuinely purged server lingers in the client until the nameless
+        // row is repaired or the connection cycles into a fresh snapshot, which
+        // re-states everything. A row that should be gone and lingers is a stale
+        // dashboard; a row that is running and reported gone is an operator
+        // assuming a server is stopped when it has players on it.
+        val nameless = listing.unreadable.count { it.name == null }
+        if (nameless > 0) {
+            LOG.warn(
+                "{} stored row(s) have no name; not deriving removals this pass because a nameless row " +
+                    "could be any server and reporting a false deletion is worse than reporting one late",
+                nameless,
+            )
+            return
+        }
+
         for (name in seen.namesAbsentFrom(present)) {
             seen.forget(name)
             connection.event(
@@ -420,6 +450,16 @@ internal class StreamRoutes(
         private val servers = HashMap<String, Versions>()
         private val unreadable = HashMap<String, ServerJsonUnreadable>()
 
+        /**
+         * Marks for rows the store holds with no name at all.
+         *
+         * A set rather than a map because there is no key to use: two nameless
+         * rows failing for the same reason are indistinguishable to everything
+         * outside the store, so they collapse into one mark and are reported
+         * once. That is honest — nothing here can tell them apart either.
+         */
+        private val nameless = HashSet<ServerJsonUnreadable>()
+
         /** Replaces everything, for a snapshot. */
         fun reset(
             current: List<StoredServer>,
@@ -427,8 +467,30 @@ internal class StreamRoutes(
         ) {
             servers.clear()
             unreadable.clear()
+            nameless.clear()
             current.forEach { servers[it.name.value] = Versions.of(it) }
-            broken.forEach { unreadable[it.name] = ServerJsonUnreadable(it.unreadable.part.name, it.unreadable.reason) }
+            broken.forEach { row ->
+                val mark = ServerJsonUnreadable(row.unreadable.part.name, row.unreadable.reason)
+                val name = row.name
+                if (name == null) nameless += mark else unreadable[name] = mark
+            }
+        }
+
+        /**
+         * Reconciles the nameless rows against [rows] and returns the ones this
+         * connection has not been told about.
+         *
+         * Rebuilt from the listing each pass rather than accumulated, so a
+         * nameless row that gets repaired stops being remembered and a later one
+         * with the same reason is reported again.
+         */
+        fun newlyNameless(rows: List<UnreadableServer>): List<UnreadableServer> {
+            val current = rows.filter { it.name == null }
+            val marks = current.map { ServerJsonUnreadable(it.unreadable.part.name, it.unreadable.reason) }
+            val fresh = current.filterIndexed { index, _ -> marks[index] !in nameless }
+            nameless.clear()
+            nameless += marks
+            return fresh
         }
 
         /**
@@ -448,10 +510,17 @@ internal class StreamRoutes(
             return if (previous == null || previous.definition != versions.definition) "definition" else "status"
         }
 
-        /** Marks [row] unreadable. True when that is new information for this connection. */
+        /**
+         * Marks a *named* [row] unreadable. True when that is new information.
+         *
+         * Nameless rows go through [newlyNameless]: they have no key to be put
+         * under, and inventing one would be inventing an identity the store does
+         * not have.
+         */
         fun markUnreadable(row: UnreadableServer): Boolean {
+            val name = row.name ?: return false
             val mark = ServerJsonUnreadable(row.unreadable.part.name, row.unreadable.reason)
-            return unreadable.put(row.name, mark) != mark
+            return unreadable.put(name, mark) != mark
         }
 
         /** Forgets the resource sent for a name, so a recovery re-sends it in full. */

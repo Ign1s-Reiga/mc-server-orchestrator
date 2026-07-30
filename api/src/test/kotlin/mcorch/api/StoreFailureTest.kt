@@ -182,12 +182,46 @@ class StoreFailureTest {
         @Volatile
         var definitionReadable: Boolean = true
 
+        /**
+         * A row the store holds with no name at all.
+         *
+         * Not hypothetical: SQLite permits NULL in a rowid table's primary key, so
+         * a hand-written row without one is possible, and `:store` reports it
+         * honestly rather than inventing a placeholder identity.
+         */
+        val nameless: UnreadableServer =
+            UnreadableServer(
+                name = null,
+                unreadable =
+                    Unreadable(
+                        part = StatePart.DESIRED,
+                        reason = "a stored definition has no name",
+                        retryable = false,
+                    ),
+            )
+
+        /** When set, the listing also carries [nameless]. */
+        @Volatile
+        var namelessPresent: Boolean = false
+
+        /** When set, the healthy server is gone from the listing, as a purge would leave it. */
+        @Volatile
+        var healthyPurged: Boolean = false
+
         override suspend fun listAll(): ServerListing =
-            if (definitionReadable) {
-                ServerListing(listOf(healthy, brokenObservation, brokenBefore), emptyList())
-            } else {
-                ServerListing(listOf(healthy, brokenObservation), listOf(brokenDefinition))
-            }
+            ServerListing(
+                servers =
+                    buildList {
+                        if (!healthyPurged) add(healthy)
+                        add(brokenObservation)
+                        if (definitionReadable) add(brokenBefore)
+                    },
+                unreadable =
+                    buildList {
+                        if (!definitionReadable) add(brokenDefinition)
+                        if (namelessPresent) add(nameless)
+                    },
+            )
 
         override suspend fun listServers(): List<StoredServer> =
             throw StoreException.Corrupt(brokenDefinition.unreadable.reason)
@@ -570,6 +604,84 @@ class StoreFailureTest {
             @Suppress("UNCHECKED_CAST")
             val pending = api.call("GET", "/api/v1/servers?state=PENDING").json()["items"] as List<Map<String, Any?>>
             pending.map { it["name"] } shouldBe listOf("survival-01")
+        }
+    }
+
+    @Test
+    fun `a row with no name is served as one, and is not made up an identity`() {
+        withPartlyUnreadableStore { api, store ->
+            store.namelessPresent = true
+
+            val body = api.call("GET", "/api/v1/servers").json()
+            body["unreadableCount"] shouldBe 1
+
+            @Suppress("UNCHECKED_CAST")
+            val row = (body["unreadable"] as List<Map<String, Any?>>).single()
+            // Null, not "" and not a placeholder. `:store` refuses to invent an
+            // identity it does not have, and neither does this.
+            row.containsKey("name") shouldBe true
+            row["name"] shouldBe null
+            row["part"] shouldBe "DESIRED"
+            (row["reason"] as String).isNotEmpty() shouldBe true
+        }
+    }
+
+    @Test
+    fun `a nameless row suspends removal reporting rather than risking a false one`() {
+        // The `present` set is keyed by name, and a nameless row cannot join it.
+        // Worse, it may *be* any previously-seen server whose name column was
+        // nulled — nothing here can tell which — so every name this connection has
+        // sent becomes un-eliminable. Deriving absence anyway would emit `removed`
+        // for a server that was never deleted, on a server that may have players
+        // on it. So the derivation is suspended while one exists.
+        withPartlyUnreadableStore { api, store ->
+            store.definitionReadable = false
+
+            val ready = CountDownLatch(1)
+            val events =
+                api.stream(limit = 6) { event ->
+                    if (event.name == "snapshot") {
+                        // A nameless row appears, and the healthy server vanishes
+                        // from the listing exactly as a completed purge would leave
+                        // it. Only one of those two facts is trustworthy.
+                        store.namelessPresent = true
+                        store.healthyPurged = true
+                        ready.countDown()
+                    }
+                    true
+                }
+            check(ready.await(20, TimeUnit.SECONDS))
+
+            events.none { it.name == "removed" } shouldBe true
+
+            // The nameless row is still reported — suspended removals are not
+            // suspended reporting.
+            val reported = events.first { it.name == "unreadable" && it.json()["name"] == null }.json()
+            reported["part"] shouldBe "DESIRED"
+        }
+    }
+
+    @Test
+    fun `with every row nameable, a vanished server is still reported removed`() {
+        // The control for the test above. Without it, "no removed event" would
+        // pass just as well if removal reporting were broken outright.
+        withPartlyUnreadableStore { api, store ->
+            store.definitionReadable = false
+
+            val ready = CountDownLatch(1)
+            val events =
+                api.stream(limit = 6) { event ->
+                    if (event.name == "snapshot") {
+                        store.healthyPurged = true
+                        ready.countDown()
+                    }
+                    true
+                }
+            check(ready.await(20, TimeUnit.SECONDS))
+
+            val removed = events.first { it.name == "removed" }.json()
+            removed["name"] shouldBe "survival-01"
+            removed["reason"] shouldBe "PURGED"
         }
     }
 
