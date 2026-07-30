@@ -8,12 +8,16 @@ import mcorch.api.http.Route
 import mcorch.api.json.Json
 import mcorch.api.json.jsonObject
 import mcorch.api.render.ServerJson
+import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
+import mcorch.schema.DrainPolicy
 import mcorch.schema.DrainState
+import mcorch.schema.FailureClass
 import mcorch.schema.FailureReason
 import mcorch.schema.SchemaVersion
 import mcorch.schema.ServerKind
 import mcorch.schema.ServerPhase
+import mcorch.schema.StorageMode
 
 /**
  * The two endpoints that describe the server rather than what it manages.
@@ -46,14 +50,27 @@ internal class MetaRoutes(
                 put("apiVersions", Json.strings(SchemaVersion.supported()))
                 put("currentApiVersion", SchemaVersion.CURRENT.wireValue)
                 put("kinds", Json.strings(ServerKind.supported()))
+                // Every closed set that can appear in a response or is needed to
+                // build a create form. Two spellings, and the split is not
+                // cosmetic: a set that appears in *observed state* is serialised
+                // by its Kotlin name (`RUNNING`), and one that appears in a
+                // *definition* is serialised by its YAML wire value
+                // (`persistent`), because a definition document has to parse. The
+                // key names say which — `…State`/`…Type`/`…Reason` are the former,
+                // `storageMode`/`drainPolicy` the latter.
                 put(
                     "enums",
                     jsonObject {
                         put("phase", Json.strings(ServerPhase.entries.map { it.name }))
                         put("drainState", Json.strings(DrainState.entries.map { it.name }))
                         put("conditionType", Json.strings(ConditionType.entries.map { it.name }))
+                        put("conditionStatus", Json.strings(ConditionStatus.entries.map { it.name }))
                         put("failureReason", Json.strings(FailureReason.entries.map { it.name }))
+                        put("failureClass", Json.strings(FailureClass.entries.map { it.name }))
                         put("displayState", Json.strings(ServerJson.DisplayState.entries.map { it.name }))
+                        // Wire values: these go back into a definition document.
+                        put("storageMode", Json.strings(StorageMode.supported()))
+                        put("drainPolicy", Json.strings(DrainPolicy.supported()))
                     },
                 )
                 put(
@@ -71,6 +88,7 @@ internal class MetaRoutes(
                         put("statusPollMillis", config.statusPollInterval.inWholeMilliseconds)
                         put("keepAliveMillis", config.streamKeepAlive.inWholeMilliseconds)
                         put("maxLifetimeMillis", config.maxStreamLifetime.inWholeMilliseconds)
+                        put("reconnectMillis", config.streamReconnectDelay.inWholeMilliseconds)
                     },
                 )
             },

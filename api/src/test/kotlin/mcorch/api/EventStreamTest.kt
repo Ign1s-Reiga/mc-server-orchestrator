@@ -14,6 +14,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
+import kotlin.time.Duration.Companion.milliseconds
 
 /**
  * The live feed, read the way a browser reads it.
@@ -220,6 +221,87 @@ class EventStreamTest {
         } finally {
             small.close()
         }
+    }
+
+    @Test
+    fun `an idle stream sends ping as an event, not as a comment frame`() {
+        // The liveness signal has to be visible to `EventSource`, which does not
+        // expose comment frames to script. Without this, an idle fleet gives a
+        // browser client no traffic at all between the opening snapshot and the
+        // lifetime cycle half an hour later — so a half-open socket leaves it
+        // rendering stale state with readyState === OPEN and no way to notice.
+        val chatty = TestApi.start { it.copy(streamKeepAlive = 80.milliseconds) }
+        try {
+            val events = chatty.stream(limit = 4)
+            events.map { it.name }.take(2) shouldBe listOf("hello", "snapshot")
+
+            val ping = events.first { it.name == "ping" }
+            val body = ping.json()
+            (body["at"] as String).isNotEmpty() shouldBe true
+            // Carries the cursor, so a watchdog that gives up and reconnects
+            // resumes from the right place rather than re-listing.
+            body["cursor"] shouldBe events[0].json()["cursor"]
+            ping.id.shouldNotBeNull()
+
+            // `hello` advertises the interval a watchdog should measure against.
+            events[0].json()["keepAliveMillis"] shouldBe 80
+        } finally {
+            chatty.close()
+        }
+    }
+
+    @Test
+    fun `hello advertises the reconnect delay the retry field also sets`() {
+        // EventSource honours `retry:` silently. A client that owns its own
+        // backoff should be able to see what it is overriding without reading a
+        // packet capture.
+        val hello = api.stream(limit = 1)[0].json()
+        hello["reconnectMillis"] shouldBe 3000
+        api.call("GET", "/api/v1/meta").json().let { meta ->
+            (meta["stream"] as Map<*, *>)["reconnectMillis"] shouldBe 3000
+        }
+    }
+
+    @Test
+    fun `update reasons are derived from what moved, and resync is not one of them`() {
+        api.call("POST", "/api/v1/servers", minimal).status shouldBe 201
+        val (definitionRun, _) = listen(limit = 3)
+        api.call(
+            "PUT",
+            "/api/v1/servers/survival-01",
+            minimal.replace("memory: 4Gi", "memory: 6Gi"),
+            headers =
+                listOf("If-Match" to "*"),
+        )
+        val afterEdit = definitionRun.get(20, TimeUnit.SECONDS)
+        afterEdit.last { it.name == "updated" }.json()["reason"] shouldBe "definition"
+
+        // An observation moves only the status version, and the resync cadence is
+        // what notices — but the reason comes from the version pair, not from
+        // whichever cadence got there. It used to be hard-coded per call site,
+        // which made a definition change recovered by the resync say "status".
+        val (statusRun, _) = listen(limit = 3)
+        kotlinx.coroutines.runBlocking {
+            api.store
+                .putStatus(
+                    mcorch.schema.PaperServerStatus
+                        .pending(
+                            name = ResourceName.of("survival-01").getOrThrow(),
+                            observedGeneration = 2,
+                            at = TestApi.CLOCK.instant(),
+                        ),
+                ).getOrThrow()
+        }
+        val afterObservation = statusRun.get(20, TimeUnit.SECONDS)
+        afterObservation.last { it.name == "updated" }.json()["reason"] shouldBe "status"
+
+        // The contract used to declare a third value it could never send. A
+        // variant a client has to handle and can never receive reads as a gap in
+        // their code.
+        (afterEdit + afterObservation)
+            .filter { it.name == "updated" }
+            .map { it.json()["reason"] }
+            .toSet() shouldBe setOf("definition", "status")
     }
 
     @Test

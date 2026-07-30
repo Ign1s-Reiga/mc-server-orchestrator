@@ -52,8 +52,8 @@ import kotlin.time.TimeSource
  *
  * ## The protocol
  *
- * Five event types, and a client that handles `snapshot`, `updated` and
- * `removed` is already correct:
+ * Six event types, and a client that handles `snapshot`, `updated` and `removed`
+ * is already correct:
  *
  * - `hello` — the connection's parameters. Always first.
  * - `snapshot` — every server, plus the cursor. Sent when the client did not
@@ -61,10 +61,11 @@ import kotlin.time.TimeSource
  *   cursor therefore needs no separate list call, and there is no window between
  *   listing and subscribing in which a change can be missed.
  * - `updated` — one server resource. Replace by name. Sent for a definition
- *   change and for an observed-state change alike; `reason` says which, for
- *   humans reading a network tab rather than for branching on.
+ *   change and for an observed-state change alike; `reason` says which, derived
+ *   from the version pair rather than from whichever cadence noticed.
  * - `removed` — `{name}`. The definition is gone: `:core` finished the drain and
  *   purged it. Delete by name.
+ * - `ping` — liveness, every [ApiConfig.streamKeepAlive]. See below.
  * - `expired` — the cursor is older than the store remembers. A `snapshot`
  *   follows immediately; a client that ignores this event still converges,
  *   because the snapshot re-states everything.
@@ -73,6 +74,23 @@ import kotlin.time.TimeSource
  *
  * Every event carries `id:` set to the current cursor, so a browser reconnect
  * resumes correctly whichever event arrived last.
+ *
+ * ## Why `ping` is an event and not a comment frame
+ *
+ * The conventional SSE keep-alive is a comment (`: keep-alive`), and this used to
+ * send one. **`EventSource` does not expose comment frames to script**, and on an
+ * idle fleet the keep-alive is the only traffic between the opening snapshot and
+ * the lifetime cycle half an hour later. A half-open socket — a NAT timeout, a
+ * sleeping laptop, a middlebox dropping the connection silently — therefore
+ * leaves an `EventSource` client rendering half-hour-old state with
+ * `readyState === OPEN`, believing it is live. It has no way to notice.
+ *
+ * A named event costs the same bytes, keeps the same proxies alive, and is
+ * visible to every client, so the client can run a watchdog: no `ping` within
+ * about two and a half keep-alive intervals means the connection is dead
+ * whatever the browser thinks. That turns a silent staleness bug into something
+ * a dashboard can show. It carries the cursor as well, so a watchdog that
+ * reconnects resumes from the right place.
  */
 internal class StreamRoutes(
     private val store: Store,
@@ -99,7 +117,7 @@ internal class StreamRoutes(
         try {
             connection = SseConnection(exchange, registry)
             registry.register(connection)
-            connection.begin(retry = RECONNECT_DELAY)
+            connection.begin(retry = config.streamReconnectDelay)
             run(connection, resumeCursor(request))
         } catch (_: StreamClosed) {
             // Ordinary: the client navigated away, or shutdown closed us.
@@ -141,6 +159,10 @@ internal class StreamRoutes(
                 put("statusPollMillis", config.statusPollInterval.inWholeMilliseconds)
                 put("keepAliveMillis", config.streamKeepAlive.inWholeMilliseconds)
                 put("maxLifetimeMillis", config.maxStreamLifetime.inWholeMilliseconds)
+                // Also sent as the SSE `retry:` field, which `EventSource` honours
+                // silently. Here as well so a client that owns its own backoff can
+                // see what it is overriding instead of discovering it in a capture.
+                put("reconnectMillis", config.streamReconnectDelay.inWholeMilliseconds)
             },
         )
         if (resume == null) {
@@ -171,7 +193,14 @@ internal class StreamRoutes(
             }
             if (lastKeepAlive.elapsedNow() >= config.streamKeepAlive) {
                 lastKeepAlive = TimeSource.Monotonic.markNow()
-                connection.keepAlive()
+                connection.event(
+                    "ping",
+                    cursor.token,
+                    jsonObject {
+                        put("at", config.clock.instant())
+                        put("cursor", cursor.token)
+                    },
+                )
             }
             delay(config.changePollInterval)
         }
@@ -223,7 +252,7 @@ internal class StreamRoutes(
                 // The names, de-duplicated: a server written three times in one
                 // interval is one read and one event, not three.
                 for (name in feed.changes.map { it.name }.distinct()) {
-                    emit(connection, feed.cursor, name, "definition", seen)
+                    emit(connection, feed.cursor, name, seen)
                 }
                 feed.cursor
             }
@@ -246,7 +275,7 @@ internal class StreamRoutes(
         val present = HashSet<ResourceName>(servers.size)
         for (server in servers) {
             present += server.name
-            send(connection, cursor, server, "status", seen)
+            send(connection, cursor, server, seen)
         }
         val gone = seen.keys.filter { it !in present }
         for (name in gone) {
@@ -266,7 +295,6 @@ internal class StreamRoutes(
         connection: SseConnection,
         cursor: StoreCursor,
         name: ResourceName,
-        reason: String,
         seen: MutableMap<ResourceName, Versions>,
     ) {
         val server = store.getServer(name)
@@ -283,20 +311,35 @@ internal class StreamRoutes(
             }
             return
         }
-        send(connection, cursor, server, reason, seen)
+        send(connection, cursor, server, seen)
     }
 
-    /** Sends [server] unless its versions are exactly what this connection last sent. */
+    /**
+     * Sends [server] unless its versions are exactly what this connection last
+     * sent, with a `reason` derived from *what actually moved*.
+     *
+     * Derived rather than passed in by the call site, because the call site does
+     * not know. The resync cadence is the repair path for anything the change
+     * feed lost, so it re-sends definition changes as well as observations; when
+     * it named its own reason it labelled a recovered definition change
+     * `"status"`, which was simply wrong. The version pair is the only thing that
+     * knows, so it is what decides.
+     *
+     * There are two values and no third. A `"resync"` reason was declared in the
+     * contract and never emitted — a variant a client must handle and can never
+     * receive is dead weight that reads as a gap in their code.
+     */
     private fun send(
         connection: SseConnection,
         cursor: StoreCursor,
         server: StoredServer,
-        reason: String,
         seen: MutableMap<ResourceName, Versions>,
     ) {
         val versions = Versions.of(server)
-        if (seen[server.name] == versions) return
+        val previous = seen[server.name]
+        if (previous == versions) return
         seen[server.name] = versions
+        val reason = if (previous == null || previous.definition != versions.definition) "definition" else "status"
         connection.event(
             "updated",
             cursor.token,
@@ -321,9 +364,6 @@ internal class StreamRoutes(
 
     companion object {
         const val STREAM: String = "/api/v1/stream"
-
-        /** What `EventSource` waits before reconnecting. Sent as the `retry:` field. */
-        private val RECONNECT_DELAY: Duration = 3.seconds
 
         private val LOG = LoggerFactory.getLogger(StreamRoutes::class.java)
     }

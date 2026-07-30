@@ -120,12 +120,14 @@ class TestApi private constructor(
                         data.append(line.removePrefix("data: "))
                     }
 
+                    // A comment frame. The stream no longer sends any — the
+                    // keep-alive is a `ping` event, because EventSource cannot see
+                    // a comment — but the parser still tolerates one rather than
+                    // treating it as data.
                     line.startsWith(":") -> {
-                        Unit
                     }
 
                     line.startsWith("retry: ") -> {
-                        Unit
                     }
 
                     line.isEmpty() -> {

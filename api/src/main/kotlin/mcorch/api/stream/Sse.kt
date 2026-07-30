@@ -97,11 +97,6 @@ internal class SseConnection(
         write(frame)
     }
 
-    /** A comment frame. Keeps proxies and load balancers from reaping an idle connection. */
-    fun keepAlive() {
-        write(": keep-alive\n\n")
-    }
-
     private fun write(text: String) {
         if (closed) throw StreamClosed()
         try {

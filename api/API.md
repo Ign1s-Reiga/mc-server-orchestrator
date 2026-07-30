@@ -227,7 +227,20 @@ write again with the new `ETag`.
 ## 5. Sending a definition
 
 `POST /api/v1/servers`, `PUT /api/v1/servers/{name}` and `POST /api/v1/validate`
-all take a definition document.
+all take a definition document. **The type is `DefinitionInput` in §14, not
+`Definition`** — the two are different and it matters: nearly everything the
+parser defaults is optional on the way in, so a four-field document validates,
+while what comes back has every default resolved. `Definition` is assignable to
+`DefinitionInput`, so a fetched definition can be edited and sent back with no
+cast.
+
+An explicit `null` is a **violation**, not "use the default" — `spec.storage:`
+with nothing under it is a mistake worth reporting rather than a request for the
+default. Omit the key. `JSON.stringify` drops `undefined` properties, so an
+optional property left unset is already correct.
+
+Unknown fields are rejected with a violation naming the field and, where the
+schema can guess, a `did you mean …?`.
 
 **Accepted `Content-Type`:** `application/json`, `application/yaml`,
 `application/x-yaml`, `text/yaml`, `text/x-yaml`, `text/plain`, or absent.
@@ -301,6 +314,10 @@ TypeScript client than symmetry is.
 Affected: `paper.build`, `network.hostPort`, `network.rcon`, `resources.cpu`,
 `storage.volume.size`, `placement.node`, and `metadata.labels` when empty. Read
 them as `spec.network.rcon ?? { enabled: false }`.
+
+This is what makes `Definition` assignable to `DefinitionInput` in §14 —
+`const draft: DefinitionInput = server.definition` compiles. What comes *out* is
+always richer than the minimum that goes *in*, never the other way round.
 
 `definition.spec` is the **effective** spec: the parser resolves every default, so
 what comes back is what the reconciler acts on, not what the operator typed. A
@@ -455,10 +472,42 @@ headers) or by bearer for a non-browser client.
 The dashboard needs server-to-client push and nothing else; every operator action
 is a request with a status code and a body, which a WebSocket makes worse. SSE is
 plain HTTP/1.1, so it inherits the cookie, the CORS decision and the reverse-proxy
-config already in place, and `EventSource` reconnects and replays
-`Last-Event-ID` with no client code. The one thing a WebSocket would buy —
-sending a header on connect — is exactly what SSE cannot do either, which is why
-the session cookie exists.
+config already in place. The one thing a WebSocket would buy — sending a header
+on connect — is exactly what SSE cannot do either, which is why the session
+cookie exists.
+
+### `EventSource` or `fetch`? Both work. Read this before choosing.
+
+Every frame this stream sends is a **named event**; there are no comment frames
+and nothing is carried out of band. That is a deliberate constraint so the two
+transports see exactly the same protocol:
+
+- **`EventSource`** — reconnects and replays `Last-Event-ID` with no client code,
+  honours `retry:` on its own. Least code.
+- **`fetch` + `ReadableStream`** — you parse the framing yourself and own the
+  reconnect policy. More code, full control.
+
+Neither is blind to anything the other sees. This used to be false: the
+keep-alive was an SSE *comment* (`: keep-alive`), and **`EventSource` does not
+expose comment frames to script**. On an idle fleet that comment is the only
+traffic between the opening snapshot and the lifetime cycle half an hour later,
+so a half-open socket — a NAT timeout, a sleeping laptop, a middlebox dropping
+the connection silently — left an `EventSource` client rendering half-hour-old
+state with `readyState === OPEN` and no way to notice. It is now a `ping` event
+(below), which both transports can see.
+
+**Run a staleness watchdog either way.** `readyState === OPEN` is not evidence
+that the connection is alive; a `ping` within the last few `keepAliveMillis` is.
+
+```js
+let lastBeat = Date.now();
+const beat = () => { lastBeat = Date.now(); };
+es.addEventListener('ping', beat);
+es.addEventListener('snapshot', beat);
+es.addEventListener('updated', beat);
+// ~2.5 keep-alive intervals. Below 2 you will reconnect on ordinary jitter.
+const stale = () => Date.now() - lastBeat > keepAliveMillis * 2.5;
+```
 
 ### Opening
 
@@ -472,32 +521,46 @@ there is no window between listing and subscribing in which a change can be lost
 `?cursor=` wins over `Last-Event-ID`; `?cursor=` set to the empty string forces a
 snapshot even on a browser reconnect.
 
+Before `hello`, the stream sends the SSE `retry:` field set to
+`reconnectMillis` (3000). **`EventSource` honours this silently** and it becomes
+your reconnect delay. A client with its own backoff simply ignores it; the same
+value is in `hello` and in `meta.stream.reconnectMillis` so you can see what you
+are overriding without reading a packet capture.
+
 ### Events
 
 Every event carries `id:` set to the current cursor, so a browser reconnect
 resumes correctly whichever event arrived last. A client that handles `snapshot`,
-`updated` and `removed` is already correct.
+`updated` and `removed` is already correct — plus `ping` if you want the
+watchdog, which you do.
 
 | event | data | do |
 |---|---|---|
-| `hello` | `{cursor, resumed, changePollMillis, statusPollMillis, keepAliveMillis, maxLifetimeMillis}` | note the cursor |
+| `hello` | `{cursor, resumed, changePollMillis, statusPollMillis, keepAliveMillis, maxLifetimeMillis, reconnectMillis}` | note the cursor |
 | `snapshot` | `{cursor, count, items:[resource]}` | replace the whole set |
 | `updated` | `{name, reason, server}` | replace by name |
 | `removed` | `{name, reason}` | delete by name |
+| `ping` | `{at, cursor}` | reset the staleness watchdog |
 | `expired` | `{cursor, message}` | nothing — a `snapshot` follows immediately |
-| `bye` | `{reason:"MAX_LIFETIME", cursor}` | nothing — the browser reconnects |
+| `bye` | `{reason:"MAX_LIFETIME", cursor}` | nothing — reconnect |
 
-`reason` on `updated` is `"definition"`, `"status"` or `"resync"`, for a human
-reading a network tab rather than for branching on. `removed` means the drain
-finished and `:core` purged the name — a *delete request* arrives as `updated`
-with `terminating: true`.
+`reason` on `updated` is `"definition"` or `"status"`, **derived from which
+version actually moved** rather than from whichever cadence noticed. It is for a
+human reading a network tab; a client replaces by name either way. There is no
+third value — a `"resync"` variant was once declared here and never emitted,
+which is dead weight that reads as a gap in your code.
+
+`removed` means the drain finished and `:core` purged the name. A *delete
+request* arrives as `updated` with `terminating: true`.
+
+`ping` arrives every `keepAliveMillis` whether or not anything changed, and
+carries the cursor, so a watchdog that gives up and reconnects resumes from the
+right place instead of re-listing.
 
 `expired` is a real case a long-lived tab will hit: the change log is bounded, and
 a connection that slept through enough writes cannot be told what it missed. A
 client that ignores the event still converges, because the snapshot that follows
 re-states everything.
-
-Comment frames (`: keep-alive`) arrive every `keepAliveMillis`.
 
 ### Two cadences
 
@@ -577,21 +640,56 @@ database.
 
 ### `GET /api/v1/meta` — authenticated
 
-Every closed set the API can return, so the dashboard does not hard-code
-enumerations it renders:
+Every closed set the API can return **or accept**, so a dashboard hard-codes
+none — not in a filter and not in a create form:
 
 ```json
 { "apiVersions": ["mcorch.dev/v1alpha1"], "currentApiVersion": "mcorch.dev/v1alpha1",
   "kinds": ["PaperServer"],
-  "enums": { "phase": [...], "drainState": [...], "conditionType": [...],
-             "failureReason": [...], "displayState": [...] },
+  "enums": {
+    "phase": [...], "drainState": [...], "conditionType": [...], "conditionStatus": [...],
+    "failureReason": [...], "failureClass": [...], "displayState": [...],
+    "storageMode": ["persistent", "ephemeral"],
+    "drainPolicy": ["waitForZeroPlayers"]
+  },
   "limits": { "maxBodyBytes": 1048576, "maxStreams": 16 },
   "stream": { "path": "/api/v1/stream", "changePollMillis": 500, "statusPollMillis": 2000,
-              "keepAliveMillis": 15000, "maxLifetimeMillis": 1800000 } }
+              "keepAliveMillis": 15000, "maxLifetimeMillis": 1800000, "reconnectMillis": 3000 } }
 ```
 
-A value added in `:schema` appears in the dashboard's filters without a frontend
-release.
+#### Two spellings, and the split is not cosmetic
+
+- **`phase`, `drainState`, `conditionType`, `conditionStatus`, `failureReason`,
+  `failureClass`, `displayState`** appear in *observed state* and are spelled by
+  their Kotlin name: `RUNNING`, `DRAIN_STALLED`.
+- **`storageMode`, `drainPolicy`** appear in a *definition* and are spelled by
+  their YAML wire value: `persistent`, `waitForZeroPlayers`. A form that offered
+  `PERSISTENT` would build a document the parser rejects.
+
+The key name tells you which: `…State`/`…Type`/`…Reason`/`…Class` are read back,
+`storageMode`/`drainPolicy` are sent.
+
+#### What "without a frontend release" actually covers
+
+A value added to one of `:schema`'s enums — a new `FailureReason`, a new
+`ConditionType`, a new `StorageMode` — appears here immediately, with no change to
+`:api` and none to the dashboard.
+
+Two things are **not** covered, and it is better to know than to assume:
+
+- **`displayState` is `:api`'s own enum, not `:schema`'s.** It is still served
+  here, so a new badge still reaches your filters with no frontend release — but
+  the guarantee is provided by `:api`, not by `:schema`. It cannot move to
+  `:schema`: `TERMINATING` is derived from the store's tombstone and `PENDING`
+  from the *absence* of an observation, and a tombstone is not a concept
+  `:schema` has (deliberately — `metadata` has no `generation` either, for the
+  same reason).
+- **A new `ServerPhase` does not silently become a new `displayState`.** The
+  mapping in §7 is exhaustive with no fallback, so a phase added in `:schema`
+  fails `:api`'s compile until somebody decides which badge it maps to. That is
+  intended: the alternative is a new phase quietly rendering as `UNKNOWN` on
+  every dashboard. It does mean a `:schema` phase addition ships with an `:api`
+  change — but never with a frontend one.
 
 ---
 
@@ -687,7 +785,86 @@ export type ConditionType =
 export type ConditionStatus = 'TRUE' | 'FALSE' | 'UNKNOWN';
 export type FailureClass = 'RETRYABLE' | 'PERMANENT';
 
-/** Absent optional fields are OMITTED here — see §6. Valid input to POST/PUT. */
+export type FailureReason =
+  | 'IMAGE_PULL_FAILED' | 'IMAGE_REFERENCE_REJECTED' | 'SANDBOX_CREATE_FAILED'
+  | 'CONTAINER_CREATE_FAILED' | 'CONTAINER_START_FAILED' | 'CONTAINER_EXITED'
+  | 'READINESS_TIMEOUT' | 'VOLUME_UNAVAILABLE' | 'NODE_UNAVAILABLE'
+  | 'RUNTIME_UNREACHABLE' | 'DRAIN_NO_DESTINATION' | 'DRAIN_TRANSFER_FAILED'
+  | 'DRAIN_SAVE_TIMEOUT' | 'DRAIN_STALLED' | 'UNKNOWN';
+
+/** Wire values, because these are written back into a definition. */
+export type StorageMode = 'persistent' | 'ephemeral';
+export type DrainPolicy = 'waitForZeroPlayers';
+
+// ── what you SEND ───────────────────────────────────────────────────────────
+
+/**
+ * The body of POST /servers, PUT /servers/{name} and POST /validate.
+ *
+ * Everything the parser defaults is optional here, which is most of the spec:
+ * a four-field document validates. Note `?:` and NOT `| null` throughout — an
+ * explicit `null` is a violation, not "use the default" (§6). `JSON.stringify`
+ * drops `undefined` properties, so an optional property left unset is correct;
+ * one set to `null` is a 422.
+ *
+ * Unknown fields are rejected with a violation naming the field, so this is not
+ * merely advisory — a typo is a 422 with `did you mean …?` attached.
+ */
+export interface DefinitionInput {
+  apiVersion: ApiVersion;
+  kind: Kind;
+  metadata: { name: string; labels?: Record<string, string> };
+  spec: PaperServerSpecInput;
+}
+
+export interface PaperServerSpecInput {
+  /** Required. Pinned to a tag or a digest; `latest` is rejected. */
+  image: string;
+  /** Required. `build` is optional. */
+  paper: { minecraftVersion: string; build?: number };
+  /** Required, and must be `true`. A Paper server never starts without it. */
+  eulaAccepted: true;
+  /** Required — but only `memory` inside it is. */
+  resources: {
+    memory: string;                     // `4Gi`, `512Mi`, `2G`
+    cpu?: string;                       // `2`, `1.5`, `500m`
+    /** Defaults to the largest heap that leaves the container headroom. */
+    heap?: { max?: string; min?: string };
+  };
+  maxPlayers?: number;                  // default 20
+  network?: {
+    port?: number;                      // default 25565
+    hostPort?: number;
+    /** Omit for no RCON. `passwordSecret` is required once `enabled` is true. */
+    rcon?: { enabled?: boolean; port?: number; passwordSecret?: SecretRef };
+  };
+  /** Defaults to persistent, on a volume named after the server. */
+  storage?:
+    | { mode?: 'persistent'; mountPath?: string; volume?: { name?: string; size?: string } }
+    /** `volume` must NOT be set here — a 422 if it is. */
+    | { mode: 'ephemeral'; mountPath?: string };
+  lifecycle?: {
+    drain?: { policy?: DrainPolicy; playerTransferTimeout?: string; saveTimeout?: string };
+    /** Must exceed `drain.saveTimeout` by at least 30s. Default: saveTimeout + 60s. */
+    stopGracePeriod?: string;
+    startupTimeout?: string;
+  };
+  placement?: { node?: string };        // omit and the scheduler chooses
+}
+
+// ── what you RECEIVE ────────────────────────────────────────────────────────
+
+/**
+ * The `definition` field of a server resource. Absent optional fields are
+ * OMITTED, not null (§6) — which is precisely what makes it assignable to
+ * `DefinitionInput`, so a fetched definition can be edited and PUT back with no
+ * cast and no rebuild:
+ *
+ *   const draft: DefinitionInput = server.definition;   // compiles
+ *
+ * Unlike `DefinitionInput`, every defaulted field is present: this is the
+ * *effective* definition the reconciler acts on, not what the operator typed.
+ */
 export interface Definition {
   apiVersion: ApiVersion;
   kind: Kind;
@@ -756,7 +933,7 @@ export interface DrainStatus {
 }
 
 export interface FailureStatus {
-  reason: string; failureClass: FailureClass;
+  reason: FailureReason; failureClass: FailureClass;
   message: string;                  // redacted upstream; no unredacted view exists
   occurredAt: string; attempts: number;
 }
@@ -809,10 +986,12 @@ export interface ApiError {
 
 export type StreamEvent =
   | { type: 'hello';    data: { cursor: string; resumed: boolean; changePollMillis: number;
-                                statusPollMillis: number; keepAliveMillis: number; maxLifetimeMillis: number } }
+                                statusPollMillis: number; keepAliveMillis: number;
+                                maxLifetimeMillis: number; reconnectMillis: number } }
   | { type: 'snapshot'; data: { cursor: string; count: number; items: ServerResource[] } }
-  | { type: 'updated';  data: { name: string; reason: 'definition' | 'status' | 'resync'; server: ServerResource } }
+  | { type: 'updated';  data: { name: string; reason: 'definition' | 'status'; server: ServerResource } }
   | { type: 'removed';  data: { name: string; reason: 'PURGED' } }
+  | { type: 'ping';     data: { at: string; cursor: string } }
   | { type: 'expired';  data: { cursor: string; message: string } }
   | { type: 'bye';      data: { reason: 'MAX_LIFETIME'; cursor: string } };
 ```
@@ -820,12 +999,14 @@ export type StreamEvent =
 ### The three flows worth writing down
 
 **Bootstrap.** `POST /auth/session` with the token → keep `csrfToken` in memory →
-open `EventSource('/api/v1/stream', {withCredentials: true})` → build the table
-from `snapshot`, apply `updated`/`removed`. No list call needed.
+`GET /meta` once for the enumerations → open the stream with `withCredentials` →
+build the table from `snapshot`, apply `updated`/`removed`, reset a staleness
+watchdog on `ping`. No list call needed.
 
-**Edit.** `GET /servers/{name}` → edit `definition` → `PUT` with
-`If-Match: <ETag>` and `X-CSRF-Token`. On `409`, re-read, re-apply, retry. On
-`422`, attach each violation to its `field`.
+**Edit.** `GET /servers/{name}` → assign `server.definition` to a
+`DefinitionInput` (it fits) → edit → `PUT` with `If-Match: <ETag>` and
+`X-CSRF-Token`. On `409`, re-read, re-apply, retry. On `422`, attach each
+violation to its `field`.
 
 **Delete.** `DELETE /servers/{name}` → `202` → keep the row, render
 `TERMINATING` and `status.drain.state` → the row goes when `removed` arrives or

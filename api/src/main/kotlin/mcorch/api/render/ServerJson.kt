@@ -101,7 +101,6 @@ internal object ServerJson {
                         // Omitted rather than rendered as `enabled: false`: absent is
                         // how the schema spells "off", and this document has to parse.
                         RconSpec.Disabled -> {
-                            Unit
                         }
 
                         is RconSpec.Enabled -> {
@@ -145,8 +144,9 @@ internal object ServerJson {
                     put("mode", spec.storage.mode.wireValue)
                     put("mountPath", spec.storage.mountPath)
                     when (val storage = spec.storage) {
+                        // An ephemeral server has no volume, and declaring one is a
+                        // violation rather than a redundancy — so nothing is written.
                         is StorageSpec.Ephemeral -> {
-                            Unit
                         }
 
                         is StorageSpec.Persistent -> {
@@ -431,7 +431,30 @@ internal object ServerJson {
             }
         }
 
-    /** The badge a dashboard renders. Derived; never stored, never authoritative. */
+    /**
+     * The badge a dashboard renders. Derived; never stored, never authoritative.
+     *
+     * ## Why this is `:api`'s and not `:schema`'s
+     *
+     * It looks like a schema enum and it is not one. `TERMINATING` — the value
+     * that outranks every other — is derived from `StoredDefinition.deletedAt`,
+     * which is `:store` bookkeeping: a tombstone is not a concept `:schema` has,
+     * deliberately, in the same way `ObjectMetadata` deliberately has no
+     * `generation`. `PENDING` for an unobserved server is likewise derived from
+     * the absence of a `StoredStatus`, not from anything a definition or a status
+     * says. Moving this into `:schema` would mean teaching `:schema` about the
+     * store, which is a worse trade than owning a presentation enum here.
+     *
+     * It is still served through `/api/v1/meta` like every other closed set, so a
+     * value added here reaches a dashboard's filters with no frontend release —
+     * the guarantee holds, it is just not `:schema` that provides it.
+     *
+     * The `when` over [ServerPhase] in [displayState] is exhaustive with no
+     * `else`, so a phase added in `:schema` breaks *this* module's compile until
+     * somebody decides which badge it maps to. That is the intended behaviour
+     * rather than a maintenance cost: the alternative is a new phase silently
+     * rendering as `UNKNOWN` on every dashboard.
+     */
     internal enum class DisplayState {
         PENDING,
         STARTING,

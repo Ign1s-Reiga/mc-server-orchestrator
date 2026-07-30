@@ -97,8 +97,22 @@ public data class ApiConfig(
     val changePollInterval: Duration = 500.milliseconds,
     /** How often an open stream re-reads observed state. Observed state is not in the change feed. */
     val statusPollInterval: Duration = 2.seconds,
-    /** Comment frames, so an idle connection is not reaped by a proxy. */
+    /**
+     * How often an idle stream sends a `ping`.
+     *
+     * Two jobs. It keeps a proxy from reaping the connection, and it is the only
+     * liveness signal a client has on an idle fleet — so a client should treat
+     * roughly two and a half of these without a `ping` as a dead connection. See
+     * [mcorch.api.routes.StreamRoutes] for why it is an event rather than the
+     * conventional SSE comment frame.
+     */
     val streamKeepAlive: Duration = 15.seconds,
+    /**
+     * Sent as the SSE `retry:` field, which `EventSource` honours silently, and
+     * echoed in the `hello` event so a client that owns its own backoff can see
+     * what it is overriding.
+     */
+    val streamReconnectDelay: Duration = 3.seconds,
     /**
      * A stream is closed after this long and the browser reconnects with
      * `Last-Event-ID`. Bounds how long one connection can hold a slot and forces

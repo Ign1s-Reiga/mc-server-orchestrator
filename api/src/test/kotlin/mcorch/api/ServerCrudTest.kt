@@ -102,6 +102,80 @@ class ServerCrudTest {
     }
 
     @Test
+    fun `the documented input type is the real one - seven fields validate, and each is required`() {
+        // API.md's DefinitionInput claims nearly everything is optional on the way
+        // in. The claim is only worth anything if the required set is exactly this,
+        // so the test drops each field in turn and expects it to be named.
+        //
+        // This is the finding that came back from the dashboard: §14 declared the
+        // *output* type as "valid input to POST/PUT", which it is, but it is not
+        // the input type — the client had to infer its own.
+        val required =
+            mapOf(
+                "apiVersion" to "\"apiVersion\":\"mcorch.dev/v1alpha1\",",
+                "kind" to "\"kind\":\"PaperServer\",",
+                "metadata.name" to "\"metadata\":{\"name\":\"survival-min\"},",
+                "spec.eulaAccepted" to "\"eulaAccepted\":true,",
+                "spec.image" to "\"image\":\"docker.io/itzg/minecraft-server:2026.6.1\",",
+                "spec.paper.minecraftVersion" to "\"paper\":{\"minecraftVersion\":\"1.21.8\"},",
+                "spec.resources.memory" to "\"resources\":{\"memory\":\"4Gi\"}",
+            )
+
+        // Reassembles into `{envelope..., "spec":{...}}`. Dropping a member leaves
+        // the rest well-formed: every fragment but the last carries its comma, and
+        // a trailing one is trimmed.
+        fun document(without: String? = null): String {
+            val envelope =
+                required.keys
+                    .take(3)
+                    .filter { it != without }
+                    .joinToString("") { required.getValue(it) }
+            val spec =
+                required.keys
+                    .drop(3)
+                    .filter { it != without }
+                    .joinToString("") { required.getValue(it) }
+            return "{$envelope\"spec\":{${spec.trimEnd(',')}}}"
+        }
+
+        api.call("POST", "/api/v1/validate", document(), contentType = "application/json").let {
+            withClue("the full minimal document") { it.status shouldBe 200 }
+        }
+        for (field in required.keys) {
+            val reply =
+                api.call(
+                    "POST",
+                    "/api/v1/validate",
+                    document(without = field),
+                    contentType = "application/json",
+                )
+            withClue("without $field") {
+                reply.status shouldBe 422
+                // The violation names the field that was dropped, or its parent
+                // when dropping the field removes the mapping that would hold it.
+                val named = violations(reply).map { it["field"].toString() }
+                named.any { field == it || field.startsWith("$it.") || it.startsWith("$field.") } shouldBe true
+            }
+        }
+    }
+
+    @Test
+    fun `what comes out of GET is valid input to PUT with nothing added`() {
+        api.call("POST", "/api/v1/servers", ExampleDefinitions.valid("full.yaml")).status shouldBe 201
+        val fetched = api.call("GET", "/api/v1/servers/survival-02")
+        val definition = fetched.json()["definition"]
+
+        // Re-sent verbatim through the validator: this is the property that lets a
+        // dashboard assign `server.definition` to its input type and PUT it back
+        // without rebuilding it. An explicit null anywhere in the rendered
+        // definition would fail here, which is why the definition omits absent
+        // optionals while everything else nulls them.
+        val revalidated = api.call("POST", "/api/v1/validate", dump(definition), contentType = "application/json")
+        revalidated.status shouldBe 200
+        revalidated.json()["definition"] shouldBe definition
+    }
+
+    @Test
     fun `an invalid definition returns every violation with its field path`() {
         val rejected = api.call("POST", "/api/v1/servers", ExampleDefinitions.invalid("many-problems.yaml"))
         rejected.status shouldBe 422
@@ -299,5 +373,16 @@ class ServerCrudTest {
 
     private infix fun String.shouldNotBeSameAs(other: String) {
         if (this == other) throw AssertionError("expected `$this` to differ from `$other`")
+    }
+
+    private fun withClue(
+        clue: String,
+        block: () -> Unit,
+    ) {
+        try {
+            block()
+        } catch (failure: AssertionError) {
+            throw AssertionError("$clue: ${failure.message}", failure)
+        }
     }
 }
