@@ -11,7 +11,9 @@ import io.kotest.matchers.types.shouldBeInstanceOf
 import kotlinx.coroutines.test.runTest
 import mcorch.schema.DrainState
 import mcorch.schema.PaperServerStatus
+import mcorch.schema.ResourceName
 import mcorch.schema.ServerPhase
+import org.junit.jupiter.api.Assumptions
 import org.junit.jupiter.api.Test
 
 /**
@@ -30,6 +32,30 @@ import org.junit.jupiter.api.Test
 abstract class StoreConformanceSuite {
     /** A fresh, empty store. Closed by the suite after each test. */
     protected abstract fun createStore(): Store
+
+    /**
+     * Makes the observation already stored for [name] undecodable, by whatever
+     * means this implementation has — reaching past the interface is the point.
+     *
+     * Every implementation must answer this, because the answer is load-bearing.
+     * The interface's defence against a half-finished drain being restarted is
+     * that a *point* read refuses a record it cannot decode: the loop asks about
+     * one server, gets a failure, and does not act. An implementation that
+     * quietly returned "no observation" instead would let the loop re-issue a
+     * save request against a server that already has one in flight. Nothing about
+     * the type signatures stops it, so the suite has to.
+     *
+     * The default aborts rather than passes. A store that cannot hold an
+     * undecodable record at all — one keeping objects in memory — is exempt in
+     * fact, and says so out loud; a store that *can* and has not implemented this
+     * is announcing untested behaviour rather than banking a green tick.
+     */
+    protected open suspend fun corruptObservation(name: ResourceName) {
+        Assumptions.abort<Unit>(
+            "this store cannot hold an undecodable observation, so it has nothing to refuse. " +
+                "An implementation that can hold one must override corruptObservation",
+        )
+    }
 
     private fun withStore(block: suspend (Store) -> Unit) =
         runTest {
@@ -637,6 +663,63 @@ abstract class StoreConformanceSuite {
             val observed = store.getServer(name).shouldNotBeNull()
             observed.neverObserved shouldBe false
             observed.unreadable.shouldBeNull()
+        }
+
+    // ------------------------------------------------ state that will not decode
+
+    /**
+     * The refusal the drain protocol leans on.
+     *
+     * A pass that cannot read the last observation cannot know whether the save
+     * request already went out, and re-sending one loads a live server and can
+     * restart a drain that was nearly done. The store's answer is to refuse the
+     * point read, so the pass fails instead of proceeding on an assumption. It is
+     * the single most load-bearing behaviour in the unreadable-state design and
+     * it is the one a new backend is most likely to get wrong, because being
+     * *lenient* here looks like robustness.
+     */
+    @Test
+    fun `a point read refuses a server whose observation cannot be decoded`() =
+        withStore { store ->
+            val name = Fixtures.resourceName("survival-a")
+            store.putDefinition(Fixtures.definitionNamed("survival-a")).getOrThrow()
+            store.putStatus(Fixtures.fullStatus("survival-a")).getOrThrow()
+
+            corruptObservation(name)
+
+            val failure =
+                runCatching { store.getServer(name) }
+                    .exceptionOrNull()
+                    .shouldBeInstanceOf<StoreException>()
+            failure.retryable shouldBe false
+        }
+
+    /**
+     * The other half of the same rule: a *listing* must not refuse, and must not
+     * pretend either. The row stays, marked, so a caller sees every other server
+     * and is told about this one — see [Store.listServers].
+     */
+    @Test
+    fun `a listing marks the server whose observation cannot be decoded and keeps the rest`() =
+        withStore { store ->
+            val name = Fixtures.resourceName("survival-a")
+            store.putDefinition(Fixtures.definitionNamed("survival-a")).getOrThrow()
+            store.putStatus(Fixtures.fullStatus("survival-a")).getOrThrow()
+            store.putDefinition(Fixtures.definitionNamed("survival-b")).getOrThrow()
+            store.putStatus(Fixtures.fullStatus("survival-b")).getOrThrow()
+
+            corruptObservation(name)
+
+            val servers = store.listServers()
+            servers.map { it.name.value }.shouldContainExactlyInAnyOrder("survival-a", "survival-b")
+
+            val marked = servers.single { it.name == name }
+            marked.status.shouldBeNull()
+            marked.unreadable.shouldNotBeNull().part shouldBe StatePart.OBSERVED
+            marked.neverObserved shouldBe false
+
+            // The untouched server is untouched: one bad record costs one server.
+            servers.single { it.name.value == "survival-b" }.status.shouldNotBeNull()
         }
 
     // --------------------------------------------------------------- change feed

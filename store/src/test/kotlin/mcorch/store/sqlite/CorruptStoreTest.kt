@@ -9,6 +9,7 @@ import io.kotest.matchers.types.shouldBeInstanceOf
 import kotlinx.coroutines.test.runTest
 import mcorch.schema.DrainState
 import mcorch.store.Fixtures
+import mcorch.store.ServerListing
 import mcorch.store.StatePart
 import mcorch.store.Store
 import mcorch.store.StoreException
@@ -106,6 +107,56 @@ class CorruptStoreTest {
                 listing.unreadable
                     .single()
                     .unreadable.reason shouldContain "VelocityProxy"
+            }
+        }
+
+    /**
+     * A row with no name at all.
+     *
+     * `server_definition.name` is `TEXT PRIMARY KEY`, and SQLite allows NULL there
+     * — the rowid-table quirk. Nothing the store writes can produce one, so this
+     * fixture inserts it the only way it can happen: raw SQL against the file.
+     *
+     * The tenth drain audit found the read path raised a `NullPointerException`
+     * for it. That is not a [StoreException], so it escaped the reconcile loop's
+     * classification entirely, cancelled the loop's scope and killed the process
+     * on every start, unrecoverable without raw SQL. A store cannot be
+     * unopenable because somebody wrote a bad row into it: this has to be one
+     * more unreadable record, in the shape everything else already handles.
+     */
+    @Test
+    fun `a row stored with no name is unreadable rather than fatal`() =
+        runTest {
+            val directory = stores.directory()
+            stores.open(directory).use { store ->
+                store.state.putDefinition(Fixtures.definitionNamed("survival-01")).getOrThrow()
+                store.state.putDefinition(Fixtures.definitionNamed("survival-03")).getOrThrow()
+            }
+            insertUnnamedDefinitionRow(directory)
+
+            stores.open(directory).use { store ->
+                val listing = store.state.listAll()
+
+                listing.servers.map { it.name.value } shouldBe listOf("survival-01", "survival-03")
+                val entry = listing.unreadable.single()
+                entry.name.shouldBeNull()
+                entry.resourceName.shouldBeNull()
+                entry.unreadable.part shouldBe StatePart.DESIRED
+                entry.unreadable.retryable shouldBe false
+                entry.unreadable.reason shouldContain "column `name` is unexpectedly null"
+
+                // The strict list refuses it in the store's own vocabulary — a
+                // permanent StoreException, never a NullPointerException.
+                val failure =
+                    runCatching { store.state.listServers() }
+                        .exceptionOrNull()
+                        .shouldBeInstanceOf<StoreException.Corrupt>()
+                failure.retryable shouldBe false
+
+                // And the loop, which reads the tolerant list, still gets its work.
+                val loop = resyncLike(store.state)
+                loop.failure.shouldBeNull()
+                loop.queued shouldBe listOf("survival-01", "survival-03")
             }
         }
 
@@ -283,13 +334,20 @@ class CorruptStoreTest {
     // ------------------------------------------------------------- what the loop sees
 
     /**
-     * The audit's sequence, at the seam it was found on: `ReconcileLoop.resync`
-     * catches [StoreException], logs `resync failed` and queues *nothing*, so a
+     * The ninth audit's sequence, at the seam it was found on: `ReconcileLoop.resync`
+     * caught [StoreException], logged `resync failed` and queued *nothing*, so a
      * single undecodable row stopped the loop from being given any work at all —
      * every resync period, forever.
+     *
+     * What is asserted is that the loop comes away with work. The server whose
+     * observation will not decode is deliberately *not* in it: `:core` holds that
+     * one back, because a pass that cannot read the last observation cannot tell
+     * whether a save request already went out. It is still reported to the loop,
+     * which is the difference between one server being held back and the fleet
+     * going quiet.
      */
     @Test
-    fun `a loop-shaped resync still queues every server when one observation will not read`() =
+    fun `a loop-shaped resync still gets work when one observation will not read`() =
         runTest {
             val directory = stores.directory()
             stores.open(directory).use { store ->
@@ -304,24 +362,26 @@ class CorruptStoreTest {
                 val loop = resyncLike(store.state)
 
                 loop.failure.shouldBeNull()
-                loop.queued shouldBe listOf("survival-01", "survival-02", "survival-03")
+                loop.queued shouldBe listOf("survival-01", "survival-03")
+                loop.heldBack shouldBe listOf("survival-02")
             }
         }
 
     /**
      * The other half of it. `ReconcileLoop.resumeDrains` runs before anything else
-     * at startup and swallows the same failure, so no in-flight drain on *any*
+     * at startup and swallowed the same failure, so no in-flight drain on *any*
      * server was picked up — against its own documented reason for existing, that
      * "a drain that is never picked up leaves players on a server nobody is
      * watching".
      *
      * The drain state a row is selected by lives beside the observation rather
      * than inside it, so the server whose observation will not decode is still
-     * found here. That is the point: it is the one the loop most needs to be told
-     * about.
+     * *found* here. That is the point: it is the one the loop most needs to be
+     * told about, and being told is what lets it hold that one back rather than
+     * all of them.
      */
     @Test
-    fun `a loop-shaped drain resumption still queues every in-flight drain when one will not read`() =
+    fun `a loop-shaped drain resumption still gets work when one drain will not read`() =
         runTest {
             val directory = stores.directory()
             stores.open(directory).use { store ->
@@ -336,9 +396,11 @@ class CorruptStoreTest {
                 val loop = resumeDrainsLike(store.state)
 
                 loop.failure.shouldBeNull()
-                loop.queued shouldBe listOf("survival-01", "survival-02", "survival-03")
+                loop.queued shouldBe listOf("survival-01", "survival-03")
+                loop.heldBack shouldBe listOf("survival-02")
                 store.state
-                    .listByDrainState(RESUMABLE_DRAIN_STATES)
+                    .listAllByDrainState(RESUMABLE_DRAIN_STATES)
+                    .servers
                     .single { it.name.value == "survival-02" }
                     .neverObserved shouldBe false
             }
@@ -347,32 +409,64 @@ class CorruptStoreTest {
     /**
      * `ReconcileLoop.resync`'s shape, reproduced rather than imported: `:store`
      * does not depend on `:core`, and a test that called the real loop would be
-     * testing the loop. What is being pinned is that a consumer written this way —
-     * read the list, queue every name, treat a [StoreException] as "no work this
-     * pass" — comes away with work.
+     * testing the loop. What is pinned is that a consumer written this way — read
+     * the tolerant listing, hold back what it cannot read, queue the rest, treat a
+     * [StoreException] as "no work this pass" — comes away with work.
      */
     private suspend fun resyncLike(store: Store): LoopShapedConsumer =
-        LoopShapedConsumer().apply {
-            try {
-                store.listServers().forEach { queued += it.name.value }
-            } catch (thrown: StoreException) {
-                failure = thrown
-            }
-        }
+        LoopShapedConsumer().apply { absorb(runCatching { store.listAll() }) }
 
     /** `ReconcileLoop.resumeDrains`'s shape, for the same reason. */
     private suspend fun resumeDrainsLike(store: Store): LoopShapedConsumer =
-        LoopShapedConsumer().apply {
-            try {
-                store.listByDrainState(RESUMABLE_DRAIN_STATES).forEach { queued += it.name.value }
-            } catch (thrown: StoreException) {
-                failure = thrown
-            }
-        }
+        LoopShapedConsumer().apply { absorb(runCatching { store.listAllByDrainState(RESUMABLE_DRAIN_STATES) }) }
 
     private class LoopShapedConsumer {
         val queued: MutableList<String> = mutableListOf()
+
+        /** Reported to the loop and skipped by it, as opposed to never seen at all. */
+        val heldBack: MutableList<String> = mutableListOf()
         var failure: StoreException? = null
+
+        fun absorb(read: Result<ServerListing>) {
+            val listing =
+                read.getOrElse { thrown ->
+                    failure = thrown as? StoreException ?: throw thrown
+                    return
+                }
+            listing.unreadable.forEach { heldBack += it.name ?: "<unnamed row>" }
+            val (blocked, actionable) = listing.servers.partition { it.unreadable != null }
+            blocked.forEach { heldBack += it.name.value }
+            actionable.forEach { queued += it.name.value }
+        }
+    }
+
+    /**
+     * A nameless row, copied from a real one so that every other column is exactly
+     * what the store itself wrote and the name is the only thing wrong with it.
+     *
+     * Schema version 4 has a trigger that rejects this, so the fixture drops it
+     * first. That is not cheating: after version 4 the only rows like this are
+     * ones written before it existed, or written by somebody with enough access
+     * to remove the guard — which is the same access it takes to write the row at
+     * all. What is being tested here is that the *read* survives such a row
+     * whatever its provenance. That the guard stops new ones is
+     * [MigrationTest]'s to prove.
+     */
+    private fun insertUnnamedDefinitionRow(directory: Path) {
+        mutate(directory, "DROP TRIGGER server_definition_name_not_null_insert")
+        mutate(
+            directory,
+            """
+            INSERT INTO server_definition (
+                name, api_version, kind, generation, resource_version,
+                created_at, updated_at, deleted_at, metadata_doc, spec_doc, doc_encoding
+            )
+            SELECT NULL, api_version, kind, generation, resource_version + 1000,
+                   created_at, updated_at, deleted_at, metadata_doc, spec_doc, doc_encoding
+              FROM server_definition
+             WHERE name = 'survival-01'
+            """.trimIndent(),
+        )
     }
 
     private fun mutate(

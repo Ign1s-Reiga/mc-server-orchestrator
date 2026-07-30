@@ -88,6 +88,28 @@ internal fun ResultSet.stringOrNull(column: String): String? {
     return if (wasNull()) null else value
 }
 
+/**
+ * A text column that the types above this expect to be present.
+ *
+ * `getString` returns Java's `null`, and Kotlin types the result as a platform
+ * type — so a NULL flowing into a non-null parameter raises a
+ * `NullPointerException` rather than anything [StoreException] shaped, and
+ * [asStoreException] never sees it because it is not an `SQLException`. That is
+ * not a theoretical gap: `server_definition.name` is `TEXT PRIMARY KEY` with no
+ * `NOT NULL`, and SQLite permits NULL in a rowid table's primary key.
+ *
+ * Every read of a column whose Kotlin counterpart is non-null goes through here,
+ * including the ones whose `NOT NULL` makes it unreachable today. The cost is a
+ * branch; the alternative is that the next column declared without `NOT NULL`
+ * reaches the reconcile loop as an exception it does not catch.
+ */
+internal fun ResultSet.requiredString(
+    column: String,
+    what: String,
+): String =
+    stringOrNull(column)
+        ?: throw StoreException.Corrupt("$what: column `$column` is unexpectedly null")
+
 internal fun ResultSet.instant(
     column: String,
     what: String,

@@ -44,10 +44,10 @@ internal data class MigrationReport(
 /**
  * The ordered migration list and the runner that applies it.
  *
- * ## Adding version 4
+ * ## Adding version 5
  *
- * 1. Write a `V4Something : Migration` below with `version = 4`.
- * 2. Append it to [ALL]. Do not renumber, do not reorder, do not touch V1, V2 or V3.
+ * 1. Write a `V5Something : Migration` below with `version = 5`.
+ * 2. Append it to [ALL]. Do not renumber, do not reorder, do not touch V1 to V4.
  * 3. If it reads a stored document, it must check `doc_encoding` against a frozen
  *    literal and refuse anything else, rather than parse whatever is on disk.
  *    [V3SplitWorldSavedInstant] is the worked example, down to why the literal is
@@ -65,7 +65,8 @@ internal data class MigrationReport(
 internal object Migrations {
     private val logger = LoggerFactory.getLogger(Migrations::class.java)
 
-    val ALL: List<Migration> = listOf(V1BaseSchema, V2StatusDrainProjection, V3SplitWorldSavedInstant)
+    val ALL: List<Migration> =
+        listOf(V1BaseSchema, V2StatusDrainProjection, V3SplitWorldSavedInstant, V4RejectUnnamedRows)
 
     val latest: Int = ALL.maxOf { it.version }
 
@@ -421,4 +422,76 @@ private object V3SplitWorldSavedInstant : Migration {
         }
         return writer.render()
     }
+}
+
+/**
+ * Closes the hole that let a row exist with no name.
+ *
+ * `server_definition.name` and `server_status.name` are `TEXT PRIMARY KEY`
+ * without `NOT NULL`, and SQLite permits NULL in a rowid table's primary key —
+ * a long-standing documented quirk kept for backwards compatibility. Confirmed
+ * on this schema with a raw insert, not assumed. Nothing the store writes can
+ * produce one (`setString` is fed a [mcorch.schema.ResourceName]), so the vector
+ * is raw SQL against the file; the tenth drain audit found that the read path
+ * then raised a `NullPointerException`, which is not a
+ * [mcorch.store.StoreException] and so escaped every guard the reconcile loop
+ * had, killing the process on every start.
+ *
+ * ## Why a trigger and not `NOT NULL`
+ *
+ * SQLite cannot add a constraint to an existing column; the documented route is
+ * to rebuild the table and copy. Measured on this schema, that route is worse
+ * than the defect:
+ *
+ * - `DROP TABLE server_definition` with `PRAGMA foreign_keys = ON` — which this
+ *   store sets, and depends on for the purge cascade — performs an implicit
+ *   `DELETE FROM` first, so `server_status`'s `ON DELETE CASCADE` fires and
+ *   **every observation on disk is deleted**. Reproduced: one definition and one
+ *   status in, one definition and zero statuses out. The observation is where
+ *   "the save request already went out" lives, so that is every in-flight drain
+ *   losing the record that stops it re-issuing a save against a live server.
+ *   Turning the pragma off is not available either: it is a no-op inside a
+ *   transaction, and migrations run in one by design.
+ * - A rebuild also cannot copy a row that already has a NULL name, so the
+ *   migration written to fix the problem would refuse to open exactly the store
+ *   that has it.
+ *
+ * The triggers reject the same writes the constraint would, from raw SQL
+ * included, while touching no data and dropping nothing. A row that is already
+ * unnamed is left alone deliberately: it stays readable as an unreadable entry,
+ * so an operator keeps being told about it every resync instead of it being
+ * quietly deleted or renamed to something invented.
+ *
+ * No document is read here, so there is no encoding to pin.
+ */
+private object V4RejectUnnamedRows : Migration {
+    override val version: Int = 4
+    override val description: String = "reject rows written with no name, which SQLite's primary key allows"
+
+    override fun apply(connection: Connection) {
+        for (table in listOf("server_definition", "server_status")) {
+            connection.execute(guard(table, "insert", "BEFORE INSERT ON $table"))
+            connection.execute(guard(table, "update", "BEFORE UPDATE OF name ON $table"))
+        }
+    }
+
+    /**
+     * `WHEN NEW.name IS NULL` rather than a bare `RAISE`, so the trigger costs a
+     * null check on the write path and nothing else. `BEFORE UPDATE OF name`
+     * narrows it further: the store never updates a name, so the ordinary write
+     * path does not reach this at all.
+     */
+    private fun guard(
+        table: String,
+        event: String,
+        on: String,
+    ): String =
+        """
+        CREATE TRIGGER ${table}_name_not_null_$event
+        $on
+        WHEN NEW.name IS NULL
+        BEGIN
+            SELECT RAISE(ABORT, '$table.name must not be NULL: a row nothing can refer to cannot be read, reconciled or purged');
+        END
+        """.trimIndent()
 }
