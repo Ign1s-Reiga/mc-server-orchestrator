@@ -46,9 +46,39 @@ Two consequences worth keeping:
   never escalate; with the class tested first, a future permanent classification
   at either call site would route players-being-online straight back in.
 
+**Better than ordering: make the premise unconstructable.** The exclusion is only
+defensible because players logging off resolves it — i.e. because that reason is
+retryable — and `FailureStatus` took reason and class as independent arguments.
+So a permanent `DRAIN_NO_DESTINATION` would have been a wedged drain that was
+*also* silently unflagged, and nothing stopped a third call site pairing them.
+`FailureStatus.init` now refuses the pair, which retires the ordering question
+entirely. The general move: when a rule's justification depends on a combination
+never occurring, forbid the combination at the type rather than defend the order
+you check things in. It costs nothing in `:store` — statuses are rebuilt through
+their constructors, so a hand-edited row becomes `StoreException.Corrupt`, which
+is the established answer here.
+
 Related: the prose has to branch too. Telling an operator "the loop keeps
 retrying" about a drain that has permanently stopped is how they wait instead of
-acting.
+acting — and the permanent text must not assert *joinability* either, since one
+of the aborts it covers is reached precisely because a probe could not answer.
+
+## Known-and-accepted, so they are not re-found
+
+Ruled cosmetic by the eighth audit, no fix required:
+
+- A stale permanent drain failure rides into the teardown status — the
+  container-is-down branch carries `drain.failure` untouched, so a terminating
+  server whose container exits on its own shows one or two passes of `STOPPED`
+  plus the flag. Self-limiting: the next pass observes `Absent` and purges.
+
+Out of scope but the cases to design against **if the flag is ever generalised
+from the drain record to `status.failure`** — all three are permanent, gate the
+loop, and today show a badge with no flag beside it: `forbiddenTransition`
+(phase `RUNNING`, `drain = null`), `refusePlacement` with `PINNED_NODE_UNKNOWN`,
+and a rejected definition. None is an *inverted* badge, which is why they stayed
+out; a generalisation has to handle all of them at once or it will look
+arbitrary.
 
 Two traps found while implementing it, both worth re-checking after any change
 to the loop's requeue policy:
