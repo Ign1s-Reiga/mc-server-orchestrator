@@ -26,6 +26,12 @@ dependencies {
     // implementation -> testImplementation -> integrationTestImplementation
     // chain, so an integration run gets the same output a real run does.
     runtimeOnly(libs.slf4j.simple)
+
+    // Reads the API's JSON in `DisplayConformanceTest`. JSON is a YAML subset
+    // and this parser is already in the build, so it beats hand-matching
+    // substrings in a response body — an assertion that passes because the key
+    // moved is exactly the kind this test exists to stop.
+    testImplementation(libs.snakeyaml.engine)
 }
 
 application {
