@@ -148,6 +148,26 @@ class TestApi private constructor(
     private fun routesStream(): String = "/api/v1/stream"
 
     /**
+     * Opens a stream, reads its response head, and closes it.
+     *
+     * For asserting on the headers a stream carries. The stream never produces a
+     * [Response] object — it takes the exchange over — so its headers are the one
+     * set nothing else in the suite would look at.
+     */
+    fun streamHead(headers: List<Pair<String, String>> = emptyList()): Reply {
+        val builder =
+            HttpRequest
+                .newBuilder(URI.create("$base${routesStream()}"))
+                .timeout(JavaDuration.ofSeconds(20))
+                .header("Authorization", "Bearer $token")
+                .GET()
+        headers.forEach { (name, value) -> builder.header(name, value) }
+        val response = client.send(builder.build(), HttpResponse.BodyHandlers.ofInputStream())
+        response.body().close()
+        return Reply(response.statusCode(), "", response.headers().map())
+    }
+
+    /**
      * A second harness pointing at [other], with this one's token.
      *
      * For the tests that need a server built over a *different* store — a failing

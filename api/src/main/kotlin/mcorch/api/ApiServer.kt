@@ -179,7 +179,6 @@ internal class Dispatcher(
                 origin = exchange.requestHeaders.getFirst(HeaderNames.ORIGIN),
                 host = exchange.requestHeaders.getFirst("Host"),
             )
-        val corsHeaders = cors.headersFor(decision)
 
         if (decision == Cors.Decision.Refused) {
             // Refused before anything else looks at the request: a cross-site page
@@ -197,6 +196,17 @@ internal class Dispatcher(
         if (method == "OPTIONS") {
             Http.send(exchange, Response.empty(204, cors.preflightHeaders(decision)))
             return
+        }
+
+        // Written onto the exchange rather than folded into the returned
+        // [Response], because the event stream never produces one: it takes the
+        // exchange over and calls `sendResponseHeaders` itself. A cross-origin
+        // `EventSource` with credentials is refused by the browser unless the
+        // stream's *own* response carries these, so folding them in at the end
+        // would leave exactly one endpoint broken cross-origin — and it is the
+        // endpoint a dashboard leaves open all day.
+        for ((name, value) in cors.headersFor(decision)) {
+            exchange.responseHeaders.add(name, value)
         }
 
         val response =
@@ -224,7 +234,7 @@ internal class Dispatcher(
                 ApiException(ErrorCode.INTERNAL, "the request could not be completed", cause = failure).toResponse()
             } ?: return
 
-        Http.send(exchange, corsHeaders.fold(response) { current, (name, value) -> current.withHeader(name, value) })
+        Http.send(exchange, response)
     }
 
     /** Null means a handler took the exchange over — see [HandlerResult.Handled]. */

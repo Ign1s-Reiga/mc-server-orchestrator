@@ -212,6 +212,17 @@ class AuthenticationTest {
             preflight.header("Access-Control-Allow-Methods").shouldNotBeNull() shouldContain "POST"
             preflight.header("Access-Control-Allow-Headers").shouldNotBeNull() shouldContain "X-CSRF-Token"
             preflight.header("Access-Control-Expose-Headers").shouldNotBeNull() shouldContain "ETag"
+
+            // The event stream too, and it is the one that would have been missed:
+            // it never produces a Response object, so headers folded in at the end
+            // of the dispatch never reach it. A cross-origin EventSource with
+            // credentials is refused by the browser without these — on the one
+            // endpoint a dashboard leaves open all day.
+            val stream = configured.streamHead(listOf("Origin" to dashboard))
+            stream.status shouldBe 200
+            stream.header("Access-Control-Allow-Origin") shouldBe dashboard
+            stream.header("Access-Control-Allow-Credentials") shouldBe "true"
+            stream.header("Content-Type").shouldNotBeNull() shouldContain "text/event-stream"
         } finally {
             configured.close()
         }
