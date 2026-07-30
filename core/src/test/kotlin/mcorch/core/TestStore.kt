@@ -68,6 +68,20 @@ internal class TestStore(
     var nextFailure: StoreException? = null
 
     /**
+     * Thrown by every fleet read, and deliberately *not* a [StoreException].
+     *
+     * A real store is not obliged to fail as one. The case that found this raised
+     * a `NullPointerException` from a row whose primary key was NULL — SQLite
+     * permits it, `resourceName` does not take a null, and `Jdbc.query` only
+     * translates `SQLException`. Every `catch (StoreException)` on the loop's
+     * path walked straight past it.
+     *
+     * A field rather than a one-shot, because the point is a read that keeps
+     * failing: the loop has to survive the ticker firing again, not just once.
+     */
+    var fleetReadThrows: Throwable? = null
+
+    /**
      * Runs once, just before the next status write lands. Lets a test simulate
      * the API server replacing a definition while a pass is in flight.
      */
@@ -192,10 +206,14 @@ internal class TestStore(
         guarded { definitions[name]?.let { StoredServer(it, statuses[name]) } }
 
     override suspend fun listServers(): List<StoredServer> =
-        guarded { definitions.values.map { StoredServer(it, statuses[it.name]) } }
+        guarded {
+            fleetReadThrows?.let { throw it }
+            definitions.values.map { StoredServer(it, statuses[it.name]) }
+        }
 
     override suspend fun listByDrainState(states: Set<DrainState>): List<StoredServer> =
         guarded {
+            fleetReadThrows?.let { throw it }
             if (states.isEmpty()) return@guarded emptyList()
             definitions.values.mapNotNull { definition ->
                 val status = statuses[definition.name] ?: return@mapNotNull null

@@ -37,5 +37,15 @@ letting a reader think it caught something is not. See
 
 The loop's skip of an unreadable observation therefore buys **reporting**, not
 safety: one clear error per resync naming the server, instead of a generic store
-failure per pass, and not leaning on a refusal that happens in another module.
-Do not oversell it if it comes up in review.
+failure per pass. It does *not* stop leaning on another module — it leans on
+`getServer` entirely — and I claimed otherwise once; the tenth audit corrected it.
+There is also **no latency trade**, which I also got wrong: a queued-and-refused
+pass ends non-retryable, and `requeue` answers that with `succeeded` and no
+re-add, so it too waits for the next resync. Held back is simply cheaper and
+clearer. Do not oversell it if it comes up in review.
+
+`Unreadable.retryable` is deliberately not consulted when partitioning. Every
+decode failure is permanent by construction today, but the reason to ignore it is
+stronger than that: a row that cannot be read *now* must not be acted on now,
+whatever a later read might do. If a genuinely retryable unreadable ever appears,
+keep skipping and stop logging it at error — do not start acting on it.

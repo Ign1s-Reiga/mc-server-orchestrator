@@ -286,6 +286,51 @@ internal class ReconcileLoopTest {
         }
 
     /**
+     * A fleet read that fails in a way nobody anticipated does not take the
+     * orchestrator down with it.
+     *
+     * The tickers are `launch`ed children, so anything escaping one cancels the
+     * scope and takes the workers and the other ticker with it. `run` does not
+     * restart them and neither does `Orchestrator`: the process is simply down,
+     * and since `seed` resyncs at startup, down again on every restart. No
+     * container is stopped by that — but every in-flight drain freezes with
+     * players on it, and the orchestrator nobody can start is the one thing that
+     * could have repaired the state.
+     *
+     * The store is made to throw a `NullPointerException`, which is not
+     * hypothetical: a `server_definition` row with a NULL primary key produces
+     * exactly that, and it is invisible to every `catch (StoreException)` on the
+     * path. What is being pinned is not that one bug — `:store` is fixing it at
+     * source — but that a `catch` naming one type is a bet on what the layer
+     * below throws, and the tickers are where losing it costs the process.
+     */
+    @Test
+    fun `a fleet read that throws something unexpected does not stop the loop`() =
+        runTest {
+            val harness = Harness()
+            harness.declare(paperDefinition())
+            // Failing from the very first read, so the startup path is covered
+            // as well as the ticker: `seed` resyncs before anything is launched.
+            harness.store.fleetReadThrows = NullPointerException("name is null")
+
+            val job = launch { loopFor(harness).run() }
+            advanceTimeBy(2.seconds)
+
+            // Still alive after a failed startup resync and a failed tick.
+            job.isActive shouldBe true
+            job.isCancelled shouldBe false
+
+            // And it recovers on its own once the store does: nothing had to be
+            // restarted, because nothing died.
+            harness.store.fleetReadThrows = null
+            advanceTimeBy(6.minutes)
+
+            harness.node.creates shouldHaveSize 1
+            harness.status(paperDefinition().metadata.name).shouldNotBeNull().phase shouldBe ServerPhase.RUNNING
+            job.cancel()
+        }
+
+    /**
      * The loop does not finish unwinding until an issued save has been recorded.
      *
      * This is the half of the save-record shield that lives here rather than in
