@@ -98,15 +98,13 @@ public class ApiServer private constructor(
             val streams = StreamRegistry(config.maxStreams)
             val sessions = SessionRegistry(config.clock, config.sessionTtl)
             val auth = OperatorAuth(config.token.digest, sessions, config.authFailureDelay)
-            val router =
-                Router(
-                    MetaRoutes(config).routes() +
-                        AuthRoutes(auth, sessions, config).routes() +
-                        ServerRoutes(store).routes() +
-                        SecretRoutes(secrets).routes() +
-                        StreamRoutes(store, config, streams).routes(),
+            val dispatcher =
+                Dispatcher(
+                    Router(routeTable(config, store, secrets, auth, sessions, streams)),
+                    auth,
+                    Cors(config.allowedOrigins),
+                    config,
                 )
-            val dispatcher = Dispatcher(router, auth, Cors(config.allowedOrigins), config)
 
             val http = HttpServer.create(InetSocketAddress(config.bindHost, config.bindPort), BACKLOG)
             val executor = Executors.newVirtualThreadPerTaskExecutor()
@@ -133,6 +131,28 @@ public class ApiServer private constructor(
             }
             return ApiServer(http, executor, streams, port)
         }
+
+        /**
+         * The whole route table, in one expression.
+         *
+         * Pulled out of [start] so a test can assert on it directly — in
+         * particular that no mutating route is declared [Access.PUBLIC]. That
+         * check cannot be made by exercising endpoints, because it has to hold
+         * for endpoints nobody has thought to exercise yet.
+         */
+        internal fun routeTable(
+            config: ApiConfig,
+            store: Store,
+            secrets: SecretStore,
+            auth: OperatorAuth,
+            sessions: SessionRegistry,
+            streams: StreamRegistry,
+        ): List<Route> =
+            MetaRoutes(config).routes() +
+                AuthRoutes(auth, sessions, config).routes() +
+                ServerRoutes(store).routes() +
+                SecretRoutes(secrets).routes() +
+                StreamRoutes(store, config, streams).routes()
     }
 }
 
