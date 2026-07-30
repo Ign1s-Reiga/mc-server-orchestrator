@@ -4,6 +4,7 @@ import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
 import mcorch.schema.DrainState
 import mcorch.schema.DrainStatus
+import mcorch.schema.FailureClass
 import mcorch.schema.FailureStatus
 import mcorch.schema.ImageStatus
 import mcorch.schema.PaperServerStatus
@@ -191,15 +192,28 @@ private fun drainMessage(
  * What a human is being called about.
  *
  * Says what will and will not happen next, because the honest answer is
- * unintuitive: the loop has *not* given up, and it is not going to stop the
- * server to unblock itself. Without that, "needs attention" reads as "the
- * orchestrator has stopped trying", and an operator who believes that may go and
- * stop the container by hand.
+ * unintuitive in both directions and they are opposite answers. For a drain the
+ * loop is still retrying, the surprise is that it has *not* given up and is not
+ * going to stop the server to unblock itself — an operator who reads "needs
+ * attention" as "the orchestrator has stopped trying" may go and stop the
+ * container by hand. For a drain that failed permanently the surprise is the
+ * reverse: nothing further will be attempted, so waiting achieves nothing.
+ *
+ * The one thing both say is that the container is **still running and still
+ * joinable**, because that is the fact a fleet view gets wrong — a failed drain
+ * ranks as `TERMINATING` in the dashboard's badge, which reads as on its way out.
  */
 private fun attentionMessage(drain: DrainStatus?): String {
     val since = drain?.startedAt?.let { " This drain has been running since $it." }.orEmpty()
-    return "this server needs a human: the drain cannot finish on its own.$since The loop keeps retrying and " +
-        "the container keeps running — it will not be stopped until a save is confirmed. " +
+    val next =
+        if (drain?.failure?.failureClass == FailureClass.PERMANENT) {
+            "Nothing further will be attempted until somebody resolves it; the container keeps running and " +
+                "will not be stopped by the orchestrator."
+        } else {
+            "The loop keeps retrying and the container keeps running — it will not be stopped until a save " +
+                "is confirmed."
+        }
+    return "this server needs a human: the drain cannot finish on its own.$since $next " +
         (drain?.failure?.message ?: "")
 }
 

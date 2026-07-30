@@ -800,15 +800,38 @@ internal class DrainController(
                 now = now,
                 after = attentionAfter,
             )
+        // The two escalations are not the same news, and one prose for both
+        // would be wrong for whichever it was not written for. A retryable drain
+        // is still being attempted; a permanent one is not, and telling an
+        // operator "the loop keeps trying" about a drain that has stopped is how
+        // they come to believe no action is needed.
+        val permanent = failureClass == FailureClass.PERMANENT
         val reported =
-            if (needsAttention) {
-                "this drain has been unable to finish for ${stuckFor.inWholeMinutes} minutes and is not going " +
-                    "to fix itself. The server keeps running and the loop keeps trying. $message"
-            } else {
-                message
+            when {
+                needsAttention && permanent -> {
+                    "this drain has stopped and cannot finish on its own. The server is still running and still " +
+                        "joinable, and nothing further will be attempted until a human resolves this. $message"
+                }
+
+                needsAttention -> {
+                    "this drain has been unable to finish for ${stuckFor.inWholeMinutes} minutes and is not " +
+                        "going to fix itself. The server keeps running and the loop keeps trying. $message"
+                }
+
+                else -> {
+                    message
+                }
             }
         val failure = recordFailure(reason, failureClass, reported, now, drain.failure)
-        if (needsAttention) {
+        if (needsAttention && permanent) {
+            LOG.error(
+                "server={} has a drain that stopped permanently after {} attempt(s); it is still running and " +
+                    "still joinable, and the loop will not try again — this needs a human: {}",
+                server,
+                failure.attempts,
+                message,
+            )
+        } else if (needsAttention) {
             LOG.error(
                 "server={} has been unable to finish a drain for {} minutes ({} attempts); it keeps running and " +
                     "the loop keeps trying, but this needs a human: {}",
@@ -882,11 +905,36 @@ internal class DrainController(
  * a server that was asked to go away, which is the protocol working exactly as
  * designed and resolves itself when they log off. An escalation that fires on a
  * busy evening every backoff interval teaches operators that the signal means
- * nothing.
+ * nothing. The exclusion is checked **before** the class, so it holds however a
+ * future call site classifies that reason — both of today's are retryable, and a
+ * permanent one must not slip in through the branch below.
  *
- * A permanent failure is excluded for the opposite reason: it is already
- * surfaced as permanent and the loop has already stopped acting on it, so
- * escalating it says nothing new.
+ * ## Why a permanent failure escalates, and escalates at once
+ *
+ * This used to require [FailureClass.RETRYABLE], on the reasoning that a
+ * permanent failure is already surfaced as permanent so the flag said nothing
+ * new. That was exactly backwards, and it left the states that most need a
+ * person as the only ones never flagged: an unconfirmable save, a
+ * `DRAIN_SAVE_TIMEOUT` that by design is never re-sent, a workload whose
+ * contract says it cannot be drained at all. Every one of those has "a human
+ * resolves this" as its documented remedy. The flag does not mean "something is
+ * wrong" — the failure already says that — it means **the loop has stopped and
+ * only a person can move this**, which is the definition of a permanent abort.
+ *
+ * It fires on the pass that records the failure rather than after [after],
+ * because for a permanent failure the timer cannot work at all. The delay exists
+ * to let a retrying drain resolve itself first; a permanent one provably will
+ * not. Worse, `Reconciler.Pass.isBlockedByPermanentFailure` returns before a
+ * non-terminating server is observed, writing no status — so a replacement drain
+ * that aborted permanently is frozen at the observation that recorded it, the
+ * threshold is never re-evaluated, and a time-based flag would never appear.
+ * Waiting would not delay the signal; it would delete it.
+ *
+ * What that costs while it is unflagged is not cosmetic: a permanently failed
+ * drain leaves the server **running and joinable**, and `:api` ranks
+ * `TERMINATING` above everything for `display.state`, so a fleet table shows it
+ * as on its way out with nothing to do. That is the one wrong answer that
+ * matters, and this flag is what stops `display.state` having to lie.
  */
 internal fun escalates(
     startedAt: Instant,
@@ -894,10 +942,13 @@ internal fun escalates(
     reason: FailureReason,
     now: Instant,
     after: Duration,
-): Boolean =
-    failureClass == FailureClass.RETRYABLE &&
-        reason != FailureReason.DRAIN_NO_DESTINATION &&
-        JavaDuration.between(startedAt, now).toKotlinDuration() >= after
+): Boolean {
+    if (reason == FailureReason.DRAIN_NO_DESTINATION) return false
+    return when (failureClass) {
+        FailureClass.PERMANENT -> true
+        FailureClass.RETRYABLE -> JavaDuration.between(startedAt, now).toKotlinDuration() >= after
+    }
+}
 
 /**
  * The same rule, asked of a drain that has already recorded its failure.
@@ -906,6 +957,25 @@ internal fun escalates(
  * is what makes the condition self-clearing. A pass that gets somewhere clears
  * `DrainStatus.failure` (see the `DRAIN_FAILED` resume), so the escalation goes
  * with it rather than being a second thing to remember to reset.
+ *
+ * ## What clears a *permanent* one, since a retry cannot
+ *
+ * The same thing, and only that thing: a drain pass that reaches a state it
+ * could not reach before. A permanent abort is not retried, so nothing clears it
+ * on its own — which is correct, because nothing about the server has changed
+ * either. Two things can produce that pass, and they are the two ways a human
+ * intervenes:
+ *
+ * - **The server is deleted.** `isBlockedByPermanentFailure` deliberately lifts
+ *   for as long as a delete is outstanding, so the loop keeps observing and can
+ *   notice that whatever was wrong has been fixed — an RCON listener that came
+ *   back, a world saved and a container stopped by hand.
+ * - **The definition is edited.** The generation moves, the gate lifts, and the
+ *   drain re-enters `DRAIN_FAILED` and either gets somewhere (cleared) or aborts
+ *   again (still flagged, correctly).
+ *
+ * A flag that expired on its own would be worse than one that persists: it would
+ * mean the dashboard stops asking for help while the server is still stuck.
  */
 internal fun DrainStatus.escalated(
     now: Instant,

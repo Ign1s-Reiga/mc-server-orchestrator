@@ -1296,6 +1296,137 @@ internal class DrainTest {
         }
 
     /**
+     * A drain that has stopped for good raises the flag, and raises it at once.
+     *
+     * This is the case the escalation was originally *inverted* on: it required
+     * `RETRYABLE`, so the states whose documented remedy is "a human resolves
+     * this" were the only ones never flagged. A server with world data and no
+     * RCON cannot be drained at all — no edit reaches the running container —
+     * and it sits `DRAIN_FAILED`, running and joinable, for ever.
+     *
+     * Immediately, with no clock advanced, and that is asserted rather than
+     * incidental. `isBlockedByPermanentFailure` returns before a non-terminating
+     * server is observed at all, so a permanent abort can be the *last* status
+     * ever written for it — a threshold that had not been crossed by then would
+     * never be re-evaluated, and the flag would never appear.
+     */
+    @Test
+    fun `a drain that failed permanently needs a human straight away`() =
+        coreTest {
+            val harness = Harness(config = ReconcilerConfig(drainAttentionAfter = 10.minutes))
+            val definition = paperDefinition(rcon = RconSpec.Disabled)
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.store.deleteDefinition(name)
+
+            repeat(8) { harness.pass(name) }
+
+            val status = harness.status(name).shouldNotBeNull()
+            val drain = status.drain.shouldNotBeNull()
+            drain.state shouldBe DrainState.DRAIN_FAILED
+            drain.failure.shouldNotBeNull().failureClass shouldBe FailureClass.PERMANENT
+
+            val attention = status.attention()
+            attention.status shouldBe ConditionStatus.TRUE
+            // No time has been advanced past `drainAttentionAfter`, so this
+            // fired on the pass that recorded the failure rather than on a
+            // timer that a permanent failure would never live to see.
+            attention.lastTransitionAt shouldBe harness.clock.instant()
+            // And it tells the truth about what happens next. Saying "the loop
+            // keeps retrying" here would be the reason an operator waits.
+            attention.message shouldContain "Nothing further will be attempted"
+            attention.message shouldNotContain "keeps retrying"
+
+            // The drain-safety assertions that always matter: nothing was
+            // stopped, and the server an operator is being called about is
+            // still the running, joinable one.
+            harness.node.stops shouldHaveSize 0
+            harness.node.saves shouldHaveSize 0
+            harness.node.workload
+                .shouldBeInstanceOf<WorkloadObservation.Present>()
+                .state shouldBe WorkloadState.RUNNING
+        }
+
+    /**
+     * The other permanent case, and the one the flag is most needed for: a save
+     * that was delivered and never confirmed.
+     *
+     * By design the request is never re-sent — only a human can say what is on
+     * disk — so this drain will sit here for ever. It is also the state where
+     * the dashboard reads worst: `:api` ranks `TERMINATING` above everything for
+     * its badge, so without the flag a fleet table shows a server that is still
+     * up and still joinable as though it were on its way out.
+     */
+    @Test
+    fun `a save that was delivered and never confirmed raises the flag too`() =
+        coreTest {
+            val harness = Harness(config = ReconcilerConfig(drainAttentionAfter = 10.minutes))
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            // Exit zero, no completion reported: delivered, unconfirmed, never
+            // re-sent.
+            harness.node.savesCleanly = false
+            harness.store.deleteDefinition(name)
+
+            repeat(8) { harness.pass(name) }
+
+            val status = harness.status(name).shouldNotBeNull()
+            val drain = status.drain.shouldNotBeNull()
+            drain.failure.shouldNotBeNull().reason shouldBe FailureReason.DRAIN_SAVE_TIMEOUT
+            drain.failure.shouldNotBeNull().failureClass shouldBe FailureClass.PERMANENT
+            status.attention().status shouldBe ConditionStatus.TRUE
+
+            // Exactly one save, and the container is still up: the flag changes
+            // what is reported, never what is done.
+            harness.node.saves shouldHaveSize 1
+            harness.node.stops shouldHaveSize 0
+            harness.node.workload
+                .shouldBeInstanceOf<WorkloadObservation.Present>()
+                .state shouldBe WorkloadState.RUNNING
+        }
+
+    /**
+     * The exclusion holds whatever class the reason is given.
+     *
+     * Both of today's `DRAIN_NO_DESTINATION` call sites are retryable, so the
+     * loop cannot produce a permanent one to drive this end to end — which is
+     * exactly why it is asserted against the rule directly. Letting a permanent
+     * classification appear at one of those sites later must not route players
+     * being online back into the escalation, and with the class checked first
+     * that is precisely what would happen.
+     */
+    @Test
+    fun `players being online is never an escalation, whichever class it is given`() =
+        coreTest {
+            val startedAt = MutableClock().instant()
+            val muchLater = startedAt.plusSeconds(60 * 60 * 4)
+
+            for (failureClass in FailureClass.entries) {
+                escalates(
+                    startedAt = startedAt,
+                    failureClass = failureClass,
+                    reason = FailureReason.DRAIN_NO_DESTINATION,
+                    now = muchLater,
+                    after = 10.minutes,
+                ).shouldBeFalse()
+            }
+
+            // The control: the same call with a different reason does escalate,
+            // so the assertion above is about the exclusion and not about some
+            // argument being wrong.
+            escalates(
+                startedAt = startedAt,
+                failureClass = FailureClass.PERMANENT,
+                reason = FailureReason.DRAIN_STALLED,
+                now = startedAt,
+                after = 10.minutes,
+            ).shouldBeTrue()
+        }
+
+    /**
      * The escalation withdraws itself when the drain gets somewhere.
      *
      * It is derived from the drain's recorded failure rather than latched, and a
