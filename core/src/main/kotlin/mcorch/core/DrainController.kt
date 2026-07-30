@@ -196,6 +196,17 @@ internal class DrainController(
         // server mid-drain — there is no proxy to seal — so a count taken three
         // states ago is not evidence of anything.
         val probe = agent.probe(node, observation.handle)
+
+        // The only place occupancy is ever built, and every abort below depends
+        // on that being true: a non-null `occupancy` means an SLP answered *this
+        // pass*, so a message or a decision may say what is online, and a null
+        // one means nothing was established and nothing may be claimed. It is
+        // threaded read-only through `DrainPass` and never reconstructed.
+        //
+        // Stated here rather than as a list of the call sites that hold it. That
+        // list was written once and was already wrong — `awaitStopped`'s abort
+        // reaches `step()` directly rather than through `requireEmpty` — while
+        // this single construction site cannot drift.
         val occupancy = (probe as? ProbeOutcome.Joinable)?.let { PlayerOccupancy(it.online, it.max, now) }
 
         val pass =
@@ -950,10 +961,17 @@ internal class DrainController(
  * Waiting would not delay the signal; it would delete it.
  *
  * What that costs while it is unflagged is not cosmetic: a permanently failed
- * drain leaves the server **running and joinable**, and `:api` ranks
- * `TERMINATING` above everything for `display.state`, so a fleet table shows it
- * as on its way out with nothing to do. That is the one wrong answer that
- * matters, and this flag is what stops `display.state` having to lie.
+ * drain leaves the container **running**, and `:api` ranks `TERMINATING` above
+ * everything for `display.state`, so a fleet table shows it as on its way out
+ * with nothing to do. That is the one wrong answer that matters, and this flag
+ * is what stops `display.state` having to lie.
+ *
+ * Deliberately "running" and not "running and joinable". Whether it still
+ * answers players is only known on the paths that took a `Joinable` probe this
+ * pass; the permanent abort on an unanswered probe establishes the opposite.
+ * That over-claim was removed from the operator-facing message and from
+ * `StatusDrafting`, and it is not restated here — this is the sentence somebody
+ * would otherwise copy back into one.
  */
 internal fun escalates(
     startedAt: Instant,

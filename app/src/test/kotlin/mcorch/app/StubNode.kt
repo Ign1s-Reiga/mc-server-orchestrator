@@ -58,7 +58,15 @@ internal class StubNode(
     private var workload: WorkloadObservation = WorkloadObservation.Absent
     private val images = mutableSetOf<String>()
 
-    /** Asserted on by nothing here, kept so a stop that should not happen is visible in a failure. */
+    /**
+     * Every stop this node was asked for.
+     *
+     * Both drains in [DisplayConformanceTest] assert this stays empty, and that
+     * is the load-bearing assertion in the file rather than a diagnostic aid: one
+     * server holds a world it can never confirm a save for, the other has players
+     * on it, and neither may be stopped for any reason. A rendering assertion
+     * would still pass on a loop that had stopped them both.
+     */
     val stops: MutableList<WorkloadHandle> = mutableListOf()
 
     override suspend fun status(): NodeStatus = NodeStatus(ready = true, detail = "ready")

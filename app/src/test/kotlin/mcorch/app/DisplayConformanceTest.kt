@@ -1,5 +1,6 @@
 package mcorch.app
 
+import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.shouldBe
 import kotlinx.coroutines.runBlocking
 import mcorch.api.ApiConfig
@@ -152,6 +153,17 @@ class DisplayConformanceTest {
 
                 assertNothingIsSilentlyStuck(display)
             }
+
+            // The assertion this file exists for as much as the rendering one.
+            // `stuck-01` holds a world and has no channel that could ever report
+            // a completed save, so the whole posture is that it is *never*
+            // stopped — CLAUDE.md invariant 1 and 3 together. This is the only
+            // place in the codebase where a real `Reconciler` drives a real
+            // drain against a real store end to end, so it is the best place to
+            // say so. Without it a regression that stopped the container would
+            // surface as a 404 from the purge, which reads as broken plumbing
+            // rather than as a container with an unsaved world being stopped.
+            node.stops.shouldBeEmpty()
         }
     }
 
@@ -223,6 +235,12 @@ class DisplayConformanceTest {
                 display["needsAttention"] shouldBe false
                 assertNothingIsSilentlyStuck(display)
             }
+
+            // Three players are connected to a server somebody asked to delete.
+            // There is no proxy to move them through, so the drain blocks — and
+            // the one thing that must never happen is the loop stopping the
+            // container to make progress (`failure-modes.md` item 4).
+            node.stops.shouldBeEmpty()
         }
     }
 
