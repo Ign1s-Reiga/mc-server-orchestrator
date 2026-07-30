@@ -443,11 +443,24 @@ internal object ServerJson {
         return jsonObject {
             put("state", state)
             put("ready", status?.ready ?: false)
+            // An unreadable row raises this as well as the flag below, and the two
+            // are not redundant: `unreadable` says *what* is wrong and is what a
+            // dashboard filters on, `needsAttention` says *somebody must act* and
+            // is what an alert fires on.
+            //
+            // It qualifies on the charter rather than by analogy. NEEDS_ATTENTION
+            // is "this is not going to fix itself and a human has to look at it",
+            // and a row the store cannot decode is exactly that: the bytes say the
+            // same thing on every pass, so the loop cannot make progress and only
+            // a person repairing the row can. Leaving it off would mean an
+            // operator alerting on `needsAttention` never sees these servers —
+            // which is the one audience that has to.
             put(
                 "needsAttention",
-                status?.conditions?.any {
-                    it.type == ConditionType.NEEDS_ATTENTION && it.status == ConditionStatus.TRUE
-                } ?: false,
+                stored.unreadable != null ||
+                    status?.conditions?.any {
+                        it.type == ConditionType.NEEDS_ATTENTION && it.status == ConditionStatus.TRUE
+                    } ?: false,
             )
             // A flag as well as a state, and for the same reason `needsAttention`
             // is one: TERMINATING outranks UNREADABLE, so a terminating server
