@@ -207,4 +207,52 @@ merged are the ones below, which pass every check in that list.
    the row unreconcilable; that is the right call, but it means the prose is the
    only spec and the prose must be state-by-state.
 
+21. **A durability test is only as strict as its most permissive fake.** A fake
+   store taking an *uncontended* `Mutex` never suspends, so it never checks
+   cancellation and lands a write the real store (`withContext(dispatcher)`,
+   whose dispatch from a cancelled coroutine never runs the block) would drop. A
+   fake node that never suspends at all keeps driving the runtime for a cancelled
+   caller that gRPC would have refused. Either one makes a cancellation-durability
+   test pass against code containing no shield. Before believing any green
+   "the record survived" result, ask of every fake on the path: *where does this
+   check cancellation, and is that at least as early as production?* Closed at
+   round 7 by an `ensureActive()` on entry to `TestStore.guarded` and
+   `FakeNode.check`, pinned by a contract test. Note the residual in the other
+   direction: `FakeNode` checks *before* recording the call, so it can only model
+   "never delivered", never "delivered then cancelled" — the tests get the second
+   shape by cancelling from inside `onExec`, after the command is recorded.
+22. **A `NonCancellable` write is worth nothing without the shutdown ordering
+   that keeps its dependencies alive.** The shield around the save record only
+   lands because `Main` closes the `Orchestrator` (and with it the store) *after*
+   `loop.join()`, and because the single shutdown hook joins rather than racing.
+   Move the close, add a second hook, or close the store from a parallel
+   `use`, and the shielded write hits a closed store, throws `StoreException`
+   from inside the region, and the record is lost exactly as before — with the
+   coroutine already cancelled, so nothing retries it. Whenever you see
+   `withContext(NonCancellable)`, find who owns the resource it writes to and
+   prove that resource outlives the region.
+23. **Write-ahead ("record the side effect before issuing it") is not the safe
+   direction here, and its window is wider, not narrower.** Ruled at round 7 for
+   `saveRequestedAt`. Recording first means a cancellation between the record and
+   the exec leaves a server that got *no* save wedged in a permanent
+   `DRAIN_SAVE_TIMEOUT` whose operator-facing message asserts a save was
+   requested — false, and unwedgeable without a human. The gap it opens is at
+   least a dispatch plus gRPC setup wide; the gap it closes needs cancellation to
+   land inside one specific in-flight RPC. It also puts a second writer on a field
+   whose disjointness is load-bearing. Prefer the benign repeat. The repeat is
+   only benign while every side effect the drain issues is idempotent on the game
+   side (`save-all flush` is) — the moment a drain issues a kick, a transfer or a
+   proxy deregistration, this ruling must be re-taken.
+24. **"It is a vanishing fraction of the window" is the argument to distrust, and
+   "what is at risk in the resting state" is the one to make.** A proportion
+   argument for leaving a hole open is the same shape as the one for closing it,
+   and both are unfalsifiable at review. The question that decides it is what the
+   failure *rests* as. The teardown partial-removal record (`Reconciler.teardown`,
+   `containerId = null`) was upheld as open at round 7 — not because the write is
+   a small slice of a window mostly inside `removeWorkload`, but because the
+   container is already gone by then, so no world and no player is at risk; what
+   is stranded is a sandbox and a store row, retryably, with a loud escalation at
+   `drainAttentionAfter`. An identical-shaped hole on a path where the container
+   is still *running* would not survive the same argument.
+
 Related: [[standalone-paper-drain-shape]]
