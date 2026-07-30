@@ -10,6 +10,7 @@ import kotlinx.coroutines.withContext
 import mcorch.schema.DrainState
 import mcorch.schema.ResourceName
 import mcorch.store.ChangeFeed
+import mcorch.store.ServerListing
 import mcorch.store.Store
 import mcorch.store.StoreCursor
 import mcorch.store.StoreException
@@ -87,16 +88,17 @@ public class ReconcileLoop(
      * other work.
      */
     private suspend fun resumeDrains(queue: WorkQueue) {
-        val inFlight =
+        val listing =
             try {
-                store.listByDrainState(RESUMABLE_DRAIN_STATES)
+                store.listAllByDrainState(RESUMABLE_DRAIN_STATES)
             } catch (failure: StoreException) {
                 LOG.warn("could not read in-flight drains at startup: {}", failure.message)
                 return
             }
-        if (inFlight.isEmpty()) return
-        LOG.info("resuming {} in-flight drain(s) before anything else", inFlight.size)
-        inFlight.forEach { queue.add(it.name) }
+        val resumable = report(listing, "resuming in-flight drains")
+        if (resumable.isEmpty()) return
+        LOG.info("resuming {} in-flight drain(s) before anything else", resumable.size)
+        resumable.forEach { queue.add(it) }
     }
 
     /** Reads the cursor *before* the resync, so nothing between the two is missed. */
@@ -113,11 +115,69 @@ public class ReconcileLoop(
     }
 
     private suspend fun resync(queue: WorkQueue) {
-        try {
-            store.listServers().forEach { queue.add(it.name) }
-        } catch (failure: StoreException) {
-            LOG.warn("resync failed: {}", failure.message)
+        val listing =
+            try {
+                store.listAll()
+            } catch (failure: StoreException) {
+                LOG.warn("resync failed: {}", failure.message)
+                return
+            }
+        report(listing, "resync").forEach { queue.add(it) }
+    }
+
+    /**
+     * The servers this pass may act on, having said out loud what it is skipping.
+     *
+     * Two kinds of row are held back, for two different reasons, and neither may
+     * be allowed to cost anything but itself. **This read used to be the strict
+     * one, and a single undecodable row threw out of it** — so a resync queued
+     * nothing at all and the loop reconciled *nothing*, on every pass, from one
+     * bad row. No world data was at risk directly, because a halted loop cannot
+     * stop a container; what was lost was the ability to act at all, including
+     * finishing a drain with players waiting on it.
+     *
+     * - An unreadable **definition** has no desired state to converge on. There
+     *   is nothing to reconcile and no [ResourceName] to queue it under — the
+     *   name itself can be what will not parse.
+     * - An unreadable **observation** is a server the loop must not act on, and
+     *   this is the drain-relevant half. The record of a delivered save lives in
+     *   the observation, so an unreadable one is exactly the case where the loop
+     *   cannot know whether a save request went out. Queueing it and letting the
+     *   pass refuse would work — [Store.getServer] raises for that row — but
+     *   holding it back here says why, once per resync, instead of one generic
+     *   store failure per pass, and it does not lean on a refusal happening in
+     *   another module.
+     *
+     * Both are reported at error every time rather than once: they do not heal on
+     * their own, and a line that appears only at startup is a line nobody sees.
+     * Repairing the row is enough to bring the server back — the next resync
+     * simply finds it readable.
+     */
+    private fun report(
+        listing: ServerListing,
+        what: String,
+    ): List<ResourceName> {
+        listing.unreadable.forEach { entry ->
+            LOG.error(
+                "{}: skipping server={} — its desired state cannot be read and nothing can be reconciled for it " +
+                    "until the row is repaired: {}",
+                what,
+                entry.name,
+                entry.unreadable.reason,
+            )
         }
+        val (blocked, actionable) = listing.servers.partition { it.unreadable != null }
+        blocked.forEach { server ->
+            LOG.error(
+                "{}: skipping server={} — its last observation cannot be read, so the loop cannot tell what it " +
+                    "has already done to this server and will not act on it. If a drain was in flight it stays " +
+                    "where it is and the container keeps running: {}",
+                what,
+                server.name,
+                server.unreadable?.reason,
+            )
+        }
+        return actionable.map { it.name }
     }
 
     private suspend fun resyncPeriodically(queue: WorkQueue) {
