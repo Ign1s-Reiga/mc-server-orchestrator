@@ -39,6 +39,9 @@ So:
 - **A deleted server does not disappear.** It comes back from `GET` with
   `metadata.terminating: true` until `:core` has finished with it. A dashboard
   that removes the row on `202` is showing a stop that has not happened.
+- **Neither does a server the store cannot read.** A row whose stored state will
+  not decode is reported as unreadable, never omitted — see §6. Absence means
+  purged, and only purged.
 
 ---
 
@@ -156,8 +159,23 @@ One shape, always:
 }
 ```
 
-`violations` and `conflict` are `null` unless the code carries them. Branch on
-`code`, never on `message`.
+`violations`, `conflict` and `unreadable` are `null` unless the code carries
+them. Branch on `code`, never on `message`.
+
+`SERVER_UNREADABLE` carries:
+
+```json
+{ "error": { "code": "SERVER_UNREADABLE", "retryable": false, "unreadable": {
+    "name": "survival-03", "part": "DESIRED", "reason": "…", "retryable": false
+} } }
+```
+
+`part` is `DESIRED` (the definition) or `OBSERVED` (the status). It is a 500
+because no retry and no change to the request will fix it — a human repairs the
+row — and a distinct code because the remedy is specific. **It is not evidence
+about the container.** The server is very probably running exactly as it was;
+what is broken is the record of it. A `DESIRED` row can be repaired through this
+API by `PUT`ting a valid definition with `If-Match: *`.
 
 | code | status | carries | meaning |
 |---|---|---|---|
@@ -175,6 +193,7 @@ One shape, always:
 | `VALIDATION_FAILED` | 422 | `violations` | the document parsed but is not a valid definition |
 | `PRECONDITION_REQUIRED` | 428 | | `PUT` with no `If-Match` |
 | `INTERNAL` | 500 | | a bug, or a permanent store failure |
+| `SERVER_UNREADABLE` | 500 | `unreadable` | the store holds this row and cannot decode the part the request needed |
 | `STORE_UNAVAILABLE` | 503 | `Retry-After` | the store could not be reached. **Retryable.** |
 | `STREAM_LIMIT` | 503 | `Retry-After` | too many event streams open. **Retryable.** |
 
@@ -292,10 +311,38 @@ single position; `source` is always `"request-body"`.
 
   "status": { … } | null,         // null until the loop has looked at it
   "statusMeta": { "resourceVersion": "…", "recordedAt": "…" } | null,
+
+  // Why `status` is null, when the answer is not "nothing has been observed".
+  // Null in the ordinary case.
+  "unreadable": { "part": "OBSERVED", "reason": "…", "retryable": false } | null,
+
   "caughtUp": false,              // status.observedGeneration === metadata.generation
+  "neverObserved": true,          // status === null AND unreadable === null
   "display": { … }                // §7
 }
 ```
+
+#### `status: null` has two meanings. Use `neverObserved`.
+
+The store holds an observation it cannot decode as *no readable observation*, so
+`status` is null for both "the loop has not looked at this yet" and "what the
+loop wrote down is corrupt". They call for opposite things from an operator —
+one you wait out, one you fix — so they are distinguishable:
+
+| | `status` | `unreadable` | `neverObserved` | `display.state` |
+|---|---|---|---|---|
+| not observed yet | `null` | `null` | `true` | `PENDING` |
+| observation will not decode | `null` | set | `false` | `UNREADABLE` |
+| observed | object | `null` | `false` | from the phase |
+
+A client that only ever tested `status === null` keeps working and keeps being
+wrong in the second row; test `neverObserved` instead.
+
+`unreadable.reason` is operator-facing text on the same terms as
+`status.failure.message`: it names the server and what about the stored form was
+rejected, and it carries no stack trace, no class name and no storage-level
+detail. `retryable` is false for anything that failed to decode — the stored
+bytes will say the same thing next time.
 
 #### Two null policies, and why
 
@@ -326,12 +373,39 @@ what comes back is what the reconciler acts on, not what the operator typed. A
 ### `GET /api/v1/servers`
 
 ```json
-{ "cursor": "17", "count": 2, "items": [ /* resources */ ] }
+{ "cursor": "17", "count": 2, "items": [ /* resources */ ],
+  "unreadableCount": 1,
+  "unreadable": [ { "name": "survival-03", "part": "DESIRED",
+                    "reason": "…", "retryable": false } ] }
 ```
 
 Sorted by name. `cursor` is the change-feed position to open the stream from
 (§8); it is read **before** the list, so a definition written between the two
 reads appears in the stream rather than being missed by both.
+
+#### `unreadable` — rows there is a name for and nothing else
+
+A server whose stored **definition** will not decode cannot be a resource: there
+is no spec, so there is nothing to render short of inventing one. It appears in
+this second array instead of in `items`.
+
+It appears at all because **absence means something**. Omitting the row would be
+indistinguishable from the server having been purged, and a dashboard derives
+removal from absence — so a bad row would silently report a deletion that never
+happened, on a server that may well still be running with players on it. Render
+these as rows with an error badge, or as a banner; do not drop them.
+
+`unreadable` is **never filtered**. A row with no readable definition cannot
+answer "is it `READY`", "does it carry this label" or "is it terminating", so any
+filter would drop it — and dropping it is the mistake above. Its own array is
+what keeps it out of `items` without hiding it.
+
+`name` is the raw stored string, not a validated resource name: the name can
+itself be why the row will not read, and a shape that could not hold an invalid
+one would throw away the only identifying thing left.
+
+One bad row costs its own server and nothing else. This endpoint does not fail
+because of one.
 
 Query parameters, all optional:
 
@@ -346,6 +420,14 @@ Query parameters, all optional:
 `200` with the resource and `ETag`. `404 NOT_FOUND` if the name is unknown.
 `400 BAD_REQUEST` if the segment is not a usable resource name.
 
+A server whose **observation** will not decode still answers `200`, with
+`unreadable` set and `display.state: "UNREADABLE"` — clicking a row in the fleet
+table never produces an error the list did not warn you about.
+
+A server whose **definition** will not decode answers `500 SERVER_UNREADABLE`,
+because there is no resource to send. Not `404`: that would say the server is
+gone when it may still be running.
+
 ### `GET /api/v1/servers/{name}/status`
 
 The observation on its own, for a cheap poll of one server.
@@ -358,6 +440,10 @@ The observation on its own, for a cheap poll of one server.
 `404` if the name is unknown **or** if nothing has been observed yet — the two
 are distinguishable by the message, and by `GET /api/v1/servers/{name}` returning
 `status: null`.
+
+`500 SERVER_UNREADABLE` if an observation exists and will not decode. This
+endpoint cannot serve an observation it cannot read, and answering `404` would
+report it as never observed.
 
 ### `POST /api/v1/servers`
 
@@ -432,7 +518,7 @@ would reject the document on submit, so the two cannot disagree.
 One derivation, served by the server, so every dashboard does not invent its own.
 
 ```json
-{ "state": "READY", "ready": true, "needsAttention": false,
+{ "state": "READY", "ready": true, "needsAttention": false, "unreadable": false,
   "drainState": null, "playersOnline": 3, "playersMax": 60,
   "detail": "" }
 ```
@@ -442,10 +528,11 @@ One derivation, served by the server, so every dashboard does not invent its own
 1. `metadata.terminating` → **`TERMINATING`** (outranks everything: a server
    showing `READY` while its name is being reclaimed is the one wrong answer that
    matters)
-2. `status == null` → **`PENDING`**
-3. a drain is in flight (`status.drain != null && state != DRAIN_FAILED`) →
+2. `unreadable != null` → **`UNREADABLE`**
+3. `neverObserved` → **`PENDING`**
+4. a drain is in flight (`status.drain != null && state != DRAIN_FAILED`) →
    **`DRAINING`**
-4. otherwise by `status.phase`:
+5. otherwise by `status.phase`:
    `FAILED`→`FAILED`, `UNKNOWN`→`UNKNOWN`, `PENDING`→`PENDING`,
    `IMAGE_PULLING`/`CREATING`/`STARTING`→`STARTING`,
    `RUNNING`→`READY` if `status.ready` else `RUNNING`,
@@ -453,10 +540,24 @@ One derivation, served by the server, so every dashboard does not invent its own
 
 `RUNNING` vs `READY` is a real distinction: running is not joinable.
 
-`needsAttention` is a **flag, not a state** — true when a `NEEDS_ATTENTION`
-condition is `TRUE`. It reports and never authorises: a drain that has been
-failing for an hour is still `DRAINING` with the flag beside it. Its
+**`UNREADABLE` is not `UNKNOWN`.** `UNKNOWN` means the node or runtime could not
+be reached — a fact about the world. `UNREADABLE` means the stored observation
+will not decode — a fact about our own record. The container is very probably
+running exactly as it was, and an operator sent to look at the wrong one of those
+two wastes an outage. It ranks below `TERMINATING` because a requested delete is
+a *readable* fact about desired state and the more actionable badge; the flag
+below carries the rest.
+
+It was previously rendered as `PENDING`, which was wrong in the direction that
+matters: `PENDING` is a state you wait out, and a corrupt row waited out for ever.
+
+`needsAttention` and `unreadable` are **flags, not states** — and the flags are
+what you filter on, because `TERMINATING` outranks both. `needsAttention` is true
+when a `NEEDS_ATTENTION` condition is `TRUE`; it reports and never authorises, so
+a drain failing for an hour is still `DRAINING` with the flag beside it, and its
 `lastTransitionAt` in `status.conditions` is what an alert should fire on.
+`display.unreadable` is true whenever the resource carries an `unreadable` mark,
+including when the badge says `TERMINATING`.
 
 `playersMax` falls back to `spec.maxPlayers` when nothing has been observed.
 
@@ -537,9 +638,10 @@ watchdog, which you do.
 | event | data | do |
 |---|---|---|
 | `hello` | `{cursor, resumed, changePollMillis, statusPollMillis, keepAliveMillis, maxLifetimeMillis, reconnectMillis}` | note the cursor |
-| `snapshot` | `{cursor, count, items:[resource]}` | replace the whole set |
+| `snapshot` | `{cursor, count, items:[resource], unreadableCount, unreadable:[row]}` | replace the whole set |
 | `updated` | `{name, reason, server}` | replace by name |
 | `removed` | `{name, reason}` | delete by name |
+| `unreadable` | `{name, part, reason, retryable}` | mark by name — **do not delete** |
 | `ping` | `{at, cursor}` | reset the staleness watchdog |
 | `expired` | `{cursor, message}` | nothing — a `snapshot` follows immediately |
 | `bye` | `{reason:"MAX_LIFETIME", cursor}` | nothing — reconnect |
@@ -552,6 +654,18 @@ which is dead weight that reads as a gap in your code.
 
 `removed` means the drain finished and `:core` purged the name. A *delete
 request* arrives as `updated` with `terminating: true`.
+
+`unreadable` means the store holds this row and cannot decode its **definition**,
+so there is no resource to send — the same rows the list endpoint puts in its
+`unreadable` array. It is emphatically **not** `removed`: the server was
+declared, its container may well be up with players on it, and treating it as a
+deletion is the failure this event exists to prevent. The row keeps whatever the
+client last knew about it, with an error badge on top. If it starts decoding
+again, an ordinary `updated` follows with the full resource.
+
+A row that is unreadable when you connect is in the snapshot's `unreadable`
+array, not in an event. The event is for a row that stops decoding while you are
+watching.
 
 `ping` arrives every `keepAliveMillis` whether or not anything changed, and
 carries the cursor, so a watchdog that gives up and reconnects resumes from the
@@ -576,6 +690,11 @@ self-loop. So the stream runs two timers:
 
 Both funnel through one emit that drops anything whose definition and status
 versions are unchanged, so the two cannot produce a duplicate between them.
+
+The re-read is the **tolerant** one, and the fast path degrades into it: a row
+the single-row read cannot decode is left to the next resync rather than ending
+the stream, so it is reported within one `statusPollMillis` instead of taking
+the connection down. One bad row does not blank a fleet.
 
 ### Backpressure
 
@@ -649,6 +768,7 @@ none — not in a filter and not in a create form:
   "enums": {
     "phase": [...], "drainState": [...], "conditionType": [...], "conditionStatus": [...],
     "failureReason": [...], "failureClass": [...], "displayState": [...],
+    "statePart": ["DESIRED", "OBSERVED"],
     "storageMode": ["persistent", "ephemeral"],
     "drainPolicy": ["waitForZeroPlayers"]
   },
@@ -660,8 +780,8 @@ none — not in a filter and not in a create form:
 #### Two spellings, and the split is not cosmetic
 
 - **`phase`, `drainState`, `conditionType`, `conditionStatus`, `failureReason`,
-  `failureClass`, `displayState`** appear in *observed state* and are spelled by
-  their Kotlin name: `RUNNING`, `DRAIN_STALLED`.
+  `failureClass`, `displayState`, `statePart`** appear in *observed state* and are
+  spelled by their Kotlin name: `RUNNING`, `DRAIN_STALLED`, `OBSERVED`.
 - **`storageMode`, `drainPolicy`** appear in a *definition* and are spelled by
   their YAML wire value: `persistent`, `waitForZeroPlayers`. A form that offered
   `PERSISTENT` would build a document the parser rejects.
@@ -755,8 +875,16 @@ start looks exactly like a healthy one until somebody needs it.
   request carries a secret. There is no second, unredacted view and no raw-state
   endpoint.
 
+- **`unreadable.reason`**, on a resource, in a listing and in a
+  `SERVER_UNREADABLE` error, is the store's own operator-facing text. It names
+  the server and what about the stored form was rejected, and it carries no stack
+  trace, no class name, no SQL and no file path — `:store` does not put them in
+  the value, and nothing here reaches past it to the exception to add them.
+
 `ResponseLeakageTest` enforces all of this against every response body an
-operator can obtain, with control assertions proving the search could have failed.
+operator can obtain, with control assertions proving the search could have
+failed; `StoreFailureTest` does the same for the unreadable paths, which no real
+store will produce on demand.
 
 ---
 
@@ -776,7 +904,10 @@ export type DrainState =
 
 export type DisplayState =
   | 'PENDING' | 'STARTING' | 'RUNNING' | 'READY' | 'DRAINING'
-  | 'TERMINATING' | 'STOPPING' | 'STOPPED' | 'FAILED' | 'UNKNOWN';
+  | 'TERMINATING' | 'STOPPING' | 'STOPPED' | 'FAILED'
+  /** The stored observation will not decode. NOT the same as UNKNOWN — see §7. */
+  | 'UNREADABLE'
+  | 'UNKNOWN';
 
 export type ConditionType =
   | 'IMAGE_AVAILABLE' | 'VOLUME_BOUND' | 'CONTAINER_RUNNING' | 'READY'
@@ -784,6 +915,9 @@ export type ConditionType =
 
 export type ConditionStatus = 'TRUE' | 'FALSE' | 'UNKNOWN';
 export type FailureClass = 'RETRYABLE' | 'PERMANENT';
+
+/** Which half of a server's stored state something is about. */
+export type StatePart = 'DESIRED' | 'OBSERVED';
 
 export type FailureReason =
   | 'IMAGE_PULL_FAILED' | 'IMAGE_REFERENCE_REJECTED' | 'SANDBOX_CREATE_FAILED'
@@ -948,22 +1082,55 @@ export interface ServerResource {
   };
   status: ServerStatus | null;
   statusMeta: { resourceVersion: string; recordedAt: string } | null;
+  /** Why `status` is null, when the answer is not "nothing has been observed". */
+  unreadable: Unreadable | null;
   caughtUp: boolean;
+  /** `status === null && unreadable === null`. Test this, not `status === null`. */
+  neverObserved: boolean;
   display: {
     state: DisplayState; ready: boolean; needsAttention: boolean;
+    /** True whenever `unreadable` is set, including when the badge says TERMINATING. */
+    unreadable: boolean;
     drainState: DrainState | null;
     playersOnline: number | null; playersMax: number | null;
     detail: string;
   };
 }
 
-export interface ServerList { cursor: string; count: number; items: ServerResource[] }
+/**
+ * A part of a server's stored state the store holds and cannot decode.
+ *
+ * `reason` is operator-facing text on the same terms as `FailureStatus.message`:
+ * safe to show, carrying no stack trace and no storage-level detail. `retryable`
+ * is false for anything that failed to decode.
+ */
+export interface Unreadable { part: StatePart; reason: string; retryable: boolean }
+
+/**
+ * A row the store has a name for and nothing else — its *definition* will not
+ * decode, so there is no resource. Reported rather than omitted because absence
+ * is how a purge is reported. `name` is the raw stored string: the name itself
+ * can be why the row will not read.
+ */
+export interface UnreadableServer {
+  name: string; part: StatePart; reason: string; retryable: boolean;
+}
+
+export interface ServerList {
+  cursor: string;
+  count: number;
+  items: ServerResource[];
+  unreadableCount: number;
+  /** Never filtered — see §6. */
+  unreadable: UnreadableServer[];
+}
 
 export type ErrorCode =
   | 'BAD_REQUEST' | 'UNAUTHENTICATED' | 'CSRF_REQUIRED' | 'CSRF_INVALID'
   | 'ORIGIN_NOT_ALLOWED' | 'NOT_FOUND' | 'METHOD_NOT_ALLOWED' | 'SECRET_NOT_READABLE'
   | 'CONFLICT' | 'PAYLOAD_TOO_LARGE' | 'UNSUPPORTED_MEDIA_TYPE' | 'VALIDATION_FAILED'
-  | 'PRECONDITION_REQUIRED' | 'INTERNAL' | 'STORE_UNAVAILABLE' | 'STREAM_LIMIT';
+  | 'PRECONDITION_REQUIRED' | 'INTERNAL' | 'SERVER_UNREADABLE'
+  | 'STORE_UNAVAILABLE' | 'STREAM_LIMIT';
 
 export interface ApiError {
   error: {
@@ -981,6 +1148,8 @@ export interface ApiError {
       currentResourceVersion: string | null;
       explanation: string;
     } | null;
+    /** Set on SERVER_UNREADABLE. Not evidence about the container — see §3. */
+    unreadable: (Unreadable & { name: string }) | null;
   };
 }
 
@@ -988,9 +1157,11 @@ export type StreamEvent =
   | { type: 'hello';    data: { cursor: string; resumed: boolean; changePollMillis: number;
                                 statusPollMillis: number; keepAliveMillis: number;
                                 maxLifetimeMillis: number; reconnectMillis: number } }
-  | { type: 'snapshot'; data: { cursor: string; count: number; items: ServerResource[] } }
+  | { type: 'snapshot'; data: { cursor: string; count: number; items: ServerResource[];
+                                unreadableCount: number; unreadable: UnreadableServer[] } }
   | { type: 'updated';  data: { name: string; reason: 'definition' | 'status'; server: ServerResource } }
   | { type: 'removed';  data: { name: string; reason: 'PURGED' } }
+  | { type: 'unreadable'; data: UnreadableServer }
   | { type: 'ping';     data: { at: string; cursor: string } }
   | { type: 'expired';  data: { cursor: string; message: string } }
   | { type: 'bye';      data: { reason: 'MAX_LIFETIME'; cursor: string } };
@@ -1012,3 +1183,18 @@ violation to its `field`.
 `TERMINATING` and `status.drain.state` → the row goes when `removed` arrives or
 `GET` answers `404`. If `drain.state` becomes `DRAIN_FAILED`, say so loudly: the
 server is still running and needs an operator.
+
+**A row the store cannot read.** Two shapes, and neither is a disappearance:
+
+- `unreadable` set on a resource → the *observation* is corrupt. The row is
+  otherwise normal: definition, labels, spec all readable. Badge `UNREADABLE`,
+  show `unreadable.reason`, and say that nothing under `status` reflects what the
+  server is doing. The reconcile loop will write a fresh observation over the
+  broken one on its own.
+- an entry in `unreadable[]` (list or snapshot), or an `unreadable` event → the
+  *definition* is corrupt. There is no resource. Keep whatever you last knew
+  about the name, badge it, and offer the repair: `PUT` a valid definition with
+  `If-Match: *`.
+
+In both cases the container is very probably running exactly as it was. Do not
+render either as an outage, and never as a deletion.

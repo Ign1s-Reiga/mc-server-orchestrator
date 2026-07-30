@@ -62,4 +62,23 @@ document the parser rejects.
 **Why:** `storageMode` and `drainPolicy` were missing and the dashboard
 hard-coded them, which is precisely what the endpoint exists to prevent.
 
+**Absence means purged, and only purged.** Anything the store cannot read is
+reported as unreadable — in its own array on the list and the snapshot, as an
+`unreadable` event on the stream, as `SERVER_UNREADABLE` on a single fetch. It is
+never omitted and never `removed`.
+
+**Why:** a ninth drain audit found one undecodable row aborting `listServers`,
+which blanked the fleet table and stopped the reconcile loop queueing work at the
+same instant. `:store` now has tolerant reads (`listAll`, `StoredServer.unreadable`,
+`neverObserved`) and `:api` uses them.
+
+**How to apply:** the two traps are silent. Testing `status === null` conflates
+"not observed yet" with "observation is corrupt" — use `neverObserved`. And any
+absence check on the stream must count unreadable rows as present, or a bad row
+reports a deletion that never happened on a server with players on it.
+
+**A badge for our own record is not a badge for the world.** `UNREADABLE` (our
+copy will not decode) is distinct from `UNKNOWN` (the node could not be reached).
+Sending an operator to the wrong one of those wastes an outage.
+
 Related: [[api-module-decisions]].

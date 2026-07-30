@@ -11,6 +11,7 @@ import mcorch.schema.SchemaVersion
 import mcorch.schema.ServerKind
 import mcorch.schema.ServerPhase
 import mcorch.schema.StorageMode
+import mcorch.store.StatePart
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -49,6 +50,7 @@ class MetaTest {
         enums["failureReason"] shouldBe FailureReason.entries.map { it.name }
         enums["failureClass"] shouldBe FailureClass.entries.map { it.name }
         enums["displayState"] shouldBe ServerJsonStates.all()
+        enums["statePart"] shouldBe StatePart.entries.map { it.name }
     }
 
     @Test
@@ -95,6 +97,7 @@ class MetaTest {
                 "failureReason",
                 "failureClass",
                 "displayState",
+                "statePart",
                 "storageMode",
                 "drainPolicy",
             )

@@ -25,6 +25,8 @@ import mcorch.schema.StatusCondition
 import mcorch.schema.StorageSpec
 import mcorch.schema.StorageStatus
 import mcorch.store.StoredServer
+import mcorch.store.Unreadable
+import mcorch.store.UnreadableServer
 
 /**
  * How a server looks on the wire.
@@ -299,6 +301,43 @@ internal object ServerJson {
             put("lastTransitionAt", condition.lastTransitionAt)
         }
 
+    /**
+     * A part of a server's stored state the store holds and cannot decode.
+     *
+     * `reason` is the store's own operator-facing text and is passed through
+     * verbatim, on the same terms as `FailureStatus.message`: it names the server
+     * and what about the stored form was rejected, and it carries no secret
+     * material because secrets are not in state at all — only their coordinates
+     * are. What it deliberately does not carry is the underlying exception: a
+     * stack trace out of whichever backend produced it is an internal detail, and
+     * `:store` does not put one in this value in the first place.
+     */
+    private fun unreadable(unreadable: Unreadable): Json.Obj =
+        jsonObject {
+            put("part", unreadable.part)
+            put("reason", unreadable.reason)
+            put("retryable", unreadable.retryable)
+        }
+
+    /**
+     * A row the store has a name for and nothing else.
+     *
+     * There is no definition, so there is no resource: this is not a
+     * [ServerResource][server] with fields missing, and rendering it as one would
+     * mean inventing a spec. It is reported at all because absence means
+     * something — see the listing endpoints.
+     */
+    fun unreadableServer(row: UnreadableServer): Json.Obj =
+        jsonObject {
+            // Raw, exactly as stored. The name can itself be why the row will not
+            // read, and a rendering that dropped an invalid one would throw away
+            // the only identifying thing left.
+            put("name", row.name)
+            put("part", row.unreadable.part)
+            put("reason", row.unreadable.reason)
+            put("retryable", row.unreadable.retryable)
+        }
+
     /** Desired state, observed state and the store's bookkeeping, as one object. */
     fun server(stored: StoredServer): Json.Obj =
         jsonObject {
@@ -322,7 +361,13 @@ internal object ServerJson {
                 put("resourceVersion", held.resourceVersion.token)
                 put("recordedAt", held.recordedAt)
             }
+            // Why `status` is null, when the answer is not "nothing has been
+            // observed". Null in the ordinary case, so a client that reads
+            // `status === null && unreadable === null` still means "not yet looked
+            // at" and needs no change to keep working.
+            putOrNull("unreadable", stored.unreadable, ::unreadable)
             put("caughtUp", stored.caughtUp)
+            put("neverObserved", stored.neverObserved)
             put("display", display(stored))
         }
 
@@ -347,8 +392,30 @@ internal object ServerJson {
                 DisplayState.TERMINATING
             }
 
-            status == null -> {
+            // Above every phase-derived value, below TERMINATING. Below, because a
+            // delete that has been requested is a readable fact about desired
+            // state and the more actionable one; the flag beside the badge carries
+            // the rest. Above everything else, because there is no phase to derive
+            // from — the observation exists and cannot be read.
+            stored.unreadable != null -> {
+                DisplayState.UNREADABLE
+            }
+
+            // `neverObserved`, not `status == null`. An observation that will not
+            // decode also leaves `status` null, and rendering that as PENDING tells
+            // an operator their server has not been looked at yet when what was
+            // recorded about it is in fact corrupt. Wrong in the direction that
+            // matters: PENDING is a state you wait out.
+            stored.neverObserved -> {
                 DisplayState.PENDING
+            }
+
+            status == null -> {
+                // Unreachable today — `status` is null only when nothing was
+                // observed or the observation would not decode, both handled above.
+                // Kept because the compiler cannot see that, and UNKNOWN is the
+                // honest answer to "there is no status and no reason for it".
+                DisplayState.UNKNOWN
             }
 
             status.draining -> {
@@ -382,6 +449,11 @@ internal object ServerJson {
                     it.type == ConditionType.NEEDS_ATTENTION && it.status == ConditionStatus.TRUE
                 } ?: false,
             )
+            // A flag as well as a state, and for the same reason `needsAttention`
+            // is one: TERMINATING outranks UNREADABLE, so a terminating server
+            // with a corrupt observation carries the fact here rather than losing
+            // it. Filter on this, not on `state == 'UNREADABLE'`.
+            put("unreadable", stored.unreadable != null)
             put("drainState", status?.drain?.state)
             put("playersOnline", status?.players?.online)
             put(
@@ -402,12 +474,30 @@ internal object ServerJson {
                 "delete requested; draining (${status.drain?.state?.name?.lowercase()?.replace('_', ' ')})"
             }
 
+            state == DisplayState.TERMINATING && stored.unreadable != null -> {
+                "delete requested; the stored observation could not be read, so how far the drain has got " +
+                    "is not known — ${stored.unreadable?.reason}"
+            }
+
             state == DisplayState.TERMINATING -> {
                 "delete requested; waiting for the reconcile loop to start the drain"
             }
 
-            status == null -> {
+            stored.unreadable != null -> {
+                // Says what is unknown rather than what is wrong. The container is
+                // very probably still running exactly as it was; what is broken is
+                // the record of it, and an operator reading this needs to know the
+                // difference before they reach for a restart.
+                "the stored observation could not be read, so nothing here reflects what the server is " +
+                    "actually doing — ${stored.unreadable?.reason}"
+            }
+
+            stored.neverObserved -> {
                 "accepted; nothing observed yet"
+            }
+
+            status == null -> {
+                "there is no observation and no reason recorded for its absence"
             }
 
             status.failure != null -> {
@@ -465,6 +555,18 @@ internal object ServerJson {
         STOPPING,
         STOPPED,
         FAILED,
+
+        /**
+         * An observation is stored for this server and cannot be decoded.
+         *
+         * Not [UNKNOWN], which means the *node or runtime* could not be reached —
+         * a fact about the world. This one is a fact about our own record of it:
+         * the container is very probably running exactly as it was, and what is
+         * broken is what we wrote down. Conflating the two would send an operator
+         * to look at the wrong thing.
+         */
+        UNREADABLE,
+
         UNKNOWN,
     }
 }
