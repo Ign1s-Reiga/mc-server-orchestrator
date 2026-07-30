@@ -4,7 +4,11 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import mcorch.api.ApiConfig
+import mcorch.api.ApiConfiguration
+import mcorch.api.ApiServer
 import org.slf4j.LoggerFactory
+import java.io.IOException
 import kotlin.system.exitProcess
 
 private val LOG = LoggerFactory.getLogger("mcorch.app.Main")
@@ -52,6 +56,13 @@ private val LOG = LoggerFactory.getLogger("mcorch.app.Main")
  * save is recorded, and `Orchestrator.close` reports it at error if it is called
  * while the loop is still running. Anything that moves the close earlier, or
  * adds a second shutdown hook that closes the store, breaks it.
+ *
+ * The dashboard API nests inside the same ordering and for the same reason: it
+ * is started after the store is open and closed before it, so no request can be
+ * part-way through a store call when the handle goes away. It is *not* wired
+ * into [Orchestrator], which the integration suite drives directly — a suite
+ * that had to invent an operator credential to reconcile a container would be
+ * paying for a dependency it does not have. See [serveApi].
  */
 public fun main() {
     val config =
@@ -62,21 +73,77 @@ public fun main() {
             exitProcess(EXIT_MISCONFIGURED)
         }
 
+    val apiConfiguration =
+        try {
+            ApiConfig.fromEnvironment(System.getenv())
+        } catch (invalid: IllegalArgumentException) {
+            LOG.error("cannot start: {}", invalid.message)
+            exitProcess(EXIT_MISCONFIGURED)
+        }
+
     Orchestrator.open(config).use { orchestrator ->
-        runBlocking {
-            val loop = launch { orchestrator.run() }
-            val stopping = stopOnSignal(loop)
-            try {
-                loop.join()
-            } finally {
-                // Removing a hook throws once shutdown has begun, which is
-                // exactly the case where it does not matter.
-                runCatching { Runtime.getRuntime().removeShutdownHook(stopping) }
+        // The API is opened *inside* the orchestrator's `use` and closed before
+        // it, so no request can be in a store call when the store is closed. It
+        // is deliberately not part of `Orchestrator.open`: the composition root
+        // is what the integration suite drives, and a suite that had to invent an
+        // operator credential to reconcile a container would be paying for a
+        // dependency it does not have.
+        serveApi(apiConfiguration, orchestrator).use {
+            runBlocking {
+                val loop = launch { orchestrator.run() }
+                val stopping = stopOnSignal(loop)
+                try {
+                    loop.join()
+                } finally {
+                    // Removing a hook throws once shutdown has begun, which is
+                    // exactly the case where it does not matter.
+                    runCatching { Runtime.getRuntime().removeShutdownHook(stopping) }
+                }
             }
         }
     }
     LOG.info("orchestrator stopped; the servers it manages are still running")
 }
+
+/**
+ * Starts the dashboard backend, or explains that it is off.
+ *
+ * There are two states and no third: a configured API with an operator
+ * credential, or `MCORCH_API_LISTEN=off`. An API that came up unauthenticated
+ * because a variable was unset is not one of them — every mutating endpoint can
+ * request a drain, and a drain is how a Minecraft server stops.
+ *
+ * Failing to bind is fatal rather than degraded. An orchestrator whose dashboard
+ * silently did not start looks exactly like a healthy one until somebody needs it.
+ */
+private fun serveApi(
+    configuration: ApiConfiguration,
+    orchestrator: Orchestrator,
+): AutoCloseable =
+    when (configuration) {
+        ApiConfiguration.Disabled -> {
+            LOG.info(
+                "the dashboard API is off ({}={}); this process reconciles but serves nothing",
+                ApiConfig.LISTEN_VARIABLE,
+                ApiConfig.DISABLED,
+            )
+            AutoCloseable {}
+        }
+
+        is ApiConfiguration.Listening -> {
+            try {
+                ApiServer.start(configuration.config, orchestrator.store, orchestrator.secrets)
+            } catch (failure: IOException) {
+                LOG.error(
+                    "cannot start: the dashboard API could not bind {}:{} — {}",
+                    configuration.config.bindHost,
+                    configuration.config.bindPort,
+                    failure.message,
+                )
+                exitProcess(EXIT_MISCONFIGURED)
+            }
+        }
+    }
 
 /**
  * Installs a shutdown hook that cancels [loop] and waits for it to unwind.
