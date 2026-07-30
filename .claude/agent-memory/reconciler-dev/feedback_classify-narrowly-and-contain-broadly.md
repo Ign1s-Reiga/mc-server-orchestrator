@@ -38,3 +38,19 @@ runtime gets translated at the edge that owns it, and the worker keeps its
 last-line-of-defence catch even so. `withContext(NonCancellable)` for cleanup
 that takes a lock — a cancelled coroutine throws instead of waiting, which would
 leak the queue entry.
+
+**Every `launch`ed child needs it, not just the worker.** I applied this to
+`work()` and stopped there; `resyncPeriodically` and `watchChanges` went two
+audits without it, and they are worse: a worker dying costs one pass, a ticker
+dying cancels the scope and takes the whole loop down. Worse still, `seed`
+resyncs *before* the children are launched, so the same throwable killed the
+process on every restart — and an orchestrator that cannot start is the one
+thing that could have repaired the state stopping it.
+
+**The tell that a `catch` is a bet, not a guard.** `catch (StoreException)` is a
+bet on what the layer below throws. The case that broke it: a NULL primary key in
+SQLite raises an NPE, because the column has no `NOT NULL`, `resourceName` takes
+a non-null `String`, and the JDBC wrapper only translates `SQLException`. No
+`catch` on the path saw it. So at a boundary where an escape is fatal, catch
+`Throwable` and rethrow `CancellationException` — the specific bug gets fixed at
+source elsewhere, but the guard has to hold for the *next* unanticipated one.
