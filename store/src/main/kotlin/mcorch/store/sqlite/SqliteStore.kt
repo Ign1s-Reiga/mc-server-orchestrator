@@ -530,18 +530,26 @@ internal class SqliteStore(
      * throwing on the first problem is what made a single hand-edited row cost
      * every server in the same read.
      *
-     * Only [StoreException] is caught. A JDBC failure arrives as an `SQLException`
-     * and is left to escape: it says the *read* did not complete, not that a
-     * particular record is unreadable, and demoting it to a per-row annotation
-     * would report an unreachable database as a corrupt server.
+     * Only a *permanent* [StoreException] is caught, and that is what makes
+     * [Unreadable.retryable] structurally false rather than incidentally false: a
+     * retryable failure is re-raised, because it describes the read rather than
+     * the record and a caller that saw it as an annotation would treat a passing
+     * problem as a corrupt row for good.
+     *
+     * A JDBC failure never reaches either branch. It arrives as an `SQLException`,
+     * which is not a [StoreException], so it passes through this function and is
+     * classified by [query] on the way out — an unreachable database stays an
+     * unreachable database rather than becoming a corrupt server.
      */
     private fun readRow(rows: ResultSet): RowRead {
-        val rawName = rows.getString("name")
+        // Not `getString`: a NULL here is exactly the case this has to survive.
+        val rawName = rows.stringOrNull("name")
         val definition =
             try {
                 val row = readDefinitionRow(rows)
                 row.toStored(decodeDefinition(row))
             } catch (failure: StoreException) {
+                if (failure.retryable) throw failure
                 return RowRead.Undecodable(
                     UnreadableServer(rawName, unreadable(StatePart.DESIRED, failure)),
                     failure,
@@ -556,6 +564,7 @@ internal class SqliteStore(
         return try {
             RowRead.Readable(StoredServer(definition, readStatus(rows, definition.name, statusVersion)), null)
         } catch (failure: StoreException) {
+            if (failure.retryable) throw failure
             RowRead.Readable(
                 StoredServer(definition, status = null, unreadable = unreadable(StatePart.OBSERVED, failure)),
                 failure,
@@ -574,9 +583,9 @@ internal class SqliteStore(
             status =
                 StatusCodec.decode(
                     name = name,
-                    apiVersion = schemaVersion(rows.getString("status_api_version"), what),
-                    kind = serverKind(rows.getString("status_kind"), what),
-                    encoded = rows.getString("status_doc"),
+                    apiVersion = schemaVersion(rows.requiredString("status_api_version", what), what),
+                    kind = serverKind(rows.requiredString("status_kind", what), what),
+                    encoded = rows.requiredString("status_doc", what),
                     what = what,
                 ),
             resourceVersion = ResourceVersion(resourceVersion.toString()),
@@ -655,41 +664,44 @@ internal class SqliteStore(
      * names; no player identity passes through the state store at all.
      */
     private fun report(
-        name: String,
+        name: String?,
         part: StatePart,
         failure: StoreException,
     ) {
-        LOG.warn("server={} has {} state this build cannot decode: {}", name, part, failure.message)
+        LOG.warn(
+            "server={} has {} state this build cannot decode: {}",
+            name ?: "<unnamed row>",
+            part,
+            failure.message,
+        )
     }
 
     private fun readDefinitionRow(rows: ResultSet): DefinitionRow {
-        val rawName = rows.getString("name")
-        val what = "definition of `$rawName`"
+        val what = describe("definition", rows.stringOrNull("name"))
         return DefinitionRow(
-            name = resourceName(rawName, what),
-            apiVersion = schemaVersion(rows.getString("api_version"), what),
-            kind = serverKind(rows.getString("kind"), what),
+            name = resourceName(rows.requiredString("name", what), what),
+            apiVersion = schemaVersion(rows.requiredString("api_version", what), what),
+            kind = serverKind(rows.requiredString("kind", what), what),
             generation = rows.getLong("generation"),
             resourceVersion = ResourceVersion(rows.getLong("resource_version").toString()),
             createdAt = rows.instant("created_at", what),
             updatedAt = rows.instant("updated_at", what),
             deletedAt = rows.instantOrNull("deleted_at", what),
-            metadataDoc = rows.getString("metadata_doc"),
-            specDoc = rows.getString("spec_doc"),
+            metadataDoc = rows.requiredString("metadata_doc", what),
+            specDoc = rows.requiredString("spec_doc", what),
             encoding = requireEncoding(rows.getInt("doc_encoding"), what),
         )
     }
 
     private fun readStatusRow(rows: ResultSet): StatusRow {
-        val rawName = rows.getString("name")
-        val what = "status of `$rawName`"
+        val what = describe("status", rows.stringOrNull("name"))
         return StatusRow(
-            name = resourceName(rawName, what),
-            apiVersion = schemaVersion(rows.getString("api_version"), what),
-            kind = serverKind(rows.getString("kind"), what),
+            name = resourceName(rows.requiredString("name", what), what),
+            apiVersion = schemaVersion(rows.requiredString("api_version", what), what),
+            kind = serverKind(rows.requiredString("kind", what), what),
             resourceVersion = ResourceVersion(rows.getLong("resource_version").toString()),
             recordedAt = rows.instant("recorded_at", what),
-            statusDoc = rows.getString("status_doc"),
+            statusDoc = rows.requiredString("status_doc", what),
             encoding = requireEncoding(rows.getInt("doc_encoding"), what),
         )
     }
@@ -697,15 +709,27 @@ internal class SqliteStore(
     private fun readChange(rows: ResultSet): ServerChange {
         val revision = rows.getLong("revision")
         val what = "change at revision $revision"
+        val kind = rows.requiredString("change_kind", what)
         return ServerChange(
-            name = resourceName(rows.getString("name"), what),
+            name = resourceName(rows.requiredString("name", what), what),
             kind =
-                ChangeKind.entries.firstOrNull { it.name == rows.getString("change_kind") }
-                    ?: throw StoreException.Corrupt("$what: unknown change kind `${rows.getString("change_kind")}`"),
+                ChangeKind.entries.firstOrNull { it.name == kind }
+                    ?: throw StoreException.Corrupt("$what: unknown change kind `$kind`"),
             resourceVersion = ResourceVersion(revision.toString()),
             at = rows.instant("at", what),
         )
     }
+
+    /**
+     * Names the record a failure is about, without assuming it has a name.
+     *
+     * A row whose own primary key is NULL has to be describable, or the message
+     * saying so cannot be built.
+     */
+    private fun describe(
+        part: String,
+        rawName: String?,
+    ): String = if (rawName == null) "$part of an unnamed row" else "$part of `$rawName`"
 
     private fun decodeDefinition(row: DefinitionRow): ServerDefinition =
         DefinitionCodec.decode(

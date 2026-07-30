@@ -71,7 +71,7 @@ class MigrationTest {
             appliedVersions(directory) shouldBe listOf(1)
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
 
                 val servers = migrated.state.listServers().associateBy { it.name.value }
                 servers.keys shouldBe setOf("survival-a", "survival-b", "survival-c")
@@ -176,8 +176,123 @@ class MigrationTest {
             }
 
             stores.open(directory).use { second ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
                 second.state.listServers().map { it.name.value } shouldBe listOf("survival-a")
+            }
+        }
+
+    // ------------------------------------------------------------------ version 4
+
+    /**
+     * Version 4 rejects a row with no name — and must not cost anything to get
+     * there.
+     *
+     * The documented way to add `NOT NULL` in SQLite is to rebuild the table, and
+     * on this schema `DROP TABLE server_definition` with foreign keys on runs an
+     * implicit `DELETE FROM` that cascades into `server_status` and empties it.
+     * That would delete every stored observation on every existing store — which
+     * is where "the save request already went out" lives. So the check is a
+     * trigger, and this test is the proof that the data is all still there
+     * afterwards, statuses most of all.
+     */
+    @Test
+    fun `version 4 rejects unnamed rows without touching the data already stored`() =
+        runTest {
+            val directory = stores.directory()
+            val definition = Fixtures.definitionNamed("survival-a")
+            val status = Fixtures.fullStatus("survival-a", drainState = DrainState.SAVING)
+            writeVersion3Database(directory) { legacy ->
+                legacy.definition(definition, generation = 3L, revision = 1L)
+                legacy.statusWithProjection(status, revision = 2L)
+            }
+            appliedVersions(directory) shouldBe listOf(1, 2, 3)
+
+            stores.open(directory).use { migrated ->
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
+
+                // Nothing was dropped, renamed or cascaded away.
+                val server = migrated.state.getServer(definition.metadata.name).shouldNotBeNull()
+                server.definition.definition shouldBe definition
+                server.definition.generation shouldBe 3L
+                server.status.shouldNotBeNull().status shouldBe status
+                migrated.state.listByDrainState(setOf(DrainState.SAVING)).map { it.name.value } shouldBe
+                    listOf("survival-a")
+            }
+
+            // And the hole is shut: the insert that used to succeed now does not.
+            val refused =
+                runCatching {
+                    rawConnection(directory).use { connection ->
+                        connection.update(
+                            """
+                            INSERT INTO server_definition (
+                                name, api_version, kind, generation, resource_version,
+                                created_at, updated_at, deleted_at, metadata_doc, spec_doc, doc_encoding
+                            )
+                            SELECT NULL, api_version, kind, generation, resource_version + 1000,
+                                   created_at, updated_at, deleted_at, metadata_doc, spec_doc, doc_encoding
+                              FROM server_definition
+                            """.trimIndent(),
+                        )
+                        connection.commit()
+                    }
+                }
+            refused
+                .exceptionOrNull()
+                .shouldNotBeNull()
+                .message
+                .shouldNotBeNull() shouldContain "must not be NULL"
+        }
+
+    /**
+     * A store that *already* holds an unnamed row still opens.
+     *
+     * This is the reason the migration does not rebuild the table with a real
+     * `NOT NULL`: the copy would refuse exactly the row the migration exists
+     * because of, and the store written to be repaired would be the one that
+     * stops opening. The row is left where it is — reported as unreadable on
+     * every read, which is how an operator finds out about it — and everything
+     * else carries on.
+     */
+    @Test
+    fun `a store that already holds an unnamed row still migrates and still opens`() =
+        runTest {
+            val directory = stores.directory()
+            writeVersion3Database(directory) { legacy ->
+                legacy.definition(Fixtures.definitionNamed("survival-a"), generation = 1L, revision = 1L)
+                legacy.statusWithProjection(
+                    Fixtures.fullStatus("survival-a", drainState = DrainState.SAVING),
+                    revision = 2L,
+                )
+            }
+            rawConnection(directory).use { connection ->
+                connection.update(
+                    """
+                    INSERT INTO server_definition (
+                        name, api_version, kind, generation, resource_version,
+                        created_at, updated_at, deleted_at, metadata_doc, spec_doc, doc_encoding
+                    )
+                    SELECT NULL, api_version, kind, generation, resource_version + 1000,
+                           created_at, updated_at, deleted_at, metadata_doc, spec_doc, doc_encoding
+                      FROM server_definition
+                    """.trimIndent(),
+                )
+                connection.commit()
+            }
+
+            stores.open(directory).use { migrated ->
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
+
+                val listing = migrated.state.listAll()
+                listing.servers.map { it.name.value } shouldBe listOf("survival-a")
+                listing.servers
+                    .single()
+                    .status
+                    .shouldNotBeNull()
+                listing.unreadable
+                    .single()
+                    .name
+                    .shouldBeNull()
             }
         }
 
@@ -269,7 +384,7 @@ class MigrationTest {
             appliedVersions(directory) shouldBe listOf(1, 2)
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
 
                 val confirmed = drainOf(migrated, "survival-a")
                 confirmed.worldSavedAt shouldBe confirmedAt
@@ -350,7 +465,7 @@ class MigrationTest {
             appliedVersions(directory) shouldBe listOf(1, 2)
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
                 val drain = drainOf(migrated, "survival-a")
 
                 // Undated evidence is no evidence. Nothing may appear here.
@@ -500,6 +615,25 @@ class MigrationTest {
         }
     }
 
+    /**
+     * A database stopped at version 3, for the version-4 cases.
+     *
+     * Version 3 changed documents rather than columns, so the row shapes here are
+     * version 2's — which is why the same writer serves both.
+     */
+    private fun writeVersion3Database(
+        directory: Path,
+        block: (LegacyWriter) -> Unit,
+    ) {
+        rawConnection(directory).use { connection ->
+            Migrations.migrate(connection, stores.clock, upTo = 3)
+            val writer = LegacyWriter(connection, hasDrainStateColumn = true)
+            block(writer)
+            writer.finish()
+            connection.commit()
+        }
+    }
+
     /** Inserts rows shaped the way an older version of the schema shaped them. */
     private class LegacyWriter(
         private val connection: Connection,
@@ -561,6 +695,38 @@ class MigrationTest {
                 setString(5, CREATED_AT.toString())
                 setString(6, StatusCodec.encode(status))
                 setInt(7, PropertyDocument.ENCODING_VERSION)
+            }
+            highest = maxOf(highest, revision)
+        }
+
+        /**
+         * A status row as versions 2 and 3 held it: the document, plus the
+         * `drain_state` projection already sitting beside it.
+         *
+         * [status] writes the version-1 shape, which has no such column. A test
+         * that starts at version 2 or later needs this one, or the projection is
+         * empty for a reason that has nothing to do with what it is testing.
+         */
+        fun statusWithProjection(
+            status: PaperServerStatus,
+            revision: Long,
+        ) {
+            connection.update(
+                """
+                INSERT INTO server_status (
+                    name, api_version, kind, resource_version, recorded_at, status_doc, doc_encoding, drain_state
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """.trimIndent(),
+            ) {
+                setString(1, status.name.value)
+                setString(2, status.apiVersion.wireValue)
+                setString(3, status.kind.wireValue)
+                setLong(4, revision)
+                setString(5, CREATED_AT.toString())
+                setString(6, StatusCodec.encode(status))
+                setInt(7, PropertyDocument.ENCODING_VERSION)
+                val drain = StatusCodec.drainStateOf(status)
+                if (drain == null) setNull(8, java.sql.Types.VARCHAR) else setString(8, drain.name)
             }
             highest = maxOf(highest, revision)
         }

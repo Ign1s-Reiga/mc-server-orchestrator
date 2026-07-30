@@ -163,9 +163,21 @@ public data class Unreadable(
      */
     val reason: String,
     /**
-     * Whether reading again could plausibly succeed. False for anything that
-     * failed to decode — the stored bytes will say the same thing next time, and
-     * a caller that retries them forever never surfaces the problem.
+     * Whether reading again could plausibly succeed.
+     *
+     * False for anything that failed to decode: the stored bytes will say the same
+     * thing next time, and a caller that retries them forever never surfaces the
+     * problem. An implementation must not turn a *retryable* failure into one of
+     * these at all — it describes the read, not the record, and a caller handed it
+     * as an annotation would write off a passing problem as a corrupt row
+     * permanently. The embedded store enforces that by re-raising anything
+     * retryable instead of attaching it, so in practice this is always false
+     * there.
+     *
+     * The field exists because a backend that decodes somewhere else can honestly
+     * disagree — "the thing that knows how to read this is unreachable, ask again"
+     * is a real answer for a networked store, and it is not the same answer as
+     * "this record is broken".
      */
     val retryable: Boolean,
 )
@@ -186,13 +198,20 @@ public data class UnreadableServer(
      * [ResourceName] because the name itself can be the reason the row will not
      * read, and a type that cannot hold it would drop the only identifying thing
      * left.
+     *
+     * Null when the record has no name at all. That is not hypothetical: SQLite
+     * permits NULL in a rowid table's primary key, so a row hand-written without
+     * one is possible, and it is precisely the record nothing can refer to — it
+     * cannot be fetched, reconciled or purged by name. Reporting it as `null` is
+     * the honest answer; substituting a placeholder would invent an identity the
+     * store does not have and contradict what this field promises.
      */
-    val name: String,
+    val name: String?,
     /** What could not be decoded. Always [StatePart.DESIRED] here. */
     val unreadable: Unreadable,
 ) {
-    /** The stored name as a [ResourceName], or null when the name is itself not a valid one. */
-    val resourceName: ResourceName? get() = ResourceName.of(name).getOrNull()
+    /** The stored name as a [ResourceName], or null when it is absent or not a valid one. */
+    val resourceName: ResourceName? get() = name?.let { ResourceName.of(it).getOrNull() }
 }
 
 /**
