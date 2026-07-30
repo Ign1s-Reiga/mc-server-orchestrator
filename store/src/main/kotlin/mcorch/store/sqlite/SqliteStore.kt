@@ -16,17 +16,23 @@ import mcorch.store.ConflictReason
 import mcorch.store.Precondition
 import mcorch.store.ResourceVersion
 import mcorch.store.ServerChange
+import mcorch.store.ServerListing
+import mcorch.store.StatePart
 import mcorch.store.Store
 import mcorch.store.StoreCursor
 import mcorch.store.StoreException
 import mcorch.store.StoredDefinition
 import mcorch.store.StoredServer
 import mcorch.store.StoredStatus
+import mcorch.store.Unreadable
+import mcorch.store.UnreadableServer
 import mcorch.store.WriteOutcome
 import mcorch.store.codec.DefinitionCodec
 import mcorch.store.codec.PropertyDocument
 import mcorch.store.codec.StatusCodec
+import org.slf4j.LoggerFactory
 import java.sql.Connection
+import java.sql.PreparedStatement
 import java.sql.ResultSet
 import java.sql.SQLException
 import java.time.Clock
@@ -297,25 +303,32 @@ internal class SqliteStore(
             connection.query(
                 "$SERVER_SELECT WHERE d.name = ?",
                 bind = { setString(1, name.value) },
-            ) { rows -> if (rows.next()) readServer(rows) else null }
-        }
+            ) { rows -> if (rows.next()) readRow(rows) else null }
+        }?.strict()
 
-    override suspend fun listServers(): List<StoredServer> =
-        read { connection ->
-            connection.query("$SERVER_SELECT ORDER BY d.name") { rows -> rows.mapAll(::readServer) }
-        }
+    override suspend fun listServers(): List<StoredServer> = allRows().servers()
 
-    override suspend fun listByDrainState(states: Set<DrainState>): List<StoredServer> {
+    override suspend fun listByDrainState(states: Set<DrainState>): List<StoredServer> = drainRows(states).servers()
+
+    override suspend fun listAll(): ServerListing = allRows().listing()
+
+    override suspend fun listAllByDrainState(states: Set<DrainState>): ServerListing = drainRows(states).listing()
+
+    private suspend fun allRows(): List<RowRead> = readRows("$SERVER_SELECT ORDER BY d.name")
+
+    private suspend fun drainRows(states: Set<DrainState>): List<RowRead> {
         if (states.isEmpty()) return emptyList()
         val placeholders = states.joinToString(", ") { "?" }
         val ordered = states.toList()
-        return read { connection ->
-            connection.query(
-                "$SERVER_SELECT WHERE s.drain_state IN ($placeholders) ORDER BY d.name",
-                bind = { ordered.forEachIndexed { index, state -> setString(index + 1, state.name) } },
-            ) { rows -> rows.mapAll(::readServer) }
+        return readRows("$SERVER_SELECT WHERE s.drain_state IN ($placeholders) ORDER BY d.name") {
+            ordered.forEachIndexed { index, state -> setString(index + 1, state.name) }
         }
     }
+
+    private suspend fun readRows(
+        sql: String,
+        bind: PreparedStatement.() -> Unit = {},
+    ): List<RowRead> = read { connection -> connection.query(sql, bind) { rows -> rows.mapAll(::readRow) } }
 
     // ---------------------------------------------------------------- change feed
 
@@ -508,28 +521,145 @@ internal class SqliteStore(
             bind = { setString(1, name.value) },
         ) { rows -> if (rows.next()) readStatusRow(rows) else null }
 
-    private fun readServer(rows: ResultSet): StoredServer {
-        val definitionRow = readDefinitionRow(rows)
-        val stored = definitionRow.toStored(decodeDefinition(definitionRow))
-        val statusVersion = rows.getLong("status_resource_version")
-        if (rows.wasNull()) return StoredServer(definition = stored, status = null)
+    /**
+     * One joined row, decoded as far as it will go.
+     *
+     * The two halves are decoded separately so that a failure in either is
+     * attributable to this row and this server, and the caller decides whether to
+     * raise it ([strict]) or to carry it ([servers], [listing]). Decoding both and
+     * throwing on the first problem is what made a single hand-edited row cost
+     * every server in the same read.
+     *
+     * Only [StoreException] is caught. A JDBC failure arrives as an `SQLException`
+     * and is left to escape: it says the *read* did not complete, not that a
+     * particular record is unreadable, and demoting it to a per-row annotation
+     * would report an unreachable database as a corrupt server.
+     */
+    private fun readRow(rows: ResultSet): RowRead {
+        val rawName = rows.getString("name")
+        val definition =
+            try {
+                val row = readDefinitionRow(rows)
+                row.toStored(decodeDefinition(row))
+            } catch (failure: StoreException) {
+                return RowRead.Undecodable(
+                    UnreadableServer(rawName, unreadable(StatePart.DESIRED, failure)),
+                    failure,
+                )
+            }
 
-        val what = "status of `${definitionRow.name}`"
-        requireEncoding(rows.getInt("status_doc_encoding"), what)
-        val status =
-            StoredStatus(
-                status =
-                    StatusCodec.decode(
-                        name = definitionRow.name,
-                        apiVersion = schemaVersion(rows.getString("status_api_version"), what),
-                        kind = serverKind(rows.getString("status_kind"), what),
-                        encoded = rows.getString("status_doc"),
-                        what = what,
-                    ),
-                resourceVersion = ResourceVersion(statusVersion.toString()),
-                recordedAt = rows.instant("status_recorded_at", what),
+        // getLong then wasNull, in that order and with nothing between them: the
+        // flag describes the column that was read last.
+        val statusVersion = rows.getLong("status_resource_version")
+        if (rows.wasNull()) return RowRead.Readable(StoredServer(definition), failure = null)
+
+        return try {
+            RowRead.Readable(StoredServer(definition, readStatus(rows, definition.name, statusVersion)), null)
+        } catch (failure: StoreException) {
+            RowRead.Readable(
+                StoredServer(definition, status = null, unreadable = unreadable(StatePart.OBSERVED, failure)),
+                failure,
             )
-        return StoredServer(definition = stored, status = status)
+        }
+    }
+
+    private fun readStatus(
+        rows: ResultSet,
+        name: ResourceName,
+        resourceVersion: Long,
+    ): StoredStatus {
+        val what = "status of `$name`"
+        requireEncoding(rows.getInt("status_doc_encoding"), what)
+        return StoredStatus(
+            status =
+                StatusCodec.decode(
+                    name = name,
+                    apiVersion = schemaVersion(rows.getString("status_api_version"), what),
+                    kind = serverKind(rows.getString("status_kind"), what),
+                    encoded = rows.getString("status_doc"),
+                    what = what,
+                ),
+            resourceVersion = ResourceVersion(resourceVersion.toString()),
+            recordedAt = rows.instant("status_recorded_at", what),
+        )
+    }
+
+    private fun unreadable(
+        part: StatePart,
+        failure: StoreException,
+    ): Unreadable =
+        Unreadable(
+            part = part,
+            reason = failure.message ?: failure.toString(),
+            retryable = failure.retryable,
+        )
+
+    /** The point-read view: whatever would not decode is raised. See [Store.getServer]. */
+    private fun RowRead.strict(): StoredServer =
+        when (this) {
+            is RowRead.Readable -> {
+                if (failure != null) throw failure
+                server
+            }
+
+            is RowRead.Undecodable -> {
+                throw failure
+            }
+        }
+
+    /**
+     * The [Store.listServers] view: an unreadable observation is marked on its own
+     * server, an unreadable definition still fails the read.
+     */
+    private fun List<RowRead>.servers(): List<StoredServer> =
+        map { row ->
+            when (row) {
+                is RowRead.Readable -> {
+                    row.failure?.let { report(row.server.name.value, StatePart.OBSERVED, it) }
+                    row.server
+                }
+
+                is RowRead.Undecodable -> {
+                    throw row.failure
+                }
+            }
+        }
+
+    /** The [Store.listAll] view: nothing is raised, everything is accounted for. */
+    private fun List<RowRead>.listing(): ServerListing {
+        val servers = ArrayList<StoredServer>(size)
+        val unreadable = mutableListOf<UnreadableServer>()
+        for (row in this) {
+            when (row) {
+                is RowRead.Readable -> {
+                    row.failure?.let { report(row.server.name.value, StatePart.OBSERVED, it) }
+                    servers += row.server
+                }
+
+                is RowRead.Undecodable -> {
+                    report(row.entry.name, StatePart.DESIRED, row.failure)
+                    unreadable += row.entry
+                }
+            }
+        }
+        return ServerListing(servers, unreadable)
+    }
+
+    /**
+     * Says out loud what a caller is only *offered*.
+     *
+     * This is the one place a failure stops being raised, and something that is
+     * neither raised nor logged is swallowed. Logged on the read rather than on the
+     * write because the row was written by a build that could encode it — a
+     * downgrade, or a hand edit, is only ever discovered here. Names are resource
+     * names; no player identity passes through the state store at all.
+     */
+    private fun report(
+        name: String,
+        part: StatePart,
+        failure: StoreException,
+    ) {
+        LOG.warn("server={} has {} state this build cannot decode: {}", name, part, failure.message)
     }
 
     private fun readDefinitionRow(rows: ResultSet): DefinitionRow {
@@ -643,6 +773,27 @@ internal class SqliteStore(
         return values
     }
 
+    /**
+     * How far one joined row decoded.
+     *
+     * The failure is kept beside the value instead of being thrown at the point it
+     * happened, so one decode can serve a point read that raises it and a listing
+     * that carries it, without reading the row twice or deciding the policy here.
+     */
+    private sealed interface RowRead {
+        /** The desired state decoded. [failure] is set when the observation did not. */
+        data class Readable(
+            val server: StoredServer,
+            val failure: StoreException?,
+        ) : RowRead
+
+        /** The desired state did not decode, so there is no server to hand back. */
+        data class Undecodable(
+            val entry: UnreadableServer,
+            val failure: StoreException,
+        ) : RowRead
+    }
+
     private data class SequenceRow(
         val nextRevision: Long,
         val compactedBelow: Long,
@@ -673,6 +824,8 @@ internal class SqliteStore(
     )
 
     private companion object {
+        private val LOG = LoggerFactory.getLogger(SqliteStore::class.java)
+
         /**
          * The joined read. Definition and status always come out of one statement so a
          * caller can never see a pair that never existed on disk.

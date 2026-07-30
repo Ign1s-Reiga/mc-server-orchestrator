@@ -124,6 +124,10 @@ class SecretLeakageTest {
                 server.toString() shouldNotContain material
                 store.state.listServers().toString() shouldNotContain material
                 store.state.changesSince(null).toString() shouldNotContain material
+                // Including the read that reports what it could not decode: an
+                // `Unreadable` quotes the stored form it rejected, so it is a state read
+                // like any other and is held to the same rule.
+                store.state.listAll().toString() shouldNotContain material
             }
         }
 

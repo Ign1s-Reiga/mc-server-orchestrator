@@ -1,5 +1,6 @@
 package mcorch.store
 
+import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.collections.shouldContainExactly
 import io.kotest.matchers.collections.shouldContainExactlyInAnyOrder
 import io.kotest.matchers.nulls.shouldBeNull
@@ -582,6 +583,60 @@ abstract class StoreConformanceSuite {
 
             store.listByDrainState(setOf(DrainState.SEALED)) shouldBe emptyList()
             store.listByDrainState(setOf(DrainState.SAVING)).map { it.name.value } shouldBe listOf("survival-a")
+        }
+
+    @Test
+    fun `listAll returns the same servers as listServers when every row reads`() =
+        withStore { store ->
+            store.putDefinition(Fixtures.definitionNamed("survival-a")).getOrThrow()
+            store.putDefinition(Fixtures.definitionNamed("survival-b")).getOrThrow()
+            store.putStatus(Fixtures.fullStatus("survival-a")).getOrThrow()
+
+            val listing = store.listAll()
+
+            listing.servers shouldBe store.listServers()
+            listing.unreadable.shouldBeEmpty()
+        }
+
+    @Test
+    fun `listAllByDrainState returns the same servers as listByDrainState when every row reads`() =
+        withStore { store ->
+            store.putDefinition(Fixtures.definitionNamed("survival-a")).getOrThrow()
+            store.putDefinition(Fixtures.definitionNamed("survival-b")).getOrThrow()
+            store.putStatus(Fixtures.fullStatus("survival-a", drainState = DrainState.SAVING)).getOrThrow()
+            store.putStatus(Fixtures.fullStatus("survival-b", drainState = DrainState.SEALED)).getOrThrow()
+
+            val listing = store.listAllByDrainState(setOf(DrainState.SAVING))
+
+            listing.servers shouldBe store.listByDrainState(setOf(DrainState.SAVING))
+            listing.servers.map { it.name.value } shouldBe listOf("survival-a")
+            listing.unreadable.shouldBeEmpty()
+        }
+
+    /**
+     * The distinction the loop's idempotency rests on.
+     *
+     * "Nothing has been observed" means reconcile from the beginning. "There is an
+     * observation and the store cannot read it" must not, or a drain that already
+     * issued its save request issues it again against a live server. Both leave
+     * [StoredServer.status] null, so the interface has to say which is which.
+     */
+    @Test
+    fun `a server with no observation reports that nothing was observed, not that it is unreadable`() =
+        withStore { store ->
+            val name = Fixtures.resourceName("survival-a")
+            store.putDefinition(Fixtures.definitionNamed("survival-a")).getOrThrow()
+
+            val fresh = store.getServer(name).shouldNotBeNull()
+            fresh.neverObserved shouldBe true
+            fresh.unreadable.shouldBeNull()
+            fresh.caughtUp shouldBe false
+
+            store.putStatus(Fixtures.fullStatus("survival-a")).getOrThrow()
+
+            val observed = store.getServer(name).shouldNotBeNull()
+            observed.neverObserved shouldBe false
+            observed.unreadable.shouldBeNull()
         }
 
     // --------------------------------------------------------------- change feed

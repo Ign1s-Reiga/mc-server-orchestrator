@@ -57,6 +57,11 @@ import mcorch.schema.ServerStatus
  *
  * A conflict is a returned value. A failure is a [StoreException], already
  * classified retryable or permanent. Implementations must not swallow either.
+ *
+ * One kind of failure is *scoped* rather than raised: a stored record this build
+ * cannot decode. That belongs to the one server it was stored for, so it comes
+ * back attached to that server ([Unreadable]) and leaves the rest of the read
+ * whole. A point read still raises it — see [getServer].
  */
 public interface Store : AutoCloseable {
     // ---------------------------------------------------------------- desired state
@@ -158,7 +163,16 @@ public interface Store : AutoCloseable {
 
     // ------------------------------------------------------------------------ reads
 
-    /** Desired and observed state for one server as a single snapshot, or null if the name is unknown. */
+    /**
+     * Desired and observed state for one server as a single snapshot, or null if
+     * the name is unknown.
+     *
+     * Unlike the listings below, this one *fails* when either half of the row will
+     * not decode, rather than handing back a snapshot with a hole in it. A caller
+     * that named one server wants the answer for that server: null would say "it
+     * is not there", and a half-read snapshot would say "there is no observation",
+     * and both are answers to a question nobody asked.
+     */
     public suspend fun getServer(name: ResourceName): StoredServer?
 
     /**
@@ -167,6 +181,22 @@ public interface Store : AutoCloseable {
      * The reconcile loop's resync read. Filtering is deliberately left to the
      * caller: at the scale this orchestrator targets, deciding what needs work is
      * reconcile policy, and policy in the store is policy in two places.
+     *
+     * ## One unreadable row costs one server
+     *
+     * Rows are decoded one at a time. A server whose *observation* will not decode
+     * still has a definition the loop can act on, so it is in this list with
+     * [StoredServer.unreadable] set and [StoredServer.status] null. The rest of the
+     * list is intact. Failing the whole read instead — which this store used to do
+     * — left the loop with nothing to reconcile and the dashboard with nothing to
+     * show, on every pass, from one hand-edited row.
+     *
+     * A server whose *definition* will not decode has no [StoredServer] to be
+     * marked on, and this read still fails for it. That is deliberate rather than
+     * lazy: quietly returning a shorter list is indistinguishable from the server
+     * having been purged, and callers do derive removal from absence. [listAll]
+     * returns those rows as entries instead of as a failure, and is the read to use
+     * anywhere absence has a meaning.
      */
     public suspend fun listServers(): List<StoredServer>
 
@@ -180,9 +210,38 @@ public interface Store : AutoCloseable {
      * loads a live server for nothing; one that is never picked up leaves players
      * on a server nobody is watching.
      *
+     * Reads one row at a time on the same terms as [listServers]: the drain state a
+     * row is selected by is stored beside the observation, so a server whose
+     * observation will not decode is still *found* here — with the drain to resume
+     * and nothing readable saying how far it got, which is exactly the case a
+     * caller must be told about rather than left to infer from an empty list.
+     *
      * An empty [states] returns nothing.
      */
     public suspend fun listByDrainState(states: Set<DrainState>): List<StoredServer>
+
+    /**
+     * [listServers], plus the rows whose desired state will not decode, as entries
+     * rather than as a failure.
+     *
+     * One consistent read: every server is in exactly one of
+     * [ServerListing.servers] and [ServerListing.unreadable].
+     *
+     * This is the read for any caller that gives absence a meaning — stopping a
+     * container it can no longer find a definition for, telling an operator a
+     * server was removed. With [listServers] such a caller cannot tell "gone" from
+     * "unreadable" without also handling the failure; here it cannot miss it.
+     *
+     * The default implementation is for stores that have no undecodable row to
+     * report — one holding objects in memory, say. It is honest rather than a
+     * silent empty: an implementation that *could* hold one would have failed
+     * [listServers] instead of hiding it.
+     */
+    public suspend fun listAll(): ServerListing = ServerListing(listServers())
+
+    /** [listByDrainState] with the tolerance [listAll] adds to [listServers]. */
+    public suspend fun listAllByDrainState(states: Set<DrainState>): ServerListing =
+        ServerListing(listByDrainState(states))
 
     // ----------------------------------------------------------------- change feed
 

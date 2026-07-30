@@ -97,13 +97,122 @@ public data class StoredStatus(
 public data class StoredServer(
     val definition: StoredDefinition,
     val status: StoredStatus? = null,
+    /**
+     * Set when there is an observation stored for this server that the store
+     * could not decode. [status] is then null, and the two together mean "an
+     * observation exists and it cannot be read", which is emphatically not
+     * "nothing has been observed yet" — see [neverObserved].
+     *
+     * Always [StatePart.OBSERVED]. A *definition* that will not decode cannot
+     * produce a [StoredServer] at all — there would be nothing to put in
+     * [definition] short of inventing it — so it surfaces as an
+     * [UnreadableServer] in [ServerListing.unreadable] instead.
+     */
+    val unreadable: Unreadable? = null,
 ) {
     val name: ResourceName get() = definition.name
 
-    /** The last observation reflects the current spec. False also when nothing has been observed yet. */
+    /**
+     * Nothing has been observed for this server yet.
+     *
+     * Deliberately not `status == null`. An observation the store cannot decode
+     * also leaves [status] null, and a caller that reads the two the same way
+     * re-runs a pass that already happened: it would re-issue the side effects of
+     * a drain that is halfway through, against a server that still has players on
+     * it. Whoever needs "there is no observation" wants this; whoever needs "I
+     * cannot see the observation" wants [unreadable].
+     */
+    val neverObserved: Boolean get() = status == null && unreadable == null
+
+    /**
+     * The last observation reflects the current spec. False also when nothing has
+     * been observed yet, and when the observation could not be decoded — an
+     * unreadable observation is not evidence of anything.
+     */
     val caughtUp: Boolean
         get() = status != null && status.status.observedGeneration == definition.generation
 }
+
+/** Which half of a server's stored state something is about. */
+public enum class StatePart {
+    /** What the operator declared. The definition. */
+    DESIRED,
+
+    /** What the reconcile loop last recorded. The status. */
+    OBSERVED,
+}
+
+/**
+ * A part of one server's stored state that the store holds but cannot decode.
+ *
+ * Returned as a value rather than raised, so a row the store cannot read costs
+ * the one server it belongs to instead of every server in the same read.
+ *
+ * Deliberately not the underlying exception. A caller can act on the
+ * classification and can show or log the [reason]; a stack trace out of whichever
+ * backend produced it is not part of this interface, and holding one would make a
+ * value type carry a snapshot of somebody's call stack.
+ */
+public data class Unreadable(
+    /** Which half could not be read. */
+    val part: StatePart,
+    /**
+     * Why, in a form that is safe to log and to show an operator. It names the
+     * server and what about the stored form was rejected. Secrets never reach
+     * this: they live in [SecretStore] and only their names are ever in state.
+     */
+    val reason: String,
+    /**
+     * Whether reading again could plausibly succeed. False for anything that
+     * failed to decode — the stored bytes will say the same thing next time, and
+     * a caller that retries them forever never surfaces the problem.
+     */
+    val retryable: Boolean,
+)
+
+/**
+ * A server the store holds and whose *desired* state it cannot decode.
+ *
+ * There is no definition to act on, so this is not a [StoredServer] and nothing
+ * can reconcile it. What it exists for is to keep the row from reading as
+ * *absent*: the server was declared, it may well have a container running with
+ * players on it, and anything that treats "not in the list" as "purged" —
+ * a garbage collector, a dashboard's removal event — would otherwise report a
+ * deletion that never happened.
+ */
+public data class UnreadableServer(
+    /**
+     * The stored name, exactly as the store holds it. Raw rather than a
+     * [ResourceName] because the name itself can be the reason the row will not
+     * read, and a type that cannot hold it would drop the only identifying thing
+     * left.
+     */
+    val name: String,
+    /** What could not be decoded. Always [StatePart.DESIRED] here. */
+    val unreadable: Unreadable,
+) {
+    /** The stored name as a [ResourceName], or null when the name is itself not a valid one. */
+    val resourceName: ResourceName? get() = ResourceName.of(name).getOrNull()
+}
+
+/**
+ * A listing that admits what it could not read.
+ *
+ * [servers] is everything a caller can act on, including servers whose
+ * observation would not decode — those keep their definition and carry
+ * [StoredServer.unreadable].
+ *
+ * [unreadable] is everything else: rows with no usable desired state. They are
+ * reported rather than dropped because absence means something to callers, and
+ * "the store could not read it" must never be delivered as "it is not there".
+ *
+ * The two lists come from one read, so a server is in exactly one of them and no
+ * caller has to reconcile two snapshots taken at different moments.
+ */
+public data class ServerListing(
+    val servers: List<StoredServer>,
+    val unreadable: List<UnreadableServer> = emptyList(),
+)
 
 /** What happened to a definition. Observed state does not appear in the feed — see [Store.changesSince]. */
 public enum class ChangeKind {
