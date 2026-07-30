@@ -69,6 +69,33 @@ class RouteTableTest {
     }
 
     @Test
+    fun `this module cannot reach a container runtime at all`() {
+        // The strongest form of "a mutating handler writes desired state and does
+        // not act": the types it would have to call are not on the classpath, so no
+        // handler can call one however it is written, and no future one can either
+        // without a visible change to api/build.gradle.kts.
+        //
+        // A test rather than a build-file comment because the comment cannot fail.
+        val outOfReach =
+            listOf(
+                "mcorch.cri.CriClient",
+                "mcorch.cri.ContainerSpec",
+                "mcorch.cri.StopGracePeriod",
+                "mcorch.core.Node",
+                "mcorch.core.Reconciler",
+                "mcorch.core.DrainController",
+                "io.grpc.ManagedChannel",
+            )
+        outOfReach.filter { runCatching { Class.forName(it) }.isSuccess } shouldBe emptyList()
+
+        // Control: the classpath is not simply empty, and the search does find the
+        // things this module *is* allowed to depend on.
+        listOf("mcorch.store.Store", "mcorch.schema.PaperServerDefinition")
+            .filter { runCatching { Class.forName(it) }.isSuccess }
+            .size shouldBe 2
+    }
+
+    @Test
     fun `the table has no route that could free a name or stop a container`() {
         val patterns = table().map { "${it.method} ${it.pattern}" }
         // purge, force-stop, restart-now: none of them exist, and none of them may.
