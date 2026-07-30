@@ -16,7 +16,9 @@ import mcorch.schema.SchemaViolation
 import mcorch.schema.ServerDefinition
 import mcorch.store.Precondition
 import mcorch.store.Store
+import mcorch.store.StoreException
 import mcorch.store.StoredServer
+import mcorch.store.UnreadableServer
 import mcorch.store.WriteOutcome
 import org.slf4j.LoggerFactory
 
@@ -66,13 +68,22 @@ internal class ServerRoutes(
     private suspend fun list(request: Request): Response {
         val cursor = store.currentCursor()
         val filter = ListFilter.of(request)
-        val items = store.listServers().filter(filter::matches).sortedBy { it.name.value }
+        val listing = store.listAll()
+        val items = listing.servers.filter(filter::matches).sortedBy { it.name.value }
+        val unreadable = listing.unreadable.sortedBy { it.name }
         return Response.json(
             200,
             jsonObject {
                 put("cursor", cursor.token)
                 put("count", items.size)
                 putArray("items", items, ServerJson::server)
+                // Never filtered, and that is deliberate. A row with no readable
+                // definition cannot answer "is it READY", "does it carry this
+                // label" or "is it terminating", so any filter would drop it — and
+                // dropping it is indistinguishable from the server having been
+                // purged. Its own array keeps it out of `items` without hiding it.
+                put("unreadableCount", unreadable.size)
+                putArray("unreadable", unreadable, ServerJson::unreadableServer)
             },
         )
     }
@@ -84,6 +95,7 @@ internal class ServerRoutes(
 
     private suspend fun status(request: Request): Response {
         val stored = mustFind(Requests.name(request))
+        stored.unreadable?.let { throw ApiException.unreadable(stored.name.value, it) }
         val held =
             stored.status
                 ?: throw ApiException(
@@ -164,7 +176,13 @@ internal class ServerRoutes(
             // `*` means "it must exist". The store has no precondition for that, so
             // it is a read — racy by nature, and honestly so: the write that follows
             // is unconditional because that is what the caller asked for.
-            mustFind(name)
+            //
+            // A row whose definition will not decode counts as existing, and this
+            // is the recovery path for one: `PUT` with `If-Match: *` writes a
+            // definition the store can read again, which is the only way an
+            // operator repairs such a row through this API. Requiring the old one
+            // to be readable first would make the broken case the unfixable one.
+            if (resolve(name) == Resolution.Absent) throw ApiException.notFound("no server named `$name`")
         }
 
         val stored =
@@ -252,8 +270,59 @@ internal class ServerRoutes(
     }
 
     private suspend fun mustFind(name: ResourceName): StoredServer =
-        store.getServer(name)
-            ?: throw ApiException.notFound("no server named `$name`")
+        when (val resolution = resolve(name)) {
+            is Resolution.Found -> resolution.server
+            is Resolution.Unreadable -> throw ApiException.unreadable(resolution.row)
+            Resolution.Absent -> throw ApiException.notFound("no server named `$name`")
+        }
+
+    /**
+     * One server, tolerantly.
+     *
+     * [Store.getServer] is strict by design: it fails when either half of the row
+     * will not decode, because a caller that named one server wants the answer for
+     * that server and a half-read snapshot would silently say "there is no
+     * observation". That is the right default and it is the wrong answer *here* —
+     * this module has somewhere honest to put the fact, so it can render the row
+     * with `unreadable` set instead of a 500.
+     *
+     * So the strict read is tried first and the tolerant listing is consulted only
+     * when it fails. The extra read costs nothing in the ordinary case, which is
+     * the one that happens.
+     *
+     * A retryable failure is *not* caught: that is the store being unreachable
+     * rather than a row being corrupt, the listing would fail the same way, and
+     * the caller wants the 503.
+     */
+    private suspend fun resolve(name: ResourceName): Resolution {
+        val direct =
+            try {
+                return Resolution.Found(store.getServer(name) ?: return Resolution.Absent)
+            } catch (failure: StoreException) {
+                if (failure.retryable) throw failure
+                failure
+            }
+        LOG.warn("`{}` did not decode; falling back to the tolerant listing", name, direct)
+        val listing = store.listAll()
+        listing.servers.firstOrNull { it.name == name }?.let { return Resolution.Found(it) }
+        listing.unreadable.firstOrNull { it.name == name.value }?.let { return Resolution.Unreadable(it) }
+        // The strict read failed and the tolerant one does not have the row at
+        // all. Reporting 404 would be a guess; the original failure is the truth.
+        throw direct
+    }
+
+    private sealed interface Resolution {
+        data class Found(
+            val server: StoredServer,
+        ) : Resolution
+
+        /** The name is stored and its desired state will not decode. There is no resource. */
+        data class Unreadable(
+            val row: UnreadableServer,
+        ) : Resolution
+
+        data object Absent : Resolution
+    }
 
     private fun rejectNameMismatch(
         name: ResourceName,

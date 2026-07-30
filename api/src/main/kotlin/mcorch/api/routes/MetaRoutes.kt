@@ -18,6 +18,7 @@ import mcorch.schema.SchemaVersion
 import mcorch.schema.ServerKind
 import mcorch.schema.ServerPhase
 import mcorch.schema.StorageMode
+import mcorch.store.StatePart
 
 /**
  * The two endpoints that describe the server rather than what it manages.
@@ -68,6 +69,7 @@ internal class MetaRoutes(
                         put("failureReason", Json.strings(FailureReason.entries.map { it.name }))
                         put("failureClass", Json.strings(FailureClass.entries.map { it.name }))
                         put("displayState", Json.strings(ServerJson.DisplayState.entries.map { it.name }))
+                        put("statePart", Json.strings(StatePart.entries.map { it.name }))
                         // Wire values: these go back into a definition document.
                         put("storageMode", Json.strings(StorageMode.supported()))
                         put("drainPolicy", Json.strings(DrainPolicy.supported()))

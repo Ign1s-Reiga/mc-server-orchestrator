@@ -4,6 +4,9 @@ import mcorch.api.json.Json
 import mcorch.api.json.jsonObject
 import mcorch.schema.SchemaViolation
 import mcorch.store.ConflictReason
+import mcorch.store.StatePart
+import mcorch.store.Unreadable
+import mcorch.store.UnreadableServer
 import mcorch.store.WriteOutcome
 
 /**
@@ -57,6 +60,17 @@ internal enum class ErrorCode(
 
     INTERNAL(500),
 
+    /**
+     * The store holds this server and cannot decode the part the request needed.
+     *
+     * A 500 because it is a server-side fault that no retry and no change to the
+     * request will fix — the stored bytes will say the same thing next time — and
+     * a distinct code because the remedy is specific: a human repairs the row.
+     * Reporting it as `NOT_FOUND` would tell an operator the server is gone when
+     * it may well be running with players on it.
+     */
+    SERVER_UNREADABLE(500),
+
     /** The store could not be reached. [mcorch.store.StoreException.retryable] was true. */
     STORE_UNAVAILABLE(503, retryable = true),
 
@@ -76,6 +90,8 @@ internal class ApiException(
     override val message: String,
     val violations: List<SchemaViolation> = emptyList(),
     val conflict: WriteOutcome.Conflict? = null,
+    /** Set on [ErrorCode.SERVER_UNREADABLE]: which half would not decode, and why. */
+    val unreadable: Pair<String, Unreadable>? = null,
     /** Response headers this failure needs — `Allow` on a 405, `ETag` on a conflict. */
     val headers: List<Pair<String, String>> = emptyList(),
     cause: Throwable? = null,
@@ -104,6 +120,12 @@ internal class ApiException(
                         put("currentResourceVersion", detail.currentResourceVersion?.token)
                         put("explanation", explain(detail.reason))
                     }
+                    putObject("unreadable", unreadable) { (name, detail) ->
+                        put("name", name)
+                        put("part", detail.part)
+                        put("reason", detail.reason)
+                        put("retryable", detail.retryable)
+                    }
                 },
             )
         }
@@ -121,6 +143,42 @@ internal class ApiException(
 
     companion object {
         fun notFound(what: String): ApiException = ApiException(ErrorCode.NOT_FOUND, what)
+
+        fun unreadable(row: UnreadableServer): ApiException = unreadable(row.name, row.unreadable)
+
+        /**
+         * The store has the row and cannot decode the half this request needed.
+         *
+         * The message says what is *unknown* rather than what is wrong, because
+         * the container is very probably running exactly as it was and what is
+         * broken is the record of it. An operator who reads this as "the server is
+         * broken" reaches for a restart, which is the one thing that would turn a
+         * bookkeeping problem into a player-facing one.
+         */
+        fun unreadable(
+            name: String,
+            detail: Unreadable,
+        ): ApiException =
+            ApiException(
+                code = ErrorCode.SERVER_UNREADABLE,
+                message =
+                    when (detail.part) {
+                        StatePart.DESIRED -> {
+                            "`$name` is stored and its definition could not be read, so there is nothing to " +
+                                "serve for it. The server may still be running: this is a fault in the record, " +
+                                "not evidence about the container. Repair it by PUTting a valid definition with " +
+                                "`If-Match: *`, or fix the row in the store"
+                        }
+
+                        StatePart.OBSERVED -> {
+                            "`$name` is stored and its last observation could not be read, so what the server " +
+                                "is actually doing is not known. The definition is intact and the container is " +
+                                "very probably running as it was; the reconcile loop will record a fresh " +
+                                "observation over the broken one"
+                        }
+                    },
+                unreadable = name to detail,
+            )
 
         fun badRequest(problem: String): ApiException = ApiException(ErrorCode.BAD_REQUEST, problem)
 
