@@ -14,6 +14,7 @@ import mcorch.store.ServerListing
 import mcorch.store.Store
 import mcorch.store.StoreCursor
 import mcorch.store.StoreException
+import mcorch.store.Unreadable
 import org.slf4j.LoggerFactory
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
@@ -64,8 +65,13 @@ public class ReconcileLoop(
         coroutineScope {
             val queue = WorkQueue(this)
             try {
-                resumeDrains(queue)
-                val cursor = seed(queue)
+                // Startup is inside the containment too, and it is the half that
+                // bites hardest: `seed` resyncs before anything is launched, so a
+                // throwable there kills the process on *every* restart rather
+                // than once. An orchestrator that cannot start is one nobody can
+                // use to repair the state that stopped it starting.
+                contained("resuming in-flight drains") { resumeDrains(queue) }
+                val cursor = contained("the startup resync", null) { seed(queue) }
                 buildList {
                     add(launch { watchChanges(queue, cursor) })
                     add(launch { resyncPeriodically(queue) })
@@ -142,16 +148,37 @@ public class ReconcileLoop(
      * - An unreadable **observation** is a server the loop must not act on, and
      *   this is the drain-relevant half. The record of a delivered save lives in
      *   the observation, so an unreadable one is exactly the case where the loop
-     *   cannot know whether a save request went out. Queueing it and letting the
-     *   pass refuse would work — [Store.getServer] raises for that row — but
-     *   holding it back here says why, once per resync, instead of one generic
-     *   store failure per pass, and it does not lean on a refusal happening in
-     *   another module.
+     *   cannot know whether a save request went out.
+     *
+     * **The protection is [Store.getServer]'s, not this function's.** That read
+     * raises for such a row, so a pass could not act on one even if it were
+     * queued; skipping here is a *reporting* improvement — one line naming the
+     * server and which half is unreadable, once per resync, instead of a generic
+     * store failure per pass — and it costs a `getServer` and two warnings less.
+     * It is not what makes the drain safe, and it does not stop leaning on
+     * another module: it leans on it entirely. Do not let this comment grow into
+     * a claim that it does.
+     *
+     * Latency is identical either way, which is worth stating because it is not
+     * obvious: a queued-and-refused pass ends in a non-retryable store failure,
+     * which [requeue] answers with `succeeded` and *no* re-add, so that variant
+     * also waits for the next resync.
      *
      * Both are reported at error every time rather than once: they do not heal on
      * their own, and a line that appears only at startup is a line nobody sees.
      * Repairing the row is enough to bring the server back — the next resync
      * simply finds it readable.
+     *
+     * ## Why [Unreadable.retryable] is not consulted
+     *
+     * Every decode failure is permanent by construction — the same bytes parse
+     * the same way next time — so today the flag is always false here and
+     * branching on it would be dead. It is deliberately *not* used as the
+     * partition key, because the safe answer does not depend on it: a row that
+     * cannot be read now must not be acted on now, whether or not a later read
+     * might succeed. If `:store` ever reports a genuinely retryable unreadable —
+     * a lock timeout surfaced this way rather than raised — the correct change is
+     * to keep skipping and stop logging it at error, not to start acting on it.
      */
     private fun report(
         listing: ServerListing,
@@ -183,7 +210,7 @@ public class ReconcileLoop(
     private suspend fun resyncPeriodically(queue: WorkQueue) {
         while (true) {
             delay(config.resyncPeriod)
-            resync(queue)
+            contained("the resync") { resync(queue) }
         }
     }
 
@@ -194,27 +221,80 @@ public class ReconcileLoop(
         var cursor = from
         while (true) {
             delay(config.changePollInterval)
-            val feed =
-                try {
-                    store.changesSince(cursor)
-                } catch (failure: StoreException) {
-                    LOG.warn("could not read the change feed: {}", failure.message)
-                    continue
-                }
-            when (feed) {
-                is ChangeFeed.Changes -> {
-                    feed.changes.forEach { queue.add(it.name) }
-                    cursor = feed.cursor
-                }
+            cursor = contained("the change feed", cursor) { poll(queue, cursor) }
+        }
+    }
 
-                is ChangeFeed.Expired -> {
-                    LOG.info("the change feed expired; falling back to a full resync")
-                    cursor = feed.cursor
-                    resync(queue)
-                }
+    private suspend fun poll(
+        queue: WorkQueue,
+        cursor: StoreCursor?,
+    ): StoreCursor? {
+        val feed =
+            try {
+                store.changesSince(cursor)
+            } catch (failure: StoreException) {
+                LOG.warn("could not read the change feed: {}", failure.message)
+                return cursor
+            }
+        return when (feed) {
+            is ChangeFeed.Changes -> {
+                feed.changes.forEach { queue.add(it.name) }
+                feed.cursor
+            }
+
+            is ChangeFeed.Expired -> {
+                LOG.info("the change feed expired; falling back to a full resync")
+                resync(queue)
+                feed.cursor
             }
         }
     }
+
+    /**
+     * Runs one tick and lets nothing but cancellation out of it.
+     *
+     * The tickers are `launch`ed children, so anything escaping one cancels the
+     * whole scope and takes the workers and the other ticker with it. `run` does
+     * not restart them and neither does `Orchestrator`, so the process is simply
+     * down — and because `seed` resyncs at startup, down again on every restart.
+     * No container is stopped by that, so nothing is lost directly; what it costs
+     * is every in-flight drain frozen with players on it and an orchestrator
+     * nobody can bring back without repairing state by hand.
+     *
+     * [work] has had this guard for a while, on exactly this reasoning. The
+     * tickers did not, and a store read is not obliged to fail as a
+     * [StoreException] — the one that found this raised an NPE from a row whose
+     * primary key was NULL, which every `catch (StoreException)` on the path
+     * walked straight past. The point is not that particular row: it is that a
+     * `catch` naming one type is a bet on what the layer below will throw, and
+     * the tickers are where losing that bet costs the whole process rather than
+     * one server.
+     *
+     * A failed tick is skipped, not retried in place — the next tick is the
+     * retry, and both cadences run for ever.
+     */
+    private suspend fun <T> contained(
+        what: String,
+        fallback: T,
+        tick: suspend () -> T,
+    ): T =
+        try {
+            tick()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (unexpected: Throwable) {
+            LOG.error(
+                "{} failed with an unhandled exception; the loop keeps running and will try again next tick",
+                what,
+                unexpected,
+            )
+            fallback
+        }
+
+    private suspend fun contained(
+        what: String,
+        tick: suspend () -> Unit,
+    ): Unit = contained(what, Unit, tick)
 
     /**
      * One worker: take a server, reconcile it, decide when to look again.
