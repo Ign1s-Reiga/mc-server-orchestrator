@@ -100,6 +100,33 @@ public enum class FailureReason {
 /**
  * A classified failure. [message] is operator-facing detail — it must not
  * contain player names, UUIDs or addresses.
+ *
+ * ## Why one pair is refused
+ *
+ * [FailureReason.DRAIN_NO_DESTINATION] means people are playing on a server that
+ * was asked to go away. That is the drain protocol working as designed, and it
+ * is the one failure the escalation deliberately never raises
+ * [ConditionType.NEEDS_ATTENTION] for — an alarm that fires on a busy evening
+ * every backoff interval is an alarm operators learn to ignore.
+ *
+ * That suppression is only defensible because the condition **resolves itself
+ * when they log off**, which is to say because it is retryable. Classified
+ * `PERMANENT` it would become a wedged, unretried drain that is also never
+ * flagged: silently the worst of both, and precisely the state the escalation
+ * exists to surface. Until now nothing stopped a call site pairing them; it was
+ * a convention held up by two call sites happening to agree, and a third would
+ * have disabled the alarm without failing a test.
+ *
+ * So the pair is refused here, where the two fields meet, rather than guarded at
+ * each site that builds one. It also makes the ordering inside
+ * `mcorch.core.escalates` stop mattering: the case it is careful to exclude
+ * before looking at the class can no longer be constructed.
+ *
+ * This runs on decode as well as construction — `mcorch.store` rebuilds statuses
+ * through their constructors on purpose — so a stored row carrying the pair is
+ * reported as a corrupt row rather than loaded. That is the intended answer: no
+ * code path writes one, so a row that has it was edited by hand, and a drain
+ * decision taken on hand-edited state is worse than a loud refusal.
  */
 public data class FailureStatus(
     val reason: FailureReason,
@@ -107,7 +134,16 @@ public data class FailureStatus(
     val message: String,
     val occurredAt: Instant,
     val attempts: Int = 1,
-)
+) {
+    init {
+        require(reason != FailureReason.DRAIN_NO_DESTINATION || failureClass == FailureClass.RETRYABLE) {
+            "a ${FailureReason.DRAIN_NO_DESTINATION} failure is always ${FailureClass.RETRYABLE}: it means " +
+                "players are online, which resolves itself when they log off. Classifying it " +
+                "${FailureClass.PERMANENT} would wedge the drain and suppress the attention condition at the " +
+                "same time"
+        }
+    }
+}
 
 /**
  * What the loop knows about the image. [resolvedDigest] is what makes a repeat

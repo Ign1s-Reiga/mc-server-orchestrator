@@ -199,9 +199,13 @@ private fun drainMessage(
  * container by hand. For a drain that failed permanently the surprise is the
  * reverse: nothing further will be attempted, so waiting achieves nothing.
  *
- * The one thing both say is that the container is **still running and still
- * joinable**, because that is the fact a fleet view gets wrong — a failed drain
- * ranks as `TERMINATING` in the dashboard's badge, which reads as on its way out.
+ * The one thing both say is that the container is **still running**, because that
+ * is the fact a fleet view gets wrong — a failed drain ranks as `TERMINATING` in
+ * the dashboard's badge, which reads as on its way out. Whether it is also
+ * *joinable* is deliberately not claimed here: only a probe that answered
+ * establishes that, and the drain's own failure message says so when it did. An
+ * abort for a probe that could not answer must not have joinability asserted on
+ * its behalf by the layer above it.
  */
 private fun attentionMessage(drain: DrainStatus?): String {
     val since = drain?.startedAt?.let { " This drain has been running since $it." }.orEmpty()

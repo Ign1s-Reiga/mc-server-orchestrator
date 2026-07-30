@@ -806,11 +806,29 @@ internal class DrainController(
         // operator "the loop keeps trying" about a drain that has stopped is how
         // they come to believe no action is needed.
         val permanent = failureClass == FailureClass.PERMANENT
+        // Only a probe that answered this pass establishes that the server is
+        // reachable by a player, and [occupancy] is non-null exactly then. The
+        // distinction is not pedantry: the abort for an *unanswered* probe is
+        // reached precisely because nothing could be confirmed about who is on
+        // the server, and claiming joinability there would be the failure's own
+        // subject matter contradicted in its own message — indefinitely, since a
+        // permanent failure freezes the status.
+        //
+        // It stays "still running", because it is: the container is up and this
+        // says nothing about stopping it. Weakening it further would start
+        // reading as permission to stop the thing by hand, which is the pressure
+        // this whole posture exists to avoid.
+        val answering =
+            if (occupancy != null) {
+                "The server is still running and still joinable"
+            } else {
+                "The container is still running; the loop could not confirm whether it is answering players"
+            }
         val reported =
             when {
                 needsAttention && permanent -> {
-                    "this drain has stopped and cannot finish on its own. The server is still running and still " +
-                        "joinable, and nothing further will be attempted until a human resolves this. $message"
+                    "this drain has stopped and cannot finish on its own. $answering, and nothing further will " +
+                        "be attempted until a human resolves this. $message"
                 }
 
                 needsAttention -> {
@@ -825,9 +843,10 @@ internal class DrainController(
         val failure = recordFailure(reason, failureClass, reported, now, drain.failure)
         if (needsAttention && permanent) {
             LOG.error(
-                "server={} has a drain that stopped permanently after {} attempt(s); it is still running and " +
-                    "still joinable, and the loop will not try again — this needs a human: {}",
+                "server={} has a drain that stopped permanently after {} attempt(s); the container is still " +
+                    "running (answeringPlayers={}) and the loop will not try again — this needs a human: {}",
                 server,
+                occupancy != null,
                 failure.attempts,
                 message,
             )

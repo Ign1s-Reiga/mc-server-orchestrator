@@ -111,6 +111,50 @@ class StatusTest {
         shouldThrow<IllegalArgumentException> { PlayerOccupancy(online = -1, max = 20, observedAt = now) }
     }
 
+    /**
+     * The pair that would disable the attention alarm cannot be built.
+     *
+     * `DRAIN_NO_DESTINATION` is the one failure the escalation never raises
+     * `NEEDS_ATTENTION` for, and that suppression is only defensible because
+     * players logging off resolves it — which is to say, because it is
+     * retryable. Classified permanent it would be a wedged drain that is also
+     * silently unflagged. It was a convention held up by two call sites
+     * happening to agree; this is what makes it true by construction, and it is
+     * why `mcorch.core.escalates` no longer depends on the order it checks
+     * things in.
+     */
+    @Test
+    fun `a permanent no-destination failure cannot be constructed`() {
+        val failure =
+            shouldThrow<IllegalArgumentException> {
+                FailureStatus(
+                    reason = FailureReason.DRAIN_NO_DESTINATION,
+                    failureClass = FailureClass.PERMANENT,
+                    message = "players are online",
+                    occurredAt = now,
+                )
+            }
+
+        failure.message.orEmpty() shouldContain "resolves itself when they log off"
+
+        // The control: every other pairing this type is asked for still builds,
+        // so the assertion above is about the one rule and not about the
+        // arguments being wrong. A permanent drain failure with a different
+        // reason is exactly the case the escalation must still flag.
+        FailureStatus(
+            reason = FailureReason.DRAIN_NO_DESTINATION,
+            failureClass = FailureClass.RETRYABLE,
+            message = "players are online",
+            occurredAt = now,
+        ).failureClass shouldBe FailureClass.RETRYABLE
+        FailureStatus(
+            reason = FailureReason.DRAIN_STALLED,
+            failureClass = FailureClass.PERMANENT,
+            message = "no save channel",
+            occurredAt = now,
+        ).failureClass shouldBe FailureClass.PERMANENT
+    }
+
     @Test
     fun `a failed drain does not count as draining, because it must not lead to a stop`() {
         val status =

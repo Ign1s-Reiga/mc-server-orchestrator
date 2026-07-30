@@ -1389,34 +1389,34 @@ internal class DrainTest {
         }
 
     /**
-     * The exclusion holds whatever class the reason is given.
+     * Players being online is never an escalation, however long it goes on.
      *
-     * Both of today's `DRAIN_NO_DESTINATION` call sites are retryable, so the
-     * loop cannot produce a permanent one to drive this end to end — which is
-     * exactly why it is asserted against the rule directly. Letting a permanent
-     * classification appear at one of those sites later must not route players
-     * being online back into the escalation, and with the class checked first
-     * that is precisely what would happen.
+     * This used to iterate both classes, because the suppression was a
+     * convention and a permanent `DRAIN_NO_DESTINATION` was constructable. It is
+     * not any more — `FailureStatus` refuses the pair, so the state this once
+     * had to check for cannot exist and the loop cannot be made to produce it.
+     * `FailureStatusInvariantTest` in `:schema` is where that is now pinned; what
+     * is left here is the behaviour that remains reachable.
      */
     @Test
-    fun `players being online is never an escalation, whichever class it is given`() =
+    fun `players being online is never an escalation, however long it goes on`() =
         coreTest {
             val startedAt = MutableClock().instant()
             val muchLater = startedAt.plusSeconds(60 * 60 * 4)
 
-            for (failureClass in FailureClass.entries) {
-                escalates(
-                    startedAt = startedAt,
-                    failureClass = failureClass,
-                    reason = FailureReason.DRAIN_NO_DESTINATION,
-                    now = muchLater,
-                    after = 10.minutes,
-                ).shouldBeFalse()
-            }
+            escalates(
+                startedAt = startedAt,
+                failureClass = FailureClass.RETRYABLE,
+                reason = FailureReason.DRAIN_NO_DESTINATION,
+                now = muchLater,
+                after = 10.minutes,
+            ).shouldBeFalse()
 
             // The control: the same call with a different reason does escalate,
             // so the assertion above is about the exclusion and not about some
-            // argument being wrong.
+            // argument being wrong. It has already earned its place — under the
+            // pre-fix rule this was the assertion that went red, while the
+            // suppression above passed for the wrong reason.
             escalates(
                 startedAt = startedAt,
                 failureClass = FailureClass.PERMANENT,

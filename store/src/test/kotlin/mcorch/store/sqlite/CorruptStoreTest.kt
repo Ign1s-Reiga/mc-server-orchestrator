@@ -89,6 +89,51 @@ class CorruptStoreTest {
             }
         }
 
+    /**
+     * A stored failure whose reason and class contradict each other is refused
+     * rather than loaded.
+     *
+     * `FailureStatus` refuses a permanent `DRAIN_NO_DESTINATION`: it means
+     * players are online, which resolves itself when they log off, and
+     * classifying it permanent would be a wedged drain that the attention
+     * condition also deliberately never flags. No code path writes that pair, so
+     * a row holding it was edited by hand — and this pins that the constructor
+     * invariant really does run on the way *in* from disk, not only in memory.
+     * The escalation's correctness now rests on that.
+     */
+    @Test
+    fun `a stored failure that contradicts itself is refused rather than loaded`() =
+        runTest {
+            val directory = stores.directory()
+            stores.open(directory).use { store ->
+                store.state.putDefinition(Fixtures.definitionNamed("survival-02")).getOrThrow()
+                store.state.putStatus(Fixtures.fullStatus("survival-02")).getOrThrow()
+            }
+            // Exactly the two keys, so the status-level failure beside it is left
+            // valid and the refusal below is about this pair and nothing else.
+            mutate(
+                directory,
+                """
+                UPDATE server_status SET status_doc = replace(
+                    replace(status_doc,
+                        'drain.failure.reason=DRAIN_TRANSFER_FAILED',
+                        'drain.failure.reason=DRAIN_NO_DESTINATION'),
+                    'drain.failure.failureClass=RETRYABLE',
+                    'drain.failure.failureClass=PERMANENT')
+                """.trimIndent(),
+            )
+
+            stores.open(directory).use { store ->
+                val failure =
+                    runCatching { store.state.listServers() }
+                        .exceptionOrNull()
+                        .shouldBeInstanceOf<StoreException.Corrupt>()
+
+                failure.retryable shouldBe false
+                failure.message.shouldNotBeNull() shouldContain "resolves itself when they log off"
+            }
+        }
+
     private fun mutate(
         directory: Path,
         sql: String,
