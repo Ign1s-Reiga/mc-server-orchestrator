@@ -5,6 +5,7 @@ import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.string.shouldNotContain
 import kotlinx.coroutines.test.runTest
+import mcorch.schema.ControlEndpointSpec
 import mcorch.schema.RconSpec
 import mcorch.schema.SecretRef
 import mcorch.schema.getOrThrow
@@ -128,6 +129,59 @@ class SecretLeakageTest {
                 // `Unreadable` quotes the stored form it rejected, so it is a state read
                 // like any other and is held to the same rule.
                 store.state.listAll().toString() shouldNotContain material
+            }
+        }
+
+    /**
+     * The same rule for the proxy kind, which is where it matters most.
+     *
+     * Invariant 4: the Velocity forwarding secret only ever travels through the
+     * secret store. A proxy spec is the one document that names it, and it names a
+     * *coordinate* — so this asserts the coordinate survives the round trip and
+     * the material appears nowhere. The control token is the second reference on
+     * the same document and gets the same treatment.
+     */
+    @Test
+    fun `neither proxy secret leaks material into what the state store hands back`() =
+        runTest {
+            val directory = directory()
+            val forwarding = SecretValue.random(48)
+            val token = SecretValue.random(32)
+            val forwardingMaterial = reveal(forwarding)
+            val tokenMaterial = reveal(token)
+            val parsed = Fixtures.proxyDefinitionNamed("edge-01")
+            val tokenSecret = SecretRef(name = Fixtures.resourceName("edge-control"), key = "token")
+            val definition =
+                parsed.copy(
+                    spec =
+                        parsed.spec.copy(
+                            control = ControlEndpointSpec(port = 8375, hostPort = 18375, tokenSecret = tokenSecret),
+                        ),
+                )
+            val forwardingRef = definition.spec.forwarding.secret
+
+            EmbeddedStore.open(EmbeddedStoreConfig(directory = directory, clock = clock)).use { store ->
+                store.secrets.put(forwardingRef, forwarding)
+                store.secrets.put(tokenSecret, token)
+                store.state.putDefinition(definition).getOrThrow()
+                store.state.putStatus(Fixtures.fullProxyStatus("edge-01")).getOrThrow()
+
+                val server = store.state.getServer(definition.metadata.name).shouldNotBeNull()
+
+                // The control assertions: both coordinates *are* there, so a search
+                // over this text is capable of finding something and the two
+                // assertions below can actually fail.
+                server.toString() shouldContain forwardingRef.name.value
+                server.toString() shouldContain forwardingRef.key
+                server.toString() shouldContain tokenSecret.name.value
+                server.toString() shouldContain tokenSecret.key
+
+                server.toString() shouldNotContain forwardingMaterial
+                server.toString() shouldNotContain tokenMaterial
+                store.state.listServers().toString() shouldNotContain forwardingMaterial
+                store.state.listServers().toString() shouldNotContain tokenMaterial
+                store.state.listAll().toString() shouldNotContain forwardingMaterial
+                store.state.listAll().toString() shouldNotContain tokenMaterial
             }
         }
 

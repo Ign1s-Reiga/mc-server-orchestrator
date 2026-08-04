@@ -1,8 +1,14 @@
 package mcorch.store.codec
 
+import mcorch.schema.BackendDrainSpec
+import mcorch.schema.BackendSelector
+import mcorch.schema.BackendsSpec
+import mcorch.schema.ControlEndpointSpec
 import mcorch.schema.CpuQuantity
 import mcorch.schema.DrainPolicy
 import mcorch.schema.DrainSpec
+import mcorch.schema.ForwardingMode
+import mcorch.schema.ForwardingSpec
 import mcorch.schema.HeapSpec
 import mcorch.schema.ImageRef
 import mcorch.schema.LifecycleSpec
@@ -15,6 +21,9 @@ import mcorch.schema.PaperServerDefinition
 import mcorch.schema.PaperServerSpec
 import mcorch.schema.PaperVersionSpec
 import mcorch.schema.PlacementSpec
+import mcorch.schema.ProxyDrainSpec
+import mcorch.schema.ProxyLifecycleSpec
+import mcorch.schema.ProxyNetworkSpec
 import mcorch.schema.RconSpec
 import mcorch.schema.ResourceName
 import mcorch.schema.ResourceSpec
@@ -25,6 +34,7 @@ import mcorch.schema.ServerKind
 import mcorch.schema.ServerSpec
 import mcorch.schema.StorageMode
 import mcorch.schema.StorageSpec
+import mcorch.schema.VelocityProxyDefinition
 import mcorch.schema.VelocityProxySpec
 import mcorch.schema.VolumeSpec
 import mcorch.store.StoreException
@@ -68,7 +78,7 @@ internal object DefinitionCodec {
         val writer = DocumentWriter()
         when (spec) {
             is PaperServerSpec -> writePaperSpec(writer, spec)
-            is VelocityProxySpec -> throw notYetPersisted(ServerKind.VELOCITY_PROXY)
+            is VelocityProxySpec -> writeProxySpec(writer, spec)
         }
         return writer.render()
     }
@@ -91,7 +101,11 @@ internal object DefinitionCodec {
             }
 
             ServerKind.VELOCITY_PROXY -> {
-                throw notYetPersisted(ServerKind.VELOCITY_PROXY)
+                VelocityProxyDefinition(
+                    apiVersion = apiVersion,
+                    metadata = metadata,
+                    spec = readProxySpec(PropertyDocument.parse(encodedSpec, what), what),
+                )
             }
         }
     }
@@ -249,6 +263,184 @@ internal object DefinitionCodec {
         )
     }
 
+    // --------------------------------------------------------------- VelocityProxy
+
+    /**
+     * No `storage` block and no `eulaAccepted`, because the type has neither.
+     *
+     * The two secrets are written the way every secret in this format is written —
+     * name and key, the coordinates of an entry in the [mcorch.store.SecretStore].
+     * There is no field on this document that could hold forwarding material, and
+     * `SecretLeakageTest` covers this kind so that stays true.
+     */
+    private fun writeProxySpec(
+        writer: DocumentWriter,
+        spec: VelocityProxySpec,
+    ) {
+        writer.put("maxPlayers", spec.maxPlayers)
+        writer.scope("image") { writeImage(this, spec.image) }
+        writer.scope("resources") {
+            put("memory", spec.resources.memory.bytes)
+            put("cpu", spec.resources.cpu?.millicores)
+            scope("heap") {
+                put("max", spec.resources.heap.max.bytes)
+                put("min", spec.resources.heap.min.bytes)
+            }
+        }
+        writer.scope("forwarding") {
+            put("mode", spec.forwarding.mode.wireValue)
+            // Coordinates only. Invariant 4: the material travels through the
+            // secret store and reaches nothing else, this row included.
+            put("secret.name", spec.forwarding.secret.name.value)
+            put("secret.key", spec.forwarding.secret.key)
+        }
+        writer.scope("backends") {
+            // Open-ended keys, so written the way metadata labels are: one entry per
+            // key under a prefix, read back with `keysUnder`. A label key may itself
+            // contain dots, which is exactly why the prefix is matched rather than
+            // the depth counted.
+            for ((key, value) in spec.backends.selector.matchLabels) {
+                put("selector.matchLabels.$key", value)
+            }
+            putList("fallback", spec.backends.fallback.map { it.value })
+            scope("drain") {
+                putDuration("sealTimeout", spec.backends.drain.sealTimeout)
+                putDuration("destinationTimeout", spec.backends.drain.destinationTimeout)
+                putDuration("deregisterTimeout", spec.backends.drain.deregisterTimeout)
+            }
+        }
+        writer.scope("control") {
+            put("port", spec.control.port)
+            put("hostPort", spec.control.hostPort)
+            put(
+                "tokenSecret.name",
+                spec.control.tokenSecret
+                    ?.name
+                    ?.value,
+            )
+            put("tokenSecret.key", spec.control.tokenSecret?.key)
+        }
+        writer.scope("network") {
+            put("port", spec.network.port)
+            put("hostPort", spec.network.hostPort)
+        }
+        writer.scope("lifecycle") {
+            putDuration("stopGracePeriod", spec.lifecycle.stopGracePeriod)
+            putDuration("startupTimeout", spec.lifecycle.startupTimeout)
+            scope("drain") {
+                put("policy", spec.lifecycle.drain.policy.wireValue)
+                putDuration("sealTimeout", spec.lifecycle.drain.sealTimeout)
+            }
+        }
+        writer.put("placement.node", spec.placement.node?.value)
+    }
+
+    /**
+     * Wrapped in [rebuilding] for the same reason [readPaperSpec] is, and with more
+     * riding on it: `BackendSelector` refuses an empty `matchLabels` and
+     * `VelocityProxySpec` refuses a control port that collides with the player
+     * port. Both run here, on the way in from disk, which is intended — a row that
+     * no longer satisfies them is a row this build must not reconcile.
+     *
+     * What [rebuilding] buys is the *type* of the refusal. An
+     * `IllegalArgumentException` out of a constructor would cross the store
+     * boundary as something `:core` cannot classify and, worse, would escape the
+     * per-row isolation in `SqliteStore.readRow`, which catches [StoreException]
+     * only — one hand-edited proxy row would take the whole fleet read down with
+     * it. As [StoreException.Corrupt] it costs exactly its own server.
+     */
+    private fun readProxySpec(
+        reader: DocumentReader,
+        what: String,
+    ): VelocityProxySpec =
+        rebuilding(what) {
+            VelocityProxySpec(
+                image = readImage(reader, "image", what),
+                resources =
+                    ResourceSpec(
+                        memory = reader.requireValue("resources.memory") { memoryOf(it) },
+                        heap =
+                            HeapSpec(
+                                max = reader.requireValue("resources.heap.max") { memoryOf(it) },
+                                min = reader.requireValue("resources.heap.min") { memoryOf(it) },
+                            ),
+                        cpu = reader.value("resources.cpu") { cpuOf(it) },
+                    ),
+                forwarding =
+                    ForwardingSpec(
+                        secret =
+                            SecretRef(
+                                name = reader.requireValue("forwarding.secret.name", ResourceName::of),
+                                key = reader.requireString("forwarding.secret.key"),
+                            ),
+                        mode =
+                            readWire("forwarding.mode", reader, ForwardingMode::fromWire) {
+                                ForwardingMode.supported()
+                            },
+                    ),
+                backends =
+                    BackendsSpec(
+                        selector = readSelector(reader),
+                        fallback = reader.list("backends.fallback").map { readName(reader, it) },
+                        drain =
+                            BackendDrainSpec(
+                                sealTimeout = reader.requireDuration("backends.drain.sealTimeout"),
+                                destinationTimeout = reader.requireDuration("backends.drain.destinationTimeout"),
+                                deregisterTimeout = reader.requireDuration("backends.drain.deregisterTimeout"),
+                            ),
+                    ),
+                control =
+                    ControlEndpointSpec(
+                        port = reader.requireInt("control.port"),
+                        hostPort = reader.int("control.hostPort"),
+                        tokenSecret = readSecretRef(reader, "control.tokenSecret"),
+                    ),
+                maxPlayers = reader.requireInt("maxPlayers"),
+                network =
+                    ProxyNetworkSpec(
+                        port = reader.requireInt("network.port"),
+                        hostPort = reader.int("network.hostPort"),
+                    ),
+                lifecycle =
+                    ProxyLifecycleSpec(
+                        drain =
+                            ProxyDrainSpec(
+                                policy =
+                                    readWire("lifecycle.drain.policy", reader, DrainPolicy::fromWire) {
+                                        DrainPolicy.supported()
+                                    },
+                                sealTimeout = reader.requireDuration("lifecycle.drain.sealTimeout"),
+                            ),
+                        stopGracePeriod = reader.requireDuration("lifecycle.stopGracePeriod"),
+                        startupTimeout = reader.requireDuration("lifecycle.startupTimeout"),
+                    ),
+                placement = PlacementSpec(node = reader.value("placement.node", NodeName::of)),
+            )
+        }
+
+    private fun readSelector(reader: DocumentReader): BackendSelector {
+        val prefix = "backends.selector.matchLabels."
+        return BackendSelector(
+            matchLabels = reader.keysUnder(prefix).associate { it.removePrefix(prefix) to reader.requireString(it) },
+        )
+    }
+
+    private fun readSecretRef(
+        reader: DocumentReader,
+        prefix: String,
+    ): SecretRef? {
+        if (!reader.has("$prefix.name")) return null
+        return SecretRef(
+            name = reader.requireValue("$prefix.name", ResourceName::of),
+            key = reader.requireString("$prefix.key"),
+        )
+    }
+
+    private fun readName(
+        reader: DocumentReader,
+        key: String,
+    ): ResourceName = reader.requireValue(key, ResourceName::of)
+
     // ------------------------------------------------------------------- shared bits
 
     fun writeImage(
@@ -319,27 +511,5 @@ internal inline fun <T> rebuilding(
         throw StoreException.Corrupt("$what: stored value no longer satisfies the schema: ${failure.message}", failure)
     }
 
-/**
- * A kind `:schema` can parse but this module has not been taught to hold.
- *
- * `VelocityProxy` landed in `:schema` with its validation complete and its
- * reconcile and persistence paths still to be written. The sealed hierarchies
- * made the compiler point at every site that has to learn it, and these branches
- * are the honest placeholder for the ones in this module: refuse loudly, at the
- * boundary, rather than encode a partial row that a later codec would have to
- * guess at.
- *
- * [StoreException.Unsupported] and not [StoreException.Failed] on purpose — it is
- * the same shape of answer as an on-disk layout this build does not understand:
- * non-retryable, surfaced, and fixed by a build that knows the kind. Replacing
- * these with real branches is `store-dev`'s half of the handoff; nothing in
- * `:schema` needs to change for it.
- */
-internal fun notYetPersisted(kind: ServerKind): StoreException =
-    StoreException.Unsupported(
-        "this build cannot store a `${kind.wireValue}`: the kind is declarable and validated, but its " +
-            "persistence has not been implemented yet",
-    )
-
-/** Keys beginning with [prefix]. Used for the open-ended maps (labels). */
+/** Keys beginning with [prefix]. Used for the open-ended maps (labels, selector match labels). */
 internal fun DocumentReader.keysUnder(prefix: String): List<String> = keys().filter { it.startsWith(prefix) }.sorted()

@@ -92,7 +92,12 @@ class CorruptStoreTest {
                 store.state.putDefinition(Fixtures.definitionNamed("survival-01")).getOrThrow()
                 store.state.putDefinition(Fixtures.definitionNamed("survival-02")).getOrThrow()
             }
-            mutate(directory, "UPDATE server_definition SET kind = 'VelocityProxy' WHERE name = 'survival-02'")
+            // A kind no build has ever written. This fixture said `VelocityProxy`
+            // until that kind became one this build stores, at which point the row
+            // decoded and the test stopped meaning what its name says. A value from
+            // a hypothetical newer build is the durable way to spell "unknown" —
+            // the enum is meant to grow, so a real member cannot stand in for one.
+            mutate(directory, "UPDATE server_definition SET kind = 'BedrockServer' WHERE name = 'survival-02'")
 
             stores.open(directory).use { store ->
                 val failure =
@@ -100,13 +105,13 @@ class CorruptStoreTest {
                         .exceptionOrNull()
                         .shouldBeInstanceOf<StoreException.Unsupported>()
 
-                failure.message.shouldNotBeNull() shouldContain "VelocityProxy"
+                failure.message.shouldNotBeNull() shouldContain "BedrockServer"
 
                 val listing = store.state.listAll()
                 listing.servers.map { it.name.value } shouldBe listOf("survival-01")
                 listing.unreadable
                     .single()
-                    .unreadable.reason shouldContain "VelocityProxy"
+                    .unreadable.reason shouldContain "BedrockServer"
             }
         }
 
@@ -157,6 +162,119 @@ class CorruptStoreTest {
                 val loop = resyncLike(store.state)
                 loop.failure.shouldBeNull()
                 loop.queued shouldBe listOf("survival-01", "survival-03")
+            }
+        }
+
+    /**
+     * A proxy row whose selector no longer satisfies the schema costs one server.
+     *
+     * `BackendSelector` refuses an empty `matchLabels` in its constructor, because
+     * an empty selector matches every object and would silently enrol the whole
+     * fleet — including a second proxy's backends, which is how two proxies end up
+     * fighting over one forwarding secret. That `require` runs on the way *in*
+     * from disk, which is intended.
+     *
+     * What matters here is the shape of the refusal. `DefinitionCodec.rebuilding`
+     * turns it into [StoreException.Corrupt]; an `IllegalArgumentException` would
+     * escape `SqliteStore.readRow`, which catches [StoreException] only, and one
+     * hand-edited proxy row would take the whole fleet read down with it — the
+     * round-10 outage, reintroduced by a new kind.
+     */
+    @Test
+    fun `a proxy row whose selector no longer satisfies the schema costs one server`() =
+        runTest {
+            val directory = stores.directory()
+            stores.open(directory).use { store ->
+                store.state.putDefinition(Fixtures.definitionNamed("survival-01")).getOrThrow()
+                store.state.putDefinition(Fixtures.proxyDefinitionNamed("edge-02")).getOrThrow()
+                store.state.putDefinition(Fixtures.definitionNamed("survival-03")).getOrThrow()
+            }
+            // Every `backends.selector.matchLabels.*` key removed, leaving a document
+            // that parses and a selector the schema will not build.
+            mutate(
+                directory,
+                """
+                UPDATE server_definition
+                   SET spec_doc = (
+                       SELECT group_concat(line, char(10)) FROM (
+                           SELECT line FROM (
+                               WITH split(line, rest) AS (
+                                   SELECT '', spec_doc || char(10)
+                                     FROM server_definition WHERE name = 'edge-02'
+                                   UNION ALL
+                                   SELECT substr(rest, 1, instr(rest, char(10)) - 1),
+                                          substr(rest, instr(rest, char(10)) + 1)
+                                     FROM split WHERE rest <> ''
+                               )
+                               SELECT line FROM split
+                                WHERE line <> '' AND line NOT LIKE 'backends.selector.matchLabels.%'
+                           )
+                       )
+                   )
+                 WHERE name = 'edge-02'
+                """.trimIndent(),
+            )
+
+            stores.open(directory).use { store ->
+                val listing = store.state.listAll()
+
+                listing.servers.map { it.name.value } shouldBe listOf("survival-01", "survival-03")
+                val entry = listing.unreadable.single()
+                entry.name shouldBe "edge-02"
+                entry.unreadable.part shouldBe StatePart.DESIRED
+                entry.unreadable.retryable shouldBe false
+                entry.unreadable.reason shouldContain "matchLabels must not be empty"
+
+                // In the store's own vocabulary, never an IllegalArgumentException.
+                runCatching { store.state.getServer(Fixtures.resourceName("edge-02")) }
+                    .exceptionOrNull()
+                    .shouldBeInstanceOf<StoreException.Corrupt>()
+
+                // And the loop still gets the servers it can read.
+                val loop = resyncLike(store.state)
+                loop.failure.shouldBeNull()
+                loop.queued shouldBe listOf("survival-01", "survival-03")
+            }
+        }
+
+    /**
+     * The other decode-time invariant on this kind, verified rather than assumed.
+     *
+     * `VelocityProxySpec` refuses a control port equal to the player port: the two
+     * cannot share one, and a proxy that claimed to would publish its control
+     * plane on the port players connect to. Like the selector, this runs on the
+     * way in from disk and has to arrive as a [StoreException.Corrupt] scoped to
+     * the one row.
+     */
+    @Test
+    fun `a proxy row whose control port collides with the player port costs one server`() =
+        runTest {
+            val directory = stores.directory()
+            stores.open(directory).use { store ->
+                store.state.putDefinition(Fixtures.definitionNamed("survival-01")).getOrThrow()
+                store.state.putDefinition(Fixtures.proxyDefinitionNamed("edge-02")).getOrThrow()
+            }
+            mutate(
+                directory,
+                """
+                UPDATE server_definition
+                   SET spec_doc = replace(spec_doc, 'control.port=8375', 'control.port=25577')
+                 WHERE name = 'edge-02'
+                """.trimIndent(),
+            )
+
+            stores.open(directory).use { store ->
+                val listing = store.state.listAll()
+
+                listing.servers.map { it.name.value } shouldBe listOf("survival-01")
+                val entry = listing.unreadable.single()
+                entry.name shouldBe "edge-02"
+                entry.unreadable.part shouldBe StatePart.DESIRED
+                entry.unreadable.reason shouldContain "must differ from spec.network.port"
+
+                runCatching { store.state.getServer(Fixtures.resourceName("edge-02")) }
+                    .exceptionOrNull()
+                    .shouldBeInstanceOf<StoreException.Corrupt>()
             }
         }
 

@@ -896,6 +896,52 @@ class MigrationTest {
         statusDocument(directory, "survival-a") shouldContain "drain.failure.reason=DRAIN_NO_DESTINATION"
     }
 
+    /**
+     * A store that predates the proxy kind holds one with no migration.
+     *
+     * The claim handed over with this work was "no on-disk migration is needed —
+     * the `kind` column is plain TEXT with no CHECK". This is that claim tested
+     * rather than taken: a database written at version 1, migrated up, and then
+     * asked to hold a kind that did not exist when it was created. If the column
+     * ever grows a constraint, a foreign key or an index that enumerates kinds,
+     * this fails and the migration that was said to be unnecessary becomes
+     * necessary.
+     */
+    @Test
+    fun `a database written before the proxy kind existed can hold one after migrating`() =
+        runTest {
+            val directory = stores.directory()
+            val existing = Fixtures.definitionNamed("survival-a")
+            writeVersion1Database(directory) { legacy ->
+                legacy.definition(existing, generation = 1L, revision = 1L)
+                legacy.status(Fixtures.fullStatus("survival-a", drainState = DrainState.SAVING), revision = 2L)
+            }
+            appliedVersions(directory) shouldBe listOf(1)
+
+            val proxy = Fixtures.proxyDefinitionNamed("edge-01")
+            val proxyStatus = Fixtures.fullProxyStatus("edge-01", drainState = DrainState.SEALED)
+            stores.open(directory).use { migrated ->
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
+
+                migrated.state.putDefinition(proxy).getOrThrow()
+                migrated.state.putStatus(proxyStatus).getOrThrow()
+            }
+
+            // Reopened, so the assertions are about what reached the disk.
+            stores.open(directory).use { reopened ->
+                val stored = reopened.state.getServer(proxy.metadata.name).shouldNotBeNull()
+                stored.definition.definition shouldBe proxy
+                stored.status.shouldNotBeNull().status shouldBe proxyStatus
+                // The pre-existing server is untouched, and one drain query finds both
+                // kinds — the projection column does not care which wrote it.
+                reopened.state.getServer(existing.metadata.name).shouldNotBeNull()
+                reopened.state
+                    .listByDrainState(setOf(DrainState.SAVING, DrainState.SEALED))
+                    .map { it.name.value }
+                    .shouldContainExactly(listOf("edge-01", "survival-a"))
+            }
+        }
+
     private suspend fun drainOf(
         store: EmbeddedStore,
         name: String,

@@ -9,11 +9,16 @@ import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.types.shouldBeInstanceOf
 import kotlinx.coroutines.test.runTest
+import mcorch.schema.BackendRoutingStatus
+import mcorch.schema.ControlEndpointSpec
 import mcorch.schema.DrainBlockReason
 import mcorch.schema.DrainState
 import mcorch.schema.PaperServerStatus
 import mcorch.schema.ResourceName
+import mcorch.schema.SecretRef
 import mcorch.schema.ServerPhase
+import mcorch.schema.VelocityProxySpec
+import mcorch.schema.VelocityProxyStatus
 import org.junit.jupiter.api.Assumptions
 import org.junit.jupiter.api.Test
 
@@ -91,6 +96,175 @@ abstract class StoreConformanceSuite {
                     .shouldNotBeNull()
                     .definition.definition shouldBe definition
             }
+        }
+
+    @Test
+    fun `a stored proxy definition comes back exactly as it went in`() =
+        withStore { store ->
+            for (example in listOf("proxy-minimal.yaml", "proxy-full.yaml")) {
+                val definition = Fixtures.proxyDefinition(example)
+
+                store.putDefinition(definition).getOrThrow()
+
+                val stored = store.getServer(definition.metadata.name).shouldNotBeNull()
+                stored.definition.definition shouldBe definition
+                // Whole-object equality already covers these, but naming them says
+                // which ones a silent loss would cost most: the selector decides what
+                // the proxy fronts at all, and the two secret coordinates are the only
+                // copy of where the material lives.
+                val spec =
+                    stored.definition.definition.spec
+                        .shouldBeInstanceOf<VelocityProxySpec>()
+                spec.backends.selector shouldBe definition.spec.backends.selector
+                spec.backends.fallback shouldBe definition.spec.backends.fallback
+                spec.forwarding.secret shouldBe definition.spec.forwarding.secret
+                spec.control.tokenSecret shouldBe definition.spec.control.tokenSecret
+            }
+        }
+
+    /**
+     * The published-control shape, which no valid example carries.
+     *
+     * `proxy-full.yaml` leaves the control endpoint unpublished, so its
+     * `tokenSecret` is null and the example alone only ever exercises the absent
+     * branch. Publishing it makes the token required — that pairing is a parse
+     * rule — and it is the one place a second secret coordinate is stored.
+     */
+    @Test
+    fun `a published control endpoint keeps its token secret coordinate`() =
+        withStore { store ->
+            val parsed = Fixtures.proxyDefinitionNamed("edge-01")
+            val tokenSecret = SecretRef(name = Fixtures.resourceName("edge-control"), key = "token")
+            val definition =
+                parsed.copy(
+                    spec =
+                        parsed.spec.copy(
+                            control = ControlEndpointSpec(port = 8375, hostPort = 18375, tokenSecret = tokenSecret),
+                        ),
+                )
+
+            store.putDefinition(definition).getOrThrow()
+
+            val spec =
+                store
+                    .getServer(definition.metadata.name)
+                    .shouldNotBeNull()
+                    .definition.definition.spec
+                    .shouldBeInstanceOf<VelocityProxySpec>()
+            spec.control.tokenSecret shouldBe tokenSecret
+            spec.control.hostPort shouldBe 18375
+        }
+
+    @Test
+    fun `a fully populated proxy status comes back exactly as it went in`() =
+        withStore { store ->
+            store.putDefinition(Fixtures.proxyDefinitionNamed("edge-01")).getOrThrow()
+            val status = Fixtures.fullProxyStatus("edge-01")
+
+            store.putStatus(status).getOrThrow()
+
+            store
+                .getServer(Fixtures.resourceName("edge-01"))
+                .shouldNotBeNull()
+                .status
+                .shouldNotBeNull()
+                .status shouldBe status
+        }
+
+    /**
+     * Three different facts, and the codec has to keep them apart.
+     *
+     * A null routing table means nothing has been observed. An empty one means the
+     * selector matched nothing — a real condition an operator has to see, and one
+     * that reads as "not observed yet" if the encoding cannot tell empty from
+     * absent. A populated one has to come back element for element, in order.
+     */
+    @Test
+    fun `a proxy routing table round-trips whether it is absent, empty or populated`() =
+        withStore { store ->
+            store.putDefinition(Fixtures.proxyDefinitionNamed("edge-01")).getOrThrow()
+            val tables =
+                listOf(
+                    null,
+                    BackendRoutingStatus(observedAt = Fixtures.T0.minusSeconds(4)),
+                    Fixtures.fullBackends(),
+                )
+
+            for (table in tables) {
+                val status = Fixtures.fullProxyStatus("edge-01", backends = table)
+                store.putStatus(status).getOrThrow()
+
+                val read =
+                    store
+                        .getServer(Fixtures.resourceName("edge-01"))
+                        .shouldNotBeNull()
+                        .status
+                        .shouldNotBeNull()
+                        .status
+                        .shouldBeInstanceOf<VelocityProxyStatus>()
+                read.backends shouldBe table
+                read.backends?.backends?.map { it.server.value } shouldBe table?.backends?.map { it.server.value }
+            }
+        }
+
+    /**
+     * The field a lost round trip costs most.
+     *
+     * `drainInitiated` is how a drain excludes a backend that is itself on the way
+     * down. Dropped, every backend reads as eligible, and two servers draining at
+     * once can be handed each other's players — a transfer cycle neither leaves.
+     * Whole-object equality above would catch it too; this asserts it by name so a
+     * failure says which field and why it matters.
+     */
+    @Test
+    fun `a backend that is itself draining still says so after a round trip`() =
+        withStore { store ->
+            store.putDefinition(Fixtures.proxyDefinitionNamed("edge-01")).getOrThrow()
+            val status = Fixtures.fullProxyStatus("edge-01")
+            val expected = status.backends.shouldNotBeNull().backends
+
+            store.putStatus(status).getOrThrow()
+
+            val read =
+                store
+                    .getServer(Fixtures.resourceName("edge-01"))
+                    .shouldNotBeNull()
+                    .status
+                    .shouldNotBeNull()
+                    .status
+                    .shouldBeInstanceOf<VelocityProxyStatus>()
+                    .backends
+                    .shouldNotBeNull()
+                    .backends
+
+            read.map { it.drainInitiated } shouldBe expected.map { it.drainInitiated }
+            read.map { it.eligibleAsDestination } shouldBe expected.map { it.eligibleAsDestination }
+            // The fixture is only meaningful if the two lists disagree somewhere.
+            expected.map { it.eligibleAsDestination }.toSet() shouldBe setOf(true, false)
+        }
+
+    @Test
+    fun `a proxy drain in flight survives being written and read back`() =
+        withStore { store ->
+            store.putDefinition(Fixtures.proxyDefinitionNamed("edge-01")).getOrThrow()
+            val status = Fixtures.fullProxyStatus("edge-01", drainState = DrainState.SEALED)
+
+            store.putStatus(status).getOrThrow()
+
+            val drain =
+                store
+                    .getServer(Fixtures.resourceName("edge-01"))
+                    .shouldNotBeNull()
+                    .status
+                    .shouldNotBeNull()
+                    .status
+                    .shouldBeInstanceOf<VelocityProxyStatus>()
+                    .drain
+                    .shouldNotBeNull()
+            drain shouldBe status.drain.shouldNotBeNull()
+            // The projection the loop finds an interrupted drain by has to see a
+            // proxy exactly as it sees a server: one state machine, one query.
+            store.listByDrainState(setOf(DrainState.SEALED)).map { it.name.value } shouldBe listOf("edge-01")
         }
 
     @Test

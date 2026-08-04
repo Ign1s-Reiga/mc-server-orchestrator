@@ -1,7 +1,11 @@
 package mcorch.store
 
+import mcorch.schema.BackendRegistration
+import mcorch.schema.BackendRoutingStatus
+import mcorch.schema.BackendStatus
 import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
+import mcorch.schema.ControlEndpointStatus
 import mcorch.schema.DrainBlock
 import mcorch.schema.DrainBlockReason
 import mcorch.schema.DrainState
@@ -21,6 +25,8 @@ import mcorch.schema.ServerEndpoint
 import mcorch.schema.ServerPhase
 import mcorch.schema.StatusCondition
 import mcorch.schema.StorageStatus
+import mcorch.schema.VelocityProxyDefinition
+import mcorch.schema.VelocityProxyStatus
 import mcorch.schema.fixtures.ExampleDefinitions
 import mcorch.schema.getOrThrow
 import mcorch.schema.yaml.ServerDefinitionParser
@@ -54,6 +60,18 @@ internal object Fixtures {
         example: String = "full.yaml",
     ): PaperServerDefinition {
         val parsed = definition(example)
+        return parsed.copy(metadata = parsed.metadata.copy(name = resourceName(name)))
+    }
+
+    fun proxyDefinition(name: String): VelocityProxyDefinition =
+        ServerDefinitionParser.parse(yaml(name), name).getOrThrow() as VelocityProxyDefinition
+
+    /** The fully-populated proxy example, renamed so several can coexist in one store. */
+    fun proxyDefinitionNamed(
+        name: String,
+        example: String = "proxy-full.yaml",
+    ): VelocityProxyDefinition {
+        val parsed = proxyDefinition(example)
         return parsed.copy(metadata = parsed.metadata.copy(name = resourceName(name)))
     }
 
@@ -142,6 +160,113 @@ internal object Fixtures {
                         lastTransitionAt = at,
                     ),
                 ),
+        )
+
+    /**
+     * A proxy observation with every field set, including a routing table holding
+     * one backend of every [BackendRegistration] there is.
+     *
+     * [backends] is the parameter the round-trip tests vary: `null` for never
+     * observed, an empty list for a selector that matched nothing, and the default
+     * for a populated table. Those three are different facts and the codec has to
+     * keep them apart — an empty table that came back as "not observed" would hide
+     * a selector matching nothing, which is a condition an operator has to see.
+     */
+    fun fullProxyStatus(
+        name: String,
+        generation: Long = 1L,
+        phase: ServerPhase = ServerPhase.DRAINING,
+        drainState: DrainState = DrainState.SAVING,
+        at: Instant = T0,
+        backends: BackendRoutingStatus? = fullBackends(at),
+    ): VelocityProxyStatus =
+        VelocityProxyStatus(
+            name = resourceName(name),
+            observedGeneration = generation,
+            phase = phase,
+            observedAt = at,
+            lastTransitionAt = at.minusSeconds(30),
+            ready = false,
+            image =
+                ImageStatus(
+                    requested = ImageRef.Tagged("registry.example.com:5000", "mc/velocity", "3.4.0"),
+                    resolvedDigest = "sha256:${"cd".repeat(32)}",
+                    pulledAt = at.minusSeconds(600),
+                ),
+            runtime =
+                RuntimeIdentity(
+                    node = nodeName("node-a"),
+                    sandboxId = "sandbox-proxy-0123",
+                    containerId = "container-proxy-9876",
+                    createdAt = at.minusSeconds(500),
+                    startedAt = at.minusSeconds(480),
+                    finishedAt = at.minusSeconds(5),
+                    exitCode = 143,
+                    restartCount = 2,
+                ),
+            endpoint = ServerEndpoint(node = nodeName("node-a"), address = "10.42.0.2", port = 25577),
+            players = PlayerOccupancy(online = 0, max = 500, observedAt = at.minusSeconds(2)),
+            backends = backends,
+            control =
+                ControlEndpointStatus(
+                    reachable = true,
+                    pluginApiVersion = "1.4.2",
+                    compatible = true,
+                    lastContactAt = at.minusSeconds(3),
+                ),
+            drain = fullDrain(drainState, at),
+            failure =
+                FailureStatus(
+                    reason = FailureReason.PROXY_PLUGIN_INCOMPATIBLE,
+                    failureClass = FailureClass.PERMANENT,
+                    message = "the proxy plugin reports an api version this build does not speak",
+                    occurredAt = at.minusSeconds(1),
+                    attempts = 2,
+                ),
+            conditions =
+                listOf(
+                    StatusCondition(
+                        type = ConditionType.BACKENDS_RESOLVED,
+                        status = ConditionStatus.TRUE,
+                        message = "",
+                        lastTransitionAt = at.minusSeconds(600),
+                    ),
+                    StatusCondition(
+                        type = ConditionType.CONTROL_ENDPOINT_READY,
+                        status = ConditionStatus.FALSE,
+                        message = "an = sign, a\nnewline and a \\ backslash, to prove the encoding escapes them",
+                        lastTransitionAt = at,
+                    ),
+                ),
+        )
+
+    /**
+     * One backend per [BackendRegistration], so no value of the enum goes
+     * unexercised, and with `drainInitiated` set on exactly one of them.
+     *
+     * That flag is the reason this fixture is careful: the drain reads it to
+     * exclude a destination that is itself draining. If the codec dropped it every
+     * backend here would come back eligible, and the test would still pass on
+     * every other field.
+     */
+    fun fullBackends(at: Instant = T0): BackendRoutingStatus =
+        BackendRoutingStatus(
+            observedAt = at.minusSeconds(4),
+            backends =
+                BackendRegistration.entries.mapIndexed { index, registration ->
+                    BackendStatus(
+                        server = resourceName("survival-0$index"),
+                        registration = registration,
+                        players =
+                            if (index == 0) {
+                                null
+                            } else {
+                                PlayerOccupancy(online = index, max = 40, observedAt = at.minusSeconds(6L + index))
+                            },
+                        drainInitiated = registration == BackendRegistration.SEALED,
+                        lastTransitionAt = at.minusSeconds(10L + index),
+                    )
+                },
         )
 
     /**

@@ -1,7 +1,11 @@
 package mcorch.store.codec
 
+import mcorch.schema.BackendRegistration
+import mcorch.schema.BackendRoutingStatus
+import mcorch.schema.BackendStatus
 import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
+import mcorch.schema.ControlEndpointStatus
 import mcorch.schema.DrainBlock
 import mcorch.schema.DrainBlockReason
 import mcorch.schema.DrainState
@@ -45,7 +49,7 @@ internal object StatusCodec {
         val writer = DocumentWriter()
         when (status) {
             is PaperServerStatus -> writePaperStatus(writer, status)
-            is VelocityProxyStatus -> throw notYetPersisted(ServerKind.VELOCITY_PROXY)
+            is VelocityProxyStatus -> writeProxyStatus(writer, status)
         }
         return writer.render()
     }
@@ -60,7 +64,7 @@ internal object StatusCodec {
         val reader = PropertyDocument.parse(encoded, what)
         return when (kind) {
             ServerKind.PAPER_SERVER -> readPaperStatus(name, apiVersion, reader, what)
-            ServerKind.VELOCITY_PROXY -> throw notYetPersisted(ServerKind.VELOCITY_PROXY)
+            ServerKind.VELOCITY_PROXY -> readProxyStatus(name, apiVersion, reader, what)
         }
     }
 
@@ -90,33 +94,9 @@ internal object StatusCodec {
                 put("pulledAt", image.pulledAt)
             }
         }
-        status.runtime?.let { runtime ->
-            writer.scope("runtime") {
-                put("node", runtime.node.value)
-                put("sandboxId", runtime.sandboxId)
-                put("containerId", runtime.containerId)
-                put("createdAt", runtime.createdAt)
-                put("startedAt", runtime.startedAt)
-                put("finishedAt", runtime.finishedAt)
-                put("exitCode", runtime.exitCode)
-                put("restartCount", runtime.restartCount)
-            }
-        }
-        status.endpoint?.let { endpoint ->
-            writer.scope("endpoint") {
-                put("node", endpoint.node.value)
-                put("address", endpoint.address)
-                put("port", endpoint.port)
-            }
-        }
-        status.players?.let { players ->
-            // Counts only. There is no key here that could hold an identity.
-            writer.scope("players") {
-                put("online", players.online)
-                put("max", players.max)
-                put("observedAt", players.observedAt)
-            }
-        }
+        status.runtime?.let { runtime -> writer.scope("runtime") { writeRuntime(this, runtime) } }
+        status.endpoint?.let { endpoint -> writer.scope("endpoint") { writeEndpoint(this, endpoint) } }
+        status.players?.let { players -> writer.scope("players") { writePlayers(this, players) } }
         status.storage?.let { storage ->
             writer.scope("storage") {
                 put("persistent", storage.persistent)
@@ -127,16 +107,65 @@ internal object StatusCodec {
         }
         status.drain?.let { drain -> writer.scope("drain") { writeDrain(this, drain) } }
         status.failure?.let { failure -> writer.scope("failure") { writeFailure(this, failure) } }
+        writeConditions(writer, status.conditions)
+    }
 
-        if (status.conditions.isNotEmpty()) {
-            writer.put("conditions.count", status.conditions.size)
-            status.conditions.forEachIndexed { index, condition ->
-                writer.scope("conditions.$index") {
-                    put("type", condition.type)
-                    put("status", condition.status)
-                    put("message", condition.message)
-                    put("lastTransitionAt", condition.lastTransitionAt)
-                }
+    // ---------------------------------------------------------------- shared blocks
+
+    private fun writeRuntime(
+        scope: DocumentScope,
+        runtime: RuntimeIdentity,
+    ) {
+        scope.put("node", runtime.node.value)
+        scope.put("sandboxId", runtime.sandboxId)
+        scope.put("containerId", runtime.containerId)
+        scope.put("createdAt", runtime.createdAt)
+        scope.put("startedAt", runtime.startedAt)
+        scope.put("finishedAt", runtime.finishedAt)
+        scope.put("exitCode", runtime.exitCode)
+        scope.put("restartCount", runtime.restartCount)
+    }
+
+    private fun writeEndpoint(
+        scope: DocumentScope,
+        endpoint: ServerEndpoint,
+    ) {
+        scope.put("node", endpoint.node.value)
+        scope.put("address", endpoint.address)
+        scope.put("port", endpoint.port)
+    }
+
+    /** Counts only. There is no key here that could hold an identity. */
+    private fun writePlayers(
+        scope: DocumentScope,
+        players: PlayerOccupancy,
+    ) {
+        scope.put("online", players.online)
+        scope.put("max", players.max)
+        scope.put("observedAt", players.observedAt)
+    }
+
+    /**
+     * Deliberately writes nothing for an empty list rather than a zero count.
+     *
+     * Unlike the routing table, `conditions` is not nullable, so "absent" and
+     * "empty" are the same value and there is nothing to tell apart. Emitting a
+     * count key here would change what every stored Paper row renders to, for no
+     * gain — and that is a comparison `putDefinition` makes on specs and a
+     * migration makes on documents.
+     */
+    private fun writeConditions(
+        writer: DocumentWriter,
+        conditions: List<StatusCondition>,
+    ) {
+        if (conditions.isEmpty()) return
+        writer.putListOf("conditions", conditions.size) { index ->
+            val condition = conditions[index]
+            writer.scope("conditions.$index") {
+                put("type", condition.type)
+                put("status", condition.status)
+                put("message", condition.message)
+                put("lastTransitionAt", condition.lastTransitionAt)
             }
         }
     }
@@ -158,7 +187,7 @@ internal object StatusCodec {
                 image = readImageStatus(reader, what),
                 runtime = readRuntime(reader),
                 endpoint = readEndpoint(reader),
-                players = readPlayers(reader),
+                players = readPlayers(reader, "players"),
                 storage = readStorage(reader),
                 drain = readDrain(reader, "drain"),
                 failure = readFailure(reader, "failure"),
@@ -202,12 +231,16 @@ internal object StatusCodec {
         )
     }
 
-    private fun readPlayers(reader: DocumentReader): PlayerOccupancy? {
-        if (!reader.has("players.online")) return null
+    /** Prefixed, because a proxy carries one of these per backend as well as one of its own. */
+    private fun readPlayers(
+        reader: DocumentReader,
+        prefix: String,
+    ): PlayerOccupancy? {
+        if (!reader.has("$prefix.online")) return null
         return PlayerOccupancy(
-            online = reader.requireInt("players.online"),
-            max = reader.requireInt("players.max"),
-            observedAt = reader.requireInstant("players.observedAt"),
+            online = reader.requireInt("$prefix.online"),
+            max = reader.requireInt("$prefix.max"),
+            observedAt = reader.requireInstant("$prefix.observedAt"),
         )
     }
 
@@ -218,6 +251,148 @@ internal object StatusCodec {
             volumeName = reader.value("storage.volumeName", ResourceName::of),
             bound = reader.requireBoolean("storage.bound"),
             lastSaveConfirmedAt = reader.instant("storage.lastSaveConfirmedAt"),
+        )
+    }
+
+    // --------------------------------------------------------------- VelocityProxy
+
+    /**
+     * No `storage`, because the type has none: a proxy holds no world, and writing
+     * an absent block would invite a later reader to conclude "not persistent yet"
+     * from the gap rather than "there is no such thing here".
+     *
+     * The two proxy-only observations are [BackendRoutingStatus] and
+     * [ControlEndpointStatus]. Everything else — image, runtime, endpoint, players,
+     * drain, failure, conditions — is written by the same helpers a Paper status
+     * uses, so a drain record reads identically whichever kind wrote it. That is
+     * deliberate rather than convenient: the drain state machine is one machine,
+     * and a restarted loop resumes both kinds from the same keys.
+     */
+    private fun writeProxyStatus(
+        writer: DocumentWriter,
+        status: VelocityProxyStatus,
+    ) {
+        writer.put("observedGeneration", status.observedGeneration)
+        writer.put("phase", status.phase)
+        writer.put("observedAt", status.observedAt)
+        writer.put("lastTransitionAt", status.lastTransitionAt)
+        writer.put("ready", status.ready)
+
+        status.image?.let { image ->
+            writer.scope("image") {
+                scope("requested") { DefinitionCodec.writeImage(this, image.requested) }
+                put("resolvedDigest", image.resolvedDigest)
+                put("pulledAt", image.pulledAt)
+            }
+        }
+        status.runtime?.let { runtime -> writer.scope("runtime") { writeRuntime(this, runtime) } }
+        status.endpoint?.let { endpoint -> writer.scope("endpoint") { writeEndpoint(this, endpoint) } }
+        status.players?.let { players -> writer.scope("players") { writePlayers(this, players) } }
+        status.backends?.let { backends -> writer.scope("backends") { writeBackends(this, backends) } }
+        status.control?.let { control ->
+            writer.scope("control") {
+                // `reachable` is the presence marker on the way back in: it is the one
+                // field of this object that is never null, so a control block that was
+                // observed can always be told from one that was not.
+                put("reachable", control.reachable)
+                put("pluginApiVersion", control.pluginApiVersion)
+                put("compatible", control.compatible)
+                put("lastContactAt", control.lastContactAt)
+            }
+        }
+        status.drain?.let { drain -> writer.scope("drain") { writeDrain(this, drain) } }
+        status.failure?.let { failure -> writer.scope("failure") { writeFailure(this, failure) } }
+        writeConditions(writer, status.conditions)
+    }
+
+    /**
+     * The routing table, as a count plus one indexed record each.
+     *
+     * The first list of *records* in this format; `conditions` is the precedent and
+     * this is the same shape, promoted to [DocumentWriter.putList]. The
+     * alternative — packing a backend into one delimited value — was rejected
+     * because it needs a second escaping scheme inside a format that already has
+     * one, and because every field would stop being individually readable by a
+     * migration, which is the level migrations here are required to work at.
+     *
+     * `observedAt` is written first and unconditionally: it is what tells a
+     * *present but empty* routing table from one that was never observed. That
+     * distinction is not cosmetic — an empty table means the selector matched
+     * nothing, which is a real condition an operator has to see, and reading it
+     * back as "no observation" would hide it.
+     */
+    private fun writeBackends(
+        scope: DocumentScope,
+        backends: BackendRoutingStatus,
+    ) {
+        scope.put("observedAt", backends.observedAt)
+        scope.putListOf("list", backends.backends.size) { index ->
+            val backend = backends.backends[index]
+            scope.scope("list.$index") {
+                put("server", backend.server.value)
+                put("registration", backend.registration)
+                // The drain reads this to exclude a destination that is itself
+                // draining. Losing it silently widens eligibility to servers on
+                // their way down, which is a transfer cycle two servers can enter
+                // and never leave.
+                put("drainInitiated", backend.drainInitiated)
+                put("lastTransitionAt", backend.lastTransitionAt)
+                backend.players?.let { players -> scope("players") { writePlayers(this, players) } }
+            }
+        }
+    }
+
+    private fun readProxyStatus(
+        name: ResourceName,
+        apiVersion: SchemaVersion,
+        reader: DocumentReader,
+        what: String,
+    ): VelocityProxyStatus =
+        rebuilding(what) {
+            VelocityProxyStatus(
+                name = name,
+                observedGeneration = reader.requireLong("observedGeneration"),
+                phase = reader.requireEnum<ServerPhase>("phase"),
+                observedAt = reader.requireInstant("observedAt"),
+                lastTransitionAt = reader.requireInstant("lastTransitionAt"),
+                ready = reader.requireBoolean("ready"),
+                image = readImageStatus(reader, what),
+                runtime = readRuntime(reader),
+                endpoint = readEndpoint(reader),
+                players = readPlayers(reader, "players"),
+                backends = readBackends(reader),
+                control = readControl(reader),
+                drain = readDrain(reader, "drain"),
+                failure = readFailure(reader, "failure"),
+                conditions = readConditions(reader),
+                apiVersion = apiVersion,
+            )
+        }
+
+    private fun readBackends(reader: DocumentReader): BackendRoutingStatus? {
+        if (!reader.has("backends.observedAt")) return null
+        return BackendRoutingStatus(
+            observedAt = reader.requireInstant("backends.observedAt"),
+            backends =
+                reader.list("backends.list").map { prefix ->
+                    BackendStatus(
+                        server = reader.requireValue("$prefix.server", ResourceName::of),
+                        registration = reader.requireEnum<BackendRegistration>("$prefix.registration"),
+                        players = readPlayers(reader, "$prefix.players"),
+                        drainInitiated = reader.requireBoolean("$prefix.drainInitiated"),
+                        lastTransitionAt = reader.requireInstant("$prefix.lastTransitionAt"),
+                    )
+                },
+        )
+    }
+
+    private fun readControl(reader: DocumentReader): ControlEndpointStatus? {
+        if (!reader.has("control.reachable")) return null
+        return ControlEndpointStatus(
+            reachable = reader.requireBoolean("control.reachable"),
+            pluginApiVersion = reader.string("control.pluginApiVersion"),
+            compatible = reader.requireBoolean("control.compatible"),
+            lastContactAt = reader.instant("control.lastContactAt"),
         )
     }
 
