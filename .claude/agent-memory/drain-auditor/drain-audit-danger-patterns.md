@@ -574,3 +574,116 @@ Related: [[standalone-paper-drain-shape]]
     upstream. One red test is enough to stop a change, so the pin works — but when
     a fact becomes load-bearing in a third place, check which dependents are
     covered by a test that could actually see it break.
+
+## Round 13: steps 2, 4 and 6 with bodies
+
+52. **A limit that counts passes while its KDoc says it counts sweeps.**
+    `MAX_TRANSFER_ATTEMPTS = 6` is documented as "how many transfer *sweeps* step 4
+    asks for", but `awaitEvacuated` calls `issueTransfer` on **every pass** with
+    players online and the plugin's start-or-join makes each of those the *same*
+    sweep. So the counter measures passes: 6 of them at the 2 s `POLL` is ~12 s,
+    against a `playerTransferTimeout` of 120 s that can therefore never be
+    reached. Whenever an orchestrator-side counter bounds a side effect the
+    counterparty deduplicates, work out what one increment actually costs the
+    counterparty — if the answer is "nothing", the counter is a wall clock in
+    disguise and its units are the poll interval.
+53. **A limit checked above the "is there anything left to do" test converts a
+    bound into a permanent wedge.** `issueTransfer` asks `exhausted` before
+    anything looks at the player count, and `startTransfer` reaches it with no
+    emptiness check at all, so once `transferAttempts >= MAX` the drain aborts on
+    every pass **including passes where the server is empty**. Nothing ever resets
+    the counter (`teardown` clears `drain`, and teardown is downstream of the
+    thing that is blocked), so a delete never completes. A retry limit is only
+    safe if the *success* path is still reachable after it trips: put the limit
+    below the precondition it is bounding, never above it.
+54. **Two derivations of the same third-party identity, one of which is only
+    defined after readiness.** The proxy is told a backend's address twice —
+    `ProxyFleet.linkFor` builds `"${node.name}:${port}"`, `ProxyPass.backends`
+    builds `"${status?.endpoint?.address ?: serverName}:${port}"`. They agree only
+    once `awaitJoinable` has written an endpoint. Register during the
+    CREATING/STARTING window (or in the window after a teardown clears
+    `endpoint`) and every later `PUT` is `ADDRESS_CONFLICT` — which the protocol
+    deliberately makes non-recoverable without a `DELETE`, so drain step 2 aborts
+    for ever and the backend is undeletable. Whenever a value is sent to an
+    external registry that refuses changes, prove there is exactly one expression
+    that computes it, and that the expression is total over the workload's whole
+    lifecycle rather than over its healthy state.
+55. **A level trigger re-asserts what a one-shot step deliberately stopped
+    asserting.** `holdSeal` skips once `deregisteredAt != null`, with an explicit
+    comment that asserting after step 6 would put the backend back in the routing
+    table moments before the stop. The proxy's own `assertBackends` sweep then
+    does exactly that, because `DrainState.DEREGISTERED.sealsBackend()` is true so
+    the backend is still in `matched` and gets a `PUT`. Sealed, so nothing is
+    routed there — but it restores the registry entry that Velocity's fallback
+    reconnect (`SwitchDecision.AllowSealed`) can land a player on. When one
+    component opts out of a level trigger for an ordering reason, check every
+    *other* holder of that trigger for the same opt-out.
+56. **A measurement assertion whose counter is structurally zero on the path under
+    test.** `a drain whose transfer keeps failing backs off instead of spinning`
+    measures `plugin.sweepsStarted.size shouldBeLessThanOrEqual 6` on a scenario
+    where every transfer is refused `DESTINATION_UNKNOWN` *before* the fake
+    records anything — so both `sweepsStarted` and `transfers` are 0 and the
+    headline measurement is vacuous. Only `failure.attempts > 1` bites. Before
+    accepting "it is measured rather than reasoned about", find the line in the
+    fake that increments the counter and check the scenario reaches it.
+57. **Compensation added at the site that was found broken, not at the class of
+    sites.** `stop()` now catches `NodeException` so the abort can re-register the
+    backend. `awaitStopped`'s re-issue — the *other* `stopWorkload` call, reached
+    in `STOPPING`, which is a sealing state — does not, so an escape there skips
+    `restoreRegistration` and leaves a running backend sealed and deregistered
+    with `Reconciler.nodeFailure` writing no drain change. Same family as item 49.
+    Also: the class KDoc's single-point claim ("no path reaches `stopWorkload`
+    except through `requireEmpty` followed by `mayStop`") is false for this site —
+    it uses an inline `online > 0` check and lets an *unanswered* probe through.
+    Deliberate and safe, but the sentence that is now the whole safety argument
+    does not describe the code.
+
+## Round 14: the anchor is the new counter
+
+58. **Deleting a counter in favour of a clock moves the whole bound onto one
+    nullable field, and that field's stamp site is now the safety property.**
+    `MAX_TRANSFER_ATTEMPTS` is gone and `exhausted` is `now - sealRequestedAt >
+    playerTransferTimeout + 2s x online`. A counter starts at 0 by construction; a
+    clock needs an anchor, and `sealRequestedAt` is written at exactly one place —
+    the `DRAIN_REQUESTED -> SEALED` edge, *below* `holdSeal`. Nothing re-enters
+    `DRAIN_REQUESTED` (the resume ladder tops out at `SEALED`), so any drain whose
+    first bodied pass could not seal, or ran with `subject.seal == null`, carries a
+    null anchor **for its whole life** and silently falls back to `enteredStateAt`
+    — the restamping anchor the change was made to remove. When a bound converts
+    from count to duration, enumerate every path that reaches the bound *without*
+    passing the stamp, and treat a `?: fallbackAnchor` as an admission that one
+    exists.
+59. **An anchor chosen for immutability is not automatically an anchor for the
+    right quantity.** `sealRequestedAt` cannot be restamped, which is why it was
+    picked; it also starts at step 2, so steps 2 and 3 — a `NoCapacity` wait, a
+    flaky `holdSeal`, an orchestrator that was down — spend a budget the schema
+    documents as step 4's (`DrainSpec.playerTransferTimeout`, "how long step 4
+    gets"). Past the allowance, step 4 aborts on its first pass having asked
+    nobody to move, and no path resets the anchor. Fixing a restamping bug by
+    moving the anchor *earlier* trades "the bound never terminates" for "the bound
+    is never granted"; the shape that gets both is a **set-once stamp on the first
+    entry into the state being bounded** (`x = x ?: now`), never a reused stamp
+    from an earlier step.
+60. **Item 34 reopens through whichever state most recently gained a body.**
+    `resumeInto` clears `failure` whenever the state it resumes into does not
+    itself land in `DRAIN_FAILED`. That was safe while `SEALED` was a no-op. Now
+    `secureDestination` has a body and reports `Progressed`, so the cycle
+    `DRAIN_FAILED -> SEALED (Chosen, Progressed, failure cleared) -> TARGET_RESOLVED
+    (abort)` runs for ever with `attempts` pinned at 1 and `occurredAt` restamped
+    every other pass — `escalates()` never fires, `queue.succeeded` resets the
+    backoff, and a status is written every pass. Reached whenever `destination` is
+    null at resume time, which `TransferReport.DestinationLost` guarantees. Re-run
+    item 8/34 against **every** state that gains a body, not only the one the
+    change was about.
+61. **A garbage collector built on a tolerant list read must consult the
+    tolerance, not just enjoy it.** `assertBackends` computes
+    `wanted = matched.map { it.server }` from `store.listAll().servers` and
+    `DELETE`s every proxy registration not in it. `listAll` was chosen over
+    `listServers` precisely so one bad row cannot fail the sweep — but
+    `ServerListing.unreadable` is discarded, so an undecodable *definition* row
+    turns into an active deregistration of a live backend. `UnreadableServer.name`
+    exists for exactly this caller and its KDoc says so ("anything that treats
+    'not in the list' as 'purged' — a garbage collector — would otherwise report a
+    deletion that never happened"). Whenever a read is made tolerant, check whether
+    any consumer derives *absence*; tolerance without the exclusion list is
+    strictly worse than the strict read for those consumers.

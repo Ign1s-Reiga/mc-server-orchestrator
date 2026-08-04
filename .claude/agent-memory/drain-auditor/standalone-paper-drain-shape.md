@@ -322,3 +322,27 @@ unable to do correctly.
 tallies, (2) does it treat a counter going *down* as a proxy restart that voids
 evacuation evidence, and (3) does it ever send a `PUT` address derived from the
 desired definition rather than the running container.
+
+## Round 14 rulings: the transfer bound is a clock
+
+- **A purely temporal bound satisfies the plugin author's handover, and the count
+  loses nothing.** The handover ("`:core` owns the step-4 retry limit, because a
+  fresh sweep zeroes the plugin's tallies") is a statement about *where* the bound
+  lives, not about its unit: it forbids `:core` inferring "stop asking" from the
+  proxy's own counters. A duration held by `:core` is orchestrator-side, survives a
+  fresh sweep and survives a plugin restart, so it implements the handover rather
+  than reinterpreting it. A count-based ceiling protects nothing here — an ask
+  costs the counterparty nothing (start-or-join dedupes) and a settled sweep can
+  restart every pass — so its removal is a deletion, not a gap. Do not re-propose
+  a count. What the trade *does* cost is that the bound now rests on one nullable
+  timestamp: see [[drain-audit-danger-patterns]] items 58 and 59.
+- **`wanted` dropping undecodable rows is not a choice between two unrepairable
+  states.** The framing ("repair it and the sweep suppresses GC for a whole pass")
+  is a false dilemma; the store already publishes the third option.
+  `ServerListing.unreadable` carries the stored name for exactly this consumer, so
+  `wanted` should be the matched names **union** the unreadable names: per-pass GC
+  keeps working for every readable row and only the specific unreadable names are
+  exempted. Not a data-loss path — the plugin refuses `DELETE` on an occupied
+  backend with no force flag — so it is a warning, but it became live rather than
+  theoretical with `DefinitionCodec.rebuilding`, which deliberately widens what
+  counts as a corrupt definition row.
