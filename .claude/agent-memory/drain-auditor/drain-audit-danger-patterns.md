@@ -350,3 +350,187 @@ Related: [[standalone-paper-drain-shape]]
     read was built for. Whenever a decode path is hardened against one exception
     type, ask what *else* that read can throw and whether the caller's catch is
     wide enough.
+
+32. **A record that enables an *undo* has the opposite safe direction from one
+    that suppresses a *repeat*.** Item 23 ruled write-ahead unsafe for
+    `saveRequestedAt`, whose record exists so a delivered save is never re-sent —
+    losing it costs one idempotent repeat, recording it early costs a false
+    permanent wedge. `sealRequestedAt` and `deregisteredAt` are the same shape of
+    field with the opposite purpose: their record is what tells a later pass there
+    is something to *reverse*. Losing one leaves a backend sealed off from new
+    joins, or deregistered, with nothing in the system knowing to put it back —
+    silent, and it looks like a healthy running server. Do not generalise item 23
+    across the `*RequestedAt` family. Better than inverting the rule: make the
+    proxy-side fact **level-triggered** — re-asserted from the drain state every
+    pass — so no record is load-bearing and there is nothing to lose.
+33. **A forward-only state machine acquires a compensation obligation the moment
+    a step gains an external counterparty, and has nowhere to put it.**
+    `DrainState` has no reverse edge and `DRAIN_FAILED` has no body: correct while
+    every step's only effect is on the container being drained. A seal and a
+    deregistration are effects on a *third party* that outlive the abort. Before
+    adding any step that changes state outside the workload, ask what the abort
+    path restores it to, and check that the answer is not "nothing".
+34. **Filling in a no-op state's body can reopen a closed danger pattern.** Item 8
+    was closed because the `DRAIN_FAILED` resume runs the resumed state in the
+    same pass and reports *its* outcome — sound while the resumed state either
+    fails immediately or reaches the end. Give the intermediate states real work
+    and the resume produces `Progressed` on one pass and the failure lands on the
+    next, so `Progressed`/`Retry` alternate, `WorkQueue.succeeded` clears the
+    attempt count every other pass, the backoff never grows, and `attempts` is
+    pinned at 1 for ever (item 11). What was a closed audit item becomes a hot
+    loop issuing real side effects at a live server. Re-run item 8 against every
+    change that lengthens the path between a resume and its failure.
+35. **A guard that was a correct *terminal* answer ends up on the wrong side of
+    the work.** `requireEmpty` wraps every state from `SEALED` onward, which is
+    right when players online means the drain has nowhere to go. It is exactly
+    wrong once those states exist to *act* on the players: the destination search
+    and the transfer would abort on the precondition that is supposed to trigger
+    them. When a no-op becomes work, check which side of each guard it lands on —
+    the guard did not move, so it will be wrong by default.
+36. **A second, more convenient source of player counts that cannot see every
+    connection.** Asking a proxy "how many players are on backend X" is one RPC
+    against an exec, and it is wrong: a client connected straight to the backend
+    port is invisible to the proxy and visible to SLP. The zero-player gate has to
+    stay on the workload's own channel; any other source is corroboration, never a
+    substitute. Whenever a new component knows something the drain currently
+    establishes the expensive way, ask what that component *cannot* see.
+37. **A shortcut that bypasses the state machine bypasses every external step in
+    it.** `advance`'s `containerIsDown` branch jumps straight to `STOPPING` with
+    `playersEvacuated = true`, which is safe for the container and skips all seven
+    steps. That costs nothing while steps 2, 4 and 6 are no-ops; once they are
+    real it leaves a third party holding stale registration for a workload that is
+    about to be removed. Every early return in `advance` needs re-checking against
+    each step that gains a body.
+38. **A closed-set enum value that meant one thing under one deployment silently
+    comes to mean two.** `DRAIN_NO_DESTINATION` means "waiting for people to log
+    off, which resolves itself" today and will also mean "the fleet has no
+    capacity anywhere", which does not. Every rule keyed on the value — an
+    escalation exclusion, a decode-time `require`, a dashboard carve-out — was
+    written for the first meaning and will silently cover the second. When a
+    deployment gains an actor, enumerate the reason codes whose meaning was
+    implicitly narrowed by that actor's absence, and split before the rules drift.
+
+39. **Two derivations of the same flag — one from the condition, one from the
+    field — drift at whichever branch was added last.** Round 11: `:api` renders
+    `display.drainBlocked` from the `DRAIN_BLOCKED` *condition* (which encodes
+    `drain.blocked != null && drain.failure == null`), while `ServerJson.detail()`
+    branches on `status.drain?.blocked != null` raw, with the TERMINATING branch
+    ordered above every failure branch. One payload can therefore say
+    `drainBlocked: false` beside `detail: "waiting, not stuck"`. The general rule:
+    when a precedence ("the failure wins") is chosen *instead of* a decode-time
+    `require`, that precedence is the entire specification and has to be pinned by
+    a test at **every** site that consults both — and it has to name *which*
+    failure. `drain.failure` and `status.failure` are different fields, and a
+    status-level failure sitting beside a drain-level block is reachable with no
+    hand edit at all: `Reconciler.nodeFailure` drafts with `drain = previous.drain`
+    and sets `failure`, so a blocked drain plus one unreachable node produces the
+    pair the design calls impossible.
+40. **A property-based conformance rule inherits the lifetime of the suppression
+    it was derived against.** The round-9 carve-out `playersOnline > 0` was sound
+    only because it was coextensive with the `DRAIN_NO_DESTINATION` escalation
+    suppression. Delete the suppression and the identical carve-out silently
+    widens from "excuses the one suppressed case" to "excuses any parked drain
+    that happens to have players on it" — which then includes a permanent
+    `DRAIN_SAVE_TIMEOUT`, the case the rule exists to catch. Re-keying it on the
+    recorded fact (`drainBlocked`) was not a tidy-up; it was forced by the same
+    change. Whenever a suppression is retired, grep for every rule whose
+    antecedent was shaped to match it and re-derive rather than re-read.
+41. **A migration that leaves derived data to "self-correct on the first pass"
+    opens a window in which two consumers of the same row disagree.** V5 rewrites
+    `drain.failure` into `drain.blocked` and deliberately does not invent the
+    `DRAIN_BLOCKED` condition (it cannot date one). Consumers reading the *field*
+    see the new truth at once; consumers reading the *condition* see the old one
+    until the next reconcile pass. Enumerate which side each consumer is on and
+    check the direction the disagreement errs — here it over-states brokenness for
+    one pass, which is the safe way round, but nothing in the design made that so.
+42. **A spec-level property that shares a name with the container-label one is a
+    trap at zero call sites.** `ServerSpec.holdsWorldData` (desired state, added in
+    round 11) versus `WorkloadContract.holdsWorldData` (read off the running
+    container's `Labels.WORLD_DATA`). The drain must use the second; reaching for
+    the first after a `persistent → ephemeral` edit is a stop with no save (item
+    5). Its KDoc says so, which is not enforcement — the safe shape is a test that
+    asserts the spec property has no reference in `core/src/main` until the
+    workload builder genuinely needs it.
+
+43. **A flag's scope is set by which adapter overload happens to exist, not by
+    its rule.** `escalates(startedAt, failureClass, now, after)` contains nothing
+    about drains — PERMANENT fires at once, RETRYABLE after a threshold — but the
+    only adapter is `DrainStatus.escalated()`, and `deriveConditions` calls only
+    the adapter. So `NEEDS_ATTENTION` is a *drain* flag purely because
+    `FailureStatus.escalated()` was never written. Six of the seven sites that
+    record a `PERMANENT` `status.failure` (`rejectDefinition`, `refusePlacement`
+    on `PINNED_NODE_UNKNOWN`, `converge`'s EXITED, `awaitJoinable`'s
+    non-retryable probe, `forbiddenTransition`, `nodeFailure`) raise nothing,
+    and `isBlockedByPermanentFailure` then freezes each status for ever. Whenever
+    a rule is factored into a general predicate plus one typed adapter, enumerate
+    the types that *could* be adapted and check whether their absence was decided
+    or defaulted.
+44. **A badge that reads "healthy" is worse than one that reads "on its way
+    out".** Round 8 flagged `TERMINATING` on a permanently failed drain as the
+    wrong answer that matters. `Reconciler.forbiddenTransition` is the mirror:
+    `PERMANENT` `DRAIN_STALLED`, `drain = null`, `phase = RUNNING`, so
+    `displayState` renders `RUNNING` on a server the loop has permanently stopped
+    managing. `TERMINATING` at least makes somebody look. For every path that
+    records a permanent failure, ask what badge it produces and whether that badge
+    invites a second look or ends one. `PENDING` (`refusePlacement`) and `STOPPED`
+    (`CONTAINER_EXITED`) fail the same test — both read as states you wait out.
+45. **A threshold pushed to the client is a threshold deleted.** When `:core`
+    declines to fold a fact into a condition, `:api` re-derives it (`passFailure`)
+    and `API.md` then tells the dashboard to derive it a third time in TypeScript
+    — `server.status?.failure ? 'not progressing'` — with **no** threshold at all.
+    So the alarm-fatigue objection that kept the fact out of the flag reappears in
+    the one place with no `drainAttentionAfter` and no audit. Item 39 counts
+    derivations inside the repo; count the ones the API doc prescribes too, and
+    treat a documented client-side re-derivation as evidence the fact belongs in
+    the condition.
+46. **The escalation's only non-dashboard channel is a log line nobody asserts
+    on.** `DrainController.abort`'s permanent branch passes `occupancy != null`
+    and `failure.attempts` in the order the format string wants `attempts` and
+    `answeringPlayers` — so the `LOG.error` an operator's alerting greps reads
+    "stopped permanently after true attempt(s) ... answeringPlayers=1". The
+    retryable branch beside it is correct, which is why review slides past it.
+    Structured-logging arg order is untyped and untested; read every escalation
+    log line against its own format string, placeholder by placeholder.
+
+## Round 12: the proxy control surface
+
+43. **A "start-or-join" whose join condition is `not finished` needs a way for a
+    sweep to *become* finished that does not depend on the sweep.**
+    `ControlService.startOrJoin` publishes a `TransferOperation` with
+    `requested = players.size` and then issues N requests; `finish()` is reached
+    only from a `whenComplete` when `settled >= requested`. Any throw part-way
+    through the issuing loop — or any future that never completes — leaves an
+    operation permanently unfinished, and every later POST *joins* it instead of
+    retrying, for ever. The remedy the drain protocol asks for (retry step 4) is
+    the thing the join branch suppresses. Whenever a counter-based completion test
+    is fed by a loop that can exit early, ask what publishes the denominator and
+    whether the numerator can still reach it.
+44. **A bundled level-triggered assert refuses in halves.** `PUT /v1/backends/{name}`
+    asserts registration *and* seal; the `ADDRESS_CONFLICT` throw happens inside
+    the registry lock and `assertAdmission` is the line after it, so refusing the
+    address half silently refuses the seal half. The refusal is right; dropping the
+    seal with it is not, because the seal has nothing to do with the address. When
+    two independent facts share one endpoint, check that a refusal of one is not a
+    refusal of the other — especially when one of them is a drain step.
+45. **A leak is only counted on the path somebody remembered to count.** The seal's
+    honesty argument rests on `admittedWithoutAlternative`. It is incremented in
+    exactly one of the three ways a player can end up on a sealed backend:
+    `InitialChoice.AdmitAnyway`. The `Redirect` whose alternative vanished between
+    listing and `getServer`, and `SealPolicy.onServerSwitch`'s `Allow` for a player
+    with no current server (login and Velocity's own fallback reconnect), both let
+    a player through silently. Enumerate the leak paths from the *player's* side,
+    not from the enum's.
+46. **Soft state with no incarnation marker cannot be verified by reading it back.**
+    The seal is deliberately unpersisted so a dead orchestrator cannot leave a
+    backend sealed for ever — sound. But `:core`'s stated mitigation is "read it
+    back rather than assume the write stuck", and a read that follows the re-assert
+    returns `true` whether the seal held for an hour or was lifted by a restart
+    200ms ago. Level-triggered soft state needs the holder to publish an
+    incarnation id or start timestamp, or the consumer's evidence chain has a hole
+    exactly the width of one restart. Same family as item 12.
+47. **A compensating update placed after the lock is released.**
+    `ControlService.deregister` drops the seal (`admission.forget`) *outside* the
+    `registryLock`, with a comment asserting an ordering the code does not enforce:
+    a concurrent `PUT` can re-register and seal in the gap and have its seal
+    erased. Cheap to fix, and the shape recurs — whenever a comment says "only
+    after X", check that X and the thing after it are under the same lock.

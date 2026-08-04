@@ -164,3 +164,161 @@ force stop". See [[drain-audit-danger-patterns]], especially items 7 and 8.
   stands unweakened — a server the loop has given up on must be surfaced, and
   here it can be, without writing anything to the corrupt row. See
   [[drain-audit-danger-patterns]] item 30 for what `:api` says instead today.
+
+## What the Velocity proxy kind supersedes (round 11, pre-implementation)
+
+Reviewed against `main` at `c85e7fd` before any proxy code existed. The human
+decisions above stand as decisions; what follows is which of *my* rulings were
+reasoned from the absence of a proxy and do not survive it.
+
+- **"Adding a proxy later fills in bodies rather than reshaping the flow" is
+  false.** `requireEmpty` wraps `SEALED`, `TARGET_RESOLVED` and `TRANSFERRING`,
+  so the three states that exist to move players abort on players being present.
+  The flow does get reshaped: the zero-player gate must apply from `SAVING`
+  onward only. See [[drain-audit-danger-patterns]] item 35.
+- **Round 7's cancellation window splits.** It survives for a *transfer* — the
+  effect is observable as the SLP count, so a repeat is benign — but only while
+  nothing gates a re-issue on a stored "transfer issued" flag. It does **not**
+  survive for the seal or the deregistration, and not because a repeat is
+  harmful: those are the first effects that need *undoing* on abort, which
+  inverts item 23's safe direction. See items 32 and 33.
+- **`DRAIN_NO_DESTINATION`'s escalation exclusion does not survive.** Its premise
+  ("this resolves itself when they log off") holds only for a drain with no
+  transfer counterparty. Split the reason; keep the exclusion on the
+  waiting-for-zero-players one.
+- **`FailureStatus.init`'s `DRAIN_NO_DESTINATION ⇒ RETRYABLE` survives on the
+  merits** — "no capacity anywhere" is still something the loop should keep
+  trying, and `PERMANENT` only ever means "stop trying" — but its stated
+  justification in the KDoc is the escalation exclusion, which does not. Re-argue
+  it rather than inheriting it.
+- **The round-5 actor mapping survives unchanged and gains rows.** SLP-off-Netty
+  vs RCON-on-main-thread is untouched by a third actor. What is new is that the
+  proxy's player count must never replace SLP for the gate (item 36), and that a
+  proxy restart silently forgets an in-memory seal.
+
+**How to apply:** when auditing proxy drain code, the first two questions are
+"what does the abort path restore at the proxy" and "what re-asserts the seal
+after the proxy restarts". Neither has an answer in the standalone machine.
+
+## Round 11 rulings: blocked is not failed
+
+Audited on `feat/velocity-proxy-kind`. No stop path was touched; the two
+`stopWorkload` sites, `mayStop`, `saveIsCurrent`, `forgetSaveEvidence`,
+`containerIsDown` and `teardown` are byte-identical to `main`.
+
+- **`DrainState.DRAIN_FAILED` holding a blocked drain is accepted**, and the
+  strongest argument is one the implementer did not give:
+  `ReconcileLoop.RESUMABLE_DRAIN_STATES` is `DrainState.entries - DRAIN_FAILED`,
+  so a new `DRAIN_BLOCKED` state would land in the *resumable* set by silent
+  set-subtraction. The three consumers of the state — `draining`, the
+  `DRAIN_FAILED → ServerPhase.RUNNING` mapping, and the resume branch — all want
+  the same answer for a block as for an abort. The cost (`display.drainState`
+  reads `DRAIN_FAILED` on a healthy wait) is only tolerable because
+  `display.drainBlocked` is rendered beside it. Do not let a later change drop
+  that flag and leave the state as the only discriminator.
+- **No decode-time `require` for blocked/failure disjointness: upheld**
+  ([[drain-audit-danger-patterns]] item 28). But with no `require`, the *precedence*
+  is the whole specification, and it is not implemented at both sites — see item
+  39. "The failure wins" also has to say which failure; `drain.failure` and
+  `status.failure` are different fields and the pair is reachable via
+  `Reconciler.nodeFailure`.
+- **Retiring `FailureReason.DRAIN_AWAITING_ZERO_PLAYERS` and deleting
+  `escalates()`'s reason parameter is right**, and it retires both round-9/10
+  findings against that mechanism rather than moving them. `DRAIN_NO_DESTINATION`
+  now has **zero production writers**; `FailureStatus.ALWAYS_RETRYABLE` and its
+  `require` are purely forward-looking for the fleet-capacity case, which is the
+  correct posture and should be re-argued, not inherited, when that case lands.
+- **The `:app` conformance property must stay end-to-end.** `:api` cannot call
+  `:core`, so `DrainBlockRenderingTest` hand-builds the condition list; the only
+  thing proving `:core`'s derivation and `:api`'s reading of it agree is
+  `DisplayConformanceTest`. Do not let it be moved into `:api`.
+
+## Round 12 ruling: `NEEDS_ATTENTION` is a general flag, not a drain flag
+
+Charter question on `feat/velocity-proxy-kind`, read-only. No stop path examined
+was changed; the ruling is about reporting only.
+
+- **The drain-only scope is an accident and should widen to `status.failure`.**
+  `escalates()` is already class-based and drain-free; only the adapter
+  (`DrainStatus.escalated()`) is drain-shaped. See
+  [[drain-audit-danger-patterns]] items 43 and 44. `ConditionType.NEEDS_ATTENTION`'s
+  own KDoc already says the name is deliberately general and a permanently failed
+  bring-up is the next thing to raise it.
+- **The alarm-fatigue objection is real but does not apply to the two-armed
+  rule.** It only bites if `status.failure` is folded in flat. Under
+  `escalates()` a retryable node blip escalates no sooner than
+  `drainAttentionAfter`, and `recordFailure` supplies the anchor: `occurredAt`
+  survives same-reason repeats, resets on a different reason, and `Pass.draft`'s
+  `failure = null` default clears the whole thing on any successful pass. The
+  widened flag is *more* self-clearing than the drain-only one and errs quiet on
+  a flapping node. Do not re-propose the flat fold, and do not anchor a pass
+  failure on `drain.startedAt` — that fires instantly on a long-running block.
+- **`Reconciler.nodeFailure` must keep leaving `drain.failure` null.** Writing it
+  would (1) abort a drain that never ran this pass, (2) destroy the `DrainBlock`
+  via `abort`'s `blocked = null`, restarting `since`/`observations` on a
+  transport blip, and (3) collapse the very distinction `detail()`'s precedence
+  discriminates on. Node failures *inside* the drain's own steps already become
+  drain failures through `abort` (`NodeOperation.EXEC`/`STOP` → `DRAIN_STALLED`).
+- **`status.failure == drain.failure` on an aborted drain is structural, not
+  incidental**: one expression, `Reconciler.kt` `failure = progress.drain.failure`
+  in the drain branch. Three consumers now depend on it — `detail()`'s
+  precedence, migration V5's decision to drop the retired top-level `failure`,
+  and the copy itself — and nothing enforces it. It holds because line 693 is a
+  *copy*; it breaks the moment anything assigns a derived value there
+  (`?.copy(...)` to add context), and `detail()` then silently drops the "the
+  drain aborted" framing for every failed drain.
+
+**How to apply:** when the widening lands, the invariants to hold are that
+nothing branches on the condition (`NEEDS_ATTENTION` must stay with zero readers
+in `core/src/main`), that `drainMessage` receives the *drain* arm only (a widened
+flag would make it assert a blocked drain is failing — item 27), and that
+`attentionMessage` never says "the drain cannot finish" about a server with no
+drain and never asserts joinability. `DisplayConformanceTest` needs a second
+property — *a server carrying a PERMANENT failure is flagged, whatever its badge*
+— driven through `forbiddenTransition`, which is the case that renders `RUNNING`.
+
+## Round 12 rulings: the Velocity control surface (`:velocity-plugin`)
+
+Audited on `feat/velocity-proxy-kind` with `:core` not yet written. The module
+contains no container operation at all, so none of the seven stop invariants can
+be violated from inside it; every finding is about what it makes `:core` able or
+unable to do correctly.
+
+- **The seal/deregistration separation holds.** Only `DELETE /v1/backends/{name}`
+  reaches `unregisterServer`. There is no set-assert endpoint, so no backend can
+  be removed by omission; `ADDRESS_CONFLICT` refuses the upsert that would have
+  hidden an unregister inside step 2; a finished sweep and a seal touch only
+  `transfers` and `AdmissionRegistry`. Do not re-derive this — re-check it only if
+  a list-shaped assert or a force flag is proposed.
+- **`PlayerHandle` having no `disconnect` is real, not decorative.** The sweep is
+  written against the port, the adapter uses `connect()` (never
+  `connectWithIndication`/`fireAndForget`), `classify` is exhaustive with no
+  `else`, and `TransferNeverKicksTest` greps the module's sources. Every failure
+  branch counts and leaves the player attached.
+- **`InitialChoice.AdmitAnyway` is the right trade** (Velocity issue 689: a
+  login-path `denied()` strands the client). The leak is bounded by `:core`'s own
+  SLP zero-player gate, so it costs convergence, never data. What is *not* right
+  is the claim that the leak is always counted — see
+  [[drain-audit-danger-patterns]] item 45.
+- **Refusing `DELETE` on a populated backend with no force flag is correct** and
+  does not by itself wedge `:core`: the occupancy resolves when players leave or
+  when the backend dies. The only path that makes it permanent is the wedged
+  sweep (item 43), and the fix belongs there.
+- **The proxy's own seal (`PUT /v1/proxy`) is load-bearing for convergence and
+  nothing says so.** With every backend sealed, `onInitialChoice` returns
+  `AdmitAnyway` for every joining player, so a fleet-wide drain never reaches
+  zero. `onPreLogin` is the only mechanism that stops it, and it is safe (a
+  refused login is not a disconnect). `:core` must assert it before sealing the
+  last admitting backend.
+- **`/v1/state`'s `backends[].players` is the tempting wrong gate.** It is the
+  proxy's view and cannot see a client connected straight to the backend port
+  ([[drain-audit-danger-patterns]] item 36). It is the right source for the
+  `BACKEND_OCCUPIED` guard — a directly-connected player is unaffected by
+  deregistration — and the wrong source for the stop gate. Both facts need to be
+  in the protocol doc before `:core` reads the field.
+
+**How to apply:** when `:core`'s proxy client lands, the first three questions are
+(1) does it keep the transfer retry count itself, since a fresh sweep zeroes the
+tallies, (2) does it treat a counter going *down* as a proxy restart that voids
+evacuation evidence, and (3) does it ever send a `PUT` address derived from the
+desired definition rather than the running container.
