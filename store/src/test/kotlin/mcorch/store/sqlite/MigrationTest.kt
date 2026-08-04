@@ -27,7 +27,9 @@ import mcorch.store.codec.PropertyDocument
 import mcorch.store.codec.StatusCodec
 import mcorch.store.getOrThrow
 import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.DynamicTest
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.TestFactory
 import java.nio.file.Path
 import java.sql.Connection
 import java.sql.DriverManager
@@ -789,6 +791,111 @@ class MigrationTest {
         statusDocument(directory, "survival-a") shouldContain "drain.failure.reason=DRAIN_NO_DESTINATION"
     }
 
+    /**
+     * A row that already carries a whole `drain.blocked` record *and* a retired
+     * failure. The copy loop keeps the former and the rewrite would write the
+     * latter on top, so the two would collide.
+     *
+     * The refusal is the point: nothing that wrote these documents could produce
+     * both, so the row was edited by hand and the migration cannot tell which of
+     * the two the operator meant. Refusing in the store's own vocabulary is what
+     * lets `:core` classify it — a bare `IllegalArgumentException` from the
+     * document writer crosses the store boundary as a type nothing above it
+     * knows how to read.
+     */
+    @Test
+    fun `a hand-edited row that is both blocked and failed fails as a store error`() {
+        val directory = stores.directory()
+        writeVersion4Database(directory) { legacy ->
+            legacy.definition(Fixtures.definitionNamed("survival-a"), generation = 1L, revision = 1L)
+            legacy.blockedLegacyStatus(
+                name = "survival-a",
+                revision = 2L,
+                reason = "DRAIN_NO_DESTINATION",
+                occurredAt = Instant.parse("2026-07-20T08:05:00Z"),
+                attempts = 2,
+                message = "3 of 20 player slots are in use",
+                extra =
+                    listOf(
+                        "drain.blocked.reason" to "AWAITING_ZERO_PLAYERS",
+                        "drain.blocked.message" to "hand-written",
+                        "drain.blocked.since" to "2026-07-19T08:05:00Z",
+                        "drain.blocked.observations" to "1",
+                    ),
+            )
+        }
+
+        expectRefusedAtVersion4(directory)
+    }
+
+    /**
+     * The same collision reached through *any* of the four keys, not just the one
+     * the guard used to name.
+     *
+     * The eleventh drain audit found the guard asked `has("drain.blocked.reason")`
+     * while the rewrite writes four keys. A row carrying only, say,
+     * `drain.blocked.message` slipped past it and collided inside
+     * `DocumentWriter`, throwing `IllegalArgumentException` — precisely the
+     * outcome the guard's own comment says it exists to prevent, and the second
+     * time this shape has been found in a migration.
+     *
+     * Every key is exercised, because a guard that names a subset is exactly the
+     * defect: `reason` alone is what shipped, and the next partial set would slip
+     * through again.
+     */
+    @TestFactory
+    fun `a hand-edited row carrying any part of a blocked record fails as a store error`() =
+        listOf(
+            "drain.blocked.reason" to "AWAITING_ZERO_PLAYERS",
+            "drain.blocked.message" to "hand-written",
+            "drain.blocked.since" to "2026-07-19T08:05:00Z",
+            "drain.blocked.observations" to "1",
+        ).map { (key, value) ->
+            DynamicTest.dynamicTest("$key alone") {
+                val directory = stores.directory()
+                writeVersion4Database(directory) { legacy ->
+                    legacy.definition(Fixtures.definitionNamed("survival-a"), generation = 1L, revision = 1L)
+                    legacy.blockedLegacyStatus(
+                        name = "survival-a",
+                        revision = 2L,
+                        reason = "DRAIN_NO_DESTINATION",
+                        occurredAt = Instant.parse("2026-07-20T08:05:00Z"),
+                        attempts = 2,
+                        message = "3 of 20 player slots are in use",
+                        extra = listOf(key to value),
+                    )
+                }
+
+                expectRefusedAtVersion4(directory)
+            }
+        }
+
+    /**
+     * Refused in the store's vocabulary, and refused *before* anything is
+     * written: one transaction per migration, so the row is still exactly as it
+     * was and an operator can downgrade, repair it and reopen.
+     */
+    private fun expectRefusedAtVersion4(directory: Path) {
+        val failure =
+            runCatching { stores.open(directory) }
+                .exceptionOrNull()
+                .shouldBeInstanceOf<StoreException.MigrationFailed>()
+
+        failure.retryable shouldBe false
+        val corrupt =
+            failure.cause
+                .shouldBeInstanceOf<StoreException.Corrupt>()
+                .message
+                .shouldNotBeNull()
+        // Enough to find the row and to know which two records disagree.
+        corrupt shouldContain "survival-a"
+        corrupt shouldContain "drain.blocked"
+        corrupt shouldContain "drain.failure"
+
+        appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
+        statusDocument(directory, "survival-a") shouldContain "drain.failure.reason=DRAIN_NO_DESTINATION"
+    }
+
     private suspend fun drainOf(
         store: EmbeddedStore,
         name: String,
@@ -1043,6 +1150,10 @@ class MigrationTest {
          * The unrelated keys are not padding. A rewrite that dropped them would
          * otherwise be silent, and losing `storage.lastSaveConfirmedAt` or a
          * condition's `lastTransitionAt` is data an operator reads.
+         *
+         * [extra] carries keys no released build wrote — a hand-edited row. It is
+         * the only way to reach version 5's refusals, which by construction
+         * nothing that wrote these documents could produce.
          */
         @Suppress("LongParameterList")
         fun blockedLegacyStatus(
@@ -1054,9 +1165,11 @@ class MigrationTest {
             message: String,
             mirrorOnStatus: Boolean = true,
             encoding: Int = PropertyDocument.ENCODING_VERSION,
+            extra: List<Pair<String, String>> = emptyList(),
         ) {
             val fields =
                 buildList {
+                    addAll(extra)
                     add("apiVersion" to SchemaVersion.CURRENT.wireValue)
                     add("kind" to ServerKind.PAPER_SERVER.wireValue)
                     add("name" to name)
