@@ -2,6 +2,7 @@ package mcorch.app
 
 import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.string.shouldContain
 import kotlinx.coroutines.runBlocking
 import mcorch.api.ApiConfig
 import mcorch.api.ApiServer
@@ -79,30 +80,32 @@ class DisplayConformanceTest {
      * where it is vacuously true. A rule that only holds for the case it was
      * written against is not the rule.
      *
-     * ## Why "no players online" is part of the antecedent
+     * ## Why "blocked" is one of the arms
      *
      * The property was first written as *progressing or flagged*, and the
-     * players-online case failed it: that drain sits in `DRAIN_FAILED` — it
-     * aborted — is not progressing, and is deliberately never flagged. It is also
+     * players-online case failed it: that drain sits in `DRAIN_FAILED` — it is
+     * parked — is not progressing, and is deliberately never flagged. It is also
      * completely fine. It is waiting for people to log off, which is the protocol
      * working, and alarming on it every backoff interval is how operators learn
      * the signal means nothing.
      *
      * So `DRAIN_FAILED` is not a usable proxy for *stuck*. What separates the two
-     * from the dashboard's side is whether anybody is on the server, and
-     * `playersOnline` is rendered, so the consumer can tell them apart without
-     * being told the failure reason. A server showing players is self-evidently
-     * not abandoned; one showing none, with a drain that has given up and a badge
-     * saying it is on its way out, is the case an operator will walk past.
+     * used to be inferred here from `playersOnline`, which was a guess about
+     * *why* a drain was parked, and only correct as long as the one block reason
+     * happened to be about players. It is now a rendered fact: `drainBlocked` is
+     * derived from the drain's own record, and using it means this property is
+     * red if `:core` records a stuck drain as a healthy wait — which the player
+     * count could not have caught, since a stuck drain usually has players on it
+     * too.
      */
     private fun assertNothingIsSilentlyStuck(display: Map<*, *>) {
         val state = display["state"]
         val ready = display["ready"] == true
         if (state !in setOf("TERMINATING", "DRAINING") || !ready) return
         val progressing = display["drainState"] != "DRAIN_FAILED"
-        val waitingOnPlayers = (display["playersOnline"] as? Int ?: 0) > 0
+        val blocked = display["drainBlocked"] == true
         val flagged = display["needsAttention"] == true
-        withClue(display) { (progressing || waitingOnPlayers || flagged) shouldBe true }
+        withClue(display) { (progressing || blocked || flagged) shouldBe true }
     }
 
     private fun withClue(
@@ -201,17 +204,23 @@ class DisplayConformanceTest {
     }
 
     /**
-     * A drain that is getting on with it satisfies the property by the *other*
-     * arm — progressing rather than flagged.
+     * A drain that is waiting for people to log off satisfies the property by the
+     * *blocked* arm — neither progressing nor flagged, and correct.
      *
      * Without this the rule could be met by flagging every draining server, which
-     * is the failure mode the exclusion for players-online exists to prevent.
+     * is the failure mode the whole blocked/failed split exists to prevent.
+     *
+     * The assertions go end to end on purpose. A real `Reconciler` drives a real
+     * drain into the block, writes it through a real `EmbeddedStore`, and a real
+     * `ApiServer` renders it over a socket — so `drainBlocked` being true here is
+     * evidence that the rule in `:core`, the codec in `:store` and the derivation
+     * in `:api` agree. Nothing inside any one module can say that.
      */
     @Test
-    fun `a drain that is progressing is not flagged`() {
+    fun `a drain waiting for players is shown as blocked rather than as needing a human`() {
         val directory = directory()
-        // Players online: the drain has nowhere to send them, so it blocks —
-        // retryably, and by design this is never escalated.
+        // Players online: the drain has nowhere to send them, so it blocks. It
+        // records no failure at all, and by design it is never escalated.
         val node = StubNode(online = 3)
         EmbeddedStore.open(EmbeddedStoreConfig(directory = directory)).use { embedded ->
             val registry = StaticNodeRegistry(listOf(node))
@@ -227,12 +236,25 @@ class DisplayConformanceTest {
 
             serving(embedded) { api ->
                 val display = api.display("busy-01")
+                val drain = api.drain("busy-01")
 
                 display["state"] shouldBe "TERMINATING"
                 // People are playing. That is the protocol working, and calling
                 // a human about it every backoff interval is how the signal
                 // stops meaning anything.
                 display["needsAttention"] shouldBe false
+                // The fact that replaced the guess. The dashboard is told *why*
+                // this drain is parked rather than being left to infer it from a
+                // player count.
+                display["drainBlocked"] shouldBe true
+                (display["detail"] as String) shouldContain "waiting, not stuck"
+
+                // Nothing anywhere in the record calls this a failure — the
+                // property the whole change turns on, checked on the bytes that
+                // actually left the process.
+                (drain["blocked"] as Map<*, *>)["reason"] shouldBe "AWAITING_ZERO_PLAYERS"
+                drain["failure"] shouldBe null
+
                 assertNothingIsSilentlyStuck(display)
             }
 
@@ -270,7 +292,19 @@ class DisplayConformanceTest {
         private val client: HttpClient =
             HttpClient.newBuilder().connectTimeout(JavaDuration.ofSeconds(5)).build()
 
-        fun display(name: String): Map<*, *> {
+        fun display(name: String): Map<*, *> =
+            // A sibling of `status`, not a field inside it: the badge fuses the
+            // status, the drain and the tombstone, and the tombstone is not part
+            // of observed state.
+            server(name)["display"] as? Map<*, *> ?: error("no display for $name")
+
+        /** The drain record as it left the process, for the assertions the badge cannot carry. */
+        fun drain(name: String): Map<*, *> {
+            val status = server(name)["status"] as? Map<*, *> ?: error("no status for $name")
+            return status["drain"] as? Map<*, *> ?: error("no drain for $name")
+        }
+
+        private fun server(name: String): Map<*, *> {
             val request =
                 HttpRequest
                     .newBuilder(URI.create("$base/api/v1/servers/$name"))
@@ -280,11 +314,7 @@ class DisplayConformanceTest {
                     .build()
             val response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8))
             check(response.statusCode() == 200) { "GET $name returned ${response.statusCode()}: ${response.body()}" }
-            val document = Load(LoadSettings.builder().build()).loadFromString(response.body()) as Map<*, *>
-            // A sibling of `status`, not a field inside it: the badge fuses the
-            // status, the drain and the tombstone, and the tombstone is not part
-            // of observed state.
-            return document["display"] as? Map<*, *> ?: error("no display in $document")
+            return Load(LoadSettings.builder().build()).loadFromString(response.body()) as Map<*, *>
         }
     }
 }

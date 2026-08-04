@@ -7,7 +7,12 @@ import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.types.shouldBeInstanceOf
 import kotlinx.coroutines.test.runTest
+import mcorch.schema.ConditionStatus
+import mcorch.schema.ConditionType
+import mcorch.schema.DrainBlockReason
 import mcorch.schema.DrainState
+import mcorch.schema.FailureClass
+import mcorch.schema.FailureReason
 import mcorch.schema.PaperServerDefinition
 import mcorch.schema.PaperServerStatus
 import mcorch.schema.SchemaVersion
@@ -71,7 +76,7 @@ class MigrationTest {
             appliedVersions(directory) shouldBe listOf(1)
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
 
                 val servers = migrated.state.listServers().associateBy { it.name.value }
                 servers.keys shouldBe setOf("survival-a", "survival-b", "survival-c")
@@ -176,7 +181,7 @@ class MigrationTest {
             }
 
             stores.open(directory).use { second ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
                 second.state.listServers().map { it.name.value } shouldBe listOf("survival-a")
             }
         }
@@ -208,7 +213,7 @@ class MigrationTest {
             appliedVersions(directory) shouldBe listOf(1, 2, 3)
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
 
                 // Nothing was dropped, renamed or cascaded away.
                 val server = migrated.state.getServer(definition.metadata.name).shouldNotBeNull()
@@ -281,7 +286,7 @@ class MigrationTest {
             }
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
 
                 val listing = migrated.state.listAll()
                 listing.servers.map { it.name.value } shouldBe listOf("survival-a")
@@ -384,7 +389,7 @@ class MigrationTest {
             appliedVersions(directory) shouldBe listOf(1, 2)
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
 
                 val confirmed = drainOf(migrated, "survival-a")
                 confirmed.worldSavedAt shouldBe confirmedAt
@@ -465,7 +470,7 @@ class MigrationTest {
             appliedVersions(directory) shouldBe listOf(1, 2)
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
                 val drain = drainOf(migrated, "survival-a")
 
                 // Undated evidence is no evidence. Nothing may appear here.
@@ -574,6 +579,216 @@ class MigrationTest {
         appliedVersions(directory) shouldBe listOf(1, 2)
     }
 
+    /**
+     * The change of meaning version 5 exists to absorb.
+     *
+     * Before it, a drain waiting for players to log off recorded
+     * `drain.failure.reason=DRAIN_NO_DESTINATION`. That reason now means
+     * something else — *the search ran and the fleet had no capacity* — which
+     * escalates once it is older than `drainAttentionAfter`. So the same bytes,
+     * read by the new code, turn every drain that was quietly waiting out a busy
+     * evening into a call for a human, and the operator is sent to look at a
+     * server where people are simply playing. That is the alert fatigue this whole
+     * change removes, delivered by the upgrade that removes it.
+     *
+     * `survival-b` carries `DRAIN_AWAITING_ZERO_PLAYERS`, which no released build
+     * wrote but a dev store opened against one commit of the branch could hold.
+     * Its failure mode is louder — the value is not in the enum any more, so the
+     * row would not decode at all — and covering it costs one entry in a set.
+     */
+    @Test
+    fun `a drain blocked on players before version 5 comes back blocked, not failed`() =
+        runTest {
+            val directory = stores.directory()
+            val blockedSince = Instant.parse("2026-07-20T08:05:00Z")
+            val message = "blocked: no drain destination. 3 of 20 player slots are in use"
+
+            writeVersion4Database(directory) { legacy ->
+                legacy.definition(Fixtures.definitionNamed("survival-a"), generation = 1L, revision = 1L)
+                legacy.definition(Fixtures.definitionNamed("survival-b"), generation = 1L, revision = 2L)
+                legacy.blockedLegacyStatus(
+                    name = "survival-a",
+                    revision = 3L,
+                    reason = "DRAIN_NO_DESTINATION",
+                    occurredAt = blockedSince,
+                    attempts = 37,
+                    message = message,
+                )
+                legacy.blockedLegacyStatus(
+                    name = "survival-b",
+                    revision = 4L,
+                    reason = "DRAIN_AWAITING_ZERO_PLAYERS",
+                    occurredAt = blockedSince,
+                    attempts = 4,
+                    message = message,
+                )
+            }
+            appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
+
+            stores.open(directory).use { migrated ->
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
+
+                for (name in listOf("survival-a", "survival-b")) {
+                    val status =
+                        migrated.state
+                            .getServer(Fixtures.resourceName(name))
+                            .shouldNotBeNull()
+                            .status
+                            .shouldNotBeNull()
+                            .status
+                            .shouldBeInstanceOf<PaperServerStatus>()
+                    val drain = status.drain.shouldNotBeNull()
+
+                    val blocked = drain.blocked.shouldNotBeNull()
+                    blocked.reason shouldBe DrainBlockReason.AWAITING_ZERO_PLAYERS
+                    // A rename, not a re-derivation. "Waiting since" must not jump
+                    // to the moment of the upgrade.
+                    blocked.since shouldBe blockedSince
+                    blocked.message shouldBe message
+                    // The assertions the migration exists for.
+                    drain.failure.shouldBeNull()
+                    // The reconciler mirrors a drain's failure one level up, so
+                    // the same fact was on disk twice and both copies have to go.
+                    status.failure.shouldBeNull()
+                }
+
+                // The count carries across as the number of times the loop has
+                // looked, so it does not restart at one.
+                drainOf(migrated, "survival-a").blocked.shouldNotBeNull().observations shouldBe 37
+                drainOf(migrated, "survival-b").blocked.shouldNotBeNull().observations shouldBe 4
+
+                // No data loss: everything the hand-written document carried that
+                // has nothing to do with the failure is still there. A rewrite
+                // that dropped unrelated keys would otherwise be silent.
+                val status =
+                    migrated.state
+                        .getServer(Fixtures.resourceName("survival-a"))
+                        .shouldNotBeNull()
+                        .status
+                        .shouldNotBeNull()
+                        .status
+                        .shouldBeInstanceOf<PaperServerStatus>()
+                status.phase shouldBe ServerPhase.RUNNING
+                status.ready shouldBe true
+                status.players.shouldNotBeNull().online shouldBe 3
+                status.players.shouldNotBeNull().max shouldBe 20
+                status.storage.shouldNotBeNull().lastSaveConfirmedAt shouldBe LEGACY_SEAL_REQUESTED_AT
+                status.storage
+                    .shouldNotBeNull()
+                    .volumeName
+                    .shouldNotBeNull()
+                    .value shouldBe "survival-a-world"
+                status.conditions.single().type shouldBe ConditionType.DRAINING
+                status.conditions.single().lastTransitionAt shouldBe LEGACY_DRAIN_ENTERED_AT
+
+                val drain = status.drain.shouldNotBeNull()
+                // Still parked. `DRAIN_FAILED` means *not advancing*, and only the
+                // record beside it says whether that is bad news — so the state and
+                // the projection column keep their value.
+                drain.state shouldBe DrainState.DRAIN_FAILED
+                drain.startedAt shouldBe LEGACY_DRAIN_STARTED_AT
+                drain.enteredStateAt shouldBe LEGACY_DRAIN_ENTERED_AT
+                drain.sealRequestedAt shouldBe LEGACY_SEAL_REQUESTED_AT
+                drain.playersEvacuated shouldBe false
+                drain.transferAttempts shouldBe 0
+            }
+        }
+
+    /**
+     * The control, and it is what makes the test above a test of the *reason*
+     * rather than of "version 5 deletes failures".
+     *
+     * A drain that genuinely failed keeps its failure, its class, its attempt
+     * count and its first-occurrence time. Nothing about it is a block.
+     */
+    @Test
+    fun `version 5 leaves a drain failure it was not written about completely alone`() =
+        runTest {
+            val directory = stores.directory()
+            val occurredAt = Instant.parse("2026-07-20T08:05:00Z")
+            writeVersion4Database(directory) { legacy ->
+                legacy.definition(Fixtures.definitionNamed("survival-a"), generation = 1L, revision = 1L)
+                legacy.blockedLegacyStatus(
+                    name = "survival-a",
+                    revision = 2L,
+                    reason = FailureReason.DRAIN_SAVE_TIMEOUT.name,
+                    occurredAt = occurredAt,
+                    attempts = 9,
+                    message = "save completion not confirmed within the save timeout",
+                )
+            }
+
+            stores.open(directory).use { migrated ->
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
+
+                val status =
+                    migrated.state
+                        .getServer(Fixtures.resourceName("survival-a"))
+                        .shouldNotBeNull()
+                        .status
+                        .shouldNotBeNull()
+                        .status
+                        .shouldBeInstanceOf<PaperServerStatus>()
+                val failure =
+                    status.drain
+                        .shouldNotBeNull()
+                        .failure
+                        .shouldNotBeNull()
+                failure.reason shouldBe FailureReason.DRAIN_SAVE_TIMEOUT
+                failure.failureClass shouldBe FailureClass.RETRYABLE
+                failure.occurredAt shouldBe occurredAt
+                failure.attempts shouldBe 9
+                status.drain
+                    .shouldNotBeNull()
+                    .blocked
+                    .shouldBeNull()
+                // And the mirrored copy, which is only dropped for a retired reason.
+                status.failure.shouldNotBeNull().reason shouldBe FailureReason.DRAIN_SAVE_TIMEOUT
+            }
+        }
+
+    /**
+     * The same refusal version 3 makes, for the same reason.
+     *
+     * A row at an encoding this migration was not written against is refused
+     * before anything is written. Skipping it would leave that drain's healthy
+     * wait reading as a fleet-capacity failure — the change of meaning version 5
+     * exists to absorb, reintroduced quietly for the rows it understood least.
+     */
+    @Test
+    fun `a status document at an encoding version 5 does not understand is refused, and nothing is rewritten`() {
+        val directory = stores.directory()
+        writeVersion4Database(directory) { legacy ->
+            legacy.definition(Fixtures.definitionNamed("survival-a"), generation = 1L, revision = 1L)
+            legacy.blockedLegacyStatus(
+                name = "survival-a",
+                revision = 2L,
+                reason = "DRAIN_NO_DESTINATION",
+                occurredAt = Instant.parse("2026-07-20T08:05:00Z"),
+                attempts = 2,
+                message = "3 of 20 player slots are in use",
+                encoding = UNREADABLE_ENCODING,
+            )
+        }
+
+        val failure =
+            runCatching { stores.open(directory) }
+                .exceptionOrNull()
+                .shouldBeInstanceOf<StoreException.MigrationFailed>()
+
+        failure.retryable shouldBe false
+        failure.cause
+            .shouldBeInstanceOf<StoreException.Corrupt>()
+            .message
+            .shouldNotBeNull()
+            .shouldContain("survival-a")
+
+        // One transaction per migration, so the store is still at version 4 with
+        // the row exactly as it was and the operator can downgrade and reopen.
+        appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
+        statusDocument(directory, "survival-a") shouldContain "drain.failure.reason=DRAIN_NO_DESTINATION"
+    }
+
     private suspend fun drainOf(
         store: EmbeddedStore,
         name: String,
@@ -627,6 +842,25 @@ class MigrationTest {
     ) {
         rawConnection(directory).use { connection ->
             Migrations.migrate(connection, stores.clock, upTo = 3)
+            val writer = LegacyWriter(connection, hasDrainStateColumn = true)
+            block(writer)
+            writer.finish()
+            connection.commit()
+        }
+    }
+
+    /**
+     * A database stopped at version 4, for the version-5 cases.
+     *
+     * Versions 3 and 5 change documents and version 4 adds triggers, so the row
+     * shapes are still version 2's and the same writer serves this too.
+     */
+    private fun writeVersion4Database(
+        directory: Path,
+        block: (LegacyWriter) -> Unit,
+    ) {
+        rawConnection(directory).use { connection ->
+            Migrations.migrate(connection, stores.clock, upTo = 4)
             val writer = LegacyWriter(connection, hasDrainStateColumn = true)
             block(writer)
             writer.finish()
@@ -792,6 +1026,94 @@ class MigrationTest {
                 setString(6, document)
                 setInt(7, encoding)
                 setString(8, drainState.name)
+            }
+            highest = maxOf(highest, revision)
+        }
+
+        /**
+         * A status document written key by key, the way version 4 wrote a drain
+         * that was blocked on players: a `FailureStatus` under `drain.failure`,
+         * mirrored onto the status by the reconciler.
+         *
+         * Deliberately not `StatusCodec.encode`. The current encoder writes
+         * `drain.blocked` and no failure at all for this case, so a test built on
+         * it would migrate a document that never needed migrating and would pass
+         * whatever version 5 did.
+         *
+         * The unrelated keys are not padding. A rewrite that dropped them would
+         * otherwise be silent, and losing `storage.lastSaveConfirmedAt` or a
+         * condition's `lastTransitionAt` is data an operator reads.
+         */
+        @Suppress("LongParameterList")
+        fun blockedLegacyStatus(
+            name: String,
+            revision: Long,
+            reason: String,
+            occurredAt: Instant,
+            attempts: Int,
+            message: String,
+            mirrorOnStatus: Boolean = true,
+            encoding: Int = PropertyDocument.ENCODING_VERSION,
+        ) {
+            val fields =
+                buildList {
+                    add("apiVersion" to SchemaVersion.CURRENT.wireValue)
+                    add("kind" to ServerKind.PAPER_SERVER.wireValue)
+                    add("name" to name)
+                    add("observedGeneration" to "1")
+                    // A blocked drain leaves the server running and joinable, and
+                    // that is what version 4 recorded too.
+                    add("phase" to ServerPhase.RUNNING.name)
+                    add("observedAt" to CREATED_AT.toString())
+                    add("lastTransitionAt" to CREATED_AT.toString())
+                    add("ready" to "true")
+                    add("players.online" to "3")
+                    add("players.max" to "20")
+                    add("players.observedAt" to CREATED_AT.toString())
+                    add("storage.persistent" to "true")
+                    add("storage.volumeName" to "$name-world")
+                    add("storage.bound" to "true")
+                    add("storage.lastSaveConfirmedAt" to LEGACY_SEAL_REQUESTED_AT.toString())
+                    add("drain.state" to DrainState.DRAIN_FAILED.name)
+                    add("drain.startedAt" to LEGACY_DRAIN_STARTED_AT.toString())
+                    add("drain.enteredStateAt" to LEGACY_DRAIN_ENTERED_AT.toString())
+                    add("drain.playersEvacuated" to "false")
+                    add("drain.sealRequestedAt" to LEGACY_SEAL_REQUESTED_AT.toString())
+                    add("drain.transferAttempts" to "0")
+                    add("drain.failure.reason" to reason)
+                    add("drain.failure.failureClass" to FailureClass.RETRYABLE.name)
+                    add("drain.failure.message" to message)
+                    add("drain.failure.occurredAt" to occurredAt.toString())
+                    add("drain.failure.attempts" to attempts.toString())
+                    if (mirrorOnStatus) {
+                        add("failure.reason" to reason)
+                        add("failure.failureClass" to FailureClass.RETRYABLE.name)
+                        add("failure.message" to message)
+                        add("failure.occurredAt" to occurredAt.toString())
+                        add("failure.attempts" to attempts.toString())
+                    }
+                    add("conditions.count" to "1")
+                    add("conditions.0.type" to ConditionType.DRAINING.name)
+                    add("conditions.0.status" to ConditionStatus.FALSE.name)
+                    add("conditions.0.message" to "drain state DRAIN_FAILED")
+                    add("conditions.0.lastTransitionAt" to LEGACY_DRAIN_ENTERED_AT.toString())
+                }
+            val document = fields.sortedBy { it.first }.joinToString("\n") { "${it.first}=${it.second}" }
+            connection.update(
+                """
+                INSERT INTO server_status (
+                    name, api_version, kind, resource_version, recorded_at, status_doc, doc_encoding, drain_state
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """.trimIndent(),
+            ) {
+                setString(1, name)
+                setString(2, SchemaVersion.CURRENT.wireValue)
+                setString(3, ServerKind.PAPER_SERVER.wireValue)
+                setLong(4, revision)
+                setString(5, CREATED_AT.toString())
+                setString(6, document)
+                setInt(7, encoding)
+                setString(8, DrainState.DRAIN_FAILED.name)
             }
             highest = maxOf(highest, revision)
         }

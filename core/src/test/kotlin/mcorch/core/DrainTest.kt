@@ -13,10 +13,15 @@ import io.kotest.matchers.types.shouldBeInstanceOf
 import mcorch.core.paper.PaperCommands
 import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
+import mcorch.schema.DrainBlock
+import mcorch.schema.DrainBlockReason
 import mcorch.schema.DrainState
+import mcorch.schema.DrainStatus
 import mcorch.schema.FailureClass
 import mcorch.schema.FailureReason
+import mcorch.schema.FailureStatus
 import mcorch.schema.RconSpec
+import mcorch.schema.ServerPhase
 import mcorch.schema.StorageSpec
 import org.junit.jupiter.api.Test
 import kotlin.time.Duration.Companion.hours
@@ -56,8 +61,19 @@ internal class DrainTest {
             harness.node.volumes shouldHaveSize 1
         }
 
+    /**
+     * The drain blocks, the container survives, and **no failure is recorded**.
+     *
+     * The last clause is the one that used to be false. A drain waiting for
+     * people to log off is the protocol working, and recording it as a
+     * `FailureStatus` made every consumer that asks "is anything wrong here" say
+     * yes about a server with three people on it — which is why the escalation
+     * needed a named exemption to stay quiet. Asserting the *absence* of the
+     * failure is therefore not tidiness: it is the property the rest of the
+     * behaviour now rests on.
+     */
     @Test
-    fun `a drain with players online aborts and the container survives`() =
+    fun `a drain with players online blocks without recording a failure, and the container survives`() =
         coreTest {
             val harness = Harness()
             val definition = paperDefinition()
@@ -72,13 +88,30 @@ internal class DrainTest {
             harness.pass(name)
             val outcome = harness.pass(name)
 
+            // Unchanged: a block is requeued with backoff exactly as an abort was,
+            // which is what lets it resolve when the last player leaves.
             outcome.shouldBeInstanceOf<ReconcileOutcome.Retry>()
             val status = harness.status(name).shouldNotBeNull()
             val drain = status.drain.shouldNotBeNull()
             drain.state shouldBe DrainState.DRAIN_FAILED
-            drain.failure.shouldNotBeNull().reason shouldBe FailureReason.DRAIN_NO_DESTINATION
-            drain.failure.shouldNotBeNull().failureClass shouldBe FailureClass.RETRYABLE
-            // A failed drain must not read as progress toward a stop.
+            drain.failure shouldBe null
+            // And not one level up either: the reconciler mirrors a drain's
+            // failure onto observed status, so a leak there would light up the
+            // dashboard's failure panel for a server nobody needs to look at.
+            status.failure shouldBe null
+
+            val blocked = drain.blocked.shouldNotBeNull()
+            blocked.reason shouldBe DrainBlockReason.AWAITING_ZERO_PLAYERS
+            blocked.since shouldBe harness.clock.instant()
+            blocked.observations shouldBe 1
+            blocked.message shouldContain "3 of 20 player slots"
+            blocked.message shouldContain "keeps running"
+
+            // The condition a dashboard reads, and its opposite number.
+            status.conditions.single { it.type == ConditionType.DRAIN_BLOCKED }.status shouldBe ConditionStatus.TRUE
+            status.attention().status shouldBe ConditionStatus.FALSE
+
+            // A parked drain must not read as progress toward a stop.
             status.draining.shouldBeFalse()
 
             // Nothing was stopped, nothing was removed, nobody was kicked.
@@ -89,6 +122,61 @@ internal class DrainTest {
                 .shouldBeInstanceOf<WorkloadObservation.Present>()
                 .state shouldBe WorkloadState.RUNNING
             harness.store.getServer(name).shouldNotBeNull()
+        }
+
+    /**
+     * Re-checking a block accumulates nothing but the count of re-checks.
+     *
+     * CLAUDE.md invariant 5 applied to the state a drain spends the longest in.
+     * `since` must not creep forward — an operator reads "waiting since" off it,
+     * and a value that reset every pass would say the block is always brand new —
+     * and no side effect may be issued for looking again.
+     */
+    @Test
+    fun `a second pass against a blocked drain issues nothing and does not restart the clock`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.node.online = 1
+            harness.store.deleteDefinition(name)
+            repeat(3) { harness.pass(name) }
+
+            val first =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+                    .blocked
+                    .shouldNotBeNull()
+            val saves = harness.node.saves.size
+            val probes = harness.node.probes.size
+
+            harness.clock.advance(5.minutes)
+            harness.pass(name)
+
+            val second =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+                    .blocked
+                    .shouldNotBeNull()
+            second.since shouldBe first.since
+            second.reason shouldBe first.reason
+            // The one thing that moves, and it moves because the loop looked.
+            second.observations shouldBe first.observations + 1
+
+            // A probe is the pass looking; everything that changes the server is
+            // still at zero.
+            harness.node.probes.size shouldBeGreaterThan probes
+            harness.node.saves shouldHaveSize saves
+            harness.node.stops shouldHaveSize 0
+            harness.node.removals shouldHaveSize 0
         }
 
     @Test
@@ -885,7 +973,12 @@ internal class DrainTest {
                     .shouldNotBeNull()
             drain.state shouldBe DrainState.DRAIN_FAILED
             drain.worldSaved.shouldBeFalse()
-            drain.failure.shouldNotBeNull().failureClass shouldBe FailureClass.RETRYABLE
+            // The other blocked call site, and the same answer: somebody is on
+            // the server, so this is a wait rather than a fault. Nothing here
+            // went wrong — the stop simply may not be re-issued while they are
+            // connected and the save no longer describes what they are doing.
+            drain.failure shouldBe null
+            drain.blocked.shouldNotBeNull().reason shouldBe DrainBlockReason.AWAITING_ZERO_PLAYERS
         }
 
     @Test
@@ -1275,12 +1368,13 @@ internal class DrainTest {
             repeat(3) { harness.pass(name) }
 
             val status = harness.status(name).shouldNotBeNull()
-            val failure =
-                status.drain
-                    .shouldNotBeNull()
-                    .failure
-                    .shouldNotBeNull()
-            failure.reason shouldBe FailureReason.DRAIN_NO_DESTINATION
+            val drain = status.drain.shouldNotBeNull()
+            // Through the new mechanism, not the deleted exemption. Four hours is
+            // twenty-four times `drainAttentionAfter`, so if this drain recorded a
+            // retryable failure of any reason at all the flag would be up: it is
+            // quiet because there is no failure to escalate from.
+            drain.failure shouldBe null
+            drain.blocked.shouldNotBeNull().reason shouldBe DrainBlockReason.AWAITING_ZERO_PLAYERS
             // Crying wolf on a busy evening every backoff interval is how an
             // operator learns the signal means nothing, and it is the only
             // escalation signal there is.
@@ -1288,6 +1382,12 @@ internal class DrainTest {
             status.conditions
                 .single { it.type == ConditionType.DRAINING }
                 .message shouldNotContain "not recovering on its own"
+            // Quiet is not the same as silent. The operator is told this is a
+            // wait rather than being told nothing, which is the difference
+            // between reading the fleet table and going to look at the host.
+            val blockedCondition = status.conditions.single { it.type == ConditionType.DRAIN_BLOCKED }
+            blockedCondition.status shouldBe ConditionStatus.TRUE
+            blockedCondition.message shouldContain "waiting, not stuck"
 
             harness.node.online = 0
             harness.settle(name, limit = 16)
@@ -1389,41 +1489,110 @@ internal class DrainTest {
         }
 
     /**
-     * Players being online is never an escalation, however long it goes on.
+     * A drain blocked on **fleet capacity** does need a human, once it has been
+     * blocked for long enough.
      *
-     * This used to iterate both classes, because the suppression was a
-     * convention and a permanent `DRAIN_NO_DESTINATION` was constructable. It is
-     * not any more — `FailureStatus` refuses the pair, so the state this once
-     * had to check for cannot exist and the loop cannot be made to produce it.
-     * `FailureStatusInvariantTest` in `:schema` is where that is now pinned; what
-     * is left here is the behaviour that remains reachable.
+     * This is the behaviour change, and it is the inverse of the test above.
+     * `DRAIN_NO_DESTINATION` used to mean both "people are playing" and "the fleet
+     * is full", so it had to be exempted from the escalation to keep the first
+     * one quiet — which silenced the second one too. The second one is exactly
+     * what the flag is for: the search ran, every server was full, and the drain
+     * will sit there until an operator adds capacity. Nothing about waiting fixes
+     * it.
+     *
+     * Driven through the drain record rather than through the loop on purpose.
+     * `:core` cannot yet *produce* this failure — there is no proxy and so no
+     * destination search — so the honest level to pin it at is the rule and the
+     * condition derived from it, which is what a dashboard reads either way.
      */
     @Test
-    fun `players being online is never an escalation, however long it goes on`() =
+    fun `a drain blocked on fleet capacity is escalated once it has been blocked for long enough`() =
         coreTest {
             val startedAt = MutableClock().instant()
-            val muchLater = startedAt.plusSeconds(60 * 60 * 4)
+            val noCapacity =
+                DrainStatus(
+                    state = DrainState.DRAIN_FAILED,
+                    startedAt = startedAt,
+                    enteredStateAt = startedAt,
+                    failure =
+                        FailureStatus(
+                            reason = FailureReason.DRAIN_NO_DESTINATION,
+                            // A literal at every call site, as the invariant in
+                            // `:schema` asks. Never computed from the reason.
+                            failureClass = FailureClass.RETRYABLE,
+                            message = "no server in the fleet had capacity for these players",
+                            occurredAt = startedAt,
+                        ),
+                )
 
-            escalates(
-                startedAt = startedAt,
-                failureClass = FailureClass.RETRYABLE,
-                reason = FailureReason.DRAIN_NO_DESTINATION,
-                now = muchLater,
-                after = 10.minutes,
-            ).shouldBeFalse()
+            // The control, and it is what makes this a test of the timer rather
+            // than of a hard-wired true: nine minutes in, the drain still has time
+            // for the fleet to change under it.
+            noCapacity.escalated(startedAt.plusSeconds(9 * 60), 10.minutes).shouldBeFalse()
+            noCapacity.escalated(startedAt.plusSeconds(11 * 60), 10.minutes).shouldBeTrue()
 
-            // The control: the same call with a different reason does escalate,
-            // so the assertion above is about the exclusion and not about some
-            // argument being wrong. It has already earned its place — under the
-            // pre-fix rule this was the assertion that went red, while the
-            // suppression above passed for the wrong reason.
+            // And it reaches the condition, which is the artefact an alert fires
+            // on. `DRAIN_BLOCKED` stays false: this one is not a healthy wait.
+            val status =
+                draftStatus(
+                    previous = null,
+                    name = resourceName("survival-01"),
+                    generation = 1,
+                    now = startedAt.plusSeconds(11 * 60),
+                    phase = ServerPhase.RUNNING,
+                    attentionAfter = 10.minutes,
+                    drain = noCapacity,
+                )
+            status.attention().status shouldBe ConditionStatus.TRUE
+            status.conditions.single { it.type == ConditionType.DRAIN_BLOCKED }.status shouldBe ConditionStatus.FALSE
+        }
+
+    /**
+     * The escalation rule has no exempt reason left, and cannot grow one back by
+     * accident.
+     *
+     * `escalates` no longer takes a [FailureReason] at all — the parameter went
+     * with the exemption — so the only inputs are the class and the elapsed time.
+     * A permanent failure fires at once; a retryable one fires on the threshold.
+     */
+    @Test
+    fun `the escalation rule is the class and the clock, and nothing else`() =
+        coreTest {
+            val startedAt = MutableClock().instant()
+
             escalates(
                 startedAt = startedAt,
                 failureClass = FailureClass.PERMANENT,
-                reason = FailureReason.DRAIN_STALLED,
                 now = startedAt,
                 after = 10.minutes,
             ).shouldBeTrue()
+            escalates(
+                startedAt = startedAt,
+                failureClass = FailureClass.RETRYABLE,
+                now = startedAt.plusSeconds(9 * 60),
+                after = 10.minutes,
+            ).shouldBeFalse()
+            escalates(
+                startedAt = startedAt,
+                failureClass = FailureClass.RETRYABLE,
+                now = startedAt.plusSeconds(10 * 60),
+                after = 10.minutes,
+            ).shouldBeTrue()
+
+            // A drain with nothing recorded against it is never escalated, whatever
+            // its age — and that one line is what keeps a blocked drain quiet now
+            // that there is no list of reasons to consult.
+            DrainStatus(
+                state = DrainState.DRAIN_FAILED,
+                startedAt = startedAt,
+                enteredStateAt = startedAt,
+                blocked =
+                    DrainBlock(
+                        reason = DrainBlockReason.AWAITING_ZERO_PLAYERS,
+                        message = "2 of 20 player slots are in use",
+                        since = startedAt,
+                    ),
+            ).escalated(startedAt.plusSeconds(60 * 60 * 4), 10.minutes).shouldBeFalse()
         }
 
     /**

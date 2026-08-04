@@ -1,5 +1,7 @@
 package mcorch.core
 
+import mcorch.schema.DrainBlock
+import mcorch.schema.DrainBlockReason
 import mcorch.schema.FailureClass
 import mcorch.schema.FailureReason
 import mcorch.schema.FailureStatus
@@ -36,6 +38,38 @@ internal fun recordFailure(
             occurredAt = now,
             attempts = 1,
         )
+    }
+
+/**
+ * The same bookkeeping for a drain that is blocked rather than failing.
+ *
+ * [DrainBlock.since] keeps pointing at the *first* pass that found this block, so
+ * "waiting since 19:40" survives every re-check, and [DrainBlock.observations]
+ * counts the passes that have looked. Together they are what tells an operator
+ * the loop is still watching rather than wedged — the same job
+ * [FailureStatus.attempts] does for a failure, which is why the two are shaped
+ * alike. A different reason starts over, because it is a different wait.
+ *
+ * Kept beside [recordFailure] rather than folded into it. They take different
+ * types, they carry different fields, and a single function over both would need
+ * the caller to say which one it meant — which is the discrimination the split
+ * exists to remove.
+ */
+internal fun recordBlock(
+    reason: DrainBlockReason,
+    message: String,
+    now: Instant,
+    previous: DrainBlock?,
+): DrainBlock =
+    if (previous != null && previous.reason == reason) {
+        DrainBlock(
+            reason = reason,
+            message = message,
+            since = previous.since,
+            observations = previous.observations + 1,
+        )
+    } else {
+        DrainBlock(reason = reason, message = message, since = now, observations = 1)
     }
 
 /**

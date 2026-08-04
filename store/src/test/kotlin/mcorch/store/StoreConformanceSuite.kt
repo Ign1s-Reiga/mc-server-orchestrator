@@ -9,6 +9,7 @@ import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.types.shouldBeInstanceOf
 import kotlinx.coroutines.test.runTest
+import mcorch.schema.DrainBlockReason
 import mcorch.schema.DrainState
 import mcorch.schema.PaperServerStatus
 import mcorch.schema.ResourceName
@@ -183,6 +184,49 @@ abstract class StoreConformanceSuite {
             // Disjoint: a confirmed save has no request outstanding, and a store
             // that resurrected one would wedge the drain on the next pass.
             drain.saveRequestedAt.shouldBeNull()
+        }
+
+    /**
+     * The third record, and the one whose meaning is carried by a null.
+     *
+     * A blocked drain is waiting for players to log off. It records a
+     * `DrainBlock` and **no** `FailureStatus`, and that absence is what keeps the
+     * escalation quiet — so a store that resurrected a failure here, or dropped
+     * the block and left the drain looking like an ordinary abort, would put a
+     * server with people happily playing on it back into the "a human must act"
+     * path on the first read after a restart.
+     *
+     * Field for field rather than by equality alone, because the fields differ in
+     * how they fail. A dropped `since` re-dates the wait to the restart; a dropped
+     * `observations` says the loop has looked once when it has looked forty times.
+     */
+    @Test
+    fun `a drain blocked on players comes back blocked, and comes back with no failure`() =
+        withStore { store ->
+            store.putDefinition(Fixtures.definitionNamed("survival-04")).getOrThrow()
+            val expected = Fixtures.blockedDrain()
+            val status = Fixtures.fullStatus("survival-04").copy(drain = expected, failure = null)
+
+            store.putStatus(status).getOrThrow()
+
+            val drain =
+                store
+                    .getServer(Fixtures.resourceName("survival-04"))
+                    .shouldNotBeNull()
+                    .status
+                    .shouldNotBeNull()
+                    .status
+                    .shouldBeInstanceOf<PaperServerStatus>()
+                    .drain
+                    .shouldNotBeNull()
+            drain shouldBe expected
+            val blocked = drain.blocked.shouldNotBeNull()
+            blocked.reason shouldBe DrainBlockReason.AWAITING_ZERO_PLAYERS
+            blocked.message shouldBe expected.blocked?.message
+            blocked.since shouldBe expected.blocked?.since
+            blocked.observations shouldBe expected.blocked?.observations
+            // The assertion the record exists for.
+            drain.failure.shouldBeNull()
         }
 
     @Test

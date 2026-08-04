@@ -5,6 +5,7 @@ import mcorch.api.json.JsonObjectBuilder
 import mcorch.api.json.jsonObject
 import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
+import mcorch.schema.DrainBlock
 import mcorch.schema.DrainState
 import mcorch.schema.DrainStatus
 import mcorch.schema.DurationFormat
@@ -314,7 +315,28 @@ internal object ServerJson {
             put("transferAttempts", drain.transferAttempts)
             // A server name. Never a player.
             put("destination", drain.destination?.value)
+            putOrNull("blocked", drain.blocked, ::blocked)
             putOrNull("failure", drain.failure, ::failure)
+        }
+
+    /**
+     * A drain that is waiting and not broken.
+     *
+     * Rendered beside `failure` and never instead of it: a client reads
+     * `blocked !== null && failure === null` as *waiting*, and the two are
+     * disjoint in everything this API serves. `observations` is deliberately a
+     * count of passes rather than a duration — `since` is the instant, and the
+     * client does the arithmetic against its own clock rather than against a
+     * number that was stale the moment it was written.
+     */
+    private fun blocked(block: DrainBlock): Json.Obj =
+        jsonObject {
+            put("reason", block.reason)
+            // Counts and prose. There is no player identity in a block message
+            // for the same reason there is none in a failure message.
+            put("message", block.message)
+            put("since", block.since)
+            put("observations", block.observations)
         }
 
     private fun failure(failure: FailureStatus): Json.Obj =
@@ -418,7 +440,10 @@ internal object ServerJson {
      * `needsAttention` stays a flag rather than a state, matching what
      * [ConditionType.NEEDS_ATTENTION] says about itself: it reports, it never
      * authorises. A drain that has been failing for an hour is still `DRAINING`,
-     * with the flag raised beside it.
+     * with the flag raised beside it. `drainBlocked` is the same shape of fact
+     * pointing the other way — *do not act* — and is a flag for the same reason:
+     * a drain waiting on players is still `TERMINATING` or `DRAINING`, and the
+     * badge must not be softened to say otherwise while a delete is outstanding.
      */
     fun displayState(stored: StoredServer): DisplayState {
         val status = stored.status?.status as? PaperServerStatus
@@ -502,6 +527,23 @@ internal object ServerJson {
             // with a corrupt observation carries the fact here rather than losing
             // it. Filter on this, not on `state == 'UNREADABLE'`.
             put("unreadable", stored.unreadable != null)
+            // The third flag, and the one that answers the question an operator
+            // actually asks about a drain that is not moving: *is this stuck, or
+            // is it just waiting for people to log off?* Without it the two are
+            // indistinguishable from a fleet table — both show `TERMINATING` with
+            // a `drainState` of `DRAIN_FAILED` — and the only discriminator a
+            // dashboard had was guessing from `playersOnline`, which is a
+            // coincidence of today's one block reason rather than the fact itself.
+            //
+            // It is the inverse of `needsAttention` in what it tells somebody to
+            // do — this one says *do not act* — so the two are never both true and
+            // a dashboard may show them as one tri-state without losing anything.
+            put(
+                "drainBlocked",
+                status?.conditions?.any {
+                    it.type == ConditionType.DRAIN_BLOCKED && it.status == ConditionStatus.TRUE
+                } ?: false,
+            )
             put("drainState", status?.drain?.state)
             put("playersOnline", status?.players?.online)
             put(
@@ -518,6 +560,16 @@ internal object ServerJson {
         state: DisplayState,
     ): String =
         when {
+            // Ahead of the general terminating branch below, and this ordering is
+            // the whole operator-facing point of the change. A delete requested on
+            // a server people are playing on used to render as "delete requested;
+            // draining (drain failed)" — which is the exact question this is meant
+            // to answer, answered wrongly: the drain has not failed, and there is
+            // nothing to do but wait.
+            state == DisplayState.TERMINATING && status?.drain?.blocked != null -> {
+                "delete requested; waiting, not stuck — ${status.drain?.blocked?.message.orEmpty()}"
+            }
+
             state == DisplayState.TERMINATING && status?.drain != null -> {
                 "delete requested; draining (${status.drain?.state?.name?.lowercase()?.replace('_', ' ')})"
             }
@@ -550,6 +602,14 @@ internal object ServerJson {
 
             status.failure != null -> {
                 status.failure?.message.orEmpty()
+            }
+
+            // Above the `DRAIN_FAILED` line below, and the ordering is the whole
+            // point: a blocked drain parks in that state too, and "the drain
+            // aborted" is the sentence that would send somebody to fix a server
+            // where people are playing.
+            status.drain?.blocked != null -> {
+                "waiting, not stuck — ${status.drain?.blocked?.message.orEmpty()}"
             }
 
             status.drain?.state == DrainState.DRAIN_FAILED -> {

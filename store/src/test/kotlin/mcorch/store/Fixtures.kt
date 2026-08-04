@@ -2,6 +2,8 @@ package mcorch.store
 
 import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
+import mcorch.schema.DrainBlock
+import mcorch.schema.DrainBlockReason
 import mcorch.schema.DrainState
 import mcorch.schema.DrainStatus
 import mcorch.schema.FailureClass
@@ -192,5 +194,30 @@ internal object Fixtures {
             worldSavedAt = at.minusSeconds(20),
             deregisteredAt = at.minusSeconds(10),
             failure = null,
+        )
+
+    /**
+     * A drain that is parked and *not* failing: people are online and there is
+     * nowhere to send them.
+     *
+     * The third record in the set, and the one whose defining feature is a null.
+     * `blocked` and `failure` are disjoint by construction, so a fixture cannot
+     * carry both — and a round trip that quietly resurrected a failure here would
+     * put a healthy server back into the escalation path on the first read after a
+     * restart.
+     */
+    fun blockedDrain(at: Instant = T0): DrainStatus =
+        fullDrain(DrainState.DRAIN_FAILED, at).copy(
+            saveRequestedAt = null,
+            playersEvacuated = false,
+            destination = null,
+            failure = null,
+            blocked =
+                DrainBlock(
+                    reason = DrainBlockReason.AWAITING_ZERO_PLAYERS,
+                    message = "3 of 20 player slots are in use; an = sign and a \\ backslash, to prove escaping",
+                    since = at.minusSeconds(900),
+                    observations = 37,
+                ),
         )
 }

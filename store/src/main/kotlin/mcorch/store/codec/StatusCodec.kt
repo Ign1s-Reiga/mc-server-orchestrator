@@ -2,6 +2,8 @@ package mcorch.store.codec
 
 import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
+import mcorch.schema.DrainBlock
+import mcorch.schema.DrainBlockReason
 import mcorch.schema.DrainState
 import mcorch.schema.DrainStatus
 import mcorch.schema.FailureClass
@@ -239,6 +241,13 @@ internal object StatusCodec {
         scope.put("deregisteredAt", drain.deregisteredAt)
         scope.put("transferAttempts", drain.transferAttempts)
         scope.put("destination", drain.destination?.value)
+        // Written as its own object beside `failure` rather than as a variant of
+        // it. The two mean opposite things to an operator — waiting versus
+        // broken — and a single object discriminated by a key would put the whole
+        // difference on whichever code path remembered to look at the
+        // discriminator. V5 rewrote the rows that carried the old shape; see
+        // `V5BlockedDrainIsNotAFailure`.
+        drain.blocked?.let { block -> scope.scope("blocked") { writeBlock(this, block) } }
         drain.failure?.let { failure -> scope.scope("failure") { writeFailure(this, failure) } }
     }
 
@@ -258,7 +267,44 @@ internal object StatusCodec {
             deregisteredAt = reader.instant("$prefix.deregisteredAt"),
             transferAttempts = reader.requireInt("$prefix.transferAttempts"),
             destination = reader.value("$prefix.destination", ResourceName::of),
+            blocked = readBlock(reader, "$prefix.blocked"),
             failure = readFailure(reader, "$prefix.failure"),
+        )
+    }
+
+    // ------------------------------------------------------------------------ block
+
+    private fun writeBlock(
+        scope: DocumentScope,
+        block: DrainBlock,
+    ) {
+        scope.put("reason", block.reason)
+        scope.put("message", block.message)
+        scope.put("since", block.since)
+        scope.put("observations", block.observations)
+    }
+
+    /**
+     * A block, or null when there is none.
+     *
+     * No `require` beyond the ones the readers already impose, deliberately.
+     * `DrainBlock` has no forbidden field combination to enforce and gains no
+     * constructor check, because everything decoded here is paid for by
+     * `listServers` — a check added on this path is another way for one
+     * hand-edited row to fail a fleet read. What can still fail is an
+     * unrecognised `reason`, which `requireEnum` reports as a corrupt row and the
+     * list read isolates to the row it came from.
+     */
+    private fun readBlock(
+        reader: DocumentReader,
+        prefix: String,
+    ): DrainBlock? {
+        if (!reader.has("$prefix.reason")) return null
+        return DrainBlock(
+            reason = reader.requireEnum<DrainBlockReason>("$prefix.reason"),
+            message = reader.requireString("$prefix.message"),
+            since = reader.requireInstant("$prefix.since"),
+            observations = reader.requireInt("$prefix.observations"),
         )
     }
 

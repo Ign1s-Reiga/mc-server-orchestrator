@@ -105,31 +105,17 @@ public enum class FailureReason {
      * This is step 3 of the drain protocol failing on its own terms: the search
      * ran and came back empty. It does **not** resolve itself — it needs an
      * operator to add capacity or start a server — so it escalates like any other
-     * retryable drain failure once it has been true for long enough. It used to
-     * cover [DRAIN_AWAITING_ZERO_PLAYERS] as well, and inherited that reason's
-     * exemption from escalation; the pair are opposite news and are now opposite
-     * values.
+     * retryable drain failure once it has been true for long enough.
+     *
+     * It is a [FailureReason] and not a [DrainBlockReason] for exactly that
+     * reason. "No transfer counterparty exists, so wait for people to log off" is
+     * the protocol working and is recorded as [DrainBlock]; "the search ran and
+     * the fleet is full" is the fleet being too small, and a human has to fix it.
+     * The two used to be this one value, which is why the escalation needed an
+     * exemption to avoid alarming on the first — see [DrainStatus.blocked] for
+     * what replaced that.
      */
     DRAIN_NO_DESTINATION,
-
-    /**
-     * The drain has nowhere to send anybody and is waiting for the players on
-     * this server to log off by themselves.
-     *
-     * There is no counterparty to transfer to: a standalone Paper server with no
-     * proxy in front of it, or the proxy's own drain, since a fleet has one front
-     * door. The protocol does not kick players to make progress, so the only
-     * correct behaviour is to keep the container running and keep looking.
-     *
-     * **This is the one reason that is never escalated.** It resolves itself
-     * when the last player logs off, and an attention flag that fires every
-     * backoff interval on a busy evening is one operators learn to ignore —
-     * which costs them the flag for the failures that do need a person. That
-     * exemption is only defensible because the state is transient, which is why
-     * it is also one of the reasons that may not be classified
-     * [FailureClass.PERMANENT]; see [FailureStatus].
-     */
-    DRAIN_AWAITING_ZERO_PLAYERS,
 
     DRAIN_TRANSFER_FAILED,
     DRAIN_SAVE_TIMEOUT,
@@ -151,36 +137,34 @@ public enum class FailureReason {
  * A classified failure. [message] is operator-facing detail — it must not
  * contain player names, UUIDs or addresses.
  *
- * ## Why two reasons may not be permanent
+ * ## Why one reason may not be permanent
  *
  * [ALWAYS_RETRYABLE] holds the reasons a call site may not classify
  * [FailureClass.PERMANENT]. `PERMANENT` is not a severity, it is an instruction:
- * *stop trying*. For these two there is no version of stopping that is safer
- * than continuing, because continuing costs a backoff interval and the container
- * stays up either way.
+ * *stop trying*.
  *
- * - [FailureReason.DRAIN_NO_DESTINATION] — no server in the fleet had capacity.
- *   Fleet capacity is not a property of this server and not a fixed one: it
- *   returns when a player logs off somewhere else, when a scale-up lands, when an
- *   operator starts a lobby. A permanent classification freezes a drain that the
- *   next pass could have finished, and freezes it in the one state where the
- *   container must keep running — so the cost of being wrong is unbounded and the
- *   saving is one search per interval. (This reason *does* escalate: it needs a
- *   person, it just does not need the loop to give up. The two are different
- *   questions and are answered in different places.)
- * - [FailureReason.DRAIN_AWAITING_ZERO_PLAYERS] — waiting for the last player to
- *   leave. This one is additionally the reason the escalation never fires on, and
- *   that exemption is only defensible while the state is transient. Classified
- *   `PERMANENT` it would be a wedged, unretried drain that is also never
- *   flagged: silently the worst of both, and precisely the state the escalation
- *   exists to surface.
+ * There is one, [FailureReason.DRAIN_NO_DESTINATION]: the search for somewhere
+ * to put this server's players ran and the fleet had no capacity. Fleet capacity
+ * is not a property of this server and not a fixed one — it comes back when a
+ * player logs off somewhere else, when a scale-up lands, when an operator starts
+ * a lobby — so there is no version of *stop looking for a destination* that is
+ * safer than *keep looking, container running*. Giving up freezes a drain the
+ * next pass could have finished, and freezes it in the one state where the
+ * container must keep running; continuing costs one search per backoff interval.
+ * The cost of being wrong is unbounded and the saving is a search.
  *
- * The pair is refused here, where the two fields meet, rather than guarded at
- * each site that builds one — it was previously a convention held up by two call
- * sites happening to agree, and a third would have broken it without failing a
- * test. Call sites should still pass [FailureClass.RETRYABLE] as a literal
- * rather than a computed value, so the check stays a backstop rather than the
- * only thing deciding.
+ * That argument stands on the capacity case alone and does not borrow anything
+ * from the escalation. This reason *does* raise [ConditionType.NEEDS_ATTENTION]
+ * once it has been true for long enough — a fleet that is too small needs a
+ * person — and the rule here would be identical if it did not. *Stop trying* and
+ * *call a human* are different questions and are answered in different places.
+ *
+ * It is refused here, where the two fields meet, rather than guarded at each site
+ * that builds one — it was previously a convention held up by two call sites
+ * happening to agree, and a third would have broken it without failing a test.
+ * Call sites should still pass [FailureClass.RETRYABLE] as a literal rather than
+ * a computed value, so the check stays a backstop rather than the only thing
+ * deciding.
  *
  * It is one `require` over a set rather than one per reason on purpose. This
  * runs on decode as well as construction — `mcorch.store` rebuilds statuses
@@ -209,13 +193,50 @@ public data class FailureStatus(
 
     public companion object {
         /** Reasons that may only ever be [FailureClass.RETRYABLE]. See the note above. */
-        public val ALWAYS_RETRYABLE: Set<FailureReason> =
-            setOf(
-                FailureReason.DRAIN_NO_DESTINATION,
-                FailureReason.DRAIN_AWAITING_ZERO_PLAYERS,
-            )
+        public val ALWAYS_RETRYABLE: Set<FailureReason> = setOf(FailureReason.DRAIN_NO_DESTINATION)
     }
 }
+
+/**
+ * Why a drain has stopped advancing when nothing has gone wrong.
+ *
+ * A closed set, like [FailureReason], and served through `/meta` for the same
+ * reason: a dashboard has to be able to render a value it was not taught.
+ */
+public enum class DrainBlockReason {
+    /**
+     * There is no counterparty to transfer players through, so the drain is
+     * waiting for the last of them to log off by themselves.
+     *
+     * A standalone Paper server with no proxy in front of it, or the proxy's own
+     * drain, since a fleet has one front door. The protocol does not kick players
+     * to make progress (`failure-modes.md` item 4), so the only correct behaviour
+     * is to keep the container running and keep looking.
+     */
+    AWAITING_ZERO_PLAYERS,
+}
+
+/**
+ * A drain that is not advancing, and is not failing either.
+ *
+ * The same shape as [FailureStatus] with one field missing, and the missing one
+ * is the point: there is no [FailureClass] because there is nothing to classify.
+ * A block is always retried — that is what it means for it to resolve on its own
+ * — so a field saying whether to keep trying would only ever hold one value, and
+ * a field that can only hold one value is an invitation to set the other.
+ *
+ * [message] is operator-facing and must not contain player names, UUIDs or
+ * addresses; counts are fine and are the whole content of the useful ones.
+ * [since] is when this block was *first* recorded rather than when the loop last
+ * looked, and [observations] is how many passes have found it still true — the
+ * pair is what tells an operator the loop is still watching rather than wedged.
+ */
+public data class DrainBlock(
+    val reason: DrainBlockReason,
+    val message: String,
+    val since: Instant,
+    val observations: Int = 1,
+)
 
 /**
  * What the loop knows about the image. [resolvedDigest] is what makes a repeat
@@ -324,6 +345,32 @@ public data class StorageStatus(
  *   confirmation, an unbroken chain of zero-player observations, and a fresh
  *   zero-player probe taken on that same pass, so it is not a stop taken on the
  *   strength of the contradictory row by itself.
+ *
+ * ## [blocked] is not [failure], and a consumer has to tell three states apart
+ *
+ * - **Progressing** — [state] is not [DrainState.DRAIN_FAILED], and neither
+ *   [blocked] nor [failure] is set.
+ * - **Blocked, and healthy** — [blocked] is set and [failure] is null. Nothing is
+ *   wrong; there is simply nothing this drain is allowed to do yet. It parks in
+ *   [DrainState.DRAIN_FAILED], keeps being retried, and resolves without anybody
+ *   doing anything.
+ * - **Failed** — [failure] is set. Something went wrong, and
+ *   [FailureStatus.failureClass] says whether the loop is still trying.
+ *
+ * A blocked drain used to record a [FailureStatus] with a dedicated
+ * [FailureReason]. Every consumer that asks "is anything wrong here" then said
+ * yes about a server with people happily playing on it, and the escalation
+ * carried an explicit exemption for that one reason so it would not alarm on a
+ * busy evening. Recording no failure retires the exemption rather than moving it:
+ * the escalation is already false whenever [failure] is null, so the correct
+ * behaviour falls out of the rule that was always there.
+ *
+ * The two are disjoint by construction — every site that records one clears the
+ * other — and that is deliberately **not** enforced by a `require` here. This
+ * type is rebuilt on every status decode, so a check costs the widest read in the
+ * system and is one more way for a single hand-edited row to abort a fleet read.
+ * A document carrying both is read, and wherever the two are consulted together
+ * the failure wins: reporting the louder of the two is the safe direction.
  */
 public data class DrainStatus(
     val state: DrainState,
@@ -339,6 +386,8 @@ public data class DrainStatus(
     val transferAttempts: Int = 0,
     /** Where players were sent. A server name, never a player. */
     val destination: ResourceName? = null,
+    /** Parked, and nothing is wrong. Null unless the drain is waiting on something. See the note above. */
+    val blocked: DrainBlock? = null,
     val failure: FailureStatus? = null,
 ) {
     /**
@@ -360,6 +409,34 @@ public enum class ConditionType {
     /** Actually joinable, not merely running. */
     READY,
     DRAINING,
+
+    /**
+     * The drain has stopped advancing and **nothing is wrong**.
+     *
+     * This is the answer to the only question an operator asks about a drain that
+     * is not moving: *is it stuck, or is it just waiting for people to log off?*
+     * Today it means the latter — see [DrainBlockReason.AWAITING_ZERO_PLAYERS] —
+     * and the honest report is that the container keeps running, the server stays
+     * joinable, and the drain resumes on its own.
+     *
+     * Deliberately a separate signal from [NEEDS_ATTENTION] rather than a shade
+     * of it: this one says **do not act**, that one says **act**. They are never
+     * both true. Folding the two together is how the attention flag comes to fire
+     * on a busy evening every backoff interval, which is how an operator learns it
+     * means nothing.
+     *
+     * `False` rather than `Unknown` on a server with no drain at all, for the same
+     * reason [NEEDS_ATTENTION] is: "nothing is blocked" is something the loop
+     * positively knows, and an alert that has to treat `Unknown` as quiet treats a
+     * genuinely unreadable status as quiet too. [StatusCondition.lastTransitionAt]
+     * is *blocked since when*, which is the number a dashboard puts beside it.
+     *
+     * True only while [DrainStatus.failure] is null. The two are disjoint by
+     * construction, and a stored document that says otherwise is reported as
+     * failed — the louder of the two.
+     */
+    DRAIN_BLOCKED,
+
     PLAYERS_EVACUATED,
     WORLD_SAVED,
 
@@ -401,15 +478,19 @@ public enum class ConditionType {
      * and keeps its container running: at a limit you stop trying, you do not
      * stop a Minecraft server (`failure-modes.md` item 7).
      *
-     * Set today only by a drain that has been failing retryably for longer than
-     * `ReconcilerConfig.drainAttentionAfter`, and never by one whose reason is
-     * [FailureReason.DRAIN_AWAITING_ZERO_PLAYERS] — that is the protocol working,
-     * and an escalation that fires on a busy evening teaches operators to ignore
-     * the signal. That exemption belongs to that reason alone: a
-     * [FailureReason.DRAIN_NO_DESTINATION] is a drain sitting blocked until
-     * somebody adds capacity, which is exactly what this flag is for. The
-     * name is deliberately general: a permanently failed bring-up is the obvious
-     * next thing to raise it, and doing so needs no schema change.
+     * Set today by a drain that has failed permanently, and by one that has been
+     * failing retryably for longer than `ReconcilerConfig.drainAttentionAfter`.
+     * **No [FailureReason] is exempt.** There used to be one, for the drain
+     * waiting on players to log off, and it is gone because that drain now records
+     * no failure at all ([DrainStatus.blocked]) — so this flag, which is false
+     * whenever [DrainStatus.failure] is null, stays quiet by the ordinary rule
+     * instead of by an exception to it. The exemption was worth deleting on its
+     * own: it was checked before the failure class to stop a future permanent
+     * classification routing a healthy drain back in, and that ordering was a
+     * second thing to get right in a rule that should not have had a first.
+     *
+     * The name is deliberately general: a permanently failed bring-up is the
+     * obvious next thing to raise it, and doing so needs no schema change.
      */
     NEEDS_ATTENTION,
 }

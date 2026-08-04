@@ -3,6 +3,7 @@ package mcorch.api
 import io.kotest.matchers.shouldBe
 import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
+import mcorch.schema.DrainBlockReason
 import mcorch.schema.DrainPolicy
 import mcorch.schema.DrainState
 import mcorch.schema.FailureClass
@@ -49,6 +50,7 @@ class MetaTest {
         enums["conditionStatus"] shouldBe ConditionStatus.entries.map { it.name }
         enums["failureReason"] shouldBe FailureReason.entries.map { it.name }
         enums["failureClass"] shouldBe FailureClass.entries.map { it.name }
+        enums["drainBlockReason"] shouldBe DrainBlockReason.entries.map { it.name }
         enums["displayState"] shouldBe ServerJsonStates.all()
         enums["statePart"] shouldBe StatePart.entries.map { it.name }
     }
@@ -96,6 +98,7 @@ class MetaTest {
                 "conditionStatus",
                 "failureReason",
                 "failureClass",
+                "drainBlockReason",
                 "displayState",
                 "statePart",
                 "storageMode",

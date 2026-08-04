@@ -2,6 +2,7 @@ package mcorch.core
 
 import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
+import mcorch.schema.DrainBlock
 import mcorch.schema.DrainState
 import mcorch.schema.DrainStatus
 import mcorch.schema.FailureClass
@@ -101,6 +102,13 @@ private fun deriveConditions(
     // flapping the condition off and on again between two passes of the same
     // stuck drain.
     val needsAttention = drain?.escalated(now, attentionAfter) == true
+    // Blocked *and* not failed. The two are disjoint by construction, so the
+    // second half only decides for a stored document that has been repaired by
+    // hand — and there the failure wins, because reporting the louder of the two
+    // is the direction that does not leave somebody uncalled. It also makes the
+    // three states a consumer has to tell apart mutually exclusive at the
+    // condition level, which is what the dashboard reads.
+    val drainBlocked = drain?.blocked != null && drain.failure == null
     val entries =
         listOf(
             condition(
@@ -123,6 +131,17 @@ private fun deriveConditions(
                 ConditionType.DRAINING,
                 draining.toConditionStatus(),
                 drain?.let { drainMessage(it, needsAttention) }.orEmpty(),
+            ),
+            // False rather than unknown for the same reason NEEDS_ATTENTION is
+            // below: "nothing is blocked" is something the loop positively knows,
+            // and a dashboard that has to read UNKNOWN as quiet reads an
+            // unreadable status as quiet too. The message is the block's own,
+            // which carries the counts an operator needs to see that people are
+            // simply playing.
+            condition(
+                ConditionType.DRAIN_BLOCKED,
+                drainBlocked.toConditionStatus(),
+                if (drainBlocked) blockedMessage(drain?.blocked) else "",
             ),
             // False rather than unknown on a server with nothing wrong with it:
             // "no escalation is outstanding" is something the loop positively
@@ -186,6 +205,27 @@ private fun drainMessage(
     } else {
         state
     }
+}
+
+/**
+ * What the drain is waiting for, and — as loudly — that waiting is the correct
+ * behaviour.
+ *
+ * The sentence an operator reads first has to say *do not act*. This condition
+ * appears on a server whose badge is `TERMINATING` or `DRAINING`, next to a
+ * `drainState` of `DRAIN_FAILED`, which without prose reads as a server that has
+ * given up. The remedy for that reading is not a quieter badge; it is telling
+ * them what will happen next, which is nothing, by design, until people log off.
+ *
+ * `since` rather than a duration: the loop drafts a status on its own schedule, so
+ * a rendered "waiting for 4 minutes" would be as stale as the last pass, whereas
+ * an instant stays correct and the dashboard can count from it.
+ */
+private fun blockedMessage(block: DrainBlock?): String {
+    if (block == null) return ""
+    return "this drain is waiting, not stuck, and needs nobody: ${block.message}. Blocked since " +
+        "${block.since}, re-checked ${block.observations} time(s); the container keeps running until it can " +
+        "finish on its own."
 }
 
 /**

@@ -282,9 +282,10 @@ public data class ProxyLifecycleSpec(
  * seals the listener and then waits for the last player to log off. That is why
  * there is no wait timeout here and there will not be one: a timeout on that
  * wait can only be spelled "disconnect them", and the protocol does not kick
- * players to make progress. A proxy drain that is still waiting records
- * [FailureReason.DRAIN_AWAITING_ZERO_PLAYERS], which is retryable and
- * deliberately never escalated.
+ * players to make progress. A proxy drain that is still waiting records no
+ * failure at all — [DrainStatus.blocked] with
+ * [DrainBlockReason.AWAITING_ZERO_PLAYERS] — so it is retried and never
+ * escalated, both by the ordinary rules.
  */
 public data class ProxyDrainSpec(
     val policy: DrainPolicy = DrainPolicy.WAIT_FOR_ZERO_PLAYERS,

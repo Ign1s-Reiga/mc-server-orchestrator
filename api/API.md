@@ -562,7 +562,7 @@ One derivation, served by the server, so every dashboard does not invent its own
 
 ```json
 { "state": "READY", "ready": true, "needsAttention": false, "unreadable": false,
-  "drainState": null, "playersOnline": 3, "playersMax": 60,
+  "drainBlocked": false, "drainState": null, "playersOnline": 3, "playersMax": 60,
   "detail": "" }
 ```
 
@@ -604,8 +604,8 @@ matters: `PENDING` is a state you wait out, and a corrupt row waited out for eve
 > broken *record* with an unreachable *host*, which are different problems with
 > different remedies.
 
-`needsAttention` and `unreadable` are **flags, not states** — and the flags are
-what you filter on, because `TERMINATING` outranks both.
+`needsAttention`, `unreadable` and `drainBlocked` are **flags, not states** — and
+the flags are what you filter on, because `TERMINATING` outranks all three.
 
 - `needsAttention` — **somebody must act.** True when a `NEEDS_ATTENTION`
   condition is `TRUE`, *and* whenever `unreadable` is set. It reports and never
@@ -613,13 +613,46 @@ what you filter on, because `TERMINATING` outranks both.
   beside it, and `lastTransitionAt` on the condition is what an alert fires on.
 - `unreadable` — **what is wrong.** True whenever the resource carries an
   `unreadable` mark, including when the badge says `TERMINATING`.
+- `drainBlocked` — **do not act.** True when a `DRAIN_BLOCKED` condition is
+  `TRUE`: the drain has stopped advancing and *nothing has gone wrong*. Today
+  that means players are still connected and there is no proxy to move them
+  through, so the protocol waits rather than disconnecting anybody. The container
+  keeps running, the server stays joinable, and it resolves on its own. Use
+  `lastTransitionAt` on the condition for "blocked since when", or
+  `status.drain.blocked.since` for the same instant on the record itself.
 
-**Both are set for an unreadable row, and they are not redundant.** A row the
-store cannot decode reads the same on every pass, so the loop cannot move it and
-only a person repairing it can — which is precisely what `needsAttention` is
-chartered to mean. Alert on `needsAttention`; filter and label with `unreadable`.
-A dashboard that only watched `needsAttention` would otherwise never see these
-servers, and that is the one audience that has to.
+**Both `needsAttention` and `unreadable` are set for an unreadable row, and they
+are not redundant.** A row the store cannot decode reads the same on every pass,
+so the loop cannot move it and only a person repairing it can — which is
+precisely what `needsAttention` is chartered to mean. Alert on `needsAttention`;
+filter and label with `unreadable`. A dashboard that only watched
+`needsAttention` would otherwise never see these servers, and that is the one
+audience that has to.
+
+**`drainBlocked` and `needsAttention` are never both true**, and that is the
+whole reason `drainBlocked` exists. A drain that is not advancing shows
+`drainState: "DRAIN_FAILED"` whether it is stuck or merely waiting — that state
+means *parked*, not *broken* — so those two badges alone are indistinguishable,
+and the only question an operator has about such a server is which of the two it
+is. Render it as a tri-state beside the badge:
+
+```ts
+const drain =
+  display.needsAttention ? 'needs a human'
+  : display.drainBlocked ? 'waiting for players'
+  : 'in progress';
+```
+
+Do not infer the waiting case from `playersOnline > 0`. That was the only
+discriminator available before this flag, and it is a coincidence of today's one
+block reason rather than the fact itself — a *stuck* drain usually has players on
+it too. `status.drain.blocked.reason` is the enumerated answer, advertised in
+`meta.enums.drainBlockReason`.
+
+A blocked drain records **no failure**: `status.failure` and
+`status.drain.failure` are both `null`, and `status.drain.blocked` is set
+instead. It used to record a `FailureReason`, which meant a server with people
+happily playing on it lit up every "is anything wrong" panel a dashboard had.
 
 `playersMax` falls back to `spec.maxPlayers` when nothing has been observed.
 
@@ -851,7 +884,8 @@ none — not in a filter and not in a create form:
   "kinds": ["PaperServer"],
   "enums": {
     "phase": [...], "drainState": [...], "conditionType": [...], "conditionStatus": [...],
-    "failureReason": [...], "failureClass": [...], "displayState": [...],
+    "failureReason": [...], "failureClass": [...], "drainBlockReason": [...],
+    "displayState": [...],
     "statePart": ["DESIRED", "OBSERVED"],
     "storageMode": ["persistent", "ephemeral"],
     "drainPolicy": ["waitForZeroPlayers"]
@@ -864,8 +898,9 @@ none — not in a filter and not in a create form:
 #### Two spellings, and the split is not cosmetic
 
 - **`phase`, `drainState`, `conditionType`, `conditionStatus`, `failureReason`,
-  `failureClass`, `displayState`, `statePart`** appear in *observed state* and are
-  spelled by their Kotlin name: `RUNNING`, `DRAIN_STALLED`, `OBSERVED`.
+  `failureClass`, `drainBlockReason`, `displayState`, `statePart`** appear in
+  *observed state* and are spelled by their Kotlin name: `RUNNING`,
+  `DRAIN_STALLED`, `OBSERVED`.
 - **`storageMode`, `drainPolicy`** appear in a *definition* and are spelled by
   their YAML wire value: `persistent`, `waitForZeroPlayers`. A form that offered
   `PERSISTENT` would build a document the parser rejects.
@@ -995,10 +1030,19 @@ export type DisplayState =
 
 export type ConditionType =
   | 'IMAGE_AVAILABLE' | 'VOLUME_BOUND' | 'CONTAINER_RUNNING' | 'READY'
-  | 'DRAINING' | 'PLAYERS_EVACUATED' | 'WORLD_SAVED' | 'NEEDS_ATTENTION';
+  | 'DRAINING'
+  /** Parked and nothing is wrong. The inverse of NEEDS_ATTENTION — see §7. */
+  | 'DRAIN_BLOCKED'
+  | 'PLAYERS_EVACUATED' | 'WORLD_SAVED' | 'NEEDS_ATTENTION';
 
 export type ConditionStatus = 'TRUE' | 'FALSE' | 'UNKNOWN';
 export type FailureClass = 'RETRYABLE' | 'PERMANENT';
+
+/**
+ * Why a drain has stopped advancing when nothing has gone wrong. Not a
+ * FailureReason, and deliberately not one: see DrainBlock below.
+ */
+export type DrainBlockReason = 'AWAITING_ZERO_PLAYERS';
 
 /** Which half of a server's stored state something is about. */
 export type StatePart = 'DESIRED' | 'OBSERVED';
@@ -1007,8 +1051,20 @@ export type FailureReason =
   | 'IMAGE_PULL_FAILED' | 'IMAGE_REFERENCE_REJECTED' | 'SANDBOX_CREATE_FAILED'
   | 'CONTAINER_CREATE_FAILED' | 'CONTAINER_START_FAILED' | 'CONTAINER_EXITED'
   | 'READINESS_TIMEOUT' | 'VOLUME_UNAVAILABLE' | 'NODE_UNAVAILABLE'
-  | 'RUNTIME_UNREACHABLE' | 'DRAIN_NO_DESTINATION' | 'DRAIN_TRANSFER_FAILED'
-  | 'DRAIN_SAVE_TIMEOUT' | 'DRAIN_STALLED' | 'UNKNOWN';
+  | 'RUNTIME_UNREACHABLE'
+  /**
+   * A destination was searched for and no server in the fleet had capacity.
+   * NOT "waiting for players to log off" — that is DrainBlockReason
+   * 'AWAITING_ZERO_PLAYERS' and is not a failure at all. This one needs an
+   * operator to add capacity, and raises NEEDS_ATTENTION once it has been true
+   * for long enough.
+   */
+  | 'DRAIN_NO_DESTINATION'
+  | 'DRAIN_TRANSFER_FAILED'
+  | 'DRAIN_SAVE_TIMEOUT' | 'DRAIN_STALLED'
+  | 'PROXY_CONTROL_UNREACHABLE' | 'PROXY_PLUGIN_INCOMPATIBLE'
+  | 'FORWARDING_SECRET_UNAVAILABLE'
+  | 'UNKNOWN';
 
 /** Wire values, because these are written back into a definition. */
 export type StorageMode = 'persistent' | 'ephemeral';
@@ -1147,6 +1203,8 @@ export interface DrainStatus {
   deregisteredAt: string | null;
   transferAttempts: number;
   destination: string | null;       // a server name, never a player
+  /** Parked and healthy. Disjoint from `failure` — see below. */
+  blocked: DrainBlock | null;
   failure: FailureStatus | null;
 }
 
@@ -1154,6 +1212,32 @@ export interface FailureStatus {
   reason: FailureReason; failureClass: FailureClass;
   message: string;                  // redacted upstream; no unredacted view exists
   occurredAt: string; attempts: number;
+}
+
+/**
+ * A drain that is waiting rather than broken.
+ *
+ * The same shape as `FailureStatus` minus `failureClass`, and the missing field
+ * is the point: a block is always retried, so there is nothing to classify. It
+ * is a sibling of `failure` rather than a variant of it, and the two are
+ * disjoint — read `blocked !== null && failure === null` as *waiting*:
+ *
+ *   state             drain.blocked   drain.failure
+ *   progressing       null            null            (and state !== 'DRAIN_FAILED')
+ *   blocked, healthy  set             null
+ *   failed            null            set
+ *
+ * `since` is when the block was first recorded, not when the loop last looked;
+ * `observations` is how many passes have found it still true, which is what says
+ * the loop is still watching rather than wedged. Count elapsed time from `since`
+ * against your own clock — the server does not render a duration, because one
+ * would be stale the moment it was written.
+ */
+export interface DrainBlock {
+  reason: DrainBlockReason;
+  message: string;                  // counts and prose; never a player identity
+  since: string;
+  observations: number;
 }
 
 export interface ServerResource {
@@ -1179,6 +1263,13 @@ export interface ServerResource {
      * says what is wrong, that one says somebody must act.
      */
     unreadable: boolean;
+    /**
+     * The drain is parked and nothing is wrong — **do not act**. Never true at
+     * the same time as `needsAttention`; the two together are the tri-state in
+     * §7. Do not infer this from `playersOnline > 0`.
+     */
+    drainBlocked: boolean;
+    /** 'DRAIN_FAILED' means *parked*, not *broken*. Read it with `drainBlocked`. */
     drainState: DrainState | null;
     playersOnline: number | null; playersMax: number | null;
     detail: string;

@@ -4,6 +4,7 @@ import mcorch.core.paper.PaperServerAgent
 import mcorch.core.paper.ProbeOutcome
 import mcorch.core.paper.SaveOutcome
 import mcorch.core.paper.WorkloadContract
+import mcorch.schema.DrainBlockReason
 import mcorch.schema.DrainState
 import mcorch.schema.DrainStatus
 import mcorch.schema.FailureClass
@@ -57,10 +58,16 @@ import java.time.Duration as JavaDuration
  * the dashboard stays legible, and adding a proxy later fills in the bodies
  * rather than reshaping the flow.
  *
- * The consequence is step 3. With no proxy there is nowhere for players to go,
- * so a server with players online has **no drain destination** and the drain
- * aborts. Kicking them to make progress is not an option
- * (`failure-modes.md` item 4).
+ * The consequence is step 3. With no proxy there is nowhere for players to go, so
+ * a server with players online cannot be emptied and the drain **blocks**.
+ * Kicking them to make progress is not an option (`failure-modes.md` item 4).
+ *
+ * Blocked is not failed, and this class records the difference: a block writes
+ * [mcorch.schema.DrainStatus.blocked] and leaves
+ * [mcorch.schema.DrainStatus.failure] null. It is retried on the same backoff an
+ * abort gets — that is what lets it resolve when the last player logs off — but
+ * nothing reports it as a fault, and the escalation stays quiet without needing to
+ * be told to. See [blocked] against [abort].
  */
 internal class DrainController(
     private val clock: Clock,
@@ -133,7 +140,14 @@ internal class DrainController(
         val down = observation.containerIsDown(hadContainer)
         if (down != null) {
             return DrainProgress(
-                drain = recorded.moveTo(DrainState.STOPPING, now).copy(playersEvacuated = true),
+                // Any block goes with it. A block is a live claim that somebody
+                // is connected to this container; the runtime has just said there
+                // is no container, so the claim cannot survive into the teardown
+                // status and be read there as "still waiting for players".
+                drain =
+                    recorded
+                        .moveTo(DrainState.STOPPING, now)
+                        .copy(playersEvacuated = true, blocked = null),
                 containerDown = true,
                 outcome = ReconcileOutcome.Progressed("the container is already $down"),
             )
@@ -376,11 +390,16 @@ internal class DrainController(
                     // drain report "attempt 1, first seen now", which is the
                     // number the escalation is built on. It is cleared below
                     // instead, on the passes that actually got somewhere.
+                    //
+                    // A recorded *block* travels the same way and for the same
+                    // reason: `recordBlock` needs it to keep "blocked since" from
+                    // resetting to now on every pass, which is the one number an
+                    // operator reads off a drain that is waiting.
                     val resumed = step(pass, drain.moveTo(resume, now))
                     if (resumed.drain.state == DrainState.DRAIN_FAILED) {
                         resumed
                     } else {
-                        resumed.copy(drain = resumed.drain.copy(failure = null))
+                        resumed.copy(drain = resumed.drain.copy(failure = null, blocked = null))
                     }
                 }
             }
@@ -404,10 +423,10 @@ internal class DrainController(
     /**
      * Step 3, for a server with no proxy.
      *
-     * With players online there is no destination and no way to make one, so
-     * this is where the drain stops. It stops *without* stopping the container:
-     * the failure is retryable, the loop backs off and looks again, and if the
-     * last player logs off the drain continues on its own.
+     * With players online there is no destination and no way to make one, so this
+     * is where the drain parks. It parks *without* stopping the container and
+     * without recording a failure: it is blocked, the loop backs off and looks
+     * again, and if the last player logs off the drain continues on its own.
      */
     private fun resolveDestination(
         definition: PaperServerDefinition,
@@ -425,8 +444,8 @@ internal class DrainController(
         }
 
     /**
-     * Runs [next] only if a fresh probe reports zero players, and aborts
-     * otherwise.
+     * Runs [next] only if a fresh probe reports zero players; blocks the drain if
+     * anybody is on, and aborts if the probe could not answer at all.
      *
      * Every state from [DrainState.SEALED] onward goes through this. It is the
      * single place that answers "is it safe to keep going", so there is one
@@ -447,13 +466,8 @@ internal class DrainController(
                 if (probe.online == 0) {
                     next()
                 } else {
-                    LOG.info(
-                        "drain blocked for server={}: {} players online and no destination",
-                        definition.metadata.name,
-                        probe.online,
-                    )
                     val resaves = drain.worldSaved
-                    abort(
+                    blocked(
                         server = definition.metadata.name,
                         // Somebody is on the server. Anything it had saved is
                         // now behind whatever they are doing, so the evidence
@@ -462,12 +476,12 @@ internal class DrainController(
                         drain = drain.forgetSaveEvidence(),
                         occupancy = occupancy,
                         now = now,
-                        reason = FailureReason.DRAIN_NO_DESTINATION,
-                        failureClass = FailureClass.RETRYABLE,
+                        reason = DrainBlockReason.AWAITING_ZERO_PLAYERS,
                         message =
-                            "blocked: no drain destination. ${probe.online} of ${probe.max} player slots are in " +
-                                "use and a standalone Paper server has no proxy to transfer them through. The " +
-                                "server keeps running; the drain resumes on its own once it is empty" +
+                            "waiting for the server to empty. ${probe.online} of ${probe.max} player slots are " +
+                                "in use and a standalone Paper server has no proxy to transfer them through, so " +
+                                "the protocol waits rather than disconnecting anybody. The server keeps running " +
+                                "and stays joinable; the drain resumes on its own once it is empty" +
                                 if (resaves) ", and saves the world again before it stops" else "",
                     )
                 }
@@ -722,13 +736,12 @@ internal class DrainController(
                     "server={} still has players after a stop was issued; not re-issuing it",
                     definition.metadata.name,
                 )
-                return abort(
+                return blocked(
                     server = server,
                     drain = drain.forgetSaveEvidence(),
                     occupancy = occupancy,
                     now = now,
-                    reason = FailureReason.DRAIN_NO_DESTINATION,
-                    failureClass = FailureClass.RETRYABLE,
+                    reason = DrainBlockReason.AWAITING_ZERO_PLAYERS,
                     message =
                         "the container is still running after a stop was issued and ${probe.online} of " +
                             "${probe.max} player slots are in use. The stop is not re-issued and the world is " +
@@ -778,6 +791,61 @@ internal class DrainController(
     }
 
     /**
+     * Records that the drain cannot advance, that nothing has gone wrong, and
+     * leaves everything alone.
+     *
+     * The counterpart to [abort], and the difference is the whole point of the
+     * type: **no [mcorch.schema.FailureStatus] is recorded.** A drain waiting for
+     * players to log off is the protocol working exactly as designed, and writing
+     * it down as a failure made every consumer that asks "is anything wrong with
+     * this server" answer yes about a server with people happily playing on it.
+     * The escalation then needed a named exemption to stay quiet; with no failure
+     * to escalate from, `escalated()` is already false and the exemption is gone.
+     *
+     * What it does **not** change is the requeue. The outcome is
+     * [ReconcileOutcome.Retry] exactly as before, so the loop keeps backing off and
+     * looking again — that is what makes a block resolve on its own when the last
+     * player logs off. A block is parked in [DrainState.DRAIN_FAILED] like an
+     * abort, and for the same reason: the state means *not advancing*, the drain
+     * re-enters it in place with a rising count rather than cycling through the
+     * earlier states, and a dashboard that showed it walking the machine every
+     * fourth pass would read as progress that is not happening.
+     *
+     * Any recorded failure is cleared. A drain that failed and is now merely
+     * waiting has had its problem resolved, and leaving the old failure beside the
+     * block would report both a fault and its absence.
+     */
+    private fun blocked(
+        server: ResourceName,
+        drain: DrainStatus,
+        occupancy: PlayerOccupancy?,
+        now: Instant,
+        reason: DrainBlockReason,
+        message: String,
+    ): DrainProgress {
+        val block = recordBlock(reason, message, now, drain.blocked)
+        // Info, not warn. Nothing is wrong, and a warning every backoff interval
+        // for a whole play session is the log-level version of the alert this
+        // change exists to stop firing.
+        LOG.info(
+            "drain for server={} is blocked and healthy: reason={} playersOnline={} since={} observations={}",
+            server,
+            reason,
+            occupancy?.online,
+            block.since,
+            block.observations,
+        )
+        return DrainProgress(
+            drain =
+                drain
+                    .moveTo(DrainState.DRAIN_FAILED, now)
+                    .copy(blocked = block, failure = null),
+            occupancy = occupancy,
+            outcome = ReconcileOutcome.Retry(message),
+        )
+    }
+
+    /**
      * Records a failure, leaves the container alone, and says how long this has
      * been going on.
      *
@@ -807,7 +875,6 @@ internal class DrainController(
             escalates(
                 startedAt = drain.startedAt,
                 failureClass = failureClass,
-                reason = reason,
                 now = now,
                 after = attentionAfter,
             )
@@ -874,7 +941,11 @@ internal class DrainController(
         val aborted =
             drain
                 .moveTo(DrainState.DRAIN_FAILED, now)
-                .copy(failure = failure)
+                // Any block goes: whatever the drain was waiting for, it has now
+                // hit something that went wrong, and a record saying both would
+                // report a fault and its absence at the same time. The failure is
+                // the louder of the two and is the one that survives.
+                .copy(failure = failure, blocked = null)
         val outcome =
             if (failureClass == FailureClass.RETRYABLE) {
                 ReconcileOutcome.Retry(reported)
@@ -931,13 +1002,27 @@ internal class DrainController(
  * disagrees with itself. The overload below unpacks a recorded failure into
  * this; nothing else decides.
  *
- * `DRAIN_NO_DESTINATION` is excluded on purpose: it means somebody is playing on
- * a server that was asked to go away, which is the protocol working exactly as
- * designed and resolves itself when they log off. An escalation that fires on a
- * busy evening every backoff interval teaches operators that the signal means
- * nothing. The exclusion is checked **before** the class, so it holds however a
- * future call site classifies that reason — both of today's are retryable, and a
- * permanent one must not slip in through the branch below.
+ * ## There is no exempt reason, and that is a deletion rather than an omission
+ *
+ * This used to take a [mcorch.schema.FailureReason] and return false for one of
+ * them — the drain waiting for players to log off, which is the protocol working
+ * and must not raise an alert on a busy evening. The exemption is gone because
+ * the thing it exempted is gone: that drain records
+ * [mcorch.schema.DrainStatus.blocked] and **no failure at all**, so the overload
+ * below never reaches this, and the correct behaviour falls out of "a drain with
+ * no recorded failure is not escalated" rather than out of a list.
+ *
+ * Worth more than the parameter it saves. The exemption produced two separate
+ * audit findings on its own: it had to be checked *before* the class so that a
+ * future permanent classification of that reason could not route a healthy drain
+ * back in, and its premise — that the reason is always retryable — was a
+ * convention nothing enforced until [mcorch.schema.FailureStatus] was made to
+ * refuse the pair. A rule with no exceptions has neither problem.
+ *
+ * What did *not* move is `DRAIN_NO_DESTINATION`, which now means only that the
+ * search for a destination ran and the fleet had no capacity. That escalates like
+ * any other retryable drain failure, and it should: it sits blocked until an
+ * operator adds capacity, which is precisely what the flag is for.
  *
  * ## Why a permanent failure escalates, and escalates at once
  *
@@ -976,24 +1061,24 @@ internal class DrainController(
 internal fun escalates(
     startedAt: Instant,
     failureClass: FailureClass,
-    reason: FailureReason,
     now: Instant,
     after: Duration,
-): Boolean {
-    if (reason == FailureReason.DRAIN_NO_DESTINATION) return false
-    return when (failureClass) {
+): Boolean =
+    when (failureClass) {
         FailureClass.PERMANENT -> true
         FailureClass.RETRYABLE -> JavaDuration.between(startedAt, now).toKotlinDuration() >= after
     }
-}
 
 /**
  * The same rule, asked of a drain that has already recorded its failure.
  *
- * A drain with no recorded failure is not escalated, whatever its age — and that
- * is what makes the condition self-clearing. A pass that gets somewhere clears
+ * A drain with no recorded failure is not escalated, whatever its age. That is
+ * what makes the condition self-clearing — a pass that gets somewhere clears
  * `DrainStatus.failure` (see the `DRAIN_FAILED` resume), so the escalation goes
- * with it rather than being a second thing to remember to reset.
+ * with it rather than being a second thing to remember to reset — and it is also
+ * what makes a *blocked* drain quiet, since a block records no failure. Both
+ * behaviours are this one line, which is why there is no list of exempt reasons
+ * above it.
  *
  * ## What clears a *permanent* one, since a retry cannot
  *
@@ -1022,7 +1107,6 @@ internal fun DrainStatus.escalated(
         escalates(
             startedAt = startedAt,
             failureClass = it.failureClass,
-            reason = it.reason,
             now = now,
             after = after,
         )

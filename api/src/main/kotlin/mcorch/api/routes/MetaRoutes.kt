@@ -10,6 +10,7 @@ import mcorch.api.json.jsonObject
 import mcorch.api.render.ServerJson
 import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
+import mcorch.schema.DrainBlockReason
 import mcorch.schema.DrainPolicy
 import mcorch.schema.DrainState
 import mcorch.schema.FailureClass
@@ -68,6 +69,7 @@ internal class MetaRoutes(
                         put("conditionStatus", Json.strings(ConditionStatus.entries.map { it.name }))
                         put("failureReason", Json.strings(FailureReason.entries.map { it.name }))
                         put("failureClass", Json.strings(FailureClass.entries.map { it.name }))
+                        put("drainBlockReason", Json.strings(DrainBlockReason.entries.map { it.name }))
                         put("displayState", Json.strings(ServerJson.DisplayState.entries.map { it.name }))
                         put("statePart", Json.strings(StatePart.entries.map { it.name }))
                         // Wire values: these go back into a definition document.

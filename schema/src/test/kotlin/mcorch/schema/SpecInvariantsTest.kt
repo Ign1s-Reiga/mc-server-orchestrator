@@ -112,26 +112,25 @@ class StatusTest {
     }
 
     /**
-     * The pairings that would stop the loop retrying a drain it could finish
+     * The pairing that would stop the loop retrying a drain it could finish
      * cannot be built.
      *
-     * Rewritten when `DRAIN_NO_DESTINATION` was split in two. It used to assert
-     * one reason and one justification — "players are online, they will log
-     * off" — which after the split belongs to
-     * [FailureReason.DRAIN_AWAITING_ZERO_PLAYERS] alone. The rule now covers
-     * both reasons and stands on the shared argument instead: what each is
-     * blocked on is not a property of this server, so `PERMANENT` — which means
-     * *stop trying* — buys nothing and costs a drain that the next pass could
-     * have completed.
+     * Narrowed to one reason when the waiting case stopped being a failure at
+     * all. What is left is the fleet-capacity case, and the rule stands on that
+     * case's own terms rather than on anything the escalation does: capacity is
+     * not a property of this server, it comes back when somebody logs off
+     * elsewhere or a lobby starts, and `PERMANENT` — which means *stop trying* —
+     * would freeze a drain the next pass could finish, in the one state where the
+     * container has to keep running. There is no safer version of "stop looking
+     * for a destination".
      *
-     * The two are not interchangeable elsewhere: only the waiting one is exempt
-     * from `NEEDS_ATTENTION`, and a `DRAIN_NO_DESTINATION` that has been true for
-     * an hour is exactly what that flag is for.
+     * That this reason *does* raise `NEEDS_ATTENTION` is a separate question with
+     * a separate answer: a fleet that is too small needs a person, it just does
+     * not need the loop to give up.
      */
     @Test
-    fun `neither always-retryable reason can be constructed permanent`() {
-        FailureStatus.ALWAYS_RETRYABLE shouldBe
-            setOf(FailureReason.DRAIN_NO_DESTINATION, FailureReason.DRAIN_AWAITING_ZERO_PLAYERS)
+    fun `the fleet-capacity reason cannot be constructed permanent`() {
+        FailureStatus.ALWAYS_RETRYABLE shouldBe setOf(FailureReason.DRAIN_NO_DESTINATION)
 
         FailureStatus.ALWAYS_RETRYABLE.forEach { reason ->
             val failure =
@@ -197,6 +196,71 @@ class StatusTest {
 
         val untouched = PaperServerStatus.pending(ResourceName.of("survival-01").getOrThrow(), 1, now)
         untouched.drainInitiated shouldBe false
+    }
+
+    /**
+     * Progressing, blocked-but-healthy and failed are three states, and the type
+     * has to let a consumer tell them apart.
+     *
+     * This is the shape the whole change turns on. A blocked drain carries
+     * [DrainStatus.blocked] and **no** [DrainStatus.failure] — that null is what
+     * makes `escalated()` quiet without an exemption list, so a test that only
+     * asserted the block were present would pass against a version that recorded
+     * both and alarmed on every busy evening.
+     *
+     * Both are still recorded against a drain that has stopped advancing, which
+     * is why the state alone cannot be the discriminator: `DRAIN_FAILED` means
+     * *parked*, and the record beside it says whether that is bad news.
+     */
+    @Test
+    fun `a blocked drain records a block and no failure, and is distinguishable from both other states`() {
+        val name = ResourceName.of("survival-01").getOrThrow()
+        val base = DrainStatus(state = DrainState.SEALED, startedAt = now, enteredStateAt = now)
+
+        val progressing = PaperServerStatus.pending(name, 1, now).copy(drain = base)
+        val blocked =
+            PaperServerStatus.pending(name, 1, now).copy(
+                drain =
+                    base.copy(
+                        state = DrainState.DRAIN_FAILED,
+                        blocked =
+                            DrainBlock(
+                                reason = DrainBlockReason.AWAITING_ZERO_PLAYERS,
+                                message = "3 of 20 player slots are in use",
+                                since = now,
+                            ),
+                    ),
+            )
+        val failed =
+            PaperServerStatus.pending(name, 1, now).copy(
+                drain =
+                    base.copy(
+                        state = DrainState.DRAIN_FAILED,
+                        failure =
+                            FailureStatus(
+                                reason = FailureReason.DRAIN_STALLED,
+                                failureClass = FailureClass.PERMANENT,
+                                message = "no save channel",
+                                occurredAt = now,
+                            ),
+                    ),
+            )
+
+        progressing.drain?.blocked shouldBe null
+        progressing.drain?.failure shouldBe null
+        progressing.draining shouldBe true
+
+        blocked.drain?.blocked?.reason shouldBe DrainBlockReason.AWAITING_ZERO_PLAYERS
+        // The assertion the change exists for.
+        blocked.drain?.failure shouldBe null
+        blocked.drain?.blocked?.observations shouldBe 1
+
+        failed.drain?.blocked shouldBe null
+        failed.drain?.failure?.failureClass shouldBe FailureClass.PERMANENT
+
+        // All three are parked or moving, and the state does not separate the
+        // last two — which is exactly why the block is its own field.
+        blocked.drain?.state shouldBe failed.drain?.state
     }
 }
 
