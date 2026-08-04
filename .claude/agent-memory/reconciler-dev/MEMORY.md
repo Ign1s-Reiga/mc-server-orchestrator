@@ -9,9 +9,9 @@
 - [Integration freeze that never was](project_integration-freeze.md) — runBlocking parented the loop, so only *passing* tests hung. Resolved; keep for the diagnosis method.
 - [LocalNode test gap](project_localnode-test-gap.md) — collapse a decision into the module that owns it; a raw value plus a flag about it means the seam is wrong.
 - [Classify narrowly, contain broadly](feedback_classify-narrowly-and-contain-broadly.md) — keep the never-retry bucket small; let no exception escape a worker.
-- [Audit remedies are hypotheses](feedback_audit-remedies-are-hypotheses.md) — the finding is established, the prescribed helper may itself be wrong; the suite arbitrates.
+- [Audit remedies are hypotheses](feedback_audit-remedies-are-hypotheses.md) — the finding is established, the remedy may be wrong or reach only half the defects; trace it per case.
 - [Prove the test can fail](feedback_prove-the-test-can-fail.md) — `--rerun` or it never ran; virtual time hides races; when no test can exist, type the arguments.
 - [Cancellation exposure](project_cancellation-exposure.md) — what the save-record shield covers, the two windows left open on purpose, and why write-ahead was rejected on its merits.
 - [Derive from the consumer](feedback_derive-from-the-consumer.md) — a status field is judged by what reads it; two of my defects passed every `:core` test and needed a real dashboard.
 - [Unreadable state posture](project_unreadable-state-posture.md) — a bad definition row cost the fleet; a bad observation was already safe via `getServer`, and the loop's skip only buys reporting.
-- [Level-triggered seal](project_level-triggered-seal.md) — assert, never issue; `sealsBackend` against `drainInitiated`; what replaced "one guard for six states", and four rulings open to overruling.
+- [Level-triggered seal](project_level-triggered-seal.md) — assert, never issue; anchor rules; why a resume never clears a failure; four rulings open to overruling.

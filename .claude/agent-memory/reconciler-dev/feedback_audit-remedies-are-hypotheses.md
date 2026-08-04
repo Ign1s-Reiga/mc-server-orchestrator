@@ -1,6 +1,6 @@
 ---
 name: audit-remedies-are-hypotheses
-description: An audit's finding and its prescribed remedy carry different weight — apply the fix, then let the existing suite arbitrate, because the named helper may itself be wrong
+description: An audit's finding and its prescribed remedy carry different weight — the named helper may be wrong, and a remedy for "the same root" may reach only one of the defects it was filed against
 metadata:
   type: feedback
 ---
@@ -42,6 +42,33 @@ not that the test is stale. Write the regression test first and confirm it fails
 against the old code, so a green suite afterwards means something. See
 [[assert-on-side-effects]] for why the assertions have to be about what was
 *done*.
+
+## A remedy can be right and still not reach every defect it was filed against
+
+Round 15 named two criticals with "the same one-line root" and prescribed one
+fix: invert `derivedOnly` into a positive claim. Inverting it closed the first
+and **not** the second, and tracing why is what found the real rule. The second
+defect's resume does a genuine `save-all flush` and the server confirms it, so it
+claims the flag honestly — the failing step is the *stop*, and a save says
+nothing about a stop.
+
+What closed it was a second rule the audit did not ask for: **the pass that
+resumes may not clear the failure, however much work it did; the ordinary pass
+after it may.** Hysteresis, the way an alarm clears on sustained recovery rather
+than on the first good sample.
+
+Two things worth keeping from it:
+
+- **Trace the prescribed fix against each defect separately before writing it.**
+  "Same root" in an audit means the same *code shape*, which is not the same as
+  the same *mechanism*. Ten minutes of tracing beat a green suite that would have
+  covered only half the brief.
+- **Two questions that look like one.** "Is this server making progress right
+  now" (which governs the backoff) and "has this drain recovered" (which governs
+  the failure record) have different answers for the same pass, and tying them
+  together breaks one of them: the strict rule on the backoff leaves a drain that
+  emptied after a play session waiting out a five-minute backoff; the loose rule
+  on the failure record is the defect.
 
 ## Arguing to leave something open
 

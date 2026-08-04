@@ -57,6 +57,25 @@ that scenario; and prefer measuring the property directly (here: no pass reports
 `Progressed` once the step is running) over a side counter that a refusal path
 can bypass.
 
+**A whole-file revert red-proofs the wrong thing when a scenario has several
+guards.** Reverting `DrainController.kt` made a stale-block test go red on its
+*first* assertion (the block's wording, fixed in the same commit) and never
+reached the block assertion at all — which passed under a targeted sabotage that
+carried the block forward, because an abort later in the scenario had already
+cleared it. The block assertion was vacuous and the whole-file red said nothing.
+Do both: **revert the whole file to prove the commit matters, then sabotage the
+single line to prove each assertion does.** A scenario that reaches an `abort`
+resets most of the drain record, so any assertion downstream of one is suspect.
+
+**How the loop spaces its own passes is part of the scenario, not a detail.** A
+drain test that advances the clock by a fixed amount models a loop that does not
+exist. At 2s throughout, save evidence never expires and the re-save under test
+never happens; at 45s throughout it expires *before the stop is ever attempted*,
+so the drain shuttles `DEREGISTERED` → `SAVING` without calling the runtime and
+the test asserts against a state the reconcile loop cannot produce. Advance by the
+poll interval after a `Progressed` and by a grown backoff after a `Retry` — the
+alternation is the mechanism in every backoff-related drain defect so far.
+
 **Do not key a test on a constant the fix will change.** A discriminator written
 against `MAX_TRANSFER_ATTEMPTS` turns red when the limit is corrected, for a
 reason unrelated to what the test is about. Key on the facts that actually differ

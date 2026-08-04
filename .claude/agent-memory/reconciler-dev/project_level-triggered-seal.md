@@ -1,6 +1,6 @@
 ---
 name: level-triggered-seal
-description: Why the proxy seal is asserted rather than issued, the two rules that look alike and are not (sealsBackend vs drainInitiated), and the single-point argument that replaced "one guard for six states"
+description: Why the proxy seal is asserted rather than issued, the two rules that look alike and are not (sealsBackend vs drainInitiated), the anchor rules a bounded drain step needs, and why a resume never clears a failure
 metadata:
   type: project
 ---
@@ -107,9 +107,51 @@ to any anchored bound:
 1. Stamp at the entry to the step being bounded, not at an earlier step that
    happens to have a convenient field.
 2. No `?:` in the consumer. A missing anchor must **stamp**, never substitute —
-   a fallback is what made two of these silent.
+   a fallback is what made two of these silent. "A parameter is the only version
+   of no fallback a future edit cannot undo" is right about the *callee* and
+   wrong about the caller that fills it: `issueTransfer` kept `?: now` three
+   lines below a caller that stamped, and it was dead only for that reason. The
+   answer is to **produce the value where it is used and return it in the
+   record**, so a second caller from an unstamped state gets a stamp rather than
+   a substitution. The same argument, one size smaller, retired
+   `pass.occupancy?.online ?: 0` in `exhausted`.
 3. Treat it like `saveRequestedAt`: one load-bearing field, covered by a test
    that drives the path where the ordinary stamp does not happen.
+
+### A flag that names the exception is wrong the moment a second exception exists
+
+`derivedOnly` was correct about the one step it was attached to and silently
+wrong about every early return added afterwards — two of them in `save` alone.
+**Invert any flag whose default is the dangerous answer**, so a step has to claim
+the privilege rather than disclaim it, and **do not enumerate the members** in the
+KDoc: the sentence "there is one such step" is what stops the next reader
+looking. State the *test* instead (a request left the process, or the ping
+established something), so a new site can be judged against it.
+
+The flag is now `DrainProgress.workDone`, and the surviving unmarked returns are
+exactly the three of that shape: choosing a destination, skipping a save for a
+container with no world, skipping a save whose confirmation is still current.
+
+### One good pass is not proof that a drain recovered
+
+The flag alone does not close every version of this, and the version it misses is
+worth remembering: a drain parked on a refused container stop re-enters through
+the ladder, finds its save evidence aged out, and **saves for real**. That is work
+by any honest definition, so the resume claims the flag — and clearing the failure
+on it reset `attempts` and restamped `occurredAt` every cycle. A stop refused for
+six hours reported three attempts and never reached the fifteen-minute threshold.
+
+The rule that closes it is hysteresis: `settleRecords` clears the failure only on
+a pass that did work **and did not begin in `DRAIN_FAILED`**. The drain proves it
+has recovered by completing one ordinary step after the resume. Deliberately
+*not* applied to the backoff — see [[audit-remedies-are-hypotheses]] for the two
+questions that look like one.
+
+A recorded **block** is settled by the opposite rule, unconditionally: it is
+written by one function that always parks in `DRAIN_FAILED`, so a block on any
+other state is stale by construction. Left riding, it reaches `stopWorkload` as
+"waiting, not stuck" seconds before the container stops, and `recordBlock` carries
+its `since` into the next genuine wait.
 
 ### "Did the pass make progress" is not "did the pass avoid failing"
 
