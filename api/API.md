@@ -613,13 +613,21 @@ the flags are what you filter on, because `TERMINATING` outranks all three.
   beside it, and `lastTransitionAt` on the condition is what an alert fires on.
 - `unreadable` — **what is wrong.** True whenever the resource carries an
   `unreadable` mark, including when the badge says `TERMINATING`.
-- `drainBlocked` — **do not act.** True when a `DRAIN_BLOCKED` condition is
-  `TRUE`: the drain has stopped advancing and *nothing has gone wrong*. Today
-  that means players are still connected and there is no proxy to move them
-  through, so the protocol waits rather than disconnecting anybody. The container
-  keeps running, the server stays joinable, and it resolves on its own. Use
-  `lastTransitionAt` on the condition for "blocked since when", or
+- `drainBlocked` — **the drain is waiting on players.** True when a
+  `DRAIN_BLOCKED` condition is `TRUE`: the drain has stopped advancing and the
+  *drain* has not failed. Today that means players are still connected and there
+  is no proxy to move them through, so the protocol waits rather than
+  disconnecting anybody. The container keeps running and the server stays
+  joinable. Use `lastTransitionAt` on the condition for "blocked since when", or
   `status.drain.blocked.since` for the same instant on the record itself.
+
+  **It is not on its own permission to ignore the server.** The condition asks
+  only about the drain; it says nothing about whether the reconcile loop is
+  still running. A pass that fails — a node that stops answering, say — leaves
+  the block untouched and records on `status.failure`, so `drainBlocked` stays
+  `true` while the drain is in fact not resuming at all. Read `status.failure`
+  alongside it. `display.detail` already does, and words the sentence
+  accordingly.
 
 **Both `needsAttention` and `unreadable` are set for an unreadable row, and they
 are not redundant.** A row the store cannot decode reads the same on every pass,
@@ -639,6 +647,9 @@ is. Render it as a tri-state beside the badge:
 ```ts
 const drain =
   display.needsAttention ? 'needs a human'
+  // A failed pass leaves the block intact, so this has to come first — see
+  // the note on `drainBlocked` above.
+  : server.status?.failure ? 'not progressing'
   : display.drainBlocked ? 'waiting for players'
   : 'in progress';
 ```
@@ -648,6 +659,29 @@ discriminator available before this flag, and it is a coincidence of today's one
 block reason rather than the fact itself — a *stuck* drain usually has players on
 it too. `status.drain.blocked.reason` is the enumerated answer, advertised in
 `meta.enums.drainBlockReason`.
+
+#### `detail` — a failure always outranks a reassurance
+
+`display.detail` is the one sentence, and its precedence is fixed:
+
+1. the observation could not be read
+2. `status.failure`, **when it is a different value from `status.drain.failure`**
+   — the latest pass did not complete
+3. `status.drain.failure` — the drain itself aborted
+4. `drainBlocked` — waiting on players, and genuinely nothing to do
+5. draining / terminating / caught-up wording
+
+"Waiting, not stuck" tells somebody *not* to act, and it is only true while the
+loop is running — so no failure can ever be outranked by it. The qualifier on (2)
+is what keeps an aborted drain, which records the same failure in both fields,
+reading as "the drain aborted" rather than losing that framing; when the two
+values differ, something newer has gone wrong and it wins.
+
+This precedence is derived from the same `DRAIN_BLOCKED` condition that
+`drainBlocked` reports, so the flag and the sentence cannot disagree. They used
+to: the flag read the condition and the sentence read `status.drain.blocked`
+directly, so a record carrying both a block and a drain failure rendered
+`drainBlocked: false` beside `detail: "waiting, not stuck"`.
 
 A blocked drain records **no failure**: `status.failure` and
 `status.drain.failure` are both `null`, and `status.drain.blocked` is set

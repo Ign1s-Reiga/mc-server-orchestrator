@@ -538,12 +538,7 @@ internal object ServerJson {
             // It is the inverse of `needsAttention` in what it tells somebody to
             // do — this one says *do not act* — so the two are never both true and
             // a dashboard may show them as one tri-state without losing anything.
-            put(
-                "drainBlocked",
-                status?.conditions?.any {
-                    it.type == ConditionType.DRAIN_BLOCKED && it.status == ConditionStatus.TRUE
-                } ?: false,
-            )
+            put("drainBlocked", drainBlocked(status))
             put("drainState", status?.drain?.state)
             put("playersOnline", status?.players?.online)
             put(
@@ -554,29 +549,138 @@ internal object ServerJson {
         }
     }
 
+    /**
+     * The failure recorded on the pass, when it is a different event from the
+     * drain's own failure.
+     *
+     * Null when the two are equal, because that is one event written to two
+     * fields — an aborted drain records in both — and the drain branch words it
+     * better. See the precedence note on [detail].
+     */
+    private fun passFailure(status: PaperServerStatus?): FailureStatus? =
+        status?.failure?.takeIf { it != status.drain?.failure }
+
+    /** The lead-in a terminating server's sentence carries, so every branch reads the same. */
+    private fun terminating(state: DisplayState): String =
+        if (state == DisplayState.TERMINATING) "delete requested; " else ""
+
+    /**
+     * Whether the drain is waiting on players rather than broken.
+     *
+     * Read from the `DRAIN_BLOCKED` **condition**, never from `drain.blocked`,
+     * and this is the only place that decides it — [display] renders it and
+     * [detail] words the sentence from it.
+     *
+     * The two used to be derived separately, and they disagreed. The condition
+     * asks `blocked != null && failure == null`; this module asked
+     * `blocked != null`. So a document carrying both — which the design
+     * deliberately permits, because the alternative was a decode-time `require`
+     * paid by the widest fleet read, where one bad row aborts `listServers` and
+     * halts every in-flight drain — rendered `drainBlocked: false` beside
+     * `detail: "waiting, not stuck"`. Declining the `require` makes this
+     * precedence the entire specification, so it has to hold at every site that
+     * reads it, and one function is how that is guaranteed rather than reviewed.
+     *
+     * It also closes a window nobody had to hand-edit anything to reach: a
+     * migrated blocked drain carries `drain.blocked` before the first pass has
+     * derived the condition, so for one pass the field is set and the condition
+     * is not. Reading the condition renders that pass as *not* blocked, which
+     * over-states brokenness — the safe way round for a sentence whose job is to
+     * stop somebody being called.
+     */
+    private fun drainBlocked(status: PaperServerStatus?): Boolean =
+        status?.conditions?.any {
+            it.type == ConditionType.DRAIN_BLOCKED && it.status == ConditionStatus.TRUE
+        } ?: false
+
+    /**
+     * The operator-facing sentence.
+     *
+     * ## A failure outranks a block, and which failure wins
+     *
+     * "Waiting, not stuck" tells somebody *not* to act, and it is only true while
+     * the loop is running. Any failure means it is not, so the precedence is:
+     *
+     * 1. `status.failure`, **when it is not the drain's own failure**. A
+     *    `NodeException` leaves the drain untouched and records here, so this is a
+     *    verdict on *now* while every other field is a snapshot from whenever the
+     *    loop last got through. If the node cannot be reached, nothing else is
+     *    being updated, and that fact explains all the others.
+     * 2. `drain.failure` — the drain itself aborted.
+     * 3. the block — waiting on players, and genuinely nothing to do.
+     *
+     * The qualifier on (1) is load-bearing rather than pedantic. A drain that
+     * aborts is recorded in *both* fields as the same value, and ranking
+     * `status.failure` first unconditionally would drop the "the drain aborted"
+     * framing for every genuinely failed drain — the more informative sentence,
+     * lost to a rule meant to catch a different case. Comparing the two values
+     * separates "one event, described twice" from "a second, newer thing has gone
+     * wrong", and only the latter outranks. It also gets the compound case right:
+     * a node failure *after* a drain aborted reports the node, because the two
+     * failures then differ.
+     *
+     * The reachable sequence this ordering exists for needs no hand-edited data:
+     * a drain blocks on players online, the next pass throws a `NodeException`,
+     * and `Reconciler.nodeFailure` carries the block forward while recording the
+     * node failure. Without the ordering an operator is told "waiting, not stuck
+     * — the drain resumes on its own once it is empty" about a server whose node
+     * the loop cannot reach, and the node failure's message is not rendered
+     * anywhere at all.
+     *
+     * Note that `drainBlocked` stays true in that case, because the condition it
+     * comes from is `:core`'s and is still accurate — the drain *is* blocked. The
+     * flag says what the drain is doing; this sentence says whether anybody
+     * should act. A client must read `needsAttention` and `status.failure` too:
+     * `drainBlocked` alone is not permission to ignore a server.
+     */
     private fun detail(
         stored: StoredServer,
         status: PaperServerStatus?,
         state: DisplayState,
     ): String =
         when {
-            // Ahead of the general terminating branch below, and this ordering is
-            // the whole operator-facing point of the change. A delete requested on
-            // a server people are playing on used to render as "delete requested;
-            // draining (drain failed)" — which is the exact question this is meant
-            // to answer, answered wrongly: the drain has not failed, and there is
-            // nothing to do but wait.
-            state == DisplayState.TERMINATING && status?.drain?.blocked != null -> {
-                "delete requested; waiting, not stuck — ${status.drain?.blocked?.message.orEmpty()}"
+            state == DisplayState.TERMINATING && stored.unreadable != null -> {
+                "delete requested; the stored observation could not be read, so how far the drain has got " +
+                    "is not known — ${stored.unreadable?.reason}"
+            }
+
+            // A failure recorded on the pass that is *not* the drain's own, ahead
+            // of every drain branch below. See the note above: this is the one that
+            // stops a server whose node is unreachable being described as quietly
+            // waiting.
+            passFailure(status) != null -> {
+                terminating(state) +
+                    if (drainBlocked(status)) {
+                        "the drain is waiting for players to leave, but the last pass did not complete, so " +
+                            "it is not resuming on its own — ${passFailure(status)?.message.orEmpty()}"
+                    } else {
+                        passFailure(status)?.message.orEmpty()
+                    }
+            }
+
+            // The drain aborted. Above the block because it is a failure and a
+            // failure outranks a reassurance; below the branch above because when
+            // the two failures are the same event this framing is the better one.
+            status?.drain?.failure != null -> {
+                terminating(state) + "the drain aborted; the server is still running — " +
+                    status.drain
+                        ?.failure
+                        ?.message
+                        .orEmpty()
+            }
+
+            // Ahead of the general drain branches below, and this ordering is the
+            // whole operator-facing point of it. A delete requested on a server
+            // people are playing on used to render as "delete requested; draining
+            // (drain failed)" — the exact question this is meant to answer,
+            // answered wrongly: the drain has not failed, and there is nothing to
+            // do but wait.
+            drainBlocked(status) -> {
+                terminating(state) + "waiting, not stuck — ${status?.drain?.blocked?.message.orEmpty()}"
             }
 
             state == DisplayState.TERMINATING && status?.drain != null -> {
                 "delete requested; draining (${status.drain?.state?.name?.lowercase()?.replace('_', ' ')})"
-            }
-
-            state == DisplayState.TERMINATING && stored.unreadable != null -> {
-                "delete requested; the stored observation could not be read, so how far the drain has got " +
-                    "is not known — ${stored.unreadable?.reason}"
             }
 
             state == DisplayState.TERMINATING -> {
@@ -600,18 +704,9 @@ internal object ServerJson {
                 "there is no observation and no reason recorded for its absence"
             }
 
-            status.failure != null -> {
-                status.failure?.message.orEmpty()
-            }
-
-            // Above the `DRAIN_FAILED` line below, and the ordering is the whole
-            // point: a blocked drain parks in that state too, and "the drain
-            // aborted" is the sentence that would send somebody to fix a server
-            // where people are playing.
-            status.drain?.blocked != null -> {
-                "waiting, not stuck — ${status.drain?.blocked?.message.orEmpty()}"
-            }
-
+            // Reached only when the drain is parked in DRAIN_FAILED with neither a
+            // recorded failure nor a block — nothing says why, so this says only
+            // what is certain.
             status.drain?.state == DrainState.DRAIN_FAILED -> {
                 "the drain aborted; the server is still running"
             }

@@ -115,6 +115,72 @@ class DrainBlockRenderingTest {
         display["needsAttention"] shouldBe true
     }
 
+    @Test
+    fun `a block and a drain failure together render as the failure at both sites`() {
+        // The design declined a decode-time `require` enforcing that these two are
+        // disjoint, because that cost is paid by the widest fleet read and one bad
+        // row aborting `listServers` halts every in-flight drain. The consequence
+        // is that this precedence *is* the specification — and it has to hold at
+        // every site that reads it, not just at the condition.
+        api.call("POST", "/api/v1/servers", ExampleDefinitions.valid("minimal.yaml")).status shouldBe 201
+        observe(blockedAndFailed())
+
+        val display = api.call("GET", "/api/v1/servers/survival-01").json()["display"] as Map<*, *>
+
+        // The condition site already got this right.
+        display["drainBlocked"] shouldBe false
+
+        // The sentence site did not: it read `drain.blocked` raw, so one payload
+        // carried `drainBlocked: false` beside "waiting, not stuck".
+        val detail = display["detail"] as String
+        detail shouldNotContain "waiting, not stuck"
+        detail shouldContain "the drain aborted"
+        detail shouldContain "no channel could confirm a completed save"
+    }
+
+    @Test
+    fun `a node failure during a block is not reported as quietly waiting`() {
+        // The sequence, and no hand-edited document is needed for any of it: the
+        // drain blocks on players online, the next pass throws a NodeException, and
+        // `Reconciler.nodeFailure` drafts with the block carried forward and the
+        // node failure recorded on the pass. The server is terminating throughout.
+        api.call("POST", "/api/v1/servers", ExampleDefinitions.valid("minimal.yaml")).status shouldBe 201
+        api.call("DELETE", "/api/v1/servers/survival-01").status shouldBe 202
+        observe(blocked(), passFailure = nodeFailure())
+
+        val document = api.call("GET", "/api/v1/servers/survival-01").json()
+        val display = document["display"] as Map<*, *>
+        display["state"] shouldBe "TERMINATING"
+
+        val detail = display["detail"] as String
+
+        // What an operator used to be told about a server whose node the loop
+        // cannot reach.
+        detail shouldNotContain "waiting, not stuck"
+        // The block's own message promises the drain resumes by itself. It does
+        // not, if the loop cannot get to the node.
+        detail shouldNotContain "resumes on its own"
+
+        // What they are told now: the block is still explained, and the reason it
+        // is not progressing is the headline rather than being dropped.
+        detail shouldContain "delete requested"
+        detail shouldContain "not resuming on its own"
+        detail shouldContain "the node did not answer a status request within 20s"
+
+        // The failure is on the pass, not on the drain — both are rendered, and a
+        // client can tell which is which.
+        val status = document["status"] as Map<*, *>
+        (status["drain"] as Map<*, *>)["failure"] shouldBe null
+        (status["failure"] as Map<*, *>)["reason"] shouldBe "NODE_UNAVAILABLE"
+
+        // `drainBlocked` stays true, because the condition it comes from is
+        // `:core`'s and is still accurate — the drain really is blocked on
+        // players. The flag says what the drain is doing; the sentence says
+        // whether anybody should act. Asserted so the split is deliberate rather
+        // than discovered.
+        display["drainBlocked"] shouldBe true
+    }
+
     private fun blocked(): DrainStatus =
         DrainStatus(
             state = DrainState.DRAIN_FAILED,
@@ -127,6 +193,27 @@ class DrainBlockRenderingTest {
                     since = Instant.parse("2026-07-28T10:05:00Z"),
                     observations = 12,
                 ),
+        )
+
+    /** A drain that is blocked *and* carries its own failure. See the both-set tests. */
+    private fun blockedAndFailed(): DrainStatus =
+        blocked().copy(
+            failure =
+                FailureStatus(
+                    reason = FailureReason.DRAIN_STALLED,
+                    failureClass = FailureClass.PERMANENT,
+                    message = "no channel could confirm a completed save",
+                    occurredAt = at,
+                ),
+        )
+
+    /** What `Reconciler.nodeFailure` records when it cannot reach the node. */
+    private fun nodeFailure(): FailureStatus =
+        FailureStatus(
+            reason = FailureReason.NODE_UNAVAILABLE,
+            failureClass = FailureClass.RETRYABLE,
+            message = "the node did not answer a status request within 20s",
+            occurredAt = at,
         )
 
     private fun failed(): DrainStatus =
@@ -151,7 +238,18 @@ class DrainBlockRenderingTest {
      * derive them — see the note on the class. They are what `display` reads, so
      * getting them consistent with the drain record is this test's own job.
      */
-    private fun observe(drain: DrainStatus) {
+    private fun observe(
+        drain: DrainStatus,
+        /**
+         * A failure recorded on the *pass* rather than on the drain.
+         *
+         * This is what `Reconciler.nodeFailure` writes: it drafts with
+         * `drain = previous.drain` — the block carried forward untouched — and the
+         * node failure here. The two fields are independent, and only modelling
+         * `drain.failure` would miss the sequence entirely.
+         */
+        passFailure: FailureStatus? = null,
+    ) {
         val blocked = drain.blocked != null && drain.failure == null
         val status =
             PaperServerStatus(
@@ -162,7 +260,7 @@ class DrainBlockRenderingTest {
                 lastTransitionAt = at,
                 ready = true,
                 drain = drain,
-                failure = drain.failure,
+                failure = passFailure ?: drain.failure,
                 conditions =
                     listOf(
                         StatusCondition(
