@@ -109,4 +109,23 @@ identity is optional. Ask what happens when the key is null before writing the
 loop — and tell the client the derivation is suspended, because a dashboard that
 silently stopped reporting deletions is worse than one that never reported them.
 
+**One fact, one derivation — and a reassurance never outranks a failure.**
+`display.drainBlocked` and `display.detail` must both come from the
+`DRAIN_BLOCKED` *condition*, never from `drain.blocked` directly. In `detail`,
+`status.failure` (when it differs from `drain.failure`) beats `drain.failure`
+beats the block.
+
+**Why:** the eleventh drain audit found the two derived separately and
+disagreeing. The reachable sequence needs no bad data: a drain blocks on players,
+the next pass throws a `NodeException`, and `Reconciler.nodeFailure` carries the
+block forward while recording on `status.failure` — so an operator was told
+"waiting, not stuck" about a server whose node was unreachable.
+
+**How to apply:** when a `require` enforcing disjointness is declined for cost
+reasons, the precedence becomes the entire specification and must hold at *every*
+site that reads it — extract a function rather than trusting review. And check
+whether two failure fields are the same event before ranking them: an aborted
+drain writes the same value to both, so a naive "newest wins" drops the better
+wording.
+
 Related: [[api-module-decisions]], [[divergences-from-drain-audits]].
