@@ -1,6 +1,6 @@
 ---
 name: repo-environment-gotchas
-description: Build and tooling facts for this repo that cost time to rediscover — offline Gradle, unsigned agent commits, and a NUL-byte hazard when writing unicode escapes through the file tools
+description: Build and tooling facts for this repo that cost time to rediscover — offline Gradle, flaky agent GPG signing, phantom merge conflicts from re-committed work, and a NUL-byte hazard when writing unicode escapes
 metadata:
   type: project
 ---
@@ -8,8 +8,13 @@ metadata:
 **Gradle works offline.** `./gradlew build --offline` succeeds from a warm cache. Use `--offline` by default; it is much faster and network is not guaranteed.
 **How to apply:** adding a *new* artifact to `gradle/libs.versions.toml` is the risky move, not bumping code. `slf4j-api`, `sqlite-jdbc`, `kotest`, `kotlinx-coroutines-test` were all already cached.
 
-**Agent commits in this repo are unsigned.** The user's own commits are GPG-signed (`%G?` = `G`), but signing from an agent shell times out on pinentry. Every prior agent commit is `N`.
-**How to apply:** commit with `--no-gpg-sign`. Do not touch the user's global signing config. Re-confirmed 2026-07-31 *against an explicit instruction that "gpg works and the passphrase is cached"* — it still failed with `PINENTRY_LAUNCHED ... curses` then `gpg: signing failed: Timeout`. The agent shell has no usable pinentry tty, so this is not about the passphrase being cached. Try the plain commit when told to, then fall back and say so in the report.
+**GPG signing from the agent shell is unreliable, not impossible — try it, check `%G?`, fall back only if it fails.**
+It failed on 2026-07-28 and again on 2026-07-31 (`PINENTRY_LAUNCHED ... curses`, then `gpg: signing failed: Timeout`) even when told the passphrase was cached, so `--no-gpg-sign` was the standing advice. On 2026-08-04 a plain `git commit` signed first try and `git log --format=%G?` returned `G`. The agent was told "gpg signs without prompting on this branch" and this time that was true — whether an agent can sign depends on whether the gpg agent already holds an unlocked key, which varies between sessions.
+**How to apply:** always attempt the plain commit first when asked to sign. Verify with `git log --format='%h %G? %s' -1` rather than assuming either way, and say in the report which happened. Only fall back to `--no-gpg-sign` on an actual failure. Never touch the user's signing config.
+
+**Before merging a coordinator's branch, check whether it already contains your work — a re-committed copy looks like a conflict, not a fast-forward.**
+**Why:** on 2026-08-04 `git merge feat/velocity-proxy-kind` produced `CONFLICT (add/add)` on six files that plainly existed on both sides. The cause: the coordinator had already merged this worktree's branch upstream and *re-committed* it under new SHAs (to sign it), so the real merge base fell all the way back to `main` and git saw every file as independently added. Nothing was wrong and nothing needed resolving.
+**How to apply:** run `git merge-base HEAD <target>` and `git diff <target> HEAD --stat` first. If the diff shows only your side lacking their new work, the branch subsumes you — `git checkout -b <topic> <target>` and carry on there. `git reset --hard` and `git merge --no-commit` are both blocked by the sandbox classifier; branching from the target is not, and is non-destructive anyway. Tell the coordinator the new branch name, since it is no longer the worktree branch they expect to merge.
 
 **Bulk-mutating source to prove tests bite is easiest as one Python driver.** The bash tool refuses compound commands with redirects and loops as "too complex to verify it stays inside the worktree", so a `for m in A B C; do ... done` loop is rejected.
 **How to apply:** write a `mutate.py` (exact-string replace with an `assert count == 1`) plus a `run_mutations.py` that backs up, mutates, shells `./gradlew :store:test`, and reads failing test names out of `store/build/test-results/test/*.xml`. One `python3 run_mutations.py A B C` call runs the whole matrix. Back up *after* `spotlessApply`, not before — the formatter rewrites chained calls into multi-line form and every literal in the mutation table stops matching.
