@@ -117,6 +117,36 @@ public interface Node {
     ): ExecOutcome
 
     /**
+     * Sends an HTTP request to a port the workload listens on, and returns what
+     * came back.
+     *
+     * The channel to a control plane running *inside* a container — today the
+     * shipped Velocity plugin, which is how the drain protocol's steps 2, 4 and 6
+     * happen at all. It is on [Node] rather than in the caller for the same
+     * reason [exec] is: a caller that opened its own socket would have decided
+     * the container is on this machine, and CLAUDE.md invariant 7 says nothing in
+     * the loop may assume that. A distributed node forwards this to its agent and
+     * no call site changes.
+     *
+     * Deliberately uninterpreted, exactly like [exec]. This interface knows
+     * nothing about the protocol being spoken: a non-2xx status is a
+     * [EndpointResponse], not an exception, because what a 409 means is a
+     * property of the protocol and the caller is the only thing that knows it.
+     * Only a failure to *reach* the port at all is a [NodeException].
+     *
+     * ## The token is a coordinate
+     *
+     * [EndpointRequest.bearerToken] is a [SecretRef], never material, and the
+     * implementation resolves it at the moment it builds the request — the same
+     * rule [WorkloadSpec.secretEnv] follows. `:core` therefore has no way to hold
+     * the token, so it has no way to log it (CLAUDE.md invariant 4 generalised).
+     */
+    public suspend fun callEndpoint(
+        handle: WorkloadHandle,
+        request: EndpointRequest,
+    ): EndpointResponse
+
+    /**
      * Stops the workload's container, killing it after [gracePeriod].
      *
      * **Never call this on a server with players online, and never before a
@@ -404,6 +434,53 @@ public data class ExecRequest(
         require(command.none { it.isBlank() }) { "exec command arguments must not be blank" }
         require(timeout.isPositive() && timeout.isFinite()) { "exec timeout must be positive and finite" }
     }
+}
+
+/** The verbs the control protocol uses. A closed set, so a typo is a compile error. */
+public enum class HttpVerb {
+    GET,
+    PUT,
+    POST,
+    DELETE,
+}
+
+/**
+ * One request to a port inside a workload.
+ *
+ * [timeout] is required and strictly positive for the reason [ExecRequest.timeout]
+ * is: a control plane that stops answering must not pin a reconcile pass. A drain
+ * waits on this one, so an unbounded wait here is a container the orchestrator can
+ * never stop.
+ */
+public data class EndpointRequest(
+    val port: Int,
+    val verb: HttpVerb,
+    val path: String,
+    val body: String? = null,
+    val contentType: String? = null,
+    /**
+     * Coordinates of the bearer token, or null when the endpoint is unpublished
+     * and needs none. **Never material** — the node resolves it.
+     */
+    val bearerToken: SecretRef? = null,
+    val timeout: Duration,
+) {
+    init {
+        require(port in 1..65535) { "port must be in 1..65535, got: $port" }
+        require(path.startsWith("/")) { "path must be absolute, got: $path" }
+        require(timeout.isPositive() && timeout.isFinite()) { "endpoint timeout must be positive and finite" }
+    }
+}
+
+/**
+ * What the endpoint answered. Uninterpreted: [status] may be any HTTP status, and
+ * deciding what a 409 means belongs to whoever knows the protocol.
+ */
+public data class EndpointResponse(
+    val status: Int,
+    val body: String,
+) {
+    public val successful: Boolean get() = status in 200..299
 }
 
 /**

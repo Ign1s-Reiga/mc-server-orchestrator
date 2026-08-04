@@ -1,5 +1,7 @@
 package mcorch.app
 
+import mcorch.core.EndpointRequest
+import mcorch.core.EndpointResponse
 import mcorch.core.ExecOutcome
 import mcorch.core.ExecRequest
 import mcorch.core.ImageAvailability
@@ -142,6 +144,21 @@ internal class StubNode(
                 ExecOutcome(1, "", "no rcon listener")
             }
         }
+
+    /**
+     * No control endpoint. Every server in these tests is standalone, so nothing
+     * should reach for one — and a stub that answered would let a drain take the
+     * proxied path in a file whose assertions are all about the standalone one.
+     */
+    override suspend fun callEndpoint(
+        handle: WorkloadHandle,
+        request: EndpointRequest,
+    ): EndpointResponse =
+        throw NodeException.Unreachable(
+            name,
+            NodeOperation.ENDPOINT,
+            "nothing is listening on port ${request.port}",
+        )
 
     override suspend fun stopWorkload(
         handle: WorkloadHandle,

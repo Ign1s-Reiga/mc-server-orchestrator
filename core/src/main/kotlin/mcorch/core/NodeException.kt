@@ -10,6 +10,9 @@ public enum class NodeOperation {
     CREATE,
     START,
     EXEC,
+
+    /** An HTTP call to a port inside a workload — the proxy control channel. */
+    ENDPOINT,
     STOP,
     REMOVE,
 }

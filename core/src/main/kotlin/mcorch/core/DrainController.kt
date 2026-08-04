@@ -49,18 +49,20 @@ import java.time.Duration as JavaDuration
  *   that applies it runs against the *old* container. It reads that container's
  *   own labels ([mcorch.core.paper.WorkloadContract]), never the new spec.
  *
- * ## What a standalone Paper server changes
+ * ## What a counterparty changes, and what it does not
  *
  * The protocol has seven steps, three of which are conversations with a proxy:
- * stop new joins (2), transfer the players (4), deregister the backend (6). A
- * standalone Paper server has no proxy, so those steps have no counterparty.
- * They are still traversed as recorded states — the state machine stays whole,
- * the dashboard stays legible, and adding a proxy later fills in the bodies
- * rather than reshaping the flow.
+ * stop new joins (2), transfer the players (4), deregister the backend (6).
+ * Whether this workload has anybody to have those conversations with is a
+ * property of [DrainSubject] — [DrainSubject.seal] and [DrainSubject.router] —
+ * and not a branch invented here. A standalone Paper server has neither; a
+ * `VelocityProxy` has a seal and no router, because a fleet has one front door and
+ * there is nowhere to send its own players.
  *
- * The consequence is step 3. With no proxy there is nowhere for players to go, so
- * a server with players online cannot be emptied and the drain **blocks**.
- * Kicking them to make progress is not an option (`failure-modes.md` item 4).
+ * With no router, step 3 is where the drain parks: there is nowhere for players to
+ * go, so a workload with players online cannot be emptied and the drain
+ * **blocks**. Kicking them to make progress is not an option (`failure-modes.md`
+ * item 4).
  *
  * Blocked is not failed, and this class records the difference: a block writes
  * [mcorch.schema.DrainStatus.blocked] and leaves
@@ -68,6 +70,40 @@ import java.time.Duration as JavaDuration
  * abort gets — that is what lets it resolve when the last player logs off — but
  * nothing reports it as a fault, and the escalation stays quiet without needing to
  * be told to. See [blocked] against [abort].
+ *
+ * ## The zero-player gate covers `SAVING` onward, and only that
+ *
+ * [requireEmpty] used to wrap every state from `SEALED` down, and the argument for
+ * it was that there was then one thing to audit rather than six. That argument was
+ * only ever available because steps 2, 3 and 4 had no bodies: fill them in and the
+ * guard aborts a drain **precisely when the states it guards are supposed to
+ * act**. A destination search that refuses to run while players are online is a
+ * destination search that never runs, and a transfer that refuses to move anybody
+ * unless nobody is there is not a transfer.
+ *
+ * What replaces the old argument is narrower, not looser, and it is the claim that
+ * actually matters:
+ *
+ * **No path reaches [Node.stopWorkload] except through [requireEmpty] followed by
+ * `mayStop`.** The gate guards `SAVING`, `DEREGISTERED`, `STOPPING` and the
+ * `DRAIN_FAILED` resume — the states that flush the world, let go of the backend
+ * and take the container away — and those are the only states whose mistake loses
+ * data. Steps 2, 3 and 4 have no [Node.stopWorkload] call and no edge to
+ * `STOPPING` that does not pass through `SAVING`, so they cannot stop anything
+ * however wrong they are; and [stop] re-asserts `mayStop` itself as a backstop for
+ * a future edit that routes around the state machine.
+ *
+ * Steps 3 and 4 get their own preconditions instead, which are the preconditions
+ * of the thing they do: step 3 needs *a destination with capacity*, step 4 needs
+ * *a sweep that is making progress*.
+ *
+ * ## The seal is asserted, never issued
+ *
+ * See [DrainSeal]. Every state that depends on the seal re-asserts it on every
+ * pass, so an abort restores joins by simply not asserting it any more and a proxy
+ * restart is repaired by the next pass. The one step that cannot work that way is
+ * the deregistration — it is the last thing before the stop — so it carries an
+ * explicit re-registration edge on the abort path out of `DEREGISTERED`.
  */
 internal class DrainController(
     private val clock: Clock,
@@ -109,8 +145,7 @@ internal class DrainController(
      */
     @Suppress("LongParameterList")
     suspend fun advance(
-        definition: PaperServerDefinition,
-        agent: PaperServerAgent,
+        subject: DrainSubject,
         node: Node,
         observation: WorkloadObservation,
         current: DrainStatus?,
@@ -121,11 +156,7 @@ internal class DrainController(
         val now = clock.instant()
         val recorded = current ?: started(now)
         if (current == null) {
-            LOG.info(
-                "drain started for {} cause={}",
-                WorkloadRef(definition.metadata.name, node.name),
-                cause,
-            )
+            LOG.info("drain started for {} cause={}", WorkloadRef(subject.server, node.name), cause)
             return DrainProgress(
                 drain = recorded,
                 outcome = ReconcileOutcome.Progressed("drain requested (${cause.detail})"),
@@ -138,13 +169,26 @@ internal class DrainController(
         // never inferred from a failed probe or an unreachable node.
         val down = observation.containerIsDown(hadContainer)
         if (down != null) {
+            // The container is gone and the proxy does not know. Skipping the
+            // teardown's proxy step would leave a live registration pointing at an
+            // address nothing is listening on, and the proxy would route new
+            // players straight into it — the drain finished correctly and the
+            // fleet is broken anyway.
+            //
+            // Safe here and nowhere else: the runtime has said there is no
+            // container, so there is provably nobody connected, which is the one
+            // precondition `DELETE` enforces. It is best-effort on purpose — a
+            // proxy that cannot be reached must not wedge a delete whose container
+            // is already gone — and the proxy's own reconcile sweep is the
+            // backstop that removes a registration this call could not.
+            val letGo = releaseRegistration(subject, recorded, node)
             return DrainProgress(
                 // Any block goes with it. A block is a live claim that somebody
                 // is connected to this container; the runtime has just said there
                 // is no container, so the claim cannot survive into the teardown
                 // status and be read there as "still waiting for players".
                 drain =
-                    recorded
+                    letGo
                         .moveTo(DrainState.STOPPING, now)
                         .copy(playersEvacuated = true, blocked = null),
                 containerDown = true,
@@ -166,7 +210,7 @@ internal class DrainController(
             LOG.warn(
                 "server={} has a world save confirmed at {} that is no longer evidence: the container now " +
                     "running started at {} and a probe last answered at {}. The drain will save again",
-                definition.metadata.name,
+                subject.server,
                 recorded.worldSavedAt,
                 observation.startedAt,
                 lastProbedAt,
@@ -179,9 +223,16 @@ internal class DrainController(
         // one thing that must not follow is a teardown. There is nothing to
         // probe either, since the handle has no container to exec into, so this
         // stops here and comes back.
+        //
+        // The registration is deliberately left alone, and this is the one early
+        // return where that is the right answer: the process may still be serving
+        // players, so removing it from routing is `failure-modes.md` item 3 with
+        // extra steps. The seal is not re-asserted either — nothing was observed —
+        // and the abort below parks the drain, which is what lifts it.
         if (observation.state == WorkloadState.SANDBOX_ONLY) {
             return abort(
-                server = definition.metadata.name,
+                subject = subject,
+                node = node,
                 // The *confirmation* goes, because nothing was observed this
                 // pass and the world may have moved on. The record of a
                 // delivered-but-unconfirmed save request stays: it is the only
@@ -204,11 +255,11 @@ internal class DrainController(
             )
         }
 
-        // Occupancy is re-read on every pass of a running server, not once at
-        // the start. Nothing is stopping new players from joining a standalone
-        // server mid-drain — there is no proxy to seal — so a count taken three
-        // states ago is not evidence of anything.
-        val probe = agent.probe(node, observation.handle)
+        // Occupancy is re-read on every pass of a running server, not once at the
+        // start. A workload with no seal keeps taking players throughout its own
+        // drain, and even a sealed one is reachable on its own port by anybody who
+        // knows it, so a count taken three states ago is not evidence of anything.
+        val probe = subject.probe(node, observation.handle)
 
         // The only place occupancy is ever built, and every abort below depends
         // on that being true: a non-null `occupancy` means an SLP answered *this
@@ -224,18 +275,70 @@ internal class DrainController(
 
         val pass =
             DrainPass(
-                definition = definition,
-                agent = agent,
+                subject = subject,
                 node = node,
                 observation = observation,
                 probe = probe,
                 occupancy = occupancy,
                 // Read once per pass, off the running container rather than off
                 // the definition, and threaded through every decision below.
-                contract = agent.contractOf(observation),
+                contract = subject.contractOf(observation),
                 now = now,
             )
         return step(pass, drain)
+    }
+
+    /**
+     * Lets the proxy go of a workload whose container the runtime says is gone.
+     *
+     * Best-effort by design. Two things are true at once: leaving a live
+     * registration behind makes the proxy route new players to a dead address, and
+     * a proxy that cannot be reached must not be able to wedge the delete of a
+     * container that has already stopped. So this tries, records the outcome when
+     * it worked, and reports the failure at warn when it did not — the proxy's own
+     * reconcile sweep removes a registration whose definition no longer matches its
+     * selector, and the plugin refuses `DELETE` outright while anybody is
+     * connected, so nothing here can disconnect a player whatever it gets wrong.
+     */
+    private suspend fun releaseRegistration(
+        subject: DrainSubject,
+        drain: DrainStatus,
+        node: Node,
+    ): DrainStatus {
+        val router = subject.router ?: return drain
+        if (drain.deregisteredAt != null) return drain
+        return when (val outcome = router.deregister()) {
+            is SealOutcome.Asserted -> {
+                LOG.info(
+                    "deregistered {} from proxy={} after its container was observed gone",
+                    WorkloadRef(subject.server, node.name),
+                    router.proxy,
+                )
+                drain.copy(deregisteredAt = clock.instant())
+            }
+
+            is SealOutcome.Refused -> {
+                LOG.warn(
+                    "proxy={} refused to deregister {} whose container is gone: {}. The teardown continues; " +
+                        "the proxy's own pass removes the registration",
+                    router.proxy,
+                    WorkloadRef(subject.server, node.name),
+                    outcome.detail,
+                )
+                drain
+            }
+
+            is SealOutcome.Unavailable -> {
+                LOG.warn(
+                    "proxy={} could not be reached to deregister {} whose container is gone: {}. The teardown " +
+                        "continues; the proxy's own pass removes the registration",
+                    router.proxy,
+                    WorkloadRef(subject.server, node.name),
+                    outcome.detail,
+                )
+                drain
+            }
+        }
     }
 
     /**
@@ -249,73 +352,68 @@ internal class DrainController(
      * ever instead of backing off. Nothing here performs more than one side
      * effect: the resume itself does none.
      */
+    @Suppress("ReturnCount")
     private suspend fun step(
         pass: DrainPass,
         drain: DrainStatus,
     ): DrainProgress {
-        val definition = pass.definition
-        val agent = pass.agent
-        val node = pass.node
         val observation = pass.observation
-        val probe = pass.probe
         val occupancy = pass.occupancy
         val contract = pass.contract
         val now = pass.now
 
         return when (drain.state) {
             DrainState.DRAIN_REQUESTED -> {
-                // Step 2: stop new joins. No proxy, so nothing to instruct.
-                // `sealRequestedAt` stays null because no request was sent —
-                // those timestamps record side effects, and recording one that
-                // never happened would make a resumed drain skip real work.
+                // Step 2: stop new joins.
+                //
+                // Asserted rather than issued, and asserted again by every state
+                // below that depends on it — see [holdSeal]. `sealRequestedAt`
+                // records when this drain *first* got the seal in place, for a
+                // dashboard; nothing gates on it, and nothing may, because a
+                // gate would be the event-shaped seal wearing a timestamp.
+                holdSeal(pass, drain)?.let { return it }
+                val sealed = pass.subject.seal != null
                 DrainProgress(
-                    drain = drain.moveTo(DrainState.SEALED, now),
+                    drain =
+                        drain
+                            .moveTo(DrainState.SEALED, now)
+                            .copy(sealRequestedAt = if (sealed) drain.sealRequestedAt ?: now else null),
                     occupancy = occupancy,
-                    outcome = ReconcileOutcome.Progressed(NO_PROXY_SEAL),
+                    outcome = ReconcileOutcome.Progressed(if (sealed) SEALED_AT_PROXY else NO_PROXY_SEAL),
                 )
             }
 
             // Step 3: secure a destination.
             DrainState.SEALED -> {
-                resolveDestination(definition, drain, probe, occupancy, now)
+                holdSeal(pass, drain)?.let { return it }
+                secureDestination(pass, drain)
             }
 
-            // Step 4: transfer. Zero players was just confirmed by the guard
-            // below, so there is nobody to move.
+            // Step 4: move the players.
             DrainState.TARGET_RESOLVED -> {
-                requireEmpty(definition, drain, probe, occupancy, now) {
-                    DrainProgress(
-                        drain = drain.moveTo(DrainState.TRANSFERRING, now).copy(playersEvacuated = true),
-                        occupancy = occupancy,
-                        outcome = ReconcileOutcome.Progressed("no players to transfer"),
-                    )
-                }
+                holdSeal(pass, drain)?.let { return it }
+                startTransfer(pass, drain)
             }
 
             DrainState.TRANSFERRING -> {
-                requireEmpty(definition, drain, probe, occupancy, now) {
-                    DrainProgress(
-                        drain = drain.moveTo(DrainState.SAVING, now).copy(playersEvacuated = true),
-                        occupancy = occupancy,
-                        outcome = ReconcileOutcome.Progressed("zero players confirmed"),
-                    )
-                }
+                holdSeal(pass, drain)?.let { return it }
+                awaitEvacuated(pass, drain)
             }
 
             // Step 5: save the world and wait for completion.
             DrainState.SAVING -> {
-                requireEmpty(definition, drain, probe, occupancy, now) {
+                holdSeal(pass, drain)?.let { return it }
+                requireEmpty(pass, drain) {
                     save(pass, drain)
                 }
             }
 
-            // Step 6: deregister the backend. No proxy, so nothing is
-            // registered; `deregisteredAt` stays null for the same reason
-            // `sealRequestedAt` does.
+            // Step 6: deregister the backend, then step 7.
             DrainState.DEREGISTERED -> {
-                requireEmpty(definition, drain, probe, occupancy, now) {
+                holdSeal(pass, drain)?.let { return it }
+                requireEmpty(pass, drain) {
                     if (drain.mayStop(contract, observation.startedAt, now, evidenceGap)) {
-                        stop(pass, drain)
+                        letGoAndStop(pass, drain)
                     } else {
                         // The evidence that got this drain here is gone — a
                         // player was seen since, or the container restarted —
@@ -364,17 +462,38 @@ internal class DrainController(
             // then it goes back and saves again rather than jumping to the stop
             // on a confirmation from the last session.
             DrainState.DRAIN_FAILED -> {
-                requireEmpty(definition, drain, probe, occupancy, now) {
+                // No seal is asserted here, and that is what restores joins. A
+                // drain that has stopped advancing is a drain that is not going to
+                // move those players, so holding the backend out of routing buys
+                // nothing and costs a running server no player can reach — for
+                // ever, if the abort was permanent, because then this pass never
+                // happens again either. The proxy's own reconcile sweep is what
+                // makes the restoration land in that case; this branch simply
+                // declines to re-assert.
+                requireEmpty(pass, drain) {
                     // The furthest state the evidence still justifies. A drain
                     // that has emptied the server and lost only its save goes
                     // back to the save rather than round the whole machine,
                     // which would make a dashboard read as though it were
                     // making progress every fourth pass for as long as the save
                     // keeps failing.
+                    //
+                    // `destination` is on the ladder for a reason that is not
+                    // cosmetic. Without it a drain whose *transfer* keeps failing
+                    // resumes at `SEALED`, re-resolves a destination it already
+                    // had, and reports `Progressed` — which makes `ReconcileLoop`
+                    // call `queue.succeeded` and reset the backoff. The next pass
+                    // transfers, fails, parks; the pass after that resolves again.
+                    // A two-second loop, for ever, issuing destination lookups and
+                    // **transfer requests at live players** with `attempts` pinned
+                    // at 1 and the backoff never growing. Resuming straight to
+                    // `TARGET_RESOLVED` makes the whole cycle one pass that ends in
+                    // an abort, so the backoff applies and the counter rises.
                     val resume =
                         when {
                             drain.saveIsCurrent(observation.startedAt, now, evidenceGap) -> DrainState.DEREGISTERED
                             drain.playersEvacuated -> DrainState.SAVING
+                            drain.destination != null -> DrainState.TARGET_RESOLVED
                             else -> DrainState.SEALED
                         }
                     // Straight into that state, in this pass, against the probe
@@ -407,8 +526,7 @@ internal class DrainController(
 
     /** Everything one pass established before it looked at the drain's state. */
     private class DrainPass(
-        val definition: PaperServerDefinition,
-        val agent: PaperServerAgent,
+        val subject: DrainSubject,
         val node: Node,
         val observation: WorkloadObservation.Present,
         val probe: ProbeOutcome,
@@ -416,71 +534,533 @@ internal class DrainController(
         val contract: WorkloadContract,
         val now: Instant,
     ) {
-        val server: ResourceName get() = definition.metadata.name
+        val server: ResourceName get() = subject.server
     }
 
     /**
-     * Step 3, for a server with no proxy.
+     * Step 2, on every pass of every state that depends on it.
      *
-     * With players online there is no destination and no way to make one, so this
-     * is where the drain parks. It parks *without* stopping the container and
-     * without recording a failure: it is blocked, the loop backs off and looks
-     * again, and if the last player logs off the drain continues on its own.
+     * Returns null when the seal is in place — or when there is nothing that could
+     * seal, which is the standalone shape — and a [DrainProgress] abort when the
+     * proxy would not or could not confirm it. Failing to hold the seal is a real
+     * abort rather than a warning: an unsealed backend keeps taking players, so a
+     * drain that carried on would be transferring into a queue that refills behind
+     * it, which is the state the protocol's own `SOURCE_NOT_SEALED` exists to make
+     * unreachable.
+     *
+     * Skipped once the backend has been deregistered. `PUT /v1/backends/{name}`
+     * asserts registration *and* admission, so asserting a seal after step 6 would
+     * put the backend back in the routing table moments before the container stops.
      */
-    private fun resolveDestination(
-        definition: PaperServerDefinition,
+    private suspend fun holdSeal(
+        pass: DrainPass,
         drain: DrainStatus,
-        probe: ProbeOutcome,
-        occupancy: PlayerOccupancy?,
-        now: Instant,
+    ): DrainProgress? {
+        val seal = pass.subject.seal ?: return null
+        if (drain.deregisteredAt != null) return null
+        return when (val outcome = seal.assertAdmission(admits = false)) {
+            is SealOutcome.Asserted -> {
+                if (!outcome.admits) {
+                    null
+                } else {
+                    // The proxy accepted the call and reports the workload still
+                    // admitting. Nothing in the protocol produces that, so it means
+                    // the read-back describes something else — a different
+                    // incarnation, or a plugin that is not doing what it says.
+                    abortSeal(pass, drain, "the proxy accepted the seal and still reports new players admitted")
+                }
+            }
+
+            is SealOutcome.Refused -> abortSeal(pass, drain, outcome.detail, outcome.retryable)
+
+            is SealOutcome.Unavailable -> abortSeal(pass, drain, outcome.detail, outcome.retryable)
+        }
+    }
+
+    private suspend fun abortSeal(
+        pass: DrainPass,
+        drain: DrainStatus,
+        detail: String,
+        retryable: Boolean = true,
     ): DrainProgress =
-        requireEmpty(definition, drain, probe, occupancy, now) {
-            DrainProgress(
+        abort(
+            subject = pass.subject,
+            node = pass.node,
+            drain = drain,
+            occupancy = pass.occupancy,
+            now = pass.now,
+            reason = FailureReason.PROXY_CONTROL_UNREACHABLE,
+            failureClass = if (retryable) FailureClass.RETRYABLE else FailureClass.PERMANENT,
+            message =
+                "new joins could not be stopped at the proxy, so the drain is not going further: $detail. " +
+                    "The server keeps running and keeps taking players",
+        )
+
+    /**
+     * Step 3: somewhere for the players to go.
+     *
+     * **The zero-player gate is deliberately not here.** A destination search that
+     * refuses to run while players are online is a destination search that never
+     * runs — the precondition would be the negation of the state's own purpose. The
+     * precondition that belongs here is the one the step is about: *a destination
+     * with capacity*.
+     *
+     * With no router there is nowhere to send anybody, so an empty workload goes
+     * straight through and one with players **blocks**: the loop backs off and
+     * looks again, and if the last player logs off the drain continues on its own.
+     * That is the standalone shape, and it is also the proxy's own drain, because a
+     * fleet has one front door.
+     */
+    private suspend fun secureDestination(
+        pass: DrainPass,
+        drain: DrainStatus,
+    ): DrainProgress {
+        val occupancy = pass.occupancy
+        val now = pass.now
+        val router =
+            pass.subject.router ?: return requireEmpty(pass, drain) {
+                DrainProgress(
+                    drain = drain.moveTo(DrainState.TARGET_RESOLVED, now).copy(playersEvacuated = true),
+                    occupancy = occupancy,
+                    outcome = ReconcileOutcome.Progressed("no destination needed: the server is empty"),
+                )
+            }
+
+        // Nobody to move: no search, and no destination recorded either. A
+        // `destination` set here would send the resume ladder to `TARGET_RESOLVED`
+        // on a drain that never needed one.
+        val probe = pass.probe
+        if (probe is ProbeOutcome.Joinable && probe.online == 0) {
+            return DrainProgress(
                 drain = drain.moveTo(DrainState.TARGET_RESOLVED, now).copy(playersEvacuated = true),
                 occupancy = occupancy,
                 outcome = ReconcileOutcome.Progressed("no destination needed: the server is empty"),
             )
         }
 
+        return when (val choice = router.resolveDestination()) {
+            is DestinationChoice.Chosen -> {
+                LOG.info(
+                    "drain for server={} will move its players to server={} through proxy={}",
+                    pass.server,
+                    choice.destination,
+                    router.proxy,
+                )
+                DrainProgress(
+                    drain =
+                        drain
+                            .moveTo(DrainState.TARGET_RESOLVED, now)
+                            .copy(destination = choice.destination, playersEvacuated = false),
+                    occupancy = occupancy,
+                    outcome = ReconcileOutcome.Progressed("destination secured: ${choice.destination}"),
+                )
+            }
+
+            is DestinationChoice.NoCapacity -> {
+                // The search ran and the fleet had nothing. That is not the
+                // protocol working — it is a fleet too small — so it is a failure
+                // rather than a block, and it escalates once it has been true long
+                // enough. `FailureStatus` refuses to let it be PERMANENT: what it
+                // is blocked on is not a property of this server.
+                abort(
+                    subject = pass.subject,
+                    node = pass.node,
+                    drain = drain,
+                    occupancy = occupancy,
+                    now = now,
+                    reason = FailureReason.DRAIN_NO_DESTINATION,
+                    failureClass = FailureClass.RETRYABLE,
+                    message =
+                        "no server behind proxy=${router.proxy} has capacity for this server's players: " +
+                            "${choice.detail}. Nobody is disconnected and the server keeps running; add " +
+                            "capacity and the drain continues on its own",
+                )
+            }
+
+            is DestinationChoice.Unavailable -> {
+                abort(
+                    subject = pass.subject,
+                    node = pass.node,
+                    drain = drain,
+                    occupancy = occupancy,
+                    now = now,
+                    reason = FailureReason.PROXY_CONTROL_UNREACHABLE,
+                    failureClass = if (choice.retryable) FailureClass.RETRYABLE else FailureClass.PERMANENT,
+                    message = "no destination could be secured: ${choice.detail}",
+                )
+            }
+        }
+    }
+
     /**
-     * Runs [next] only if a fresh probe reports zero players; blocks the drain if
-     * anybody is on, and aborts if the probe could not answer at all.
+     * Step 4, first pass: ask the proxy to move everybody.
      *
-     * Every state from [DrainState.SEALED] onward goes through this. It is the
-     * single place that answers "is it safe to keep going", so there is one
-     * thing to audit rather than six — and, because it is the only place a
-     * positive player count is ever observed, it is also the single place that
-     * can void a save confirmation.
+     * The precondition is *a sweep that can start*, not zero players. With no
+     * router, or with nobody to move, this is the old empty-server path and
+     * [requireEmpty] still guards it — there is genuinely nothing else it could
+     * mean.
      */
-    private inline fun requireEmpty(
-        definition: PaperServerDefinition,
+    private suspend fun startTransfer(
+        pass: DrainPass,
         drain: DrainStatus,
-        probe: ProbeOutcome,
-        occupancy: PlayerOccupancy?,
-        now: Instant,
+    ): DrainProgress {
+        val occupancy = pass.occupancy
+        val now = pass.now
+        val router = pass.subject.router
+        val destination = drain.destination
+        if (router == null || destination == null) {
+            return requireEmpty(pass, drain) {
+                DrainProgress(
+                    drain = drain.moveTo(DrainState.TRANSFERRING, now).copy(playersEvacuated = true),
+                    occupancy = occupancy,
+                    outcome = ReconcileOutcome.Progressed("no players to transfer"),
+                )
+            }
+        }
+        return issueTransfer(pass, drain, router, destination, DrainState.TRANSFERRING)
+    }
+
+    /**
+     * Step 4, waiting: is the sweep getting anywhere, and is the server empty yet.
+     *
+     * ## The gate is the workload's own Server List Ping, and a proxy count never moves it
+     *
+     * A proxy makes a cheaper count available — one RPC where SLP is an
+     * `ExecSync` — and it is strictly wrong for this decision. A client connected
+     * straight to the backend's own port is invisible to the proxy and visible to
+     * SLP, and whether backends are firewalled is a deployment property this code
+     * cannot assert. So the proxy's number is read, logged when it disagrees, and
+     * never consulted: a disagreement is a log line, never a decision.
+     */
+    private suspend fun awaitEvacuated(
+        pass: DrainPass,
+        drain: DrainStatus,
+    ): DrainProgress {
+        val occupancy = pass.occupancy
+        val now = pass.now
+        val router = pass.subject.router
+        val destination = drain.destination
+        if (router == null || destination == null) {
+            return requireEmpty(pass, drain) {
+                DrainProgress(
+                    drain = drain.moveTo(DrainState.SAVING, now).copy(playersEvacuated = true),
+                    occupancy = occupancy,
+                    outcome = ReconcileOutcome.Progressed("zero players confirmed"),
+                )
+            }
+        }
+
+        return when (val probe = pass.probe) {
+            // Same answer as `requireEmpty`, and it has to be: a probe that did not
+            // answer is not a zero-player report, and nothing about a sweep being
+            // in flight changes that.
+            is ProbeOutcome.Unanswered -> unansweredProbe(pass, drain, probe)
+
+            is ProbeOutcome.Joinable -> {
+                corroborate(pass, router, probe.online)
+                if (probe.online == 0) {
+                    DrainProgress(
+                        drain = drain.moveTo(DrainState.SAVING, now).copy(playersEvacuated = true),
+                        occupancy = occupancy,
+                        outcome = ReconcileOutcome.Progressed("zero players confirmed after the transfer"),
+                    )
+                } else {
+                    // Somebody is still on, so anything this drain had saved is
+                    // behind whatever they are doing.
+                    issueTransfer(
+                        pass = pass,
+                        drain = drain.forgetSaveEvidence(),
+                        router = router,
+                        destination = destination,
+                        into = DrainState.TRANSFERRING,
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * Asks the proxy to sweep, once, and counts the ask.
+     *
+     * ## `transferAttempts` counts; it never gates
+     *
+     * It is read to decide *when to stop asking* and to report how many times this
+     * drain has asked. It is never read as "a transfer already went out, so skip
+     * this one" — the moment a pass declines to re-issue because a record says one
+     * was issued, a lost status write wedges a drain on a server with players and a
+     * seal applied, and there is nothing left that can move them. The protocol is
+     * what makes re-issuing safe: a repeat naming the same destination while a
+     * sweep is still running joins that sweep and asks nobody to move again.
+     */
+    private suspend fun issueTransfer(
+        pass: DrainPass,
+        drain: DrainStatus,
+        router: DrainRouter,
+        destination: ResourceName,
+        into: DrainState,
+    ): DrainProgress {
+        val occupancy = pass.occupancy
+        val now = pass.now
+        exhausted(pass, drain)?.let { limit ->
+            // `failure-modes.md` item 7, and the line somebody writes after "2 of 6
+            // transfers were refused" is a disconnect. At the limit the loop stops
+            // *trying*; it does not kick and it does not stop the container.
+            //
+            // RETRYABLE rather than PERMANENT, and the choice is load-bearing. A
+            // permanent abort freezes the status and stops the loop passing over
+            // this server at all, which would leave it sealed, invisible and
+            // running with nobody left to lift the seal. It is only safe because
+            // the proxy's own sweep restores joins for a parked drain — see the
+            // `DRAIN_FAILED` branch.
+            return abort(
+                subject = pass.subject,
+                node = pass.node,
+                drain = drain,
+                occupancy = occupancy,
+                now = now,
+                reason = FailureReason.DRAIN_TRANSFER_FAILED,
+                failureClass = FailureClass.RETRYABLE,
+                message =
+                    "the loop has stopped asking proxy=${router.proxy} to move this server's players to " +
+                        "`$destination`: $limit. Nobody is disconnected, the container is not stopped, and new " +
+                        "joins are restored while this drain is parked",
+            )
+        }
+
+        return when (val report = router.transfer(destination)) {
+            is TransferReport.Sweeping -> {
+                DrainProgress(
+                    drain =
+                        drain
+                            .moveTo(into, now)
+                            .copy(transferAttempts = drain.transferAttempts + 1, playersEvacuated = false),
+                    occupancy = occupancy,
+                    // Waiting, not Progressed: a sweep in flight is something that
+                    // changes by itself, and reporting progress on every pass of it
+                    // would reset the backoff that the retry limit is measured
+                    // against.
+                    outcome =
+                        if (report.remaining == 0 && report.finished) {
+                            ReconcileOutcome.Progressed("every player has been moved to `$destination`")
+                        } else {
+                            ReconcileOutcome.Waiting(
+                                "moving ${report.remaining} player(s) to `$destination` " +
+                                    "(${report.unmoved} still to re-try)",
+                                POLL,
+                            )
+                        },
+                )
+            }
+
+            is TransferReport.DestinationLost -> {
+                // Not a failure. The destination stopped being one — it went away,
+                // or it started draining itself — so the drain goes back and picks
+                // another rather than moving players onto a server they would have
+                // to be moved off again.
+                LOG.info(
+                    "destination `{}` is no longer eligible for server={}: {}. Choosing another",
+                    destination,
+                    pass.server,
+                    report.detail,
+                )
+                DrainProgress(
+                    drain = drain.moveTo(DrainState.SEALED, now).copy(destination = null),
+                    occupancy = occupancy,
+                    outcome = ReconcileOutcome.Progressed("the destination is no longer eligible; choosing another"),
+                )
+            }
+
+            is TransferReport.Refused -> {
+                abort(
+                    subject = pass.subject,
+                    node = pass.node,
+                    drain = drain.copy(transferAttempts = drain.transferAttempts + 1),
+                    occupancy = occupancy,
+                    now = now,
+                    reason = FailureReason.DRAIN_TRANSFER_FAILED,
+                    failureClass = if (report.retryable) FailureClass.RETRYABLE else FailureClass.PERMANENT,
+                    message = "proxy=${router.proxy} refused to move this server's players: ${report.detail}",
+                )
+            }
+
+            is TransferReport.Unavailable -> {
+                abort(
+                    subject = pass.subject,
+                    node = pass.node,
+                    drain = drain,
+                    occupancy = occupancy,
+                    now = now,
+                    reason = FailureReason.PROXY_CONTROL_UNREACHABLE,
+                    failureClass = if (report.retryable) FailureClass.RETRYABLE else FailureClass.PERMANENT,
+                    message = "the players could not be moved: ${report.detail}",
+                )
+            }
+        }
+    }
+
+    /**
+     * Whether step 4 has asked enough times, and why.
+     *
+     * Two bounds, because they fail differently. The attempt count catches a sweep
+     * that keeps being refused; the clock catches one that keeps being accepted and
+     * never converges. The time allowance is extended per player, because a fixed
+     * value always fails on a full server
+     * (`drain-protocol/references/state-machine.md`).
+     */
+    private fun exhausted(
+        pass: DrainPass,
+        drain: DrainStatus,
+    ): String? {
+        if (drain.transferAttempts >= MAX_TRANSFER_ATTEMPTS) {
+            return "$MAX_TRANSFER_ATTEMPTS transfer sweeps have been asked for and players are still connected"
+        }
+        val online = pass.occupancy?.online ?: 0
+        val allowance = pass.subject.playerTransferTimeout + PER_PLAYER_TRANSFER_ALLOWANCE * online
+        val waited = JavaDuration.between(drain.enteredStateAt, pass.now).toKotlinDuration()
+        return if (waited > allowance) {
+            "players have been moving for ${waited.inWholeSeconds}s, past the " +
+                "${allowance.inWholeSeconds}s allowed for $online player(s)"
+        } else {
+            null
+        }
+    }
+
+    /**
+     * Reads the proxy's own count and says so when it disagrees with the ping.
+     *
+     * It decides nothing. The value of reading it at all is that the disagreement
+     * itself is diagnostic: the proxy seeing fewer means somebody is connected
+     * straight to the backend port, which is a deployment problem an operator wants
+     * to know about, and the proxy seeing more means the ping is answering from a
+     * cached status that is behind.
+     */
+    private suspend fun corroborate(
+        pass: DrainPass,
+        router: DrainRouter,
+        pinged: Int,
+    ) {
+        val reported = router.observedPlayers() ?: return
+        if (reported == pinged) return
+        LOG.info(
+            "server={} occupancy disagrees: the Server List Ping reports {} and proxy={} reports {}. The ping " +
+                "decides; a player connected straight to the server's own port is invisible to the proxy",
+            pass.server,
+            pinged,
+            router.proxy,
+            reported,
+        )
+    }
+
+    /**
+     * Step 6 and then step 7, in that order and on separate passes.
+     *
+     * Deregistration is the one step that cannot be level-triggered: it is the last
+     * thing before the stop, so "assert it every pass" would mean asserting it from
+     * states that must not reach it. It therefore happens exactly here, on the edge
+     * into it, and the abort path out carries the compensating re-registration —
+     * see [abort].
+     *
+     * The plugin refuses `DELETE` outright while anybody is connected, and there is
+     * no force flag. Reaching that refusal means this caller's own ordering was
+     * wrong, so it aborts rather than pressing on: [requireEmpty] has just
+     * confirmed zero players by ping, and the proxy contradicting that is exactly
+     * the case where the safe answer is to stop.
+     */
+    private suspend fun letGoAndStop(
+        pass: DrainPass,
+        drain: DrainStatus,
+    ): DrainProgress {
+        val router = pass.subject.router
+        val now = pass.now
+        if (router == null || drain.deregisteredAt != null) return stop(pass, drain)
+        return when (val outcome = router.deregister()) {
+            is SealOutcome.Asserted -> {
+                LOG.info("deregistered server={} from proxy={}", pass.server, router.proxy)
+                DrainProgress(
+                    drain = drain.copy(deregisteredAt = now),
+                    occupancy = pass.occupancy,
+                    outcome = ReconcileOutcome.Progressed("the backend has left the proxy's routing table"),
+                )
+            }
+
+            is SealOutcome.Refused -> {
+                abort(
+                    subject = pass.subject,
+                    node = pass.node,
+                    drain = drain,
+                    occupancy = pass.occupancy,
+                    now = now,
+                    reason = FailureReason.DRAIN_TRANSFER_FAILED,
+                    failureClass = if (outcome.retryable) FailureClass.RETRYABLE else FailureClass.PERMANENT,
+                    message =
+                        "proxy=${router.proxy} refused to deregister this backend: ${outcome.detail}. The " +
+                            "container is not stopped: the proxy still has somebody on it, whatever the ping said",
+                )
+            }
+
+            is SealOutcome.Unavailable -> {
+                abort(
+                    subject = pass.subject,
+                    node = pass.node,
+                    drain = drain,
+                    occupancy = pass.occupancy,
+                    now = now,
+                    reason = FailureReason.PROXY_CONTROL_UNREACHABLE,
+                    failureClass = if (outcome.retryable) FailureClass.RETRYABLE else FailureClass.PERMANENT,
+                    message =
+                        "the backend could not be deregistered, so the container is not stopped: " +
+                            "${outcome.detail}. Stopping it while the proxy still routes to it would send new " +
+                            "players to a dead address",
+                )
+            }
+        }
+    }
+
+    /**
+     * Runs [next] only if a fresh ping reports zero players; blocks the drain if
+     * anybody is on, and aborts if the ping could not answer at all.
+     *
+     * ## What it guards, and why that set shrank
+     *
+     * `SAVING`, `DEREGISTERED`, `STOPPING` and the `DRAIN_FAILED` resume — the
+     * states that flush the world, let go of the backend and take the container
+     * away. It used to guard `SEALED`, `TARGET_RESOLVED` and `TRANSFERRING` too,
+     * which was defensible only while those three had no bodies: a destination
+     * search that aborts when players are online never runs, and a transfer that
+     * refuses to move anybody unless nobody is there is not a transfer. See the
+     * class note for the single-point argument that replaced "one guard for six
+     * states".
+     *
+     * It is still the only place a positive player count voids a save
+     * confirmation, and `awaitEvacuated` — which reads a positive count without
+     * going through here — voids it the same way, at its own call site.
+     */
+    private suspend inline fun requireEmpty(
+        pass: DrainPass,
+        drain: DrainStatus,
         next: () -> DrainProgress,
     ): DrainProgress =
-        when (probe) {
+        when (val probe = pass.probe) {
             is ProbeOutcome.Joinable -> {
                 if (probe.online == 0) {
                     next()
                 } else {
                     val resaves = drain.worldSaved
                     blocked(
-                        server = definition.metadata.name,
+                        subject = pass.subject,
                         // Somebody is on the server. Anything it had saved is
                         // now behind whatever they are doing, so the evidence
                         // goes and a later pass has to save again before it can
                         // reach a stop.
                         drain = drain.forgetSaveEvidence(),
-                        occupancy = occupancy,
-                        now = now,
+                        occupancy = pass.occupancy,
+                        now = pass.now,
                         reason = DrainBlockReason.AWAITING_ZERO_PLAYERS,
                         message =
                             "waiting for the server to empty. ${probe.online} of ${probe.max} player slots are " +
-                                "in use and a standalone Paper server has no proxy to transfer them through, so " +
-                                "the protocol waits rather than disconnecting anybody. The server keeps running " +
-                                "and stays joinable; the drain resumes on its own once it is empty" +
+                                "in use and there is no proxy to transfer them through, so the protocol waits " +
+                                "rather than disconnecting anybody. The server keeps running and stays " +
+                                "joinable; the drain resumes on its own once it is empty" +
                                 if (resaves) ", and saves the world again before it stops" else "",
                     )
                 }
@@ -513,19 +1093,32 @@ internal class DrainController(
             // and let the next healthy pass re-send the save — silently
             // replacing "a human confirms the world state" with "the exec
             // channel flickered".
-            is ProbeOutcome.Unanswered -> {
-                abort(
-                    server = definition.metadata.name,
-                    drain = drain.forgetSaveConfirmation(),
-                    occupancy = occupancy,
-                    now = now,
-                    reason = FailureReason.DRAIN_STALLED,
-                    failureClass =
-                        if (probe.retryable) FailureClass.RETRYABLE else FailureClass.PERMANENT,
-                    message = "cannot confirm zero players: ${probe.detail}",
-                )
-            }
+            is ProbeOutcome.Unanswered -> unansweredProbe(pass, drain, probe)
         }
+
+    /**
+     * The abort for a ping that did not answer, shared by [requireEmpty] and by
+     * [awaitEvacuated].
+     *
+     * Two call sites and one body, deliberately: the second one exists because step
+     * 4 cannot use [requireEmpty] any more, and a second copy of this reasoning is
+     * a second place for it to drift. See [requireEmpty] for the full argument.
+     */
+    private suspend fun unansweredProbe(
+        pass: DrainPass,
+        drain: DrainStatus,
+        probe: ProbeOutcome.Unanswered,
+    ): DrainProgress =
+        abort(
+            subject = pass.subject,
+            node = pass.node,
+            drain = drain.forgetSaveConfirmation(),
+            occupancy = pass.occupancy,
+            now = pass.now,
+            reason = FailureReason.DRAIN_STALLED,
+            failureClass = if (probe.retryable) FailureClass.RETRYABLE else FailureClass.PERMANENT,
+            message = "cannot confirm zero players: ${probe.detail}",
+        )
 
     /** Step 5. Requests a save at most once, and only proceeds on a confirmed completion. */
     private suspend fun save(
@@ -567,7 +1160,8 @@ internal class DrainController(
             // is not the answer: this drain has no evidence the world is on
             // disk, and only a human can supply that.
             return abort(
-                server = server,
+                subject = pass.subject,
+                node = pass.node,
                 drain = drain,
                 occupancy = occupancy,
                 now = now,
@@ -580,7 +1174,7 @@ internal class DrainController(
             )
         }
 
-        return when (val outcome = pass.agent.requestSave(pass.node, observation, contract)) {
+        return when (val outcome = pass.subject.requestSave(pass.node, observation, contract)) {
             SaveOutcome.Confirmed -> {
                 DrainProgress(
                     drain =
@@ -607,7 +1201,8 @@ internal class DrainController(
                 // you the save has not finished, never that it is now fine to
                 // stop the container (`failure-modes.md` item 1).
                 abort(
-                    server = server,
+                    subject = pass.subject,
+                    node = pass.node,
                     drain = drain.copy(saveRequestedAt = now),
                     occupancy = occupancy,
                     now = now,
@@ -622,7 +1217,8 @@ internal class DrainController(
                 // The request never went out, so trying again later is safe and
                 // `saveRequestedAt` stays null.
                 abort(
-                    server = server,
+                    subject = pass.subject,
+                    node = pass.node,
                     drain = drain,
                     occupancy = occupancy,
                     now = now,
@@ -635,7 +1231,8 @@ internal class DrainController(
 
             is SaveOutcome.Unconfirmable -> {
                 abort(
-                    server = server,
+                    subject = pass.subject,
+                    node = pass.node,
                     drain = drain,
                     occupancy = occupancy,
                     now = now,
@@ -660,7 +1257,6 @@ internal class DrainController(
         pass: DrainPass,
         drain: DrainStatus,
     ): DrainProgress {
-        val definition = pass.definition
         val observation = pass.observation
         val contract = pass.contract
         val occupancy = pass.occupancy
@@ -673,7 +1269,8 @@ internal class DrainController(
             // the stop without a current save, it aborts instead of losing a
             // world.
             return abort(
-                server = server,
+                subject = pass.subject,
+                node = pass.node,
                 drain = drain,
                 occupancy = occupancy,
                 now = now,
@@ -683,7 +1280,7 @@ internal class DrainController(
             )
         }
 
-        val grace = definition.spec.lifecycle.stopGracePeriod
+        val grace = pass.subject.stopGracePeriod
         // Through a typed record, because this is the line an investigator reads
         // first after a world is lost and the two booleans used to be adjacent
         // `Any?` arguments — a swap would have reported a save that never
@@ -726,7 +1323,6 @@ internal class DrainController(
         pass: DrainPass,
         drain: DrainStatus,
     ): DrainProgress {
-        val definition = pass.definition
         val observation = pass.observation
         val probe = pass.probe
         val contract = pass.contract
@@ -737,10 +1333,10 @@ internal class DrainController(
             if (probe is ProbeOutcome.Joinable && probe.online > 0) {
                 LOG.warn(
                     "server={} still has players after a stop was issued; not re-issuing it",
-                    definition.metadata.name,
+                    server,
                 )
                 return blocked(
-                    server = server,
+                    subject = pass.subject,
                     drain = drain.forgetSaveEvidence(),
                     occupancy = occupancy,
                     now = now,
@@ -768,9 +1364,9 @@ internal class DrainController(
             }
             LOG.warn(
                 "server={} is still running after a stop was issued; re-issuing with the same grace period",
-                definition.metadata.name,
+                server,
             )
-            pass.node.stopWorkload(observation.handle, definition.spec.lifecycle.stopGracePeriod)
+            pass.node.stopWorkload(observation.handle, pass.subject.stopGracePeriod)
             return DrainProgress(
                 drain = drain,
                 occupancy = occupancy,
@@ -818,14 +1414,16 @@ internal class DrainController(
      * waiting has had its problem resolved, and leaving the old failure beside the
      * block would report both a fault and its absence.
      */
-    private fun blocked(
-        server: ResourceName,
+    private suspend fun blocked(
+        subject: DrainSubject,
         drain: DrainStatus,
         occupancy: PlayerOccupancy?,
         now: Instant,
         reason: DrainBlockReason,
         message: String,
     ): DrainProgress {
+        val server = subject.server
+        val restored = restoreRegistration(subject, drain)
         val block = recordBlock(reason, message, now, drain.blocked)
         // Info, not warn. Nothing is wrong, and a warning every backoff interval
         // for a whole play session is the log-level version of the alert this
@@ -840,12 +1438,72 @@ internal class DrainController(
         )
         return DrainProgress(
             drain =
-                drain
+                restored
                     .moveTo(DrainState.DRAIN_FAILED, now)
                     .copy(blocked = block, failure = null),
             occupancy = occupancy,
             outcome = ReconcileOutcome.Retry(message),
         )
+    }
+
+    /**
+     * The compensating edge out of `DEREGISTERED`, taken whenever a drain parks
+     * after having let go of the backend.
+     *
+     * Deregistration is the one proxy step that cannot be level-triggered — it is
+     * the last thing before the stop, so re-asserting it every pass would mean
+     * asserting it from states that must not reach it — so an abort or a block out
+     * of `DEREGISTERED` has to put the registration back explicitly. Without this,
+     * a drain that deregistered and then failed its stop leaves the backend running
+     * and unreachable through the proxy, with nothing left that would re-add it.
+     *
+     * The seal is *not* re-asserted on the way back. `PUT /v1/backends/{name}`
+     * registers and admits in one call, which is exactly what a parked drain
+     * should leave behind: reachable again, because the drain is not going to move
+     * those players.
+     *
+     * Best-effort, and it clears [DrainStatus.deregisteredAt] only when the proxy
+     * confirmed. A failure here leaves the field set, so the next pass through this
+     * function tries again.
+     */
+    private suspend fun restoreRegistration(
+        subject: DrainSubject,
+        drain: DrainStatus,
+    ): DrainStatus {
+        val router = subject.router ?: return drain
+        if (drain.deregisteredAt == null) return drain
+        return when (val outcome = router.reregister()) {
+            is SealOutcome.Asserted -> {
+                LOG.info(
+                    "re-registered server={} with proxy={}: its drain has parked, so it takes players again",
+                    subject.server,
+                    router.proxy,
+                )
+                drain.copy(deregisteredAt = null)
+            }
+
+            is SealOutcome.Refused -> {
+                LOG.warn(
+                    "proxy={} refused to re-register server={} after its drain parked: {}. The server is " +
+                        "running and unreachable through the proxy until this succeeds",
+                    router.proxy,
+                    subject.server,
+                    outcome.detail,
+                )
+                drain
+            }
+
+            is SealOutcome.Unavailable -> {
+                LOG.warn(
+                    "proxy={} could not be reached to re-register server={} after its drain parked: {}. The " +
+                        "server is running and unreachable through the proxy until this succeeds",
+                    router.proxy,
+                    subject.server,
+                    outcome.detail,
+                )
+                drain
+            }
+        }
     }
 
     /**
@@ -863,8 +1521,9 @@ internal class DrainController(
      * human is told, which is the thing the system was missing.
      */
     @Suppress("LongParameterList")
-    private fun abort(
-        server: ResourceName,
+    private suspend fun abort(
+        subject: DrainSubject,
+        node: Node,
         drain: DrainStatus,
         occupancy: PlayerOccupancy?,
         now: Instant,
@@ -873,6 +1532,11 @@ internal class DrainController(
         message: String,
         sideEffectIssued: Boolean = false,
     ): DrainProgress {
+        val server = subject.server
+        // The explicit edge out of `DEREGISTERED`. Everything else the proxy holds
+        // is level-triggered and lapses on its own once this drain stops asserting
+        // it; a deregistration does not, so it is undone here.
+        val restored = restoreRegistration(subject, drain)
         // The first pass that recorded *this* failure, not the first pass of the
         // drain. Asked before `recordFailure` builds the failure, because the
         // escalation decides the wording of the message that call is given — see
@@ -949,7 +1613,7 @@ internal class DrainController(
             )
         }
         val aborted =
-            drain
+            restored
                 .moveTo(DrainState.DRAIN_FAILED, now)
                 // Any block goes: whatever the drain was waiting for, it has now
                 // hit something that went wrong, and a record saying both would
@@ -1035,6 +1699,26 @@ internal class DrainController(
             "the runtime did not report a usable container state; not acting on it"
         private const val NO_PROXY_SEAL =
             "no proxy to seal: a standalone server accepts joins until it stops"
+        private const val SEALED_AT_PROXY =
+            "new joins stopped at the proxy; the players already connected stay connected"
+
+        /**
+         * How many transfer sweeps step 4 asks for before it stops asking.
+         *
+         * The limit is the orchestrator's to own, because a fresh sweep zeroes the
+         * plugin's tallies — the plugin cannot count across them. At the limit the
+         * loop stops *asking*; nobody is disconnected and nothing is stopped.
+         */
+        private const val MAX_TRANSFER_ATTEMPTS = 6
+
+        /**
+         * Added to `spec.lifecycle.drain.playerTransferTimeout` per player.
+         *
+         * A fixed transfer allowance always fails on a full server
+         * (`drain-protocol/references/state-machine.md`), so the declared timeout is
+         * the floor and this is the slope.
+         */
+        private val PER_PLAYER_TRANSFER_ALLOWANCE = 2.seconds
 
         /**
          * How long a drain may keep failing before it is reported as needing a

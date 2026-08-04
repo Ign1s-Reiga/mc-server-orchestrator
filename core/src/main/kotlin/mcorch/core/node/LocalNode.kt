@@ -1,5 +1,9 @@
 package mcorch.core.node
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import mcorch.core.EndpointRequest
+import mcorch.core.EndpointResponse
 import mcorch.core.ExecOutcome
 import mcorch.core.ExecRequest
 import mcorch.core.ImageAvailability
@@ -43,9 +47,17 @@ import mcorch.schema.SecretRef
 import mcorch.store.SecretStore
 import mcorch.store.StoreException
 import org.slf4j.LoggerFactory
+import java.io.IOException
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.net.http.HttpTimeoutException
+import java.nio.charset.StandardCharsets
 import java.nio.file.Path
 import kotlin.coroutines.cancellation.CancellationException
 import kotlin.time.Duration
+import kotlin.time.toJavaDuration
 
 /**
  * The [Node] that runs containers through a containerd on one host.
@@ -85,6 +97,23 @@ public class LocalNode internal constructor(
     private val cgroupParent: String?,
 ) : Node,
     AutoCloseable {
+    /**
+     * One client for this node's lifetime, for [callEndpoint].
+     *
+     * Redirects are **never** followed: a control plane that can seal every
+     * backend in a fleet is not something to chase a `Location` header for, and
+     * the plugin never sends one. HTTP/1.1 rather than the default negotiation,
+     * because the plugin serves a `com.sun.net.httpserver` socket and an upgrade
+     * attempt against it is a round trip that can only fail.
+     */
+    private val httpClient: HttpClient =
+        HttpClient
+            .newBuilder()
+            .version(HttpClient.Version.HTTP_1_1)
+            .followRedirects(HttpClient.Redirect.NEVER)
+            .connectTimeout(java.time.Duration.ofSeconds(CONNECT_TIMEOUT_SECONDS))
+            .build()
+
     // ── health ───────────────────────────────────────────────────────────────
 
     override suspend fun status(): NodeStatus =
@@ -358,6 +387,122 @@ public class LocalNode internal constructor(
             ExecOutcome(exitCode = result.exitCode, stdout = result.stdout, stderr = result.stderr)
         }
     }
+
+    /**
+     * Reaches a port inside the sandbox over HTTP.
+     *
+     * ## The one place "inside the sandbox" is a routable address
+     *
+     * A remote node would forward this to its own agent and never expose an
+     * address at all; on this host the sandbox has a CNI address and the
+     * orchestrator process can open a socket to it directly. That difference is
+     * the whole reason [Node.callEndpoint] exists as an interface method — a
+     * caller that resolved an address itself would have hard-coded the single-host
+     * deployment (CLAUDE.md invariant 7).
+     *
+     * The address is read fresh on every call rather than cached on the handle. A
+     * sandbox that is recreated gets a new one, and a control request aimed at the
+     * previous occupant of an address is a request that seals somebody else's
+     * backend.
+     *
+     * ## What is not logged
+     *
+     * The address, ever. `SandboxStatus` redacts `ips` from its own `toString`
+     * for the same reason, and CLAUDE.md forbids addresses in log lines. Failures
+     * name the port and the path, which are declared configuration.
+     */
+    override suspend fun callEndpoint(
+        handle: WorkloadHandle,
+        request: EndpointRequest,
+    ): EndpointResponse {
+        val sandboxId = SandboxId(handle.sandboxId)
+        return translating(NodeOperation.ENDPOINT) {
+            val status = client.sandboxStatus(sandboxId)
+            val address =
+                status.ips.firstOrNull()
+                    ?: throw NodeException.Busy(
+                        name,
+                        NodeOperation.ENDPOINT,
+                        "the runtime reports no address for sandbox ${handle.sandboxId} yet, so port " +
+                            "${request.port} cannot be reached. A sandbox gets one when its network is " +
+                            "attached, so this is a wait rather than a misconfiguration",
+                    )
+            // Coordinates in, material out, and the material never leaves this
+            // function: `Authorization` is built here and the header map is
+            // discarded with the request.
+            val token = request.bearerToken?.let { resolveToken(it) }
+            send(address, request, token)
+        }
+    }
+
+    private suspend fun resolveToken(ref: SecretRef): String {
+        val secret =
+            secrets.resolve(ref) ?: throw NodeException.Rejected(
+                name,
+                NodeOperation.ENDPOINT,
+                "the control-endpoint token `${ref.name}/${ref.key}` is not in the secret store",
+            )
+        return try {
+            secret.use { material -> String(material) }
+        } finally {
+            secret.destroy()
+        }
+    }
+
+    /**
+     * The blocking half, on the IO dispatcher.
+     *
+     * `HttpClient.send` blocks a thread, so it cannot run on the loop's
+     * dispatcher — and the timeout is set on the request rather than relied on
+     * from cancellation, because a blocking call is not interruptible by a
+     * cancelled coroutine. Both halves are needed: the request timeout bounds the
+     * wait, and [translating] turns whatever comes out of it into a
+     * [NodeException].
+     */
+    private suspend fun send(
+        address: String,
+        request: EndpointRequest,
+        token: String?,
+    ): EndpointResponse =
+        withContext(Dispatchers.IO) {
+            val host = if (address.contains(':')) "[$address]" else address
+            val builder =
+                HttpRequest
+                    .newBuilder(URI.create("http://$host:${request.port}${request.path}"))
+                    .timeout(request.timeout.toJavaDuration())
+            val publisher =
+                request.body?.let { HttpRequest.BodyPublishers.ofString(it, StandardCharsets.UTF_8) }
+                    ?: HttpRequest.BodyPublishers.noBody()
+            builder.method(request.verb.name, publisher)
+            request.contentType?.let { builder.header("Content-Type", it) }
+            token?.let { builder.header("Authorization", "Bearer $it") }
+            val response =
+                try {
+                    httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8))
+                } catch (timeout: HttpTimeoutException) {
+                    throw NodeException.Timeout(
+                        name,
+                        NodeOperation.ENDPOINT,
+                        "port ${request.port} did not answer ${request.verb} ${request.path} within " +
+                            "${request.timeout.inWholeSeconds}s",
+                        timeout,
+                        // The *call* ran out of time, not a command the caller
+                        // asked the node to run. `commandTimeout` is reserved for
+                        // the latter; claiming it here would tell a caller the
+                        // node is healthy when it may not be.
+                        commandTimeout = false,
+                    )
+                } catch (failure: IOException) {
+                    throw NodeException.Unreachable(
+                        name,
+                        NodeOperation.ENDPOINT,
+                        "port ${request.port} refused or dropped ${request.verb} ${request.path}: " +
+                            "${failure::class.simpleName}",
+                        failure,
+                    )
+                }
+            EndpointResponse(status = response.statusCode(), body = response.body().orEmpty())
+        }
 
     /**
      * Stops the container, and nothing else.
@@ -718,6 +863,15 @@ public class LocalNode internal constructor(
         private const val SANDBOX_PREFIX = "mcorch-"
         private const val CPU_PERIOD_MICROS = 100_000L
         private const val MILLICORES_PER_CORE = 1000L
+
+        /**
+         * How long a TCP connect to a sandbox address may take.
+         *
+         * Short and separate from the caller's per-request timeout, which bounds
+         * the *answer*. Connecting to a port on the same host either succeeds
+         * immediately or the listener is not there.
+         */
+        private const val CONNECT_TIMEOUT_SECONDS = 5L
 
         /**
          * Opens a node against a containerd on this host.

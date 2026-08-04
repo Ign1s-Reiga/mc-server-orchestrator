@@ -1,7 +1,9 @@
 package mcorch.core
 
+import mcorch.schema.BackendRoutingStatus
 import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
+import mcorch.schema.ControlEndpointStatus
 import mcorch.schema.DrainBlock
 import mcorch.schema.DrainState
 import mcorch.schema.DrainStatus
@@ -16,6 +18,7 @@ import mcorch.schema.ServerEndpoint
 import mcorch.schema.ServerPhase
 import mcorch.schema.StatusCondition
 import mcorch.schema.StorageStatus
+import mcorch.schema.VelocityProxyStatus
 import java.time.Instant
 import kotlin.time.Duration
 
@@ -94,6 +97,91 @@ internal fun draftStatus(
     )
 }
 
+/**
+ * The same drafting for a [VelocityProxyStatus].
+ *
+ * A separate function rather than a generic one over [ServerStatus]: the two
+ * statuses differ in their *fields*, not in how the shared ones are derived, and a
+ * generic builder over a sealed hierarchy would need a branch per kind at every
+ * assignment anyway. What is genuinely shared — the condition derivation, which is
+ * where the escalation rule lives and where two copies would be a real hazard — is
+ * shared, and [deriveConditions] is the one implementation.
+ *
+ * `storage` is synthesised rather than stored. [VelocityProxyStatus] has no
+ * storage block on purpose — a nullable one would invite a reader to conclude "not
+ * persistent yet" from an absence — but `VOLUME_BOUND` and `WORLD_SAVED` are in
+ * the shared condition set and both have a true answer for a proxy: there is no
+ * volume, and there is no world to save.
+ */
+@Suppress("LongParameterList")
+internal fun draftProxyStatus(
+    previous: VelocityProxyStatus?,
+    name: ResourceName,
+    generation: Long,
+    now: Instant,
+    phase: ServerPhase,
+    attentionAfter: Duration,
+    ready: Boolean = false,
+    image: ImageStatus? = previous?.image,
+    runtime: RuntimeIdentity? = previous?.runtime,
+    endpoint: ServerEndpoint? = previous?.endpoint,
+    players: PlayerOccupancy? = previous?.players,
+    backends: BackendRoutingStatus? = previous?.backends,
+    control: ControlEndpointStatus? = previous?.control,
+    drain: DrainStatus? = previous?.drain,
+    failure: FailureStatus? = null,
+): VelocityProxyStatus {
+    val transitioned = previous == null || previous.phase != phase
+    val storage = StorageStatus(persistent = false, bound = runtime != null)
+    return VelocityProxyStatus(
+        name = name,
+        observedGeneration = generation,
+        phase = phase,
+        observedAt = now,
+        lastTransitionAt = if (transitioned) now else previous.lastTransitionAt,
+        ready = ready,
+        image = image,
+        runtime = runtime,
+        endpoint = endpoint,
+        players = players,
+        backends = backends,
+        control = control,
+        drain = drain,
+        failure = failure,
+        conditions =
+            deriveConditions(
+                previous = previous?.conditions.orEmpty(),
+                now = now,
+                phase = phase,
+                ready = ready,
+                image = image,
+                storage = storage,
+                drain = drain,
+                failure = failure,
+                attentionAfter = attentionAfter,
+                proxy =
+                    ProxyConditions(
+                        backends = backends,
+                        control = control,
+                    ),
+            ),
+    )
+}
+
+/**
+ * The two observations only a proxy can make, so the shared derivation can emit
+ * their conditions without a `when` on the status type.
+ *
+ * Null for a `PaperServer`, and then neither condition is emitted at all. That is
+ * the honest answer: a Paper server has no backend selector and no control
+ * endpoint, so `BACKENDS_RESOLVED = Unknown` on one would be a condition about a
+ * thing that does not exist.
+ */
+internal class ProxyConditions(
+    val backends: BackendRoutingStatus?,
+    val control: ControlEndpointStatus?,
+)
+
 @Suppress("LongParameterList")
 private fun deriveConditions(
     previous: List<StatusCondition>,
@@ -105,6 +193,7 @@ private fun deriveConditions(
     drain: DrainStatus?,
     failure: FailureStatus?,
     attentionAfter: Duration,
+    proxy: ProxyConditions? = null,
 ): List<StatusCondition> {
     val draining = drain != null && drain.state != DrainState.DRAIN_FAILED
     // Asked of the drain rather than passed in from the pass that aborted it,
@@ -213,7 +302,7 @@ private fun deriveConditions(
                 (drain?.worldSaved == true).toConditionStatus(),
                 worldSavedMessage(storage, drain),
             ),
-        )
+        ) + proxyEntries(proxy)
     return entries.map { entry ->
         val before = previous.firstOrNull { it.type == entry.first }
         // The transition time is when the condition *became* what it is, not
@@ -445,6 +534,61 @@ private fun worldSavedMessage(
             "no save has ever been confirmed for this server"
         }
     }
+
+/**
+ * The proxy-only conditions, and nothing at all for anything else.
+ *
+ * `BACKENDS_RESOLVED` false is **not** a failure — the proxy is running and an
+ * operator may simply not have labelled a server yet — but it is the answer to
+ * "why can nobody join". A selector that matches nothing cannot be caught at parse
+ * time: it is checked against definitions the parse never sees.
+ *
+ * `CONTROL_ENDPOINT_READY` false means seal, transfer and deregister are
+ * unavailable, which means **no backend behind this proxy can complete a drain**.
+ * It keeps "did not answer" apart from "answered, wrong version" in its message,
+ * because only one of those two has "upgrade the proxy image" as its remedy.
+ */
+private fun proxyEntries(proxy: ProxyConditions?): List<Triple<ConditionType, ConditionStatus, String>> {
+    if (proxy == null) return emptyList()
+    val backends = proxy.backends
+    val control = proxy.control
+    val resolved = backends != null && backends.matched > 0
+    val endpointReady = control != null && control.reachable && control.compatible
+    return listOf(
+        condition(
+            ConditionType.BACKENDS_RESOLVED,
+            if (backends == null) ConditionStatus.UNKNOWN else resolved.toConditionStatus(),
+            when {
+                backends == null -> "the selector has not been resolved yet"
+                !resolved ->
+                    "spec.backends.selector matches no server. Nobody can join through this proxy until a " +
+                        "server carries the labels it names"
+
+                else ->
+                    "${backends.registered} of ${backends.matched} matched server(s) are in the routing " +
+                        "table; ${backends.destinations} can receive a transfer"
+            },
+        ),
+        condition(
+            ConditionType.CONTROL_ENDPOINT_READY,
+            if (control == null) ConditionStatus.UNKNOWN else endpointReady.toConditionStatus(),
+            when {
+                control == null -> "the control endpoint has not been contacted yet"
+                !control.reachable ->
+                    "the control endpoint did not answer, so no backend behind this proxy can be sealed, " +
+                        "transferred or deregistered — which means none of them can complete a drain"
+
+                !control.compatible ->
+                    "the plugin answered and speaks control protocol " +
+                        "`${control.pluginApiVersion}`, which this build does not. Upgrade the proxy image to " +
+                        "one built from this revision; until then no backend behind this proxy can complete a " +
+                        "drain"
+
+                else -> ""
+            },
+        ),
+    )
+}
 
 private fun condition(
     type: ConditionType,

@@ -18,11 +18,23 @@ plugins {
 // slf4j is API-only, as everywhere else in this repo: :core logs, :app picks
 // the binding.
 
+// :velocity-plugin is `implementation`, and only for `mcorch.velocity.control`.
+// CLAUDE.md blesses exactly this one arrow so the wire contract — the protocol
+// version, the paths, the error codes — has one definition rather than a copy in
+// the reconciler that goes stale silently. That package names no Velocity type,
+// and the dependency is on this module's *thin* jar (`pluginJar` is a separate
+// artifact), so nothing downstream gets a second kotlin-stdlib.
+//
+// `implementation` rather than `api`: no signature in :core's public API mentions
+// a `mcorch.velocity.control` type, and it must stay that way — :api and :app
+// have no business speaking the control protocol.
+
 dependencies {
     api(project(":schema"))
     api(project(":store"))
 
     implementation(project(":cri"))
+    implementation(project(":velocity-plugin"))
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.slf4j.api)
 }

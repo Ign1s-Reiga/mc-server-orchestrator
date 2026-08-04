@@ -8,6 +8,7 @@ import mcorch.core.WorkloadSpec
 import mcorch.schema.MemoryQuantity
 import mcorch.schema.PaperServerDefinition
 import mcorch.schema.RconSpec
+import mcorch.schema.SecretRef
 import mcorch.schema.StorageSpec
 import java.security.MessageDigest
 
@@ -24,7 +25,18 @@ internal object PaperWorkloadPlanner {
     const val GAME_PORT_NAME: String = "game"
     const val RCON_PORT_NAME: String = "rcon"
 
-    fun plan(definition: PaperServerDefinition): WorkloadSpec {
+    /**
+     * @param forwardingSecret the `spec.forwarding.secret` of the proxy that
+     *   claims this server, or null when nothing does. **Coordinates only** — the
+     *   node resolves it at the moment it hands it to the runtime, so no material
+     *   passes through this module (CLAUDE.md invariant 4). Modern forwarding needs
+     *   the same value on the proxy and on every backend, and this is how the
+     *   backend gets it without its own definition ever mentioning a proxy.
+     */
+    fun plan(
+        definition: PaperServerDefinition,
+        forwardingSecret: SecretRef? = null,
+    ): WorkloadSpec {
         val spec = definition.spec
         val name = definition.metadata.name
         val ports =
@@ -63,16 +75,19 @@ internal object PaperWorkloadPlanner {
 
         val environment = PaperImageContract.environment(definition)
         val secretEnvironment =
-            when (val rcon = spec.network.rcon) {
-                is RconSpec.Enabled -> mapOf(PaperImageContract.RCON_PASSWORD to rcon.passwordSecret)
-                RconSpec.Disabled -> emptyMap()
+            buildMap {
+                when (val rcon = spec.network.rcon) {
+                    is RconSpec.Enabled -> put(PaperImageContract.RCON_PASSWORD, rcon.passwordSecret)
+                    RconSpec.Disabled -> Unit
+                }
+                forwardingSecret?.let { put(PaperImageContract.FORWARDING_SECRET, it) }
             }
 
         return WorkloadSpec(
             server = name,
             kind = definition.kind,
             image = spec.image,
-            specHash = specHash(definition),
+            specHash = specHash(definition, forwardingSecret),
             storage = storage,
             resources =
                 ResourceRequest(
@@ -80,7 +95,7 @@ internal object PaperWorkloadPlanner {
                     cpuMillicores = spec.resources.cpu?.millicores,
                 ),
             hostname = name.value,
-            env = environment,
+            env = environment + PaperImageContract.forwarding(forwardingSecret != null),
             secretEnv = secretEnvironment,
             ports = ports,
             labels =
@@ -110,7 +125,10 @@ internal object PaperWorkloadPlanner {
      * running container keeps the password it was created with until something
      * else recreates it.
      */
-    fun specHash(definition: PaperServerDefinition): String {
+    fun specHash(
+        definition: PaperServerDefinition,
+        forwardingSecret: SecretRef? = null,
+    ): String {
         val spec = definition.spec
         val rcon = spec.network.rcon
         val canonical =
@@ -145,6 +163,11 @@ internal object PaperWorkloadPlanner {
                     }
                 }
                 add("maxPlayers=${spec.maxPlayers}")
+                // Absent rather than "none" when nothing claims this server, so a
+                // fleet with no proxy in it hashes exactly as it did before this
+                // field existed. Adding the proxy kind must not recreate every
+                // container that has nothing to do with one.
+                forwardingSecret?.let { add("forwarding.secret=${it.name}/${it.key}") }
             }.joinToString("\n")
 
         val digest = MessageDigest.getInstance("SHA-256").digest(canonical.toByteArray(Charsets.UTF_8))
@@ -181,6 +204,30 @@ internal object PaperImageContract {
     const val ENABLE_RCON: String = "ENABLE_RCON"
     const val RCON_PORT: String = "RCON_PORT"
     const val RCON_PASSWORD: String = "RCON_PASSWORD"
+
+    /**
+     * Modern forwarding's shared secret, and the switch that turns it on.
+     *
+     * The value never appears here: it is carried as a `SecretRef` in
+     * `WorkloadSpec.secretEnv` and resolved by the node at the moment it reaches
+     * the runtime. Only *modern* forwarding is expressible — `:schema` has one
+     * `ForwardingMode` and rejects the other two by name — so there is nothing to
+     * branch on.
+     */
+    const val FORWARDING_SECRET: String = "VELOCITY_FORWARDING_SECRET"
+    const val ONLINE_MODE: String = "ONLINE_MODE"
+
+    /**
+     * What a backend needs when it sits behind a proxy.
+     *
+     * `ONLINE_MODE=false` is not a weakening. Under modern forwarding the *proxy*
+     * authenticates against Mojang and the backend trusts the forwarded identity,
+     * which the shared secret is what makes unforgeable; a backend left in online
+     * mode behind a proxy refuses every connection. It is emitted only when a
+     * secret was supplied, so a standalone server is untouched.
+     */
+    fun forwarding(behindProxy: Boolean): Map<String, String> =
+        if (behindProxy) mapOf(ONLINE_MODE to "false") else emptyMap()
 
     fun environment(definition: PaperServerDefinition): Map<String, String> {
         val spec = definition.spec

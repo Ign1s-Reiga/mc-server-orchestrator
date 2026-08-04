@@ -5,6 +5,15 @@ import kotlinx.coroutines.withContext
 import mcorch.core.paper.PaperServerAgent
 import mcorch.core.paper.PaperWorkloadPlanner
 import mcorch.core.paper.ProbeOutcome
+import mcorch.core.proxy.ControlChannel
+import mcorch.core.proxy.ControlOutcome
+import mcorch.core.proxy.ProxySelfLink
+import mcorch.core.proxy.VelocityProxyAgent
+import mcorch.core.proxy.VelocityWorkloadPlanner
+import mcorch.schema.BackendRegistration
+import mcorch.schema.BackendRoutingStatus
+import mcorch.schema.BackendStatus
+import mcorch.schema.ControlEndpointStatus
 import mcorch.schema.DrainState
 import mcorch.schema.FailureClass
 import mcorch.schema.FailureReason
@@ -15,11 +24,13 @@ import mcorch.schema.PaperServerStatus
 import mcorch.schema.PlayerOccupancy
 import mcorch.schema.ResourceName
 import mcorch.schema.RuntimeIdentity
+import mcorch.schema.SecretRef
 import mcorch.schema.ServerEndpoint
 import mcorch.schema.ServerPhase
 import mcorch.schema.StorageSpec
 import mcorch.schema.StorageStatus
 import mcorch.schema.VelocityProxyDefinition
+import mcorch.schema.VelocityProxyStatus
 import mcorch.store.ConflictReason
 import mcorch.store.Precondition
 import mcorch.store.Store
@@ -110,18 +121,8 @@ public class Reconciler(
                 reconcilePaper(stored, definition)
             }
 
-            // `VelocityProxy` is declarable and fully validated in `:schema`; the
-            // loop has not been taught it yet. Settling — rather than failing — is
-            // deliberate: a pass that does nothing is trivially idempotent and
-            // creates no container, whereas an outcome that looks like a failure
-            // would put a proxy into backoff for a state that is not the
-            // operator's doing. It also cannot reach here in practice today,
-            // because `:store` refuses to hold the kind at all.
             is VelocityProxyDefinition -> {
-                ReconcileOutcome.Settled(
-                    "`${definition.metadata.name}` is a ${definition.kind.wireValue}, which this build " +
-                        "validates but does not yet reconcile",
-                )
+                reconcileProxy(stored, definition)
             }
         }
     }
@@ -132,6 +133,21 @@ public class Reconciler(
     ): ReconcileOutcome {
         val now = clock.instant()
 
+        // Which proxy, if any, fronts this server. A fleet-level read, because the
+        // reference points proxy → backend: nothing in *this* definition says it is
+        // behind a proxy, and that is what keeps a backend portable and keeps the
+        // forwarding secret out of it.
+        val fleet =
+            try {
+                ProxyFleet.resolve(store, stored)
+            } catch (failure: StoreException) {
+                return storeOutcome(stored.name, failure)
+            }
+        if (fleet is ProxyFleet.Resolution.Conflicted) {
+            return refuseConflictedProxies(stored, now, fleet)
+        }
+        val binding = (fleet as? ProxyFleet.Resolution.Behind)?.binding
+
         // Deriving the workload can reject the definition — the workload types
         // enforce their own invariants — and that has to become an observation
         // rather than an exception thrown out of a pass. Built here, inside a
@@ -140,7 +156,7 @@ public class Reconciler(
         // it.
         val pass =
             try {
-                Pass(stored, definition, now)
+                Pass(stored, definition, now, binding?.forwardingSecret)
             } catch (rejected: IllegalArgumentException) {
                 return rejectDefinition(stored, now, rejected)
             } catch (rejected: IllegalStateException) {
@@ -169,7 +185,7 @@ public class Reconciler(
                     if (cause == null) {
                         converge(pass, placement.node, observation)
                     } else {
-                        drain(pass, placement.node, observation, cause)
+                        drain(pass, placement.node, observation, cause, binding)
                     }
                 }
             }
@@ -179,6 +195,906 @@ public class Reconciler(
             storeOutcome(pass.name, failure)
         }
     }
+
+    /**
+     * Two proxies claim this backend and disagree about its forwarding secret.
+     *
+     * Not a parse error — neither document is wrong on its own, and neither parse
+     * can see the other — so it surfaces here, on the server the conflict is
+     * *about*. The container is not created or recreated while it holds: bringing
+     * one up would mean choosing one of the two secrets, and choosing wrong means a
+     * backend that authenticates nobody.
+     *
+     * **Retryable, and it escalates.** An operator fixing a selector on either
+     * proxy resolves it without touching this server, which is the definition of a
+     * failure that must not be classified permanent. It does need a person, and the
+     * ordinary threshold is what calls them.
+     */
+    private suspend fun refuseConflictedProxies(
+        stored: StoredServer,
+        now: Instant,
+        conflict: ProxyFleet.Resolution.Conflicted,
+    ): ReconcileOutcome {
+        LOG.error("server={} is claimed by conflicting proxies: {}", stored.name, conflict.message)
+        val previous = stored.status?.status as? PaperServerStatus
+        val status =
+            draftStatus(
+                previous = previous,
+                name = stored.name,
+                generation = stored.definition.generation,
+                now = now,
+                phase = if (previous?.runtime == null) ServerPhase.PENDING else ServerPhase.RUNNING,
+                attentionAfter = config.drainAttentionAfter,
+                failure =
+                    recordFailure(
+                        reason = FailureReason.FORWARDING_SECRET_UNAVAILABLE,
+                        failureClass = FailureClass.RETRYABLE,
+                        message = conflict.message,
+                        now = now,
+                        previous = previous?.failure,
+                    ),
+            )
+        return try {
+            store.putStatus(status, observedDefinition = stored.definition.resourceVersion)
+            ReconcileOutcome.Retry(conflict.message)
+        } catch (storeFailure: StoreException) {
+            storeOutcome(stored.name, storeFailure)
+        }
+    }
+
+    // ── the proxy kind ───────────────────────────────────────────────────────
+
+    /**
+     * One pass over a `VelocityProxy`.
+     *
+     * The same shape as [reconcilePaper] — place, observe, diff, one step — with
+     * two things a server does not have:
+     *
+     * - **A control endpoint**, which is observed rather than declared. A proxy
+     *   that is joinable but whose plugin does not answer is a proxy behind which
+     *   *no backend can complete a drain*, so the two are separate observations and
+     *   neither implies the other.
+     * - **A backend routing table**, asserted from the fleet on every pass. That
+     *   assertion is the level trigger the whole seal design rests on: it is what
+     *   restores joins to a backend whose drain has parked, including one whose
+     *   permanent failure means the loop never passes over *it* again.
+     *
+     * **`:store` cannot persist this kind yet.** Its codec throws for
+     * `VelocityProxy` on both the definition and the status, deliberately, so in a
+     * real deployment this function is unreachable until that lands. It is
+     * reachable in tests, and it is written to be correct when the codec arrives
+     * rather than after.
+     */
+    private suspend fun reconcileProxy(
+        stored: StoredServer,
+        definition: VelocityProxyDefinition,
+    ): ReconcileOutcome {
+        val now = clock.instant()
+        val pass =
+            try {
+                ProxyPass(stored, definition, now)
+            } catch (rejected: IllegalArgumentException) {
+                return rejectProxyDefinition(stored, now, rejected)
+            } catch (rejected: IllegalStateException) {
+                return rejectProxyDefinition(stored, now, rejected)
+            }
+
+        if (pass.isBlockedByPermanentFailure()) {
+            return ReconcileOutcome.Failed(
+                pass.previous?.failure?.message ?: "a permanent failure is recorded on observed status",
+            )
+        }
+
+        return try {
+            when (val placement = placeProxy(pass)) {
+                is Placement.Refused -> refuseProxyPlacement(pass, placement)
+
+                is Placement.On -> {
+                    val observation = placement.node.observe(pass.name)
+                    val cause = placement.cause ?: proxyDrainCause(pass, observation)
+                    if (cause == null) {
+                        convergeProxy(pass, placement.node, observation)
+                    } else {
+                        drainProxy(pass, placement.node, observation, cause)
+                    }
+                }
+            }
+        } catch (failure: NodeException) {
+            proxyNodeFailure(pass, failure)
+        } catch (failure: StoreException) {
+            storeOutcome(pass.name, failure)
+        }
+    }
+
+    private suspend fun placeProxy(pass: ProxyPass): Placement {
+        val spec = pass.definition.spec
+        val currentNode = pass.previous?.runtime?.node
+        val decision =
+            scheduler.schedule(
+                PlacementRequest(
+                    server = pass.name,
+                    pin = spec.placement.node,
+                    currentNode = currentNode,
+                    demand =
+                        PlacementDemand(
+                            maxPlayers = spec.maxPlayers,
+                            memoryBytes = spec.resources.memory.bytes,
+                            cpuMillicores = spec.resources.cpu?.millicores,
+                            // A proxy holds no world, so there is nothing that has
+                            // to be reachable from the node it lands on.
+                            persistentVolume = null,
+                        ),
+                ),
+            )
+        return when (decision) {
+            is PlacementDecision.Unschedulable -> Placement.Refused(decision.problem, decision.message)
+
+            is PlacementDecision.Scheduled -> {
+                if (currentNode != null && currentNode != decision.node) {
+                    val source = registry.node(currentNode)
+                    if (source != null) return Placement.On(source, DrainCause.RELOCATION)
+                    LOG.warn(
+                        "server={} was last seen on node={}, which is no longer registered",
+                        pass.name,
+                        currentNode,
+                    )
+                    return Placement.Refused(
+                        null,
+                        "this proxy's workload was last observed on node `$currentNode`, which is no longer " +
+                            "registered. It is not being scheduled onto `${decision.node}`: that would run a " +
+                            "second front door while the first may still have players on it",
+                    )
+                }
+                val node =
+                    registry.node(decision.node)
+                        ?: return Placement.Refused(
+                            null,
+                            "the scheduler chose node `${decision.node}`, which is not registered",
+                        )
+                Placement.On(node, null)
+            }
+        }
+    }
+
+    private fun proxyDrainCause(
+        pass: ProxyPass,
+        observation: WorkloadObservation,
+    ): DrainCause? {
+        if (pass.stored.definition.terminating) return DrainCause.DELETION
+        val present = observation as? WorkloadObservation.Present ?: return null
+        val actual = present.specHash ?: return null
+        return if (actual == pass.desired.specHash) null else DrainCause.REPLACEMENT
+    }
+
+    /** Moves an undrained proxy one step toward running, joinable and routing. */
+    private suspend fun convergeProxy(
+        pass: ProxyPass,
+        node: Node,
+        observation: WorkloadObservation,
+    ): ReconcileOutcome {
+        val image = ensureProxyImage(pass, node, observation)
+        return when (observation) {
+            WorkloadObservation.Absent -> {
+                val created = node.ensureWorkload(pass.desired)
+                LOG.info(
+                    "created proxy workload for {} sandbox={} container={}",
+                    WorkloadRef(pass.name, node.name),
+                    created.handle.sandboxId,
+                    created.handle.containerId,
+                )
+                write(pass, pass.draft(ServerPhase.CREATING, image = image, runtime = pass.identity(created))) {
+                    ReconcileOutcome.Progressed("proxy workload created")
+                }
+            }
+
+            is WorkloadObservation.Present -> {
+                when (observation.state) {
+                    WorkloadState.SANDBOX_ONLY -> {
+                        val created = node.ensureWorkload(pass.desired)
+                        write(
+                            pass,
+                            pass.draft(ServerPhase.CREATING, image = image, runtime = pass.identity(created)),
+                        ) { ReconcileOutcome.Progressed("proxy container created in the existing sandbox") }
+                    }
+
+                    WorkloadState.CREATED -> {
+                        node.startWorkload(observation.handle)
+                        write(
+                            pass,
+                            pass.draft(ServerPhase.STARTING, image = image, runtime = pass.identity(observation)),
+                        ) { ReconcileOutcome.Progressed("proxy container started") }
+                    }
+
+                    WorkloadState.RUNNING -> awaitProxyReady(pass, node, observation, image)
+
+                    WorkloadState.EXITED -> {
+                        val detail = observation.reason.ifBlank { observation.message }
+                        val message =
+                            "the proxy container exited with code ${observation.exitCode ?: "unknown"}" +
+                                if (detail.isBlank()) "" else " ($detail)"
+                        LOG.error("{} is down and nothing will restart it: {}", WorkloadRef(pass.name, node.name), message)
+                        val failure =
+                            recordFailure(
+                                reason = FailureReason.CONTAINER_EXITED,
+                                failureClass = FailureClass.PERMANENT,
+                                message = message,
+                                now = pass.now,
+                                previous = pass.previous?.failure,
+                            )
+                        write(
+                            pass,
+                            pass.draft(
+                                ServerPhase.STOPPED,
+                                image = image,
+                                runtime = pass.identity(observation),
+                                failure = failure,
+                            ),
+                        ) { ReconcileOutcome.Failed(message) }
+                    }
+
+                    WorkloadState.UNKNOWN -> {
+                        write(pass, pass.draft(ServerPhase.UNKNOWN, image = image)) {
+                            ReconcileOutcome.Waiting(
+                                "the runtime did not report a usable container state",
+                                config.containerPollInterval,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private suspend fun ensureProxyImage(
+        pass: ProxyPass,
+        node: Node,
+        observation: WorkloadObservation,
+    ): ImageStatus {
+        val recorded = pass.previous?.image
+        val settled =
+            observation is WorkloadObservation.Present && observation.state != WorkloadState.SANDBOX_ONLY
+        if (settled && recorded != null && recorded.available && recorded.requested == pass.definition.spec.image) {
+            return recorded
+        }
+        val availability = node.ensureImage(pass.definition.spec.image)
+        if (availability.pulled) {
+            LOG.info(
+                "pulled image for {} image={}",
+                WorkloadRef(pass.name, node.name),
+                pass.definition.spec.image.canonical,
+            )
+        }
+        return ImageStatus(
+            requested = pass.definition.spec.image,
+            resolvedDigest = availability.id,
+            pulledAt = if (availability.pulled) pass.now else recorded?.pulledAt ?: pass.now,
+        )
+    }
+
+    /**
+     * A running proxy container is not a working front door.
+     *
+     * Three separate observations, in the order a failure of each blocks the next:
+     * the player port answers a Server List Ping, the plugin answers its handshake
+     * and speaks a protocol this build knows, and the routing table matches what
+     * the selector resolves to.
+     *
+     * The middle one is the reason this kind exists. `CONTROL_ENDPOINT_READY` being
+     * false does not stop players joining — the proxy is perfectly functional — but
+     * it means **no backend behind it can complete a drain**, which is a fleet-wide
+     * property that nothing else would report.
+     */
+    private suspend fun awaitProxyReady(
+        pass: ProxyPass,
+        node: Node,
+        observation: WorkloadObservation.Present,
+        image: ImageStatus?,
+    ): ReconcileOutcome {
+        val channel = pass.channel(node, observation.handle)
+        val control = readControl(pass, channel)
+        val probe = pass.agent.probe(node, observation.handle)
+        val endpoint =
+            ServerEndpoint(
+                node = node.name,
+                address = node.name.value,
+                port = pass.definition.spec.network.hostPort ?: pass.definition.spec.network.port,
+            )
+
+        if (probe !is ProbeOutcome.Joinable) {
+            val startedAt = observation.startedAt ?: observation.createdAt ?: pass.now
+            val waited = JavaDuration.between(startedAt, pass.now).toKotlinDuration()
+            val detail = (probe as ProbeOutcome.Unanswered).detail
+            val within = waited <= pass.definition.spec.lifecycle.startupTimeout
+            val failure =
+                if (within) {
+                    null
+                } else {
+                    recordFailure(
+                        reason = FailureReason.READINESS_TIMEOUT,
+                        failureClass = FailureClass.RETRYABLE,
+                        message = "the proxy is not joinable ${waited.inWholeSeconds}s after start: $detail",
+                        now = pass.now,
+                        previous = pass.previous?.failure,
+                    )
+                }
+            val status =
+                pass.draft(
+                    ServerPhase.STARTING,
+                    image = image,
+                    runtime = pass.identity(observation),
+                    endpoint = endpoint,
+                    control = control,
+                    failure = failure,
+                )
+            return write(pass, status) {
+                if (within) {
+                    ReconcileOutcome.Waiting("the proxy is not joinable yet: $detail", config.readinessPollInterval)
+                } else {
+                    ReconcileOutcome.Retry("the proxy is not joinable: $detail")
+                }
+            }
+        }
+
+        val players = PlayerOccupancy(probe.online, probe.max, pass.now)
+        val routing = assertBackends(pass, channel, control)
+        val status =
+            pass.draft(
+                ServerPhase.RUNNING,
+                ready = true,
+                image = image,
+                runtime = pass.identity(observation),
+                endpoint = endpoint,
+                players = players,
+                backends = routing.status,
+                control = control,
+                drain = null,
+                failure = routing.failure,
+            )
+        return write(pass, status) {
+            when {
+                routing.failure != null -> ReconcileOutcome.Retry(routing.failure.message)
+                else -> ReconcileOutcome.Settled("running, joinable and routing")
+            }
+        }
+    }
+
+    /** The handshake, turned into the observation a dashboard reads. */
+    private suspend fun readControl(
+        pass: ProxyPass,
+        channel: ControlChannel,
+    ): ControlEndpointStatus =
+        when (val outcome = channel.version()) {
+            is ControlOutcome.Answered ->
+                ControlEndpointStatus(
+                    reachable = true,
+                    pluginApiVersion = outcome.value.pluginApiVersion,
+                    // Set membership, read from `ControlProtocol` rather than
+                    // re-derived here — the point of the one blessed dependency
+                    // arrow is that this build cannot hold a stale copy.
+                    compatible = outcome.value.compatible,
+                    lastContactAt = pass.now,
+                )
+
+            is ControlOutcome.Refused ->
+                ControlEndpointStatus(reachable = true, compatible = false, lastContactAt = pass.now)
+
+            is ControlOutcome.Unavailable ->
+                ControlEndpointStatus(
+                    reachable = false,
+                    compatible = false,
+                    lastContactAt = pass.previous?.control?.lastContactAt,
+                )
+        }
+
+    /**
+     * Asserts the routing table, every pass, from the fleet.
+     *
+     * ## This is the level trigger
+     *
+     * Every seal in this system lapses when nothing re-asserts it, and *this* is
+     * what re-asserts. `PUT /v1/backends/{name}` states registration and admission
+     * together, so one call per backend per pass repairs: a proxy that restarted
+     * and lost every seal, a backend whose drain aborted and should take players
+     * again, a backend whose drain aborted **permanently** — where the backend's
+     * own passes have stopped, so nothing else could — and an orchestrator that
+     * died mid-drain.
+     *
+     * `admitsNewPlayers` is the negation of "this backend has any drain record at
+     * all", which is the same rule the destination search uses and for the same
+     * reason: `draining` is deliberately false in `DRAIN_FAILED`.
+     *
+     * ## It also lets go of what the selector no longer matches
+     *
+     * A backend whose definition was purged, or relabelled, leaves a registration
+     * pointing at an address nothing is listening on. Removing it is drain step 6
+     * performed by a sweep — which is safe *here and only here* because the plugin
+     * refuses `DELETE` outright while anybody is connected, with no force flag. The
+     * sweep therefore cannot disconnect a player however wrong it is, and it is the
+     * only thing that can repair a registration whose backend is gone.
+     */
+    private suspend fun assertBackends(
+        pass: ProxyPass,
+        channel: ControlChannel,
+        control: ControlEndpointStatus,
+    ): ProxyRouting {
+        if (!control.reachable || !control.compatible) {
+            val message =
+                if (!control.reachable) {
+                    "the proxy's control endpoint did not answer, so its routing table cannot be asserted and " +
+                        "no backend behind it can complete a drain"
+                } else {
+                    "the proxy's plugin speaks control protocol `${control.pluginApiVersion}`, which this " +
+                        "build does not. No backend behind it can complete a drain"
+                }
+            return ProxyRouting(
+                status = pass.previous?.backends,
+                failure =
+                    recordFailure(
+                        reason =
+                            if (control.reachable) {
+                                FailureReason.PROXY_PLUGIN_INCOMPATIBLE
+                            } else {
+                                FailureReason.PROXY_CONTROL_UNREACHABLE
+                            },
+                        // Retryable even for the version mismatch. "Stop trying" on
+                        // a proxy freezes its status and stops the sweep above,
+                        // which is the one thing that restores joins to a parked
+                        // backend — so the narrow bucket stays narrow here too.
+                        failureClass = FailureClass.RETRYABLE,
+                        message = message,
+                        now = pass.now,
+                        previous = pass.previous?.failure,
+                    ),
+            )
+        }
+
+        val matched = pass.backends(store)
+        val registered =
+            when (val state = channel.state()) {
+                is ControlOutcome.Answered -> state.value
+                else -> null
+            }
+        val statuses = mutableListOf<BackendStatus>()
+        var problem: String? = null
+        for (backend in matched) {
+            val admits = !backend.drainInitiated
+            when (val outcome = channel.assertBackend(backend.server, backend.address, admits)) {
+                is ControlOutcome.Answered -> {
+                    statuses +=
+                        BackendStatus(
+                            server = backend.server,
+                            registration =
+                                when {
+                                    // Filled from this loop's own probe, never from
+                                    // the proxy: a proxy-side ping would make the
+                                    // read path blocking, which the plugin author
+                                    // ruled out.
+                                    !backend.ready -> BackendRegistration.UNREACHABLE
+                                    outcome.value.admitsNewPlayers -> BackendRegistration.REGISTERED
+                                    else -> BackendRegistration.SEALED
+                                },
+                            players =
+                                backend.online?.let {
+                                    PlayerOccupancy(it, backend.maxPlayers, pass.now)
+                                },
+                            drainInitiated = backend.drainInitiated,
+                            lastTransitionAt = pass.now,
+                        )
+                }
+
+                is ControlOutcome.Refused -> {
+                    problem = problem ?: "`${backend.server}` could not be registered (${outcome.code})"
+                    statuses +=
+                        BackendStatus(
+                            server = backend.server,
+                            registration = BackendRegistration.PENDING,
+                            drainInitiated = backend.drainInitiated,
+                            lastTransitionAt = pass.now,
+                        )
+                }
+
+                is ControlOutcome.Unavailable -> {
+                    problem = problem ?: outcome.detail
+                    statuses +=
+                        BackendStatus(
+                            server = backend.server,
+                            registration = BackendRegistration.PENDING,
+                            drainInitiated = backend.drainInitiated,
+                            lastTransitionAt = pass.now,
+                        )
+                }
+            }
+        }
+
+        // What the proxy holds that the selector no longer matches. See the note.
+        val wanted = matched.map { it.server.value.lowercase() }.toSet()
+        registered?.backends?.filter { it.name.lowercase() !in wanted }?.forEach { stale ->
+            ResourceName.of(stale.name).getOrNull()?.let { name ->
+                when (val outcome = channel.deregister(name)) {
+                    is ControlOutcome.Answered ->
+                        LOG.info(
+                            "deregistered `{}` from proxy={}: no definition matches its backend selector any more",
+                            name,
+                            pass.name,
+                        )
+
+                    // BACKEND_OCCUPIED, in practice. The plugin refusing is the
+                    // guard working: somebody is connected, so nothing is removed.
+                    is ControlOutcome.Refused ->
+                        LOG.info(
+                            "left `{}` registered with proxy={}: {}",
+                            name,
+                            pass.name,
+                            outcome.problem,
+                        )
+
+                    is ControlOutcome.Unavailable -> Unit
+                }
+            }
+        }
+
+        // The proxy's own login seal, from the same rule the drain uses. With every
+        // backend sealed the login path has nowhere to deflect a joining player to
+        // and admits them anyway, so a fleet-wide drain could never reach zero.
+        val proxyDraining = pass.previous?.drainInitiated == true
+        val anyAdmitting = matched.any { !it.drainInitiated }
+        channel.assertProxyAdmission(admits = !proxyDraining && anyAdmitting)
+
+        val routing = BackendRoutingStatus(observedAt = pass.now, backends = statuses)
+        return ProxyRouting(
+            status = routing,
+            failure =
+                problem?.let {
+                    recordFailure(
+                        reason = FailureReason.PROXY_CONTROL_UNREACHABLE,
+                        failureClass = FailureClass.RETRYABLE,
+                        message = "the proxy's routing table could not be fully asserted: $it",
+                        now = pass.now,
+                        previous = pass.previous?.failure,
+                    )
+                },
+        )
+    }
+
+    private class ProxyRouting(
+        val status: BackendRoutingStatus?,
+        val failure: FailureStatus?,
+    )
+
+    /**
+     * The proxy's own drain.
+     *
+     * It keeps the standalone shape — seal the login path, then wait for the last
+     * player to log off — because a proxy has nowhere to send its own players by
+     * construction: a fleet has one front door. [ProxyDrainSubject] therefore has a
+     * [DrainSeal] and no [DrainRouter], and there is no cross-server sequencing
+     * anywhere in it.
+     */
+    private suspend fun drainProxy(
+        pass: ProxyPass,
+        node: Node,
+        observation: WorkloadObservation,
+        cause: DrainCause,
+    ): ReconcileOutcome {
+        val seal =
+            (observation as? WorkloadObservation.Present)?.let {
+                ProxySelfLink(pass.channel(node, it.handle))
+            }
+        val progress =
+            drainController.advance(
+                subject = ProxyDrainSubject(pass.definition, pass.agent, seal),
+                node = node,
+                observation = observation,
+                current = pass.previous?.drain,
+                cause = cause,
+                lastProbedAt = pass.previous?.players?.observedAt,
+                hadContainer = pass.previous?.runtime?.containerId != null,
+            )
+        val phase =
+            when {
+                progress.containerDown -> ServerPhase.STOPPED
+                progress.drain.state == DrainState.DRAIN_FAILED -> ServerPhase.RUNNING
+                progress.drain.state == DrainState.STOPPING -> ServerPhase.STOPPING
+                else -> ServerPhase.DRAINING
+            }
+        val status =
+            pass.draft(
+                phase = phase,
+                ready = progress.occupancy != null && phase == ServerPhase.RUNNING,
+                runtime =
+                    (observation as? WorkloadObservation.Present)
+                        ?.let { pass.identity(it) }
+                        ?: pass.previous?.runtime,
+                players = progress.occupancy ?: pass.previous?.players,
+                drain = progress.drain,
+                // A copy, and it must stay one — see the note on `Reconciler.drain`.
+                failure = progress.drain.failure,
+            )
+        if (!progress.containerDown) {
+            return write(pass, status, mustRecord = progress.sideEffectIssued) { progress.outcome }
+        }
+        return teardownProxy(pass, node, observation, status, cause)
+    }
+
+    private suspend fun teardownProxy(
+        pass: ProxyPass,
+        node: Node,
+        observation: WorkloadObservation,
+        status: VelocityProxyStatus,
+        cause: DrainCause,
+    ): ReconcileOutcome {
+        if (observation is WorkloadObservation.Present) {
+            val removal = node.removeWorkload(observation.handle)
+            if (!removal.complete) {
+                val partial = status.copy(runtime = status.runtime?.copy(containerId = null))
+                return write(pass, partial) { ReconcileOutcome.Retry(removal.detail) }
+            }
+            LOG.info("removed proxy workload for {}", WorkloadRef(pass.name, node.name))
+            return write(pass, status) { ReconcileOutcome.Progressed("proxy workload removed") }
+        }
+        if (pass.stored.definition.terminating) {
+            val verdict = writeProxyStatus(pass, status)
+            if (verdict is WriteVerdict.Conflicted) return verdict.outcome
+            return when (val outcome = store.purge(pass.name, Precondition.AtVersion(pass.stored.definition.resourceVersion))) {
+                is WriteOutcome.Applied -> {
+                    LOG.info("purged proxy={}: its workload is gone", pass.name)
+                    ReconcileOutcome.Progressed("definition purged")
+                }
+
+                is WriteOutcome.Conflict -> ReconcileOutcome.Retry("the purge conflicted (${outcome.reason}); re-reading")
+            }
+        }
+        val cleared =
+            pass.draft(
+                phase = status.phase,
+                image = status.image,
+                runtime = null,
+                endpoint = null,
+                players = null,
+                backends = null,
+                control = null,
+                drain = null,
+            )
+        return write(pass, cleared) {
+            ReconcileOutcome.Progressed("the old proxy workload is gone; ${cause.detail} is applied next pass")
+        }
+    }
+
+    private suspend fun refuseProxyPlacement(
+        pass: ProxyPass,
+        refusal: Placement.Refused,
+    ): ReconcileOutcome {
+        val permanent = refusal.problem == PlacementProblem.PINNED_NODE_UNKNOWN
+        val failure =
+            recordFailure(
+                reason = FailureReason.NODE_UNAVAILABLE,
+                failureClass = if (permanent) FailureClass.PERMANENT else FailureClass.RETRYABLE,
+                message = refusal.message,
+                now = pass.now,
+                previous = pass.previous?.failure,
+            )
+        if (permanent) LOG.error("proxy={} cannot be placed: {}", pass.name, refusal.message)
+        val status =
+            pass.draft(
+                phase = if (pass.previous?.runtime == null) ServerPhase.PENDING else ServerPhase.UNKNOWN,
+                failure = failure,
+            )
+        return write(pass, status) {
+            if (permanent) ReconcileOutcome.Failed(refusal.message) else ReconcileOutcome.Retry(refusal.message)
+        }
+    }
+
+    private suspend fun proxyNodeFailure(
+        pass: ProxyPass,
+        failure: NodeException,
+    ): ReconcileOutcome {
+        val recorded =
+            recordFailure(
+                reason = failure.asFailureReason(),
+                failureClass = failure.asFailureClass(),
+                message = failure.message,
+                now = pass.now,
+                previous = pass.previous?.failure,
+            )
+        if (failure.retryable) {
+            LOG.warn("node operation failed for proxy={}: {}", pass.name, failure.message)
+        } else {
+            LOG.error("node operation failed permanently for proxy={}: {}", pass.name, failure.message)
+        }
+        val status =
+            pass.draft(
+                phase = if (pass.previous?.runtime == null) ServerPhase.PENDING else ServerPhase.UNKNOWN,
+                failure = recorded,
+            )
+        return write(pass, status) {
+            if (failure.retryable) ReconcileOutcome.Retry(failure.message) else ReconcileOutcome.Failed(failure.message)
+        }
+    }
+
+    private suspend fun rejectProxyDefinition(
+        stored: StoredServer,
+        now: Instant,
+        failure: RuntimeException,
+    ): ReconcileOutcome {
+        val message = "the proxy definition cannot be turned into a workload: ${failure.message}"
+        LOG.error("proxy={} was rejected: {}", stored.name, message)
+        val previous = stored.status?.status as? VelocityProxyStatus
+        val status =
+            draftProxyStatus(
+                previous = previous,
+                name = stored.name,
+                generation = stored.definition.generation,
+                now = now,
+                phase = ServerPhase.FAILED,
+                attentionAfter = config.drainAttentionAfter,
+                failure =
+                    recordFailure(
+                        reason = FailureReason.CONTAINER_CREATE_FAILED,
+                        failureClass = FailureClass.PERMANENT,
+                        message = message,
+                        now = now,
+                        previous = previous?.failure,
+                    ),
+            )
+        return try {
+            store.putStatus(status, observedDefinition = stored.definition.resourceVersion)
+            ReconcileOutcome.Failed(message)
+        } catch (storeFailure: StoreException) {
+            storeOutcome(stored.name, storeFailure)
+        }
+    }
+
+    private suspend inline fun write(
+        pass: ProxyPass,
+        status: VelocityProxyStatus,
+        mustRecord: Boolean = false,
+        outcome: () -> ReconcileOutcome,
+    ): ReconcileOutcome {
+        val verdict =
+            if (mustRecord) {
+                withContext(NonCancellable) { writeProxyStatus(pass, status) }
+            } else {
+                writeProxyStatus(pass, status)
+            }
+        return when (verdict) {
+            is WriteVerdict.Conflicted -> verdict.outcome
+            WriteVerdict.Written, WriteVerdict.Unchanged -> outcome()
+        }
+    }
+
+    private suspend fun writeProxyStatus(
+        pass: ProxyPass,
+        status: VelocityProxyStatus,
+    ): WriteVerdict {
+        val recorded = pass.stored.status
+        val previous = recorded?.status as? VelocityProxyStatus
+        if (previous != null && status.copy(observedAt = previous.observedAt) == previous) {
+            val since = JavaDuration.between(recorded.recordedAt, pass.now).toKotlinDuration()
+            if (since < config.statusHeartbeat) return WriteVerdict.Unchanged
+        }
+        val outcome = store.putStatus(status = status, observedDefinition = pass.stored.definition.resourceVersion)
+        return when (outcome) {
+            is WriteOutcome.Applied -> WriteVerdict.Written
+            is WriteOutcome.Conflict ->
+                when (outcome.reason) {
+                    ConflictReason.NOT_FOUND ->
+                        WriteVerdict.Conflicted(
+                            ReconcileOutcome.Settled("the definition was purged while this pass ran"),
+                        )
+
+                    else ->
+                        WriteVerdict.Conflicted(
+                            ReconcileOutcome.Retry("the observation was rejected (${outcome.reason}); re-reading"),
+                        )
+                }
+        }
+    }
+
+    /** Everything one proxy pass needs, read once. */
+    private inner class ProxyPass(
+        val stored: StoredServer,
+        val definition: VelocityProxyDefinition,
+        val now: Instant,
+    ) {
+        val name: ResourceName = definition.metadata.name
+        val previous: VelocityProxyStatus? = stored.status?.status as? VelocityProxyStatus
+        val agent: VelocityProxyAgent = VelocityProxyAgent(definition)
+        val desired: WorkloadSpec = VelocityWorkloadPlanner.plan(definition)
+
+        fun isBlockedByPermanentFailure(): Boolean {
+            val failed =
+                previous != null &&
+                    previous.observedGeneration == stored.definition.generation &&
+                    previous.failure?.failureClass == FailureClass.PERMANENT
+            return failed && !stored.definition.terminating
+        }
+
+        fun channel(
+            node: Node,
+            handle: WorkloadHandle,
+        ): ControlChannel =
+            ControlChannel(
+                node = node,
+                handle = handle,
+                port = definition.spec.control.port,
+                token = definition.spec.control.tokenSecret,
+                timeout = definition.spec.backends.drain.sealTimeout,
+            )
+
+        /** Every server this proxy's selector matches, with what the fleet knows about each. */
+        suspend fun backends(store: Store): List<MatchedBackend> {
+            val selector = definition.spec.backends.selector
+            return store.listServers().mapNotNull { row ->
+                val backend = row.definition.definition as? PaperServerDefinition ?: return@mapNotNull null
+                if (!selector.matches(backend.metadata.labels)) return@mapNotNull null
+                val status = row.status?.status as? PaperServerStatus
+                MatchedBackend(
+                    server = backend.metadata.name,
+                    address =
+                        "${status?.endpoint?.address ?: backend.metadata.name.value}:" +
+                            "${backend.spec.network.hostPort ?: backend.spec.network.port}",
+                    maxPlayers = backend.spec.maxPlayers,
+                    online = status?.players?.online,
+                    ready = status?.ready == true,
+                    drainInitiated = status?.drainInitiated == true || row.definition.terminating,
+                )
+            }
+        }
+
+        @Suppress("LongParameterList")
+        fun draft(
+            phase: ServerPhase,
+            ready: Boolean = false,
+            image: ImageStatus? = previous?.image,
+            runtime: RuntimeIdentity? = previous?.runtime,
+            endpoint: ServerEndpoint? = previous?.endpoint,
+            players: PlayerOccupancy? = previous?.players,
+            backends: BackendRoutingStatus? = previous?.backends,
+            control: ControlEndpointStatus? = previous?.control,
+            drain: mcorch.schema.DrainStatus? = previous?.drain,
+            failure: FailureStatus? = null,
+        ): VelocityProxyStatus =
+            draftProxyStatus(
+                previous = previous,
+                name = name,
+                generation = stored.definition.generation,
+                now = now,
+                phase = phase,
+                attentionAfter = config.drainAttentionAfter,
+                ready = ready,
+                image = image,
+                runtime = runtime,
+                endpoint = endpoint,
+                players = players,
+                backends = backends,
+                control = control,
+                drain = drain,
+                failure = failure,
+            )
+
+        fun identity(observation: WorkloadObservation.Present): RuntimeIdentity =
+            RuntimeIdentity(
+                node = observation.handle.node,
+                sandboxId = observation.handle.sandboxId,
+                containerId = observation.handle.containerId ?: previous?.runtime?.containerId,
+                createdAt = observation.createdAt,
+                startedAt = observation.startedAt,
+                finishedAt = observation.finishedAt,
+                exitCode = observation.exitCode,
+                restartCount = previous?.runtime?.restartCount ?: 0,
+            )
+    }
+
+    /** One server the proxy's selector matched, as the routing assertion needs it. */
+    private class MatchedBackend(
+        val server: ResourceName,
+        /** `host:port` as the proxy must dial it. A backend address, never a player's. */
+        val address: String,
+        val maxPlayers: Int,
+        val online: Int?,
+        val ready: Boolean,
+        val drainInitiated: Boolean,
+    )
 
     /**
      * Records a definition that cannot be turned into a workload at all.
@@ -658,12 +1574,23 @@ public class Reconciler(
         node: Node,
         observation: WorkloadObservation,
         cause: DrainCause,
+        binding: ProxyFleet.Binding?,
     ): ReconcileOutcome {
         forbiddenTransition(pass, observation, cause)?.let { return it }
-        val progress =
-            drainController.advance(
+        // The proxy conversation for steps 2, 4 and 6, or nothing. Built per pass
+        // and never cached: which servers are eligible destinations, and whether
+        // this is the last admitting backend, are facts about the fleet *now*.
+        val link = binding?.let { ProxyFleet.linkFor(it, pass.name, registry, scheduler, node.name, config) }
+        val subject =
+            PaperDrainSubject(
                 definition = pass.definition,
                 agent = pass.agent,
+                seal = link,
+                router = link,
+            )
+        val progress =
+            drainController.advance(
+                subject = subject,
                 node = node,
                 observation = observation,
                 current = pass.previous?.drain,
@@ -1194,11 +2121,23 @@ public class Reconciler(
         val stored: StoredServer,
         val definition: PaperServerDefinition,
         val now: Instant,
+        /**
+         * The proxy's `spec.forwarding.secret`, when a proxy claims this server.
+         *
+         * **Coordinates only.** It travels into [WorkloadSpec.secretEnv] and the
+         * node resolves it at the moment it hands it to the runtime, so no
+         * material exists in this process, in a stored row, in an API response or
+         * in a log line (CLAUDE.md invariant 4). The coordinate is in the spec
+         * hash, so enrolling a server behind a proxy — or moving it to one with a
+         * different secret — is a recreate, and a recreate goes through the drain
+         * like every other one.
+         */
+        val forwardingSecret: SecretRef? = null,
     ) {
         val name: ResourceName = definition.metadata.name
         val previous: PaperServerStatus? = stored.status?.status as? PaperServerStatus
         val agent: PaperServerAgent = PaperServerAgent(definition)
-        val desired: WorkloadSpec = PaperWorkloadPlanner.plan(definition)
+        val desired: WorkloadSpec = PaperWorkloadPlanner.plan(definition, forwardingSecret)
 
         fun isBlockedByPermanentFailure(): Boolean {
             val failed =

@@ -53,6 +53,12 @@ internal class FakeNode(
     val containerRemovals: MutableList<WorkloadHandle> = mutableListOf()
     val execs: MutableList<List<String>> = mutableListOf()
 
+    /** Every control-channel request, so a test can count seals and transfers at the wire. */
+    val endpointCalls: MutableList<EndpointRequest> = mutableListOf()
+
+    /** What is listening inside the sandbox, by port. A proxy's plugin goes here. */
+    val endpoints: MutableMap<Int, FakeProxyPlugin> = mutableMapOf()
+
     /** Every call that reached the node, failed ones included. Counts attempts. */
     val calls: MutableList<NodeOperation> = mutableListOf()
 
@@ -220,6 +226,33 @@ internal class FakeNode(
         }
         execs += request.command
         return onExec(request.command)
+    }
+
+    /**
+     * The in-sandbox HTTP channel, answered by whatever is listening on that port.
+     *
+     * A port with nothing on it is [NodeException.Unreachable], which is what a
+     * real node reports for a refused connection — and it is the state a proxy
+     * whose plugin failed to load is in, so it has to be reachable from a test.
+     */
+    override suspend fun callEndpoint(
+        handle: WorkloadHandle,
+        request: EndpointRequest,
+    ): EndpointResponse {
+        check(NodeOperation.ENDPOINT)
+        endpointCalls += request
+        val listener =
+            endpoints[request.port]
+                ?: throw NodeException.Unreachable(
+                    name,
+                    NodeOperation.ENDPOINT,
+                    "nothing is listening on port ${request.port}",
+                )
+        return try {
+            listener.handle(request)
+        } catch (refused: java.io.IOException) {
+            throw NodeException.Unreachable(name, NodeOperation.ENDPOINT, refused.message.orEmpty(), refused)
+        }
     }
 
     override suspend fun stopWorkload(
