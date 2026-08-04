@@ -346,3 +346,34 @@ desired definition rather than the running container.
   backend with no force flag — so it is a warning, but it became live rather than
   theoretical with `DefinitionCodec.rebuilding`, which deliberately widens what
   counts as a corrupt definition row.
+
+## Round 15 rulings: the anchor holds, the resume does not
+
+- **`DrainStatus.transferStartedAt` is the right anchor and the enumeration
+  checks out.** Every path that can reach `exhausted` passes a stamp: both
+  `secureDestination` branches that enter `TARGET_RESOLVED` with a router, and
+  `transferStep`'s players-online branch for the three paths that never had a
+  bodied step-3 pass. The no-router entry to `TARGET_RESOLVED` does not stamp and
+  does not need to — `transferStep` short-circuits to `requireEmpty` whenever
+  `router == null || destination == null`. Nothing clears it: `moveTo`,
+  `forgetSaveEvidence`, `forgetSaveConfirmation`, `dropUnusableSaveEvidence`,
+  `abort`, `blocked`, `restoreRegistration` and the container-down branch are all
+  `copy`-based, and the only `drain = null` sites in `Reconciler` discard the
+  whole record with the workload. Persistence does not reopen critical 2: the key
+  is nullable (`PropertyDocument.instant` returns null on a missing key),
+  `ENCODING_VERSION` is unchanged at 1, and an old row costs one extra allowance.
+  Do not re-litigate the anchor.
+- **The ruling on module ownership: a two-line codec edit by the `:core` owner is
+  what the rule intends.** CLAUDE.md's "changes spanning `:schema` or `:cri` go to
+  a single agent as one unit" is a rule against *leaving one side stale*, not a
+  rule about who may type in which directory. The `:store` and `:api` edits here
+  are the mechanical consequence of one `:schema` field — one `scope.put`, one
+  `reader.instant`, one `put` in `ServerJson` — and routing them would have split
+  a single semantic change across three reviews with a window in which the field
+  existed and was not persisted. The line to hold is behavioural: route when the
+  other module has to make a *decision* (a migration, a precedence, a badge rank),
+  keep it when the other module only has to carry the value.
+- **A green suite with no test XML is not a result.** A wedged Gradle daemon that
+  reports `BUILD FAILED` and writes no reports is indistinguishable from "nothing
+  ran"; treating it as an unknown was correct. Never accept a signed count that
+  cannot be traced to per-module XML.

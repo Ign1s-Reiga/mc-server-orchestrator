@@ -687,3 +687,55 @@ Related: [[standalone-paper-drain-shape]]
     deletion that never happened"). Whenever a read is made tolerant, check whether
     any consumer derives *absence*; tolerance without the exclusion list is
     strictly worse than the strict read for those consumers.
+
+## Round 15: the flag that closed one site
+
+62. **A `derivedOnly`-style marker closes the resume's failure-clearing hole only
+    at the sites it is attached to, and the class is bigger than the site that was
+    found.** `resumeInto` clears `failure`/`blocked` on any resumed step that did
+    not itself land in `DRAIN_FAILED`; the round-14 fix marked
+    `secureDestination`'s `Chosen` and nothing else. `save()` has **two** early
+    returns of exactly the same shape — `!contract.holdsWorldData` and
+    `saveIsCurrent` — that report `Progressed` after reading a container label or
+    a stored timestamp and issuing no RPC. So an *ephemeral* workload whose step 6
+    or step 7 keeps failing alternates `SAVING → DEREGISTERED` (Progressed,
+    failure cleared) with `DEREGISTERED → abort` at `stepInterval` for ever:
+    `attempts` pinned at 1, `occurredAt` restamped, `escalates()` never true,
+    `queue.succeeded` resetting the backoff on the `Progressed`. Whenever a
+    "this step did no work" marker is introduced, enumerate **every** state body
+    that can return without touching the node or the proxy — a label read, a
+    timestamp comparison, a `?:` — rather than marking the one the bug was found
+    in.
+63. **The persistent variant of the same loop runs at the evidence-gap cadence
+    instead of the poll interval, and that is enough to delete the escalation.**
+    With `holdsWorldData` true the resume's `SAVING` does real work, so
+    `Progressed` there is honest — but `dropUnusableSaveEvidence` voids the
+    confirmation every `saveEvidenceMaxGap` (30 s), which sends the ladder back
+    through `SAVING`, which clears the failure. `attempts` therefore resets every
+    30 s, `FailureStatus.occurredAt` restamps, and a 15-minute
+    `drainAttentionAfter` can never elapse. A drain stuck for hours on a refused
+    `stopWorkload` never raises `NEEDS_ATTENTION` and re-issues `save-all flush`
+    every 30 s. Before believing any "the backoff grows and it escalates"
+    argument, find the *slowest* thing that periodically produces a `Progressed`
+    on the failing cycle and compare its period against the attention threshold.
+64. **A non-null parameter is only "no fallback" if the caller cannot supply
+    one.** `exhausted(pass, transferStartedAt: Instant)` is documented as
+    unfallbackable — "A `?:` fallback here is what made both defects silent, so
+    there is none" — and the single caller opens with
+    `val anchor = drain.transferStartedAt ?: now`. Dead today, because
+    `transferStep` stamps immediately above. It is exactly the elvis the design
+    forbids, moved one frame up where the callee's signature cannot see it, and it
+    restores defect 1 (a restamping anchor, so the bound never trips) for any
+    future second caller of `issueTransfer`. When a type change is offered as the
+    enforcement, read the call site, not the signature.
+65. **A step that is excused from clearing the failure is also excused from
+    clearing the block, and nothing downstream clears either.** `resumeInto`'s
+    `derivedOnly` branch returns before `copy(failure = null, blocked = null)`, and
+    no ordinary forward step clears them. So a drain that blocked once, resumed via
+    the derived step, and then succeeded carries a stale `DrainBlock` — and a drain
+    that hit one transient `DestinationLost` carries a stale `FailureStatus` —
+    through the transfer, the save, the deregistration and the stop. `:api` then
+    renders "waiting, not stuck" or "the drain aborted; the server is still
+    running" about a drain seconds from `stopWorkload`. Whenever a clearing rule
+    grows an exemption, ask what else the exempted branch was the *only* thing
+    clearing.
