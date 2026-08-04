@@ -239,6 +239,14 @@ internal object StatusCodec {
         // carried the flag — see `V3SplitWorldSavedInstant`.
         scope.put("worldSavedAt", drain.worldSavedAt)
         scope.put("deregisteredAt", drain.deregisteredAt)
+        // The anchor drain step 4's allowance is measured from. Set once, never
+        // cleared, and losing it is not cosmetic: a drain that came back without it
+        // would re-stamp on the next pass and be handed its full allowance again,
+        // which is the loop the field exists to close. A row written before this
+        // field existed reads null, and the next pass through step 4 stamps it —
+        // one extra allowance for a drain that was mid-transfer across an upgrade,
+        // which is the safe direction.
+        scope.put("transferStartedAt", drain.transferStartedAt)
         scope.put("transferAttempts", drain.transferAttempts)
         scope.put("destination", drain.destination?.value)
         // Written as its own object beside `failure` rather than as a variant of
@@ -265,6 +273,7 @@ internal object StatusCodec {
             saveRequestedAt = reader.instant("$prefix.saveRequestedAt"),
             worldSavedAt = reader.instant("$prefix.worldSavedAt"),
             deregisteredAt = reader.instant("$prefix.deregisteredAt"),
+            transferStartedAt = reader.instant("$prefix.transferStartedAt"),
             transferAttempts = reader.requireInt("$prefix.transferAttempts"),
             destination = reader.value("$prefix.destination", ResourceName::of),
             blocked = readBlock(reader, "$prefix.blocked"),

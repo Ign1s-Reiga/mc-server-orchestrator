@@ -16,12 +16,16 @@ import mcorch.store.ConflictReason
 import mcorch.store.Precondition
 import mcorch.store.ResourceVersion
 import mcorch.store.ServerChange
+import mcorch.store.ServerListing
+import mcorch.store.StatePart
 import mcorch.store.Store
 import mcorch.store.StoreCursor
 import mcorch.store.StoreException
 import mcorch.store.StoredDefinition
 import mcorch.store.StoredServer
 import mcorch.store.StoredStatus
+import mcorch.store.Unreadable
+import mcorch.store.UnreadableServer
 import mcorch.store.WriteOutcome
 import java.time.Clock
 import java.time.Instant
@@ -87,6 +91,20 @@ internal class TestStore(
      * the API server replacing a definition while a pass is in flight.
      */
     var beforeStatusWrite: (suspend () -> Unit)? = null
+
+    /**
+     * Rows whose *definition* this build cannot decode, reported by [listAll].
+     *
+     * A hand-edited spec document, in practice. They are entries rather than a
+     * failure so one bad row cannot break a fleet read — and a caller that drops
+     * them is not being tolerant, it is treating "this build cannot describe that
+     * server" as "that server is gone". The proxy's routing sweep is the consumer
+     * where that difference becomes an outbound `DELETE`.
+     *
+     * A null entry is the row with no name at all, which SQLite permits and which
+     * nothing can refer to.
+     */
+    val unreadableDefinitions: MutableList<String?> = mutableListOf()
 
     override suspend fun putDefinition(
         definition: ServerDefinition,
@@ -209,7 +227,9 @@ internal class TestStore(
     override suspend fun listServers(): List<StoredServer> =
         guarded {
             fleetReadThrows?.let { throw it }
-            definitions.values.map { StoredServer(it, statuses[it.name]) }
+            definitions.values
+                .filterNot { it.name in hidden }
+                .map { StoredServer(it, statuses[it.name]) }
         }
 
     override suspend fun listByDrainState(states: Set<DrainState>): List<StoredServer> =
@@ -227,6 +247,41 @@ internal class TestStore(
                 if (drain in states) StoredServer(definition, status) else null
             }
         }
+
+    /**
+     * Makes a stored definition undecodable, the way a hand-edited spec document
+     * does: the row is still there and its container is still running, but this
+     * build cannot describe it. It leaves [listServers] and appears in
+     * [ServerListing.unreadable].
+     */
+    suspend fun hide(name: ResourceName) {
+        guarded {
+            if (definitions.containsKey(name)) hidden += name
+        }
+    }
+
+    suspend fun unhide(name: ResourceName) {
+        guarded { hidden -= name }
+    }
+
+    private val hidden = mutableSetOf<ResourceName>()
+
+    override suspend fun listAll(): ServerListing =
+        ServerListing(
+            servers = listServers(),
+            unreadable =
+                (unreadableDefinitions + hidden.map { it.value }).map { name ->
+                    UnreadableServer(
+                        name = name,
+                        unreadable =
+                            Unreadable(
+                                part = StatePart.DESIRED,
+                                reason = "the stored spec document could not be decoded",
+                                retryable = false,
+                            ),
+                    )
+                },
+        )
 
     override suspend fun currentCursor(): StoreCursor = guarded { StoreCursor(revision.toString()) }
 

@@ -33,6 +33,7 @@ import mcorch.schema.VelocityProxyDefinition
 import mcorch.schema.VelocityProxyStatus
 import mcorch.store.ConflictReason
 import mcorch.store.Precondition
+import mcorch.store.ServerListing
 import mcorch.store.Store
 import mcorch.store.StoreException
 import mcorch.store.StoredServer
@@ -270,11 +271,10 @@ public class Reconciler(
      *   restores joins to a backend whose drain has parked, including one whose
      *   permanent failure means the loop never passes over *it* again.
      *
-     * **`:store` cannot persist this kind yet.** Its codec throws for
-     * `VelocityProxy` on both the definition and the status, deliberately, so in a
-     * real deployment this function is unreachable until that lands. It is
-     * reachable in tests, and it is written to be correct when the codec arrives
-     * rather than after.
+     * This is a live path. `:store` persists the kind, so a proxy declared through
+     * the API reaches this function on the next pass — the sentence that used to
+     * stand here said the opposite, and it is the sentence a reader uses to decide
+     * how carefully to read the rest.
      */
     private suspend fun reconcileProxy(
         stored: StoredServer,
@@ -623,9 +623,12 @@ public class Reconciler(
      * own passes have stopped, so nothing else could — and an orchestrator that
      * died mid-drain.
      *
-     * `admitsNewPlayers` is the negation of "this backend has any drain record at
-     * all", which is the same rule the destination search uses and for the same
-     * reason: `draining` is deliberately false in `DRAIN_FAILED`.
+     * `admitsNewPlayers` is the negation of `DrainState.sealsBackend()` — *is this
+     * drain holding the backend out of routing* — and **not** of `drainInitiated`,
+     * which is the destination-eligibility rule. The two are opposite answers about
+     * a drain parked in `DRAIN_FAILED`: it takes players again, and it must never be
+     * handed somebody else's. Substituting one for the other here kept a parked
+     * backend sealed for ever.
      *
      * ## It also lets go of what the selector no longer matches
      *
@@ -672,7 +675,15 @@ public class Reconciler(
             )
         }
 
-        val matched = pass.backends(store)
+        // The whole listing, not `.servers`. `listAll` was chosen over `listServers`
+        // precisely so one undecodable row could not break this sweep — and the part
+        // that made that safe is the `unreadable` half, which names the rows whose
+        // *definitions* could not be read. Discarding it keeps the tolerance and
+        // throws away the safety: an unreadable row is not "a server that went away",
+        // it is a server this build cannot describe, and the garbage collector below
+        // would turn that absence into an outbound `DELETE` against a live backend.
+        val listing = store.listAll()
+        val matched = pass.backends(listing)
         val registered =
             when (val state = channel.state()) {
                 is ControlOutcome.Answered -> state.value
@@ -749,8 +760,24 @@ public class Reconciler(
             }
         }
 
-        // What the proxy holds that the selector no longer matches. See the note.
-        val wanted = matched.map { it.server.value.lowercase() }.toSet()
+        // What the proxy holds that the selector no longer matches — plus every name
+        // this build could not read, which is exempt rather than swept.
+        //
+        // Per-pass garbage collection keeps working for every readable row; the
+        // exemption is exactly as wide as the ignorance and lapses the moment the row
+        // is repaired. `DefinitionCodec` deliberately widens the population landing
+        // in `unreadable`, and this sweep is the one consumer that would turn that
+        // absence into a destructive call.
+        //
+        // Residual, named rather than fixed: a row whose stored name is NULL cannot
+        // be matched to a registration at all, so a backend registered under a name
+        // that build cannot recover is still swept. `BACKEND_OCCUPIED` is what stops
+        // that harming anybody — the plugin refuses while a player is connected — and
+        // inventing a placeholder name to close it would contradict what
+        // `UnreadableServer.name` promises.
+        val wanted =
+            matched.map { it.server.value.lowercase() }.toSet() +
+                listing.unreadable.mapNotNull { it.name?.lowercase() }.toSet()
         registered?.backends?.filter { it.name.lowercase() !in wanted }?.forEach { stale ->
             ResourceName.of(stale.name).getOrNull()?.let { name ->
                 when (val outcome = channel.deregister(name)) {
@@ -1095,9 +1122,9 @@ public class Reconciler(
          * this path would stop the proxy asserting *any* backend — which is the
          * level trigger that restores joins to a parked drain.
          */
-        suspend fun backends(store: Store): List<MatchedBackend> {
+        suspend fun backends(listing: ServerListing): List<MatchedBackend> {
             val selector = definition.spec.backends.selector
-            return store.listAll().servers.mapNotNull { row ->
+            return listing.servers.mapNotNull { row ->
                 val backend = row.definition.definition as? PaperServerDefinition ?: return@mapNotNull null
                 if (!selector.matches(backend.metadata.labels)) return@mapNotNull null
                 val status = row.status?.status as? PaperServerStatus

@@ -312,6 +312,11 @@ internal object ServerJson {
             put("worldSavedAt", drain.worldSavedAt)
             put("worldSaved", drain.worldSaved)
             put("deregisteredAt", drain.deregisteredAt)
+            // Rendered beside the attempt count because the two answer the
+            // dashboard's question together: how many times the loop has asked, and
+            // how long it has been asking. The *duration* is the bound step 4
+            // actually stops on; the count is a report.
+            put("transferStartedAt", drain.transferStartedAt)
             put("transferAttempts", drain.transferAttempts)
             // A server name. Never a player.
             put("destination", drain.destination?.value)
