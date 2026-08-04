@@ -1,6 +1,6 @@
 ---
 name: prove-the-test-can-fail
-description: Before trusting a green run, prove the check could have gone red — Gradle skips up-to-date tasks, and virtual time hides races that only a real dispatcher shows
+description: Before trusting a green run, prove the check could have gone red — Gradle skips up-to-date tasks, virtual time hides races, and some checks belong in the type system instead
 metadata:
   type: feedback
 ---
@@ -38,8 +38,22 @@ by adding dead code, and treat "no failures **and** no test-count line" as a
 build failure to investigate rather than a pass. Check the exit status or the
 `BUILD` line, not just the failure list.
 
-**Why:** each produces a confident green that means nothing, and the cost lands
-on whoever trusts it next. Two rounds of diagnosis here went after the wrong
+## When the check cannot exist, move it to the compiler
+
+Structured-logging argument order is untyped and untested anywhere in this repo —
+at `LOG.error(pattern, vararg Any?)` everything is `Any?`, so a swap between a
+`Boolean` and an `Int` compiles and prints garbage. One such line shipped and
+review slid past it because the correct branch sat directly beside it.
+
+The fix that generalises is **not a log-capture harness**: it is wrapping the call
+in a function whose parameters are named and typed so that neighbouring arguments
+differ in type. The same mistake then does not compile. Prefer this wherever the
+failure mode is positional — a test only guards the sites somebody remembered to
+write one for, and the guard has to be re-remembered at every new call site.
+Prove it the same way: make the swap and confirm the compiler rejects it.
+
+**Why:** each of the above produces a confident green that means nothing, and the
+cost lands on whoever trusts it next. Two rounds of diagnosis here went after the wrong
 component partly on the strength of results that had not actually run.
 
 **How to apply:** for any bug fix, stash the fix

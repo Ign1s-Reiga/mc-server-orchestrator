@@ -80,6 +80,42 @@ failed)" — the exact question the new flag answers, answered wrongly. A new
 branch has to be inserted ahead of every existing branch it is a special case of,
 not merely added; only the `:app` end-to-end test saw it.
 
+## The flag is no longer a drain flag (2026-08-04)
+
+`drain-auditor` ruled the drain scope an **accident of which overload got
+written** — `escalates()` contains nothing drain-specific; only the
+`DrainStatus.escalated()` adapter is drain-shaped. `deriveConditions` now asks
+the same rule of the failure recorded on the *pass*, discriminated against the
+drain's own (`failure.takeIf { it != drain?.failure }`).
+
+The decisive case was `forbiddenTransition`: permanent, `drain = null`, phase
+`RUNNING`, and `isBlockedByPermanentFailure` then freezes that status for ever.
+**The badge lied in the *quieter* direction, and that is worse than the
+terminating one** — `TERMINATING` at least makes somebody look. The three cases
+listed here as out-of-scope (`forbiddenTransition`, `refusePlacement` with
+`PINNED_NODE_UNKNOWN`, a rejected definition) all fall in together, as required.
+
+What the widening turned on, none of it obvious:
+
+- **Anchor the pass arm on `failure.occurredAt`, never `drain.startedAt`.** A
+  node failure during a long block would already be past the threshold and fire
+  on the first pass that saw it — the alarm-fatigue outcome, by the back door.
+- The alarm-fatigue objection defeats a *flat* fold of `status.failure`, not the
+  two-armed rule. Under `escalates()` a retryable failure waits out the
+  threshold, and `Pass.draft`'s `failure = null` default clears it on any
+  successful pass — so the widened flag is **more** self-clearing than the drain
+  one.
+- `drainMessage` takes `drainAttention`, not `needsAttention`, or a blocked drain
+  beside a dead node gets a `DRAINING` condition calling it "failing".
+
+**Two derivations of one fact, in modules with no shared dependency.** `:core`'s
+`passFailure` and `:api`'s `ServerJson.passFailure` ask the identical question,
+and both rest on `Reconciler.drain` assigning `failure = progress.drain.failure`
+as a *copy*. Nothing enforces that; a `?.copy(...)` there to add context silently
+reroutes every aborted drain through the pass arm and drops `:api`'s "the drain
+aborted" framing. Pinned by a `:core` test that asserts the *wording*, not the
+line — proved by sabotage.
+
 ## Known-and-accepted, so they are not re-found
 
 Ruled cosmetic by the eighth audit, no fix required:
@@ -88,14 +124,6 @@ Ruled cosmetic by the eighth audit, no fix required:
   container-is-down branch carries `drain.failure` untouched, so a terminating
   server whose container exits on its own shows one or two passes of `STOPPED`
   plus the flag. Self-limiting: the next pass observes `Absent` and purges.
-
-Out of scope but the cases to design against **if the flag is ever generalised
-from the drain record to `status.failure`** — all three are permanent, gate the
-loop, and today show a badge with no flag beside it: `forbiddenTransition`
-(phase `RUNNING`, `drain = null`), `refusePlacement` with `PINNED_NODE_UNKNOWN`,
-and a rejected definition. None is an *inverted* badge, which is why they stayed
-out; a generalisation has to handle all of them at once or it will look
-arbitrary.
 
 Two traps found while implementing it, both worth re-checking after any change
 to the loop's requeue policy:
