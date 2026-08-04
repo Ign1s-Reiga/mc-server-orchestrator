@@ -593,7 +593,10 @@ One derivation, served by the server, so every dashboard does not invent its own
   "detail": "" }
 ```
 
-`proxy` is null for a `PaperServer` and populated for a `VelocityProxy`:
+`proxy` is null for a `PaperServer`, and populated for a `VelocityProxy` **once
+there is an observation** — it is null, not zero-filled, while the proxy is
+`neverObserved`. Read a null as "no counts yet" rather than "not a proxy"; the
+`kind` discriminant is what tells you which kind you have:
 
 ```json
 "proxy": { "backendsMatched": 5, "backendsRegistered": 2, "backendsDestinations": 1,
@@ -1200,12 +1203,23 @@ export type DisplayState =
   | 'UNREADABLE'
   | 'UNKNOWN';
 
+/**
+ * A transcription of `:schema`'s enum, which `/meta.enums.conditionType` serves
+ * live from `ConditionType.entries`. When the two disagree, `/meta` is right and
+ * this is stale — it has been stale before. Do not switch exhaustively on it
+ * without a default arm.
+ */
 export type ConditionType =
   | 'IMAGE_AVAILABLE' | 'VOLUME_BOUND' | 'CONTAINER_RUNNING' | 'READY'
   | 'DRAINING'
   /** Parked and nothing is wrong. The inverse of NEEDS_ATTENTION — see §7. */
   | 'DRAIN_BLOCKED'
-  | 'PLAYERS_EVACUATED' | 'WORLD_SAVED' | 'NEEDS_ATTENTION';
+  | 'PLAYERS_EVACUATED' | 'WORLD_SAVED'
+  /** VelocityProxy only. False is not a failure: the proxy runs, routing nowhere. */
+  | 'BACKENDS_RESOLVED'
+  /** VelocityProxy only. False means seal, transfer and deregister are unavailable. */
+  | 'CONTROL_ENDPOINT_READY'
+  | 'NEEDS_ATTENTION';
 
 export type ConditionStatus = 'TRUE' | 'FALSE' | 'UNKNOWN';
 export type FailureClass = 'RETRYABLE' | 'PERMANENT';
