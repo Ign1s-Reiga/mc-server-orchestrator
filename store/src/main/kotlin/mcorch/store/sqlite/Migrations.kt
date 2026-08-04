@@ -54,9 +54,22 @@ internal data class MigrationReport(
  *    not `PropertyDocument.ENCODING_VERSION`. [V2StatusDrainProjection] has no such
  *    check because it shipped before the rule, which is a grandfathered gap and not
  *    a precedent.
- * 4. Add a case to the migration test: write data through the store at the previous
+ * 4. If it rewrites a document by copying the old keys and writing new ones on top,
+ *    its duplicate-key guard must cover **every** key it writes, not one
+ *    representative. [DocumentWriter.put] refuses a repeat with an
+ *    `IllegalArgumentException`, which is not a [StoreException] and so crosses the
+ *    store boundary as a type `:core` cannot classify — the exact outcome such a
+ *    guard exists to prevent. Guard on the prefix
+ *    (`document.keys().any { it.startsWith(...) }`) when the keys share one, so a
+ *    field added to the record later is covered without anyone remembering this
+ *    rule. Two migrations have now been found guarding one key while writing
+ *    several; [V3SplitWorldSavedInstant] is safe only because each branch writes
+ *    exactly one key and names it.
+ * 5. Add a case to the migration test: write data through the store at the previous
  *    version, migrate, assert every field is still there and anything new is
- *    correctly derived from the data that was already on disk.
+ *    correctly derived from the data that was already on disk. A refusal needs a
+ *    case per key that can trigger it — a parametrised one, so the set cannot drift
+ *    from what the guard checks.
  *
  * A store whose recorded version is *higher* than [latest] is refused outright.
  * An older binary that reinterpreted a newer layout would be the one failure mode
@@ -622,13 +635,21 @@ private object V5BlockedDrainIsNotAFailure : Migration {
         // combination, so refuse in the store's own vocabulary and name the row: a
         // store that will not open is when an operator most needs to be told which
         // one to go and look at.
-        if (block && document.has("$DRAIN_BLOCK.reason")) {
+        //
+        // Every key under the prefix, not the one that happens to be written
+        // first. The rewrite below writes four, so a guard naming one of them
+        // leaves a row carrying only `message`, `since` or `observations` to
+        // collide anyway — which is this refusal failing in exactly the way it
+        // exists to prevent. Prefix, so a key added to the block record later is
+        // covered without anyone remembering to come back here.
+        val existingBlock = document.keys().filter { it.startsWith("$DRAIN_BLOCK.") }
+        if (block && existingBlock.isNotEmpty()) {
             throw StoreException.Corrupt(
-                "$what records a drain that is both blocked and failed with `${document.string(
-                    "$DRAIN_FAILURE.reason",
-                )}`. Nothing that wrote these rows could produce that combination, so the row has been edited " +
-                    "by hand and this migration cannot tell which of the two the operator meant. Refusing to " +
-                    "guess: remove one of `$DRAIN_BLOCK` or `$DRAIN_FAILURE` and open the store again",
+                "$what records a drain that is both blocked (${existingBlock.joinToString(", ") { "`$it`" }}) " +
+                    "and failed with `${document.string("$DRAIN_FAILURE.reason")}`. Nothing that wrote these " +
+                    "rows could produce that combination, so the row has been edited by hand and this " +
+                    "migration cannot tell which of the two the operator meant. Refusing to guess: remove " +
+                    "either the `$DRAIN_BLOCK` keys or the `$DRAIN_FAILURE` ones and open the store again",
             )
         }
         val writer = DocumentWriter()
