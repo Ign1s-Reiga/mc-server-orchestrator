@@ -736,22 +736,13 @@ internal class DrainController(
     private suspend fun startTransfer(
         pass: DrainPass,
         drain: DrainStatus,
-    ): DrainProgress {
-        val occupancy = pass.occupancy
-        val now = pass.now
-        val router = pass.subject.router
-        val destination = drain.destination
-        if (router == null || destination == null) {
-            return requireEmpty(pass, drain) {
-                DrainProgress(
-                    drain = drain.moveTo(DrainState.TRANSFERRING, now).copy(playersEvacuated = true),
-                    occupancy = occupancy,
-                    outcome = ReconcileOutcome.Progressed("no players to transfer"),
-                )
-            }
-        }
-        return issueTransfer(pass, drain, router, destination, DrainState.TRANSFERRING)
-    }
+    ): DrainProgress =
+        transferStep(
+            pass = pass,
+            drain = drain,
+            emptyState = DrainState.TRANSFERRING,
+            emptyDetail = "no players to transfer",
+        )
 
     /**
      * Step 4, waiting: is the sweep getting anywhere, and is the server empty yet.
@@ -768,25 +759,61 @@ internal class DrainController(
     private suspend fun awaitEvacuated(
         pass: DrainPass,
         drain: DrainStatus,
+    ): DrainProgress =
+        transferStep(
+            pass = pass,
+            drain = drain,
+            emptyState = DrainState.SAVING,
+            emptyDetail = "zero players confirmed after the transfer",
+        )
+
+    /**
+     * Both halves of step 4, because they differ only in where an empty server
+     * goes next.
+     *
+     * ## The zero-player exit is taken **before** the retry limit is consulted
+     *
+     * That ordering is the whole of this function's safety, and getting it wrong
+     * produced a drain that could never finish. `startTransfer` used to go straight
+     * to [issueTransfer], which asks [exhausted] first — so once the counter was
+     * spent, the resume ladder (`DRAIN_FAILED` → `TARGET_RESOLVED` → here) re-entered
+     * the limit check *without ever reading the player count*. An operator who
+     * deleted a populated backend got a drain that parked permanently, and it stayed
+     * parked after every last player had logged off: nothing clears
+     * `transferAttempts` short of the teardown the wedge is upstream of, a generation
+     * bump does not clear the drain record, and `DRAIN_FAILED` does not seal, so the
+     * proxy sweep re-admitted players to a server nobody could retire. The path from
+     * there is a manual `crictl stop`, which is a container stopped with no save.
+     *
+     * So: a server that is empty finishes, whatever the counter says. A limit bounds
+     * how long the loop keeps *asking*, and there is nothing left to ask for.
+     */
+    private suspend fun transferStep(
+        pass: DrainPass,
+        drain: DrainStatus,
+        emptyState: DrainState,
+        emptyDetail: String,
     ): DrainProgress {
         val occupancy = pass.occupancy
         val now = pass.now
         val router = pass.subject.router
         val destination = drain.destination
+
+        // No counterparty, or nobody was ever assigned one: the standalone shape,
+        // where zero players is the only way forward and `requireEmpty` says so.
         if (router == null || destination == null) {
             return requireEmpty(pass, drain) {
                 DrainProgress(
-                    drain = drain.moveTo(DrainState.SAVING, now).copy(playersEvacuated = true),
+                    drain = drain.moveTo(emptyState, now).copy(playersEvacuated = true),
                     occupancy = occupancy,
-                    outcome = ReconcileOutcome.Progressed("zero players confirmed"),
+                    outcome = ReconcileOutcome.Progressed(emptyDetail),
                 )
             }
         }
 
         return when (val probe = pass.probe) {
-            // Same answer as `requireEmpty`, and it has to be: a probe that did not
-            // answer is not a zero-player report, and nothing about a sweep being
-            // in flight changes that.
+            // A probe that did not answer is not a zero-player report, and nothing
+            // about a sweep being in flight changes that.
             is ProbeOutcome.Unanswered -> {
                 unansweredProbe(pass, drain, probe)
             }
@@ -795,9 +822,9 @@ internal class DrainController(
                 corroborate(pass, router, probe.online)
                 if (probe.online == 0) {
                     DrainProgress(
-                        drain = drain.moveTo(DrainState.SAVING, now).copy(playersEvacuated = true),
+                        drain = drain.moveTo(emptyState, now).copy(playersEvacuated = true),
                         occupancy = occupancy,
-                        outcome = ReconcileOutcome.Progressed("zero players confirmed after the transfer"),
+                        outcome = ReconcileOutcome.Progressed(emptyDetail),
                     )
                 } else {
                     // Somebody is still on, so anything this drain had saved is
@@ -858,7 +885,8 @@ internal class DrainController(
                 message =
                     "the loop has stopped asking proxy=${router.proxy} to move this server's players to " +
                         "`$destination`: $limit. Nobody is disconnected, the container is not stopped, and new " +
-                        "joins are restored while this drain is parked",
+                        "joins are restored while this drain is parked. It finishes on its own if the last " +
+                        "player logs off",
             )
         }
 
@@ -868,7 +896,15 @@ internal class DrainController(
                     drain =
                         drain
                             .moveTo(into, now)
-                            .copy(transferAttempts = drain.transferAttempts + 1, playersEvacuated = false),
+                            // A report of how many times this drain has asked, and
+                            // **nothing gates on it** — see [exhausted] for why the
+                            // attempt bound was removed rather than corrected. A
+                            // counter nothing branches on cannot wedge anything, so
+                            // it can afford to be the simple honest number.
+                            .copy(
+                                transferAttempts = drain.transferAttempts + 1,
+                                playersEvacuated = false,
+                            ),
                     occupancy = occupancy,
                     // **Never `Progressed`, whatever the sweep says.** A sweep in
                     // flight is something that changes by itself, so `Waiting` is the
@@ -952,24 +988,58 @@ internal class DrainController(
     }
 
     /**
-     * Whether step 4 has asked enough times, and why.
+     * Whether step 4 has been trying long enough, and why.
      *
-     * Two bounds, because they fail differently. The attempt count catches a sweep
-     * that keeps being refused; the clock catches one that keeps being accepted and
-     * never converges. The time allowance is extended per player, because a fixed
-     * value always fails on a full server
-     * (`drain-protocol/references/state-machine.md`).
+     * ## One bound, and it is the clock
+     *
+     * There were two, and the attempt bound was worse than redundant. The plugin's
+     * start-or-join means a repeat while a sweep is in flight asks nobody to move
+     * again, so counting *passes* counted nothing that happened — and at a
+     * two-second poll it spent a six-sweep budget in twelve seconds, which made the
+     * documented `playerTransferTimeout` allowance unreachable. Counting completed
+     * sweeps instead is no better in the one case that matters: a sweep the proxy
+     * settles instantly starts fresh on every pass, and the count runs away again at
+     * exactly the same rate.
+     *
+     * The clock has neither problem. It measures the thing an operator would
+     * measure — how long these players have been failing to move — it cannot be
+     * outrun by the poll interval, and it is what
+     * `drain-protocol/references/state-machine.md` prescribes. The allowance is
+     * extended per player, because a fixed value always fails on a full server.
+     *
+     * [mcorch.schema.DrainStatus.transferAttempts] survives as a *report* — how many
+     * times this drain has asked — and nothing branches on it. That is the whole of
+     * its remit: a counter nothing gates on cannot wedge anything.
+     *
+     * ## Only reachable with players online
+     *
+     * [transferStep] takes the zero-player exit before calling anything that
+     * consults this, so a server that has emptied finishes its drain whatever this
+     * says. That ordering is what stops a spent budget becoming a drain that can
+     * never be completed — see [transferStep].
      */
     private fun exhausted(
         pass: DrainPass,
         drain: DrainStatus,
     ): String? {
-        if (drain.transferAttempts >= MAX_TRANSFER_ATTEMPTS) {
-            return "$MAX_TRANSFER_ATTEMPTS transfer sweeps have been asked for and players are still connected"
-        }
         val online = pass.occupancy?.online ?: 0
         val allowance = pass.subject.playerTransferTimeout + PER_PLAYER_TRANSFER_ALLOWANCE * online
-        val waited = JavaDuration.between(drain.enteredStateAt, pass.now).toKotlinDuration()
+        // Anchored on the seal, not on `enteredStateAt`. A drain that reaches this
+        // bound parks in `DRAIN_FAILED`, and the resume ladder re-enters
+        // `TARGET_RESOLVED` on the next pass — which restamps `enteredStateAt` and
+        // hands the allowance back in full. The drain would then alternate: two
+        // minutes of asking, one pass parked, two minutes of asking, for ever, with
+        // the resume clearing `failure` each time so the escalation never
+        // accumulates and an operator never sees a stable signal.
+        //
+        // `sealRequestedAt` is stamped once, when step 2 first asserted, and nothing
+        // clears it. It also measures the better quantity: not "how long since we
+        // last re-entered this state" but **how long this server has been sealed and
+        // failing to empty**, which is what an operator is being asked to act on. It
+        // is null only when there is no seal at all, and this is unreachable without
+        // a router — so the fallback is for completeness, not for a real case.
+        val since = drain.sealRequestedAt ?: drain.enteredStateAt
+        val waited = JavaDuration.between(since, pass.now).toKotlinDuration()
         return if (waited > allowance) {
             "players have been moving for ${waited.inWholeSeconds}s, past the " +
                 "${allowance.inWholeSeconds}s allowed for $online player(s)"
@@ -1443,7 +1513,26 @@ internal class DrainController(
                 "server={} is still running after a stop was issued; re-issuing with the same grace period",
                 server,
             )
-            pass.node.stopWorkload(observation.handle, pass.subject.stopGracePeriod)
+            // The same catch as in [stop], and it is needed *more* here. This runs in
+            // `STOPPING`, which is a sealing state, so the proxy's level trigger will
+            // not restore joins either — and by this point the backend has already
+            // left the routing table. A node blip escaping to `Reconciler.nodeFailure`
+            // would leave the record untouched: deregistered, running, and with
+            // nothing that would ever re-register it.
+            try {
+                pass.node.stopWorkload(observation.handle, pass.subject.stopGracePeriod)
+            } catch (failure: NodeException) {
+                return abort(
+                    subject = pass.subject,
+                    node = pass.node,
+                    drain = drain,
+                    occupancy = occupancy,
+                    now = now,
+                    reason = FailureReason.DRAIN_STALLED,
+                    failureClass = if (failure.retryable) FailureClass.RETRYABLE else FailureClass.PERMANENT,
+                    message = "the container stop could not be re-issued: ${failure.message}",
+                )
+            }
             return DrainProgress(
                 drain = drain,
                 occupancy = occupancy,
@@ -1780,20 +1869,13 @@ internal class DrainController(
             "new joins stopped at the proxy; the players already connected stay connected"
 
         /**
-         * How many transfer sweeps step 4 asks for before it stops asking.
-         *
-         * The limit is the orchestrator's to own, because a fresh sweep zeroes the
-         * plugin's tallies — the plugin cannot count across them. At the limit the
-         * loop stops *asking*; nobody is disconnected and nothing is stopped.
-         */
-        private const val MAX_TRANSFER_ATTEMPTS = 6
-
-        /**
          * Added to `spec.lifecycle.drain.playerTransferTimeout` per player.
          *
          * A fixed transfer allowance always fails on a full server
          * (`drain-protocol/references/state-machine.md`), so the declared timeout is
-         * the floor and this is the slope.
+         * the floor and this is the slope. Together they are the **only** bound on
+         * step 4 — the retry limit the orchestrator was said to own is this, in the
+         * unit an operator can reason about.
          */
         private val PER_PLAYER_TRANSFER_ALLOWANCE = 2.seconds
 

@@ -62,6 +62,46 @@ at the gate: **reporting `Progressed` from a sweep's `remaining`** resets the
 backoff on every pass of a drain getting nowhere, and prints "every player has
 been moved" about a populated server. A sweep in flight is always `Waiting`.
 
+## A limit on a drain step is a wedge unless the success exit precedes it
+
+Two states the thirteenth audit found, both ending in a manual `crictl stop`:
+
+- **The limit was consulted before the player count.** `startTransfer` went
+  straight to the retry check, so once the budget was spent the resume ladder
+  re-entered it on every pass *without ever reading whether anybody was still
+  there*. The delete could not be completed by waiting for the last player to
+  log off, by editing the definition (a drain record survives a generation
+  bump), or by restarting the loop. **The general rule: the exit that means
+  "this step succeeded" must sit above the exit that means "this step has tried
+  enough".**
+- **The bound counted passes.** With start-or-join, a repeat asks nobody to move
+  again, so a six-sweep budget went in twelve seconds at a two-second poll and
+  the documented `playerTransferTimeout` was unreachable. Counting *completed*
+  sweeps fails identically when the proxy settles one instantly. The bound is
+  now the clock and nothing else — a second bound that cannot bite is worse than
+  no second bound — anchored on `sealRequestedAt`, because `enteredStateAt`
+  restamps on every park-and-resume and hands the allowance back in full.
+
+`transferAttempts` survives as a report. **A counter nothing gates on cannot
+wedge anything**, which is the only reason it is safe to keep.
+
+## The address had two derivations, and they disagreed for the window that matters
+
+The proxy sweep read `status.endpoint.address` (written by `awaitJoinable`,
+cleared by `teardown`) and fell back to the *server name*; the drain read the
+node. A proxy pass landing while a backend was `Absent`/`CREATING`/`STARTING`
+registered it at a hostname that does not resolve, and because `ADDRESS_CONFLICT`
+is deliberately not an upsert, drain step 2 then aborted every pass **for ever**
+— the only thing that clears a wrong registration is the `DELETE` that step 2
+never reaches.
+
+This was the fourth one-fact-two-derivations bug in a single session
+(`saveRequestedAt`/`worldSaved`, `passFailure` across two modules, `drainBlocked`
+condition-versus-field, and this). **When a value is asserted to a third party
+from more than one call site, make it one function before writing the second
+site.** And prefer *not asserting* over asserting a guessed value: "not
+registered yet" is a state a protocol handles; "registered wrongly" often is not.
+
 ## Rulings I made that a human may overrule
 
 1. **`DRAIN_FAILED` unseals.** A blocked-with-a-proxy drain therefore takes new
@@ -69,9 +109,11 @@ been moved" about a populated server. A sweep in flight is always `Waiting`.
    the audit named as the harm.
 2. **More than one proxy claiming a backend is a retryable failure on the
    *backend's* status**, and the container is not created while it holds. The
-   drain of an already-running one still proceeds through the lexicographically
-   first proxy — a delete must always be possible — so the second proxy keeps
-   routing during that drain. Known gap, flagged.
+   refusal is **exempt for a terminating definition** — it returns before
+   placement, so without the exemption such a backend was permanently
+   undeletable, which is the state that produces a manual stop. A conflicted
+   delete drains with no binding at all, so it blocks on players rather than
+   transferring them.
 3. **The proxy sweep deregisters registrations whose selector no longer
    matches.** That is step 6 performed by a sweep, and it is safe only because
    the plugin refuses `DELETE` with `BACKEND_OCCUPIED` and has no force flag.

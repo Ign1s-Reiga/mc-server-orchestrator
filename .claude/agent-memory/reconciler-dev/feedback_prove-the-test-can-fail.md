@@ -48,6 +48,21 @@ because that is the first observable that differs. Generalise it — when the
 property you changed sits upstream of another guard, the negative assertions are
 about the downstream guard and you need a positive one about yours.
 
+**An instrument that reads zero by construction measures nothing.** A hot-loop
+test asserted `sweepsStarted <= 6`, in a scenario whose setup removed the
+destination from the fake proxy — so the call was refused *before* recording
+anything and the counter was structurally zero. The assertion could not fail.
+Before trusting a bound, assert that the quantity it bounds actually moved in
+that scenario; and prefer measuring the property directly (here: no pass reports
+`Progressed` once the step is running) over a side counter that a refusal path
+can bypass.
+
+**Do not key a test on a constant the fix will change.** A discriminator written
+against `MAX_TRANSFER_ATTEMPTS` turns red when the limit is corrected, for a
+reason unrelated to what the test is about. Key on the facts that actually differ
+between the two behaviours — the state the drain lands in, whether it recorded a
+block — not on which of two failures a limit happened to produce.
+
 ## When the check cannot exist, move it to the compiler
 
 Structured-logging argument order is untyped and untested anywhere in this repo —

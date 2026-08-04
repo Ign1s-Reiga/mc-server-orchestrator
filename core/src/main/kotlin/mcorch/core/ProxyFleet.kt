@@ -38,11 +38,15 @@ internal object ProxyFleet {
          * Surfaced on the *backend's* status rather than refused at parse time,
          * because neither document is wrong on its own and neither parse can see
          * the other.
+         *
+         * Refuses the *create* and never the *delete* — see the exemption in
+         * `Reconciler.reconcilePaper`. Both shapes are refused, not only the
+         * differing-secret one: two proxies routing to one backend means only one of
+         * them would be told to stop during a drain, which is a live registration
+         * pointing at a container on its way out.
          */
         data class Conflicted(
             val message: String,
-            /** True when they also disagree about the forwarding secret. */
-            val secretsDiffer: Boolean,
         ) : Resolution
     }
 
@@ -108,6 +112,14 @@ internal object ProxyFleet {
         val online: Int?,
         val ready: Boolean,
         /**
+         * Whether this sibling's own drain is holding it out of routing.
+         *
+         * `DrainState.sealsBackend()`, the one definition of that rule. Distinct
+         * from [drainInitiated] below and the distinction is load-bearing in both
+         * directions — see the note there.
+         */
+        val sealed: Boolean,
+        /**
          * Any drain record at all, in flight *or* aborted.
          *
          * `PaperServerStatus.drainInitiated`, never `draining`: the latter is
@@ -145,19 +157,18 @@ internal object ProxyFleet {
         if (claiming.size > 1) {
             val names = claiming.joinToString(", ") { (proxy, _) -> "`${proxy.metadata.name}`" }
             val secrets = claiming.map { (proxy, _) -> proxy.spec.forwarding.secret }.distinct()
-            val differ = secrets.size > 1
+            val why =
+                if (secrets.size > 1) {
+                    "they name different forwarding secrets, so there is no value this container could be " +
+                        "created with that both proxies would accept"
+                } else {
+                    "both would route players to it, and a drain would tell only one of them to stop"
+                }
             return Resolution.Conflicted(
                 message =
                     "this server matches the backend selector of $names. A backend belongs to one proxy: " +
-                        if (differ) {
-                            "they name different forwarding secrets, so there is no value this container " +
-                                "could be created with that both proxies would accept. It is not being " +
-                                "created or recreated until one of the selectors stops matching it"
-                        } else {
-                            "both would route players to it and only one of them would be told to stop " +
-                                "during a drain. Narrow one of the selectors"
-                        },
-                secretsDiffer = differ,
+                        "$why. It is not created or recreated until one of the selectors stops matching it. " +
+                        "Deleting it is still allowed and still drains it",
             )
         }
         val (proxy, row) = claiming.first()
@@ -173,6 +184,7 @@ internal object ProxyFleet {
                     maxPlayers = backend.spec.maxPlayers,
                     online = status?.players?.online,
                     ready = status?.ready == true,
+                    sealed = status?.drain?.state?.sealsBackend() == true,
                     // A tombstoned definition is a server on its way out even
                     // before its drain record exists, and handing players to one is
                     // handing them to a container about to be removed.
@@ -225,12 +237,11 @@ internal object ProxyFleet {
                         server = it.server,
                         maxPlayers = it.maxPlayers,
                         online = it.online,
-                        // Whether the proxy is still routing to it is a fact about
-                        // this proxy, and the only thing that stops routing is a
-                        // drain — which `drainInitiated` already carries. Reading
-                        // it back over the wire would be a second RPC per pass for
-                        // an answer the fleet already has.
-                        admitsNewPlayers = !it.drainInitiated,
+                        // Whether the proxy is still routing to it, from the same
+                        // rule the sweep asserts with. Reading it back over the wire
+                        // would be a second RPC per pass for an answer the fleet
+                        // already has.
+                        admitsNewPlayers = !it.sealed,
                         drainInitiated = it.drainInitiated,
                         ready = it.ready,
                     )
@@ -238,9 +249,9 @@ internal object ProxyFleet {
         return BackendLink(
             backend = backend,
             proxy = binding.proxy,
-            // The address the *proxy* dials, which is the backend's node and the
-            // port it publishes. Never a player's address, and never logged.
-            address = "${backendNode.value}:${backendPort(binding, backend)}",
+            // Through [backendAddress], which is the *only* derivation of it. See
+            // that function for what two of them cost.
+            address = backendAddress(backendNode, backendPort(binding, backend)),
             channel =
                 ControlChannel(
                     node = proxyNode,
@@ -257,7 +268,14 @@ internal object ProxyFleet {
             // a fleet-wide drain can never reach zero. Derived from stored state
             // rather than read back, so it costs nothing and errs safe: in doubt it
             // seals the proxy, which only refuses logins and disconnects nobody.
-            lastAdmitting = siblings.none { it.server != backend && !it.drainInitiated },
+            //
+            // **`sealed`, not `drainInitiated`** — the same rule the proxy's sweep
+            // uses for `anyAdmitting`. A sibling parked in `DRAIN_FAILED` is
+            // `drainInitiated` and *not* sealed, so the two rules disagreed about
+            // it: this call site thought the proxy should stop admitting logins and
+            // the sweep put them straight back, once per cadence, for as long as a
+            // backend stayed parked.
+            lastAdmitting = siblings.none { it.server != backend && !it.sealed },
         )
     }
 
@@ -277,3 +295,32 @@ internal object ProxyFleet {
     /** Velocity's default backend port, for a server the fleet read could not describe. */
     private const val DEFAULT_BACKEND_PORT = 25565
 }
+
+/**
+ * **The one expression for a backend's address**, used by the proxy's routing
+ * sweep and by drain steps 2 and 6.
+ *
+ * It was two, and they disagreed for exactly the window that matters. The sweep
+ * derived `status.endpoint.address` — written only by `awaitJoinable` and cleared
+ * by `teardown` — and fell back to the *server name*; the drain derived the node.
+ * So any proxy pass landing while a backend was `Absent`, `CREATING` or `STARTING`
+ * registered it under a hostname that does not resolve, and every later assertion
+ * sent the node instead. `PUT` answers `ADDRESS_CONFLICT` rather than upserting —
+ * deliberately, because moving a registration means unregister-then-register and
+ * that is step 6 performed at step 2 — so **drain step 2 then aborted on every
+ * pass, for ever**, and the only thing that could clear the wrong entry was the
+ * `DELETE` the wedge made unreachable. Meanwhile players routed to that entry got
+ * a connection failure while the fleet reported healthy.
+ *
+ * There is therefore no fallback here and no second caller with its own
+ * expression. A backend whose node is not known yet is simply **not asserted** —
+ * see the `runtime == null` skip in the sweep — because "not registered yet" is a
+ * state the protocol handles and "registered at a name that does not resolve" is
+ * not.
+ *
+ * It is a backend address. Never a player's, and never logged.
+ */
+internal fun backendAddress(
+    node: NodeName,
+    port: Int,
+): String = "${node.value}:$port"

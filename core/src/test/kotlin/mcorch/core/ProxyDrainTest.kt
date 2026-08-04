@@ -13,6 +13,7 @@ import mcorch.schema.DrainState
 import mcorch.schema.FailureClass
 import mcorch.schema.FailureReason
 import org.junit.jupiter.api.Test
+import kotlin.time.Duration.Companion.seconds
 
 /**
  * The drain, with a proxy on the other end of it.
@@ -84,21 +85,31 @@ internal class ProxyDrainTest {
         }
 
     /**
-     * A failing transfer must back off, not spin.
+     * A transfer that never converges must back off, and must not spin.
      *
      * Round 4 closed the hot loop because a resume ran the resumed state in the
-     * same pass. Bodies reopen it: `DRAIN_FAILED` resumes to `SEALED`, the
-     * destination search succeeds, that reports `Progressed`, `ReconcileLoop` calls
-     * `queue.succeeded` and clears the attempt counter — then the next pass
-     * transfers, fails, and parks again. A two-second loop, for ever, issuing
-     * destination lookups and **transfer requests at live players**, with `attempts`
-     * pinned at 1 and the backoff never growing.
+     * same pass. Bodies reopen it: `DRAIN_FAILED` resumes, the destination search
+     * succeeds, that reports `Progressed`, `ReconcileLoop` calls `queue.succeeded`
+     * and clears the attempt counter — then the next pass transfers, fails, and
+     * parks again. A two-second loop, for ever, issuing destination lookups and
+     * **transfer requests at live players**, with the backoff never growing.
      *
-     * It is measured rather than reasoned about: the number of sweeps the plugin
-     * was asked to start, and the failure's attempt count, over twenty passes.
+     * ## The instrument
+     *
+     * The property that actually matters is that **no pass reports `Progressed`
+     * while the transfer is unfinished**, because `Progressed` is the only thing
+     * that resets the backoff. That is measured directly here rather than through a
+     * proxy-side counter: an earlier version of this test asserted
+     * `sweepsStarted <= 6` in a scenario where the destination had been removed from
+     * the plugin, so `transfer` refused before recording anything and the counter
+     * was structurally zero. It could not have failed.
+     *
+     * The scenario here keeps a real, eligible destination and a sweep that never
+     * settles — the ordinary "players are slow to move" case — so every request is
+     * recorded and the counter can move.
      */
     @Test
-    fun `a drain whose transfer keeps failing backs off instead of spinning`() =
+    fun `a transfer that never converges backs off instead of spinning`() =
         coreTest {
             val leaving = backendDefinition("survival-01")
             val destination = backendDefinition("survival-02", hostPort = 30002)
@@ -110,31 +121,118 @@ internal class ProxyDrainTest {
                 .backend("survival-01")
                 .shouldNotBeNull()
                 .players = 4
-            // The destination goes away between step 3 and step 4 and stays away,
-            // so every sweep request is refused.
             harness.store.deleteDefinition(leaving.metadata.name)
-            repeat(2) { harness.pass(leaving.metadata.name) }
-            harness.plugin.backends.remove("survival-02")
 
-            repeat(20) { harness.pass(leaving.metadata.name) }
+            val outcomes = mutableListOf<ReconcileOutcome>()
 
-            val status = harness.status(leaving.metadata.name).shouldNotBeNull()
-            val drain = status.drain.shouldNotBeNull()
+            // First: the bound is the clock, not a count of passes. Ten passes at
+            // the poll interval is a couple of seconds of wall time and well inside
+            // the 120s allowance, so a drain that is trying must still be trying. A
+            // pass-counting bound spends a six-sweep budget here in twelve seconds
+            // and parks — which is what made the documented allowance unreachable
+            // and, with the ordering bug above it, made the drain unfinishable.
+            repeat(10) {
+                outcomes += harness.pass(leaving.metadata.name)
+                harness.clock.advance(2.seconds)
+            }
+            harness
+                .status(leaving.metadata.name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .state shouldBe DrainState.TRANSFERRING
+
+            // Then let the allowance actually elapse.
+            repeat(20) {
+                outcomes += harness.pass(leaving.metadata.name)
+                harness.clock.advance(10.seconds)
+            }
+
+            val drain =
+                harness
+                    .status(leaving.metadata.name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+
+            // The instrument is not vacuous: requests were recorded, so a counter
+            // that failed to move would be a real observation rather than an absence.
+            harness.plugin.transfers.size shouldBeGreaterThan 1
+
+            // The measurement. Once the drain is in step 4 nothing reports progress,
+            // so `ReconcileLoop` never resets the backoff.
+            val afterTransfer = outcomes.dropWhile { it !is ReconcileOutcome.Waiting }
+            afterTransfer.none { it is ReconcileOutcome.Progressed }.shouldBeTrue()
+
+            // And it stops asking rather than asking for ever.
             drain.state shouldBe DrainState.DRAIN_FAILED
-
-            // The measurement. Twenty passes against a destination that is never
-            // coming back must not produce twenty sweeps: the drain stops asking at
-            // the limit, and every pass after that is one abort rather than a
-            // resolve/transfer cycle.
-            harness.plugin.sweepsStarted.size shouldBeLessThanOrEqual 6
-            // And the counter the backoff is built on actually moves, which is the
-            // half that the `Progressed` reset used to destroy.
+            drain.failure.shouldNotBeNull().reason shouldBe FailureReason.DRAIN_TRANSFER_FAILED
+            drain.failure.shouldNotBeNull().failureClass shouldBe FailureClass.RETRYABLE
             drain.failure.shouldNotBeNull().attempts shouldBeGreaterThan 1
 
             // At the limit the loop stops trying. It does not kick and it does not
             // stop (`failure-modes.md` item 7).
             harness.nodeOf(leaving).stops.shouldBeEmpty()
-            drain.failure.shouldNotBeNull().failureClass shouldBe FailureClass.RETRYABLE
+        }
+
+    /**
+     * A drain that spent its transfer budget still finishes once the server empties.
+     *
+     * The wedge this pins is the worst state the proxy work can produce, because its
+     * exit is a manual `crictl stop` — a container stopped with no save.
+     * `startTransfer` used to go straight to the limit check, which reads no player
+     * count, so once `transferAttempts` was spent the resume ladder re-entered the
+     * limit on every pass **and never looked at whether anybody was still there**.
+     * The delete could not be completed by waiting for the last player to log off,
+     * by editing the definition (the drain record survives a generation bump), or by
+     * restarting the loop. Meanwhile `DRAIN_FAILED` does not seal, so the proxy
+     * sweep kept re-admitting players to it.
+     *
+     * The fix is an ordering: the zero-player exit is taken *before* the limit is
+     * consulted. A limit bounds how long the loop keeps asking, and an empty server
+     * has nothing left to ask for.
+     */
+    @Test
+    fun `a drain that has spent its transfer budget still finishes when the server empties`() =
+        coreTest {
+            val leaving = backendDefinition("survival-01")
+            val destination = backendDefinition("survival-02", hostPort = 30002)
+            val harness = ProxyHarness(backends = listOf(leaving, destination))
+            harness.bringUp()
+
+            harness.nodeOf(leaving).online = 4
+            harness.plugin
+                .backend("survival-01")
+                .shouldNotBeNull()
+                .players = 4
+            harness.store.deleteDefinition(leaving.metadata.name)
+
+            // Spend the budget: the sweep never settles and the allowance elapses.
+            repeat(20) {
+                harness.pass(leaving.metadata.name)
+                harness.clock.advance(10.seconds)
+            }
+            harness
+                .status(leaving.metadata.name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .failure
+                .shouldNotBeNull()
+                .reason shouldBe FailureReason.DRAIN_TRANSFER_FAILED
+
+            // Now everybody logs off by themselves, which is what the protocol has
+            // been waiting for all along.
+            harness.plugin.completeSweep("survival-01")
+            harness.nodeOf(leaving).online = 0
+
+            repeat(10) { harness.pass(leaving.metadata.name) }
+
+            // The drain completes: saved, deregistered, stopped, in that order.
+            harness.nodeOf(leaving).saves shouldHaveSize 1
+            harness.plugin.deregistrations shouldContain "survival-01"
+            harness.nodeOf(leaving).stops shouldHaveSize 1
+            harness.store.getServer(leaving.metadata.name) shouldBe null
         }
 
     /**
@@ -249,20 +347,21 @@ internal class ProxyDrainTest {
             // The three negatives above are satisfied by the `SAVING` gate whatever
             // step 4 concluded — a drain that *had* believed the proxy would still
             // not stop, save or deregister, and this test would pass having proved
-            // nothing. What differs is where the drain ends up. Believing the proxy
-            // makes step 4 conclude the server is empty, walk to `SAVING`, and be
-            // stopped there by the ping — which records a **block** and no failure.
-            // Not believing it keeps step 4 asking until the limit, which records
-            // `DRAIN_TRANSFER_FAILED` and no block.
+            // nothing. What differs is where the drain ends up: believing the proxy
+            // makes step 4 conclude the server is empty and walk on to `SAVING`.
+            //
+            // Keyed on the state and on `playersEvacuated`, deliberately, and not on
+            // which failure gets recorded — that would couple this test to the
+            // transfer retry limit, so a change to the limit would turn it red for a
+            // reason that has nothing to do with which count decides.
             val drain =
                 harness
                     .status(leaving.metadata.name)
                     .shouldNotBeNull()
                     .drain
                     .shouldNotBeNull()
-            drain.failure.shouldNotBeNull().reason shouldBe FailureReason.DRAIN_TRANSFER_FAILED
-            drain.blocked shouldBe null
-            drain.transferAttempts shouldBeGreaterThan 1
+            drain.state shouldBe DrainState.TRANSFERRING
+            drain.playersEvacuated shouldBe false
             harness.plugin.transfers.size shouldBeGreaterThan 1
         }
 
@@ -301,6 +400,51 @@ internal class ProxyDrainTest {
             harness.plugin.backend("survival-01") shouldBe null
             // Nothing was stopped: it was already down.
             harness.nodeOf(leaving).stops.shouldBeEmpty()
+        }
+
+    /**
+     * The proxy's sweep must not undo drain step 6.
+     *
+     * `holdSeal` stops asserting once the backend has been deregistered, with a
+     * comment explaining that putting it back between steps 6 and 7 would re-add an
+     * entry moments before the container stops. The proxy's own level trigger then
+     * did exactly that: `DEREGISTERED.sealsBackend()` is true, so the backend stayed
+     * in the matched set and received a `PUT` on any proxy pass landing in that
+     * window. Sealed, so nothing is routed there deliberately — but Velocity's own
+     * fallback reconnect can land a player on any *registered* backend, and this one
+     * is about to go away.
+     *
+     * One pass wide, and the two halves of the same rule have to agree about it.
+     */
+    @Test
+    fun `a proxy pass between steps 6 and 7 does not re-register the backend`() =
+        coreTest {
+            val leaving = backendDefinition("survival-01")
+            val harness = ProxyHarness(backends = listOf(leaving))
+            harness.bringUp()
+            harness.store.deleteDefinition(leaving.metadata.name)
+
+            // Seven passes lands exactly in the window: deregistered, stop next.
+            repeat(7) { harness.pass(leaving.metadata.name) }
+            val drain =
+                harness
+                    .status(leaving.metadata.name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            drain.state shouldBe DrainState.DEREGISTERED
+            drain.deregisteredAt.shouldNotBeNull()
+            harness.plugin.backend("survival-01") shouldBe null
+            harness.nodeOf(leaving).stops.shouldBeEmpty()
+
+            // The proxy sweeps while the drain sits between step 6 and step 7.
+            harness.pass(harness.proxyDefinition.metadata.name)
+
+            harness.plugin.backend("survival-01") shouldBe null
+
+            // And the drain still completes from there.
+            repeat(4) { harness.pass(leaving.metadata.name) }
+            harness.nodeOf(leaving).stops shouldHaveSize 1
         }
 
     /**
@@ -452,6 +596,69 @@ internal class ProxyDrainTest {
             harness.plugin.sweepsStarted.shouldBeEmpty()
             harness.nodeOf(first).stops.shouldBeEmpty()
             harness.nodeOf(second).stops.shouldBeEmpty()
+        }
+
+    /**
+     * A backend registered before it was joinable must still be drainable.
+     *
+     * `:core` derived a backend's address in two places, and they disagreed for
+     * exactly the window that matters. The proxy sweep read
+     * `status.endpoint.address` — written only by `awaitJoinable` and cleared by
+     * `teardown` — and fell back to the *server name*; the drain derived the node.
+     * So a proxy pass landing while a backend was `Absent`, `CREATING` or `STARTING`
+     * registered it under a hostname that does not resolve.
+     *
+     * Two things followed, and the second is the wedge. Players routed to that entry
+     * got a connection failure while the fleet reported healthy — and every later
+     * assertion sent the node instead, which the plugin answers with
+     * `ADDRESS_CONFLICT` rather than upserting, so **drain step 2 aborted on every
+     * pass, for ever**. The only thing that clears a wrong registration is `DELETE`,
+     * which is step 6, which step 2 never reaches.
+     *
+     * This is the window `ProxyHarness.sweep()` cannot produce, because it runs
+     * backends before the proxy: the proxy is brought up first here, and the backend
+     * is declared afterwards.
+     */
+    @Test
+    fun `a backend registered before it was joinable can still be sealed and drained`() =
+        coreTest {
+            val leaving = backendDefinition("survival-01")
+            val harness = ProxyHarness(backends = listOf(leaving))
+
+            // The proxy comes up on its own, with nothing behind it yet.
+            harness.declare(harness.proxyDefinition)
+            repeat(4) { harness.pass(harness.proxyDefinition.metadata.name) }
+
+            // The backend is declared and the proxy sweeps *before* it is joinable —
+            // the recreate window of every REPLACEMENT and RELOCATION, and the
+            // ordinary case for a server added to a running fleet.
+            harness.declare(leaving)
+            harness.pass(harness.proxyDefinition.metadata.name)
+            harness
+                .status(leaving.metadata.name)
+                ?.endpoint shouldBe null
+
+            // Now it comes up, and the proxy sweeps again.
+            repeat(4) { harness.pass(leaving.metadata.name) }
+            harness.pass(harness.proxyDefinition.metadata.name)
+
+            // Whatever it was registered as, it is registered as one thing: a second
+            // assertion never contradicts the first, so the plugin never has to
+            // refuse one.
+            val registered = harness.plugin.backend("survival-01").shouldNotBeNull()
+            registered.address shouldBe "node-survival-01:25565"
+
+            // And the drain gets past step 2, which is the property the conflict
+            // destroyed. It reaches the stop.
+            harness.store.deleteDefinition(leaving.metadata.name)
+            repeat(10) { harness.pass(leaving.metadata.name) }
+
+            harness
+                .status(leaving.metadata.name)
+                ?.drain
+                ?.failure shouldBe null
+            harness.plugin.deregistrations shouldContain "survival-01"
+            harness.nodeOf(leaving).stops shouldHaveSize 1
         }
 
     /**
