@@ -350,6 +350,32 @@ attached to a row, because "the thing that reads this is unreachable" describes
 the read and not the record. Treat `true` as a possibility a networked backend
 could honestly report, not as something to expect today.
 
+#### There are two kinds, and `kind` discriminates every shape
+
+`ServerResource.definition` and `ServerResource.status` are **unions**, tagged by
+`kind`. Every endpoint returns both kinds from the same routes — there is no
+`/proxies` — so a client that assumed one shape needs a discriminant now:
+
+```ts
+if (server.status?.kind === 'VelocityProxy') { /* backends, control */ }
+else if (server.status?.kind === 'PaperServer') { /* storage */ }
+```
+
+| | `PaperServer` | `VelocityProxy` |
+|---|---|---|
+| spec has | `paper`, `storage`, `eulaAccepted` | `forwarding`, `backends`, `control` |
+| status has | `storage` | `backends`, `control` |
+| `display.proxy` | `null` | populated |
+
+A proxy has **no `storage`**, in the spec or the status, and no way to ask for
+one: it holds no world, and a proxy that claimed to would become a container the
+orchestrator could never stop, because it has no save to confirm. Its absence is
+structural, not an omission to default.
+
+Everything else is common: `metadata`, `display`, `unreadable`, `caughtUp`,
+optimistic concurrency, deletion semantics, the event stream. A proxy is drained
+before it is stopped exactly like a server.
+
 #### Two null policies, and why
 
 `definition` **omits** absent optional fields. Everything else renders them as an
@@ -563,8 +589,24 @@ One derivation, served by the server, so every dashboard does not invent its own
 ```json
 { "state": "READY", "ready": true, "needsAttention": false, "unreadable": false,
   "drainBlocked": false, "drainState": null, "playersOnline": 3, "playersMax": 60,
+  "proxy": null,
   "detail": "" }
 ```
+
+`proxy` is null for a `PaperServer` and populated for a `VelocityProxy`:
+
+```json
+"proxy": { "backendsMatched": 5, "backendsRegistered": 2, "backendsDestinations": 1,
+           "backendsObserved": true, "controlReachable": true, "controlCompatible": true }
+```
+
+It exists so a fleet table can render a proxy row without reaching into
+`status.backends` per row and re-deriving the counts — which is the sort of
+derivation that ends up wrong in one place. The counts come from `:schema`'s own
+derived properties, so a dashboard and the reconciler cannot disagree about what
+"registered" means: `registered` counts `REGISTERED` **and** `SEALED` (both are in
+the routing table), while `destinations` counts only those that may receive a
+transfer right now.
 
 `state` is computed top-down and the order is the whole definition:
 
@@ -578,10 +620,36 @@ One derivation, served by the server, so every dashboard does not invent its own
 5. otherwise by `status.phase`:
    `FAILED`→`FAILED`, `UNKNOWN`→`UNKNOWN`, `PENDING`→`PENDING`,
    `IMAGE_PULLING`/`CREATING`/`STARTING`→`STARTING`,
-   `RUNNING`→`READY` if `status.ready` else `RUNNING`,
-   `DRAINING`→`DRAINING`, `STOPPING`→`STOPPING`, `STOPPED`→`STOPPED`
+   `DRAINING`→`DRAINING`, `STOPPING`→`STOPPING`, `STOPPED`→`STOPPED`,
+   and `RUNNING`→ one of three:
+   - `RUNNING` if `!ready` — up, not accepting yet
+   - `DEGRADED` if a **capability condition is explicitly `False`**
+   - `READY` otherwise
 
 `RUNNING` vs `READY` is a real distinction: running is not joinable.
+
+**`DEGRADED` — up, accepting, and unable to do its job.** A proxy whose selector
+matches no backend is accepting players and routing them nowhere; one whose
+control endpoint will not answer, or answers with an incompatible plugin, cannot
+seal, transfer or deregister, so *no backend behind it can finish a drain*. Both
+are up and both are broken, and neither is a failure the loop can act on — an
+operator has to label a server or fix an image. `READY` would put a green badge
+on a front door with nothing behind it.
+
+The capability conditions today are `BACKENDS_RESOLVED` and
+`CONTROL_ENDPOINT_READY`. The badge is deliberately general rather than a
+proxy-specific `NO_BACKENDS`: it says *up and not working*, and which capability
+is missing is in `display.detail` and in `status.conditions`. A kind that later
+grows its own capability condition needs no new badge value.
+
+Only an **explicitly `False`** condition degrades — never an absent one — so a
+`PaperServer`, which raises neither, is never `DEGRADED` by omission.
+
+`display.ready` stays the kind's own readiness and is **not** widened to mean
+"and it has somewhere to send them". A `DEGRADED` proxy reports `ready: true`,
+because it genuinely is accepting connections. The badge carries the rest, and
+folding it into `ready` would make the field disagree with the `READY` condition
+and with what `:core` wrote.
 
 **`UNREADABLE` is not `UNKNOWN`.** `UNKNOWN` means the node or runtime could not
 be reached — a fact about the world, and the remedy is to go and look at the
@@ -972,13 +1040,15 @@ none — not in a filter and not in a create form:
 
 ```json
 { "apiVersions": ["mcorch.dev/v1alpha1"], "currentApiVersion": "mcorch.dev/v1alpha1",
-  "kinds": ["PaperServer"],
+  "kinds": ["PaperServer", "VelocityProxy"],
   "enums": {
     "phase": [...], "drainState": [...], "conditionType": [...], "conditionStatus": [...],
     "failureReason": [...], "failureClass": [...], "drainBlockReason": [...],
     "displayState": [...],
     "statePart": ["DESIRED", "OBSERVED"],
+    "backendRegistration": ["PENDING", "REGISTERED", "SEALED", "DEREGISTERED", "UNREACHABLE"],
     "storageMode": ["persistent", "ephemeral"],
+    "forwardingMode": ["modern"],
     "drainPolicy": ["waitForZeroPlayers"]
   },
   "limits": { "maxBodyBytes": 1048576, "maxStreams": 16 },
@@ -989,15 +1059,16 @@ none — not in a filter and not in a create form:
 #### Two spellings, and the split is not cosmetic
 
 - **`phase`, `drainState`, `conditionType`, `conditionStatus`, `failureReason`,
-  `failureClass`, `drainBlockReason`, `displayState`, `statePart`** appear in
-  *observed state* and are spelled by their Kotlin name: `RUNNING`,
-  `DRAIN_STALLED`, `OBSERVED`.
-- **`storageMode`, `drainPolicy`** appear in a *definition* and are spelled by
-  their YAML wire value: `persistent`, `waitForZeroPlayers`. A form that offered
-  `PERSISTENT` would build a document the parser rejects.
+  `failureClass`, `drainBlockReason`, `displayState`, `statePart`,
+  `backendRegistration`** appear in *observed state* and are spelled by their
+  Kotlin name: `RUNNING`, `DRAIN_STALLED`, `OBSERVED`, `SEALED`.
+- **`storageMode`, `drainPolicy`, `forwardingMode`** appear in a *definition* and
+  are spelled by their YAML wire value: `persistent`, `waitForZeroPlayers`,
+  `modern`. A form that offered `PERSISTENT` would build a document the parser
+  rejects.
 
-The key name tells you which: `…State`/`…Type`/`…Reason`/`…Class` are read back,
-`storageMode`/`drainPolicy` are sent.
+The key name tells you which: `…State`/`…Type`/`…Reason`/`…Class`/`…Registration`
+are read back, `storageMode`/`drainPolicy`/`forwardingMode` are sent.
 
 #### What "without a frontend release" actually covers
 
@@ -1078,8 +1149,16 @@ start looks exactly like a healthy one until somebody needs it.
   `{online, max, observedAt}` and the type has no field an identity could live in.
   `status.endpoint.address` is the *server's* address, never a client's.
   `status.drain.destination` is a server name.
-- **No secret material, ever.** `spec.network.rcon.passwordSecret` is
-  `{name, key}` — coordinates. There is no endpoint that resolves them.
+- **No secret material, ever.** `spec.network.rcon.passwordSecret`,
+  `spec.forwarding.secret` and `spec.control.tokenSecret` are all `{name, key}` —
+  coordinates. There is no endpoint that resolves any of them. The second is the
+  modern-forwarding secret, which the repository's fourth invariant says travels
+  through the secret store and nowhere else; it is set through
+  `PUT /api/v1/secrets/{name}/{key}` and never read back.
+- **A proxy sees every player in the fleet**, so the counts-only rule matters
+  most there. `status.backends[].players` is `{online, max, observedAt}` and
+  `BackendStatus` has no field an identity could live in. `backends[].server` is
+  a declared object's name.
 - **`status.failure.message` and `status.drain.failure.message`** are
   operator-facing and already redacted upstream for the CRI operations whose
   request carries a secret. There is no second, unredacted view and no raw-state
@@ -1102,7 +1181,7 @@ store will produce on demand.
 
 ```ts
 export type ApiVersion = 'mcorch.dev/v1alpha1';
-export type Kind = 'PaperServer';
+export type Kind = 'PaperServer' | 'VelocityProxy';
 
 export type ServerPhase =
   | 'PENDING' | 'IMAGE_PULLING' | 'CREATING' | 'STARTING' | 'RUNNING'
@@ -1115,6 +1194,8 @@ export type DrainState =
 export type DisplayState =
   | 'PENDING' | 'STARTING' | 'RUNNING' | 'READY' | 'DRAINING'
   | 'TERMINATING' | 'STOPPING' | 'STOPPED' | 'FAILED'
+  /** Up, accepting connections, and unable to do its job — see §7. */
+  | 'DEGRADED'
   /** The stored observation will not decode. NOT the same as UNKNOWN — see §7. */
   | 'UNREADABLE'
   | 'UNKNOWN';
@@ -1137,6 +1218,13 @@ export type DrainBlockReason = 'AWAITING_ZERO_PLAYERS';
 
 /** Which half of a server's stored state something is about. */
 export type StatePart = 'DESIRED' | 'OBSERVED';
+
+/** How the proxy currently routes to one backend. The drain protocol's own vocabulary. */
+export type BackendRegistration =
+  | 'PENDING' | 'REGISTERED' | 'SEALED' | 'DEREGISTERED' | 'UNREACHABLE';
+
+/** Wire value. The only forwarding this orchestrator will run. */
+export type ForwardingMode = 'modern';
 
 export type FailureReason =
   | 'IMAGE_PULL_FAILED' | 'IMAGE_REFERENCE_REJECTED' | 'SANDBOX_CREATE_FAILED'
@@ -1175,11 +1263,51 @@ export type DrainPolicy = 'waitForZeroPlayers';
  * Unknown fields are rejected with a violation naming the field, so this is not
  * merely advisory — a typo is a 422 with `did you mean …?` attached.
  */
-export interface DefinitionInput {
+export type DefinitionInput = PaperServerInput | VelocityProxyInput;
+
+export interface PaperServerInput {
   apiVersion: ApiVersion;
-  kind: Kind;
+  kind: 'PaperServer';
   metadata: { name: string; labels?: Record<string, string> };
   spec: PaperServerSpecInput;
+}
+
+export interface VelocityProxyInput {
+  apiVersion: ApiVersion;
+  kind: 'VelocityProxy';
+  metadata: { name: string; labels?: Record<string, string> };
+  spec: VelocityProxySpecInput;
+}
+
+export interface VelocityProxySpecInput {
+  /** Required. Pinned to a tag or a digest; `latest` is rejected. */
+  image: string;
+  /** Required — but only `memory` inside it is. */
+  resources: {
+    memory: string;
+    cpu?: string;
+    heap?: { max?: string; min?: string };
+  };
+  /** Required. The coordinate of the modern-forwarding secret — never a value. */
+  forwarding: { secret: SecretRef; mode?: ForwardingMode };
+  /** Required. `matchLabels` must be non-empty: an empty selector enrols the fleet. */
+  backends: {
+    selector: { matchLabels: Record<string, string> };
+    fallback?: string[];
+    drain?: { sealTimeout?: string; destinationTimeout?: string; deregisterTimeout?: string };
+  };
+  /** `tokenSecret` becomes required once `hostPort` is set — checked at parse time. */
+  control?: { port?: number; hostPort?: number; tokenSecret?: SecretRef };
+  maxPlayers?: number;                  // default 500
+  network?: { port?: number; hostPort?: number };
+  lifecycle?: {
+    /** No wait timeout, and there will not be one: the only way to spell it is "disconnect them". */
+    drain?: { policy?: DrainPolicy; sealTimeout?: string };
+    stopGracePeriod?: string;
+    startupTimeout?: string;
+  };
+  placement?: { node?: string };
+  /** There is no `storage` block and no way to ask for one. A proxy holds no world. */
 }
 
 export interface PaperServerSpecInput {
@@ -1230,11 +1358,40 @@ export interface PaperServerSpecInput {
  * Unlike `DefinitionInput`, every defaulted field is present: this is the
  * *effective* definition the reconciler acts on, not what the operator typed.
  */
-export interface Definition {
+export type Definition = PaperServerDefinition | VelocityProxyDefinition;
+
+export interface PaperServerDefinition {
   apiVersion: ApiVersion;
-  kind: Kind;
+  kind: 'PaperServer';
   metadata: { name: string; labels?: Record<string, string> };
   spec: PaperServerSpec;
+}
+
+export interface VelocityProxyDefinition {
+  apiVersion: ApiVersion;
+  kind: 'VelocityProxy';
+  metadata: { name: string; labels?: Record<string, string> };
+  spec: VelocityProxySpec;
+}
+
+export interface VelocityProxySpec {
+  image: string;
+  maxPlayers: number;
+  network: { port: number; hostPort?: number };
+  resources: { memory: string; cpu?: string; heap: { max: string; min: string } };
+  forwarding: { mode: ForwardingMode; secret: SecretRef };
+  backends: {
+    selector: { matchLabels: Record<string, string> };
+    fallback?: string[];
+    drain: { sealTimeout: string; destinationTimeout: string; deregisterTimeout: string };
+  };
+  control: { port: number; hostPort?: number; tokenSecret?: SecretRef };
+  lifecycle: {
+    drain: { policy: DrainPolicy; sealTimeout: string };
+    stopGracePeriod: string;
+    startupTimeout: string;
+  };
+  placement?: { node: string };
 }
 
 export interface PaperServerSpec {
@@ -1262,9 +1419,66 @@ export interface PaperServerSpec {
 /** Coordinates. There is no endpoint that turns this into a value. */
 export interface SecretRef { name: string; key: string }
 
+export type ServerStatus = PaperServerStatus | VelocityProxyStatus;
+
+/**
+ * Observed state of a proxy.
+ *
+ * Not a `PaperServerStatus` with fields removed. There is no `storage` — a proxy
+ * holds no world, and a nullable storage block would invite "not persistent yet"
+ * from an absence. What it has instead is the two observations only a proxy can
+ * make.
+ */
+export interface VelocityProxyStatus {
+  apiVersion: ApiVersion; kind: 'VelocityProxy'; name: string;
+  observedGeneration: number;
+  phase: ServerPhase;
+  observedAt: string; lastTransitionAt: string;
+  /** Accepting player connections. Says nothing about having anywhere to send them. */
+  ready: boolean; draining: boolean;
+  image: ImageStatus | null;
+  runtime: RuntimeIdentity | null;
+  endpoint: { node: string; address: string; port: number } | null;
+  players: { online: number; max: number; observedAt: string } | null;
+  /** `null` = never observed. Present with `matched: 0` = the selector matched nothing. */
+  backends: BackendRoutingStatus | null;
+  control: ControlEndpointStatus | null;
+  drain: DrainStatus | null;
+  failure: FailureStatus | null;
+  conditions: Array<{ type: ConditionType; status: ConditionStatus; message: string; lastTransitionAt: string }>;
+}
+
+export interface BackendRoutingStatus {
+  observedAt: string;
+  /** Matched by the selector, whatever state they are in. */
+  matched: number;
+  /** In the routing table: REGISTERED or SEALED. */
+  registered: number;
+  /** May receive a transfer right now: REGISTERED and not draining. */
+  destinations: number;
+  backends: BackendStatus[];
+}
+
+export interface BackendStatus {
+  server: string;                       // a declared object's name
+  registration: BackendRegistration;
+  players: { online: number; max: number; observedAt: string } | null;
+  drainInitiated: boolean;
+  eligibleAsDestination: boolean;
+  lastTransitionAt: string;
+}
+
+export interface ControlEndpointStatus {
+  reachable: boolean;
+  /** What the endpoint reported, never anything declared. */
+  pluginApiVersion: string | null;
+  compatible: boolean;
+  lastContactAt: string | null;
+}
+
 /** Absent optional fields are `null` here, not omitted. */
-export interface ServerStatus {
-  apiVersion: ApiVersion; kind: Kind; name: string;
+export interface PaperServerStatus {
+  apiVersion: ApiVersion; kind: 'PaperServer'; name: string;
   observedGeneration: number;
   phase: ServerPhase;
   observedAt: string; lastTransitionAt: string;
@@ -1363,8 +1577,21 @@ export interface ServerResource {
     /** 'DRAIN_FAILED' means *parked*, not *broken*. Read it with `drainBlocked`. */
     drainState: DrainState | null;
     playersOnline: number | null; playersMax: number | null;
+    /** Kind-specific headline numbers. Null for a kind that has none. */
+    proxy: ProxyFacts | null;
     detail: string;
   };
+}
+
+export interface ProxyFacts {
+  /** All null until something has looked — see `backendsObserved`. */
+  backendsMatched: number | null;
+  backendsRegistered: number | null;
+  backendsDestinations: number | null;
+  /** False = never observed. True with `backendsMatched: 0` = the selector matched nothing. */
+  backendsObserved: boolean;
+  controlReachable: boolean | null;
+  controlCompatible: boolean | null;
 }
 
 /**
@@ -1475,3 +1702,11 @@ server is still running and needs an operator.
 
 In both cases the container is very probably running exactly as it was. Do not
 render either as an outage, and never as a deletion.
+
+**A proxy row.** Branch on `kind` for the detail panel, but the fleet table needs
+no branch: `display` is common, and `display.proxy` carries the numbers a proxy
+row wants. `DEGRADED` is the badge to give a distinct colour — it is the one that
+means "up, and nobody can play" — and `display.detail` already says which
+capability is missing. `status.backends === null` is "nothing has looked yet";
+`status.backends.matched === 0` is "the selector matched nothing", which is the
+answer to *why can nobody join* and wants an operator, not a spinner.

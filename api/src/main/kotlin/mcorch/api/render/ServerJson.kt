@@ -3,8 +3,11 @@ package mcorch.api.render
 import mcorch.api.json.Json
 import mcorch.api.json.JsonObjectBuilder
 import mcorch.api.json.jsonObject
+import mcorch.schema.BackendRoutingStatus
+import mcorch.schema.BackendStatus
 import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
+import mcorch.schema.ControlEndpointStatus
 import mcorch.schema.DrainBlock
 import mcorch.schema.DrainState
 import mcorch.schema.DrainStatus
@@ -27,6 +30,7 @@ import mcorch.schema.StatusCondition
 import mcorch.schema.StorageSpec
 import mcorch.schema.StorageStatus
 import mcorch.schema.VelocityProxyDefinition
+import mcorch.schema.VelocityProxySpec
 import mcorch.schema.VelocityProxyStatus
 import mcorch.store.StoreException
 import mcorch.store.StoredServer
@@ -87,32 +91,22 @@ internal object ServerJson {
             }
 
             is VelocityProxyDefinition -> {
-                throw notYetRendered(definition.kind)
+                jsonObject {
+                    put("apiVersion", definition.apiVersion.wireValue)
+                    put("kind", definition.kind.wireValue)
+                    put(
+                        "metadata",
+                        jsonObject {
+                            put("name", definition.metadata.name.value)
+                            if (definition.metadata.labels.isNotEmpty()) {
+                                put("labels", Json.map(definition.metadata.labels))
+                            }
+                        },
+                    )
+                    put("spec", proxySpec(definition.spec))
+                }
             }
         }
-
-    /**
-     * A kind this module has not been taught to render.
-     *
-     * `VelocityProxy` is declarable and fully validated in `:schema` and is
-     * neither reconciled nor persisted yet — `:store` refuses to hold one — so
-     * nothing this module reads from the store can currently be one, and these
-     * branches are unreachable rather than merely unimplemented. They exist
-     * because the sealed hierarchies made the compiler ask, and a partial
-     * rendering would be worse than a refusal: this object's contract is that it
-     * emits *every* field of every type, which is what makes "no player identity
-     * and no secret material" checkable instead of promised. A half-rendered
-     * proxy would quietly break that guarantee.
-     *
-     * Raised as a [StoreException.Unsupported] so it travels the path this module
-     * already has for "the store held something this build cannot work with",
-     * rather than as an unhandled 500.
-     */
-    private fun notYetRendered(kind: ServerKind): StoreException =
-        StoreException.Unsupported(
-            "this build cannot render a `${kind.wireValue}`: the kind is declarable and validated, but its " +
-                "API representation has not been implemented yet",
-        )
 
     private fun spec(spec: PaperServerSpec): Json.Obj =
         jsonObject {
@@ -218,6 +212,104 @@ internal object ServerJson {
             }
         }
 
+    /**
+     * A proxy's declared state, on the same omission rules as a server's: absent
+     * optionals are left out so the document stays valid input.
+     *
+     * Two references and no material. `forwarding.secret` is the coordinate of
+     * the modern-forwarding secret — the one CLAUDE.md's fourth invariant is
+     * about — and `control.tokenSecret` is the coordinate of the control token.
+     * Both render as `{name, key}` through the same [secretRef] every other
+     * reference goes through, and there is no endpoint anywhere in this module
+     * that turns either into a value.
+     */
+    private fun proxySpec(spec: VelocityProxySpec): Json.Obj =
+        jsonObject {
+            put("image", spec.image.canonical)
+            put("maxPlayers", spec.maxPlayers)
+            put(
+                "network",
+                jsonObject {
+                    put("port", spec.network.port)
+                    spec.network.hostPort?.let { put("hostPort", it) }
+                },
+            )
+            put(
+                "resources",
+                jsonObject {
+                    put("memory", spec.resources.memory.render())
+                    spec.resources.cpu?.let { put("cpu", it.render()) }
+                    put(
+                        "heap",
+                        jsonObject {
+                            put(
+                                "max",
+                                spec.resources.heap.max
+                                    .render(),
+                            )
+                            put(
+                                "min",
+                                spec.resources.heap.min
+                                    .render(),
+                            )
+                        },
+                    )
+                },
+            )
+            put(
+                "forwarding",
+                jsonObject {
+                    put("mode", spec.forwarding.mode.wireValue)
+                    put("secret", secretRef(spec.forwarding.secret))
+                },
+            )
+            put(
+                "backends",
+                jsonObject {
+                    put(
+                        "selector",
+                        jsonObject { put("matchLabels", Json.map(spec.backends.selector.matchLabels)) },
+                    )
+                    if (spec.backends.fallback.isNotEmpty()) {
+                        put("fallback", Json.strings(spec.backends.fallback.map { it.value }))
+                    }
+                    put(
+                        "drain",
+                        jsonObject {
+                            put("sealTimeout", DurationFormat.render(spec.backends.drain.sealTimeout))
+                            put("destinationTimeout", DurationFormat.render(spec.backends.drain.destinationTimeout))
+                            put("deregisterTimeout", DurationFormat.render(spec.backends.drain.deregisterTimeout))
+                        },
+                    )
+                },
+            )
+            put(
+                "control",
+                jsonObject {
+                    put("port", spec.control.port)
+                    spec.control.hostPort?.let { put("hostPort", it) }
+                    spec.control.tokenSecret?.let { put("tokenSecret", secretRef(it)) }
+                },
+            )
+            put(
+                "lifecycle",
+                jsonObject {
+                    put(
+                        "drain",
+                        jsonObject {
+                            put("policy", spec.lifecycle.drain.policy.wireValue)
+                            put("sealTimeout", DurationFormat.render(spec.lifecycle.drain.sealTimeout))
+                        },
+                    )
+                    put("stopGracePeriod", DurationFormat.render(spec.lifecycle.stopGracePeriod))
+                    put("startupTimeout", DurationFormat.render(spec.lifecycle.startupTimeout))
+                },
+            )
+            spec.placement.node?.let { node ->
+                put("placement", jsonObject { put("node", node.value) })
+            }
+        }
+
     /** Coordinates. There is no rendering of a secret *value* anywhere in this module. */
     private fun secretRef(ref: SecretRef): Json.Obj =
         jsonObject {
@@ -250,8 +342,90 @@ internal object ServerJson {
             }
 
             is VelocityProxyStatus -> {
-                throw notYetRendered(status.kind)
+                jsonObject {
+                    put("apiVersion", status.apiVersion.wireValue)
+                    put("kind", status.kind.wireValue)
+                    put("name", status.name.value)
+                    put("observedGeneration", status.observedGeneration)
+                    put("phase", status.phase)
+                    put("observedAt", status.observedAt)
+                    put("lastTransitionAt", status.lastTransitionAt)
+                    put("ready", status.ready)
+                    put("draining", status.draining)
+                    putOrNull("image", status.image, ::image)
+                    putOrNull("runtime", status.runtime, ::runtime)
+                    putOrNull("endpoint", status.endpoint, ::endpoint)
+                    putOrNull("players", status.players, ::players)
+                    // The two observations only a proxy can make. There is no
+                    // `storage`: a proxy holds no world, and a nullable storage
+                    // block would invite a reader to conclude "not persistent yet"
+                    // from an absence.
+                    putOrNull("backends", status.backends, ::backendRouting)
+                    putOrNull("control", status.control, ::controlEndpoint)
+                    putOrNull("drain", status.drain, ::drain)
+                    putOrNull("failure", status.failure, ::failure)
+                    putArray("conditions", status.conditions, ::condition)
+                }
             }
+        }
+
+    /**
+     * What the selector currently resolves to.
+     *
+     * Null and empty are **different answers and both are rendered**. Null is
+     * "nothing has looked yet"; an object with `backends: []` is "the selector was
+     * evaluated and matched nothing", which is a live condition an operator has to
+     * see — it is the answer to "why can nobody join", and it cannot be caught at
+     * parse time because the selector is checked against definitions the parse
+     * never sees. Collapsing the two would hide the second behind the first.
+     *
+     * The three counts are `:schema`'s own derived properties rather than
+     * arithmetic repeated here, so a dashboard and the reconciler cannot disagree
+     * about what "registered" means.
+     */
+    private fun backendRouting(routing: BackendRoutingStatus): Json.Obj =
+        jsonObject {
+            put("observedAt", routing.observedAt)
+            put("matched", routing.matched)
+            put("registered", routing.registered)
+            put("destinations", routing.destinations)
+            putArray("backends", routing.backends, ::backend)
+        }
+
+    /**
+     * One backend as this proxy sees it.
+     *
+     * A proxy sees every player in the fleet, so this is the place the counts-only
+     * discipline matters most: [players] is a [PlayerOccupancy] and there is no
+     * field here that could hold who is connected. [server] is a declared object's
+     * name.
+     */
+    private fun backend(backend: BackendStatus): Json.Obj =
+        jsonObject {
+            put("server", backend.server.value)
+            put("registration", backend.registration)
+            putOrNull("players", backend.players, ::players)
+            put("drainInitiated", backend.drainInitiated)
+            put("eligibleAsDestination", backend.eligibleAsDestination)
+            put("lastTransitionAt", backend.lastTransitionAt)
+        }
+
+    /**
+     * Whether the control endpoint answered, and whether it speaks a protocol this
+     * build understands.
+     *
+     * `reachable` and `compatible` stay separate fields because the remedies
+     * differ: one is "the proxy is not answering", the other is "it answered and
+     * the plugin is the wrong version", and only the second is fixed by changing
+     * the image. `pluginApiVersion` is what the endpoint reported, never anything
+     * declared — the spec deliberately does not pin it.
+     */
+    private fun controlEndpoint(control: ControlEndpointStatus): Json.Obj =
+        jsonObject {
+            put("reachable", control.reachable)
+            put("pluginApiVersion", control.pluginApiVersion)
+            put("compatible", control.compatible)
+            put("lastContactAt", control.lastContactAt)
         }
 
     private fun image(image: ImageStatus): Json.Obj =
@@ -429,6 +603,95 @@ internal object ServerJson {
         }
 
     /**
+     * The parts of an observation the badge and the sentence need, with the kind
+     * erased.
+     *
+     * Every consumer below used to reach for `as? PaperServerStatus`, which is why
+     * a proxy rendered as `UNKNOWN` the moment one could exist: a failed cast is
+     * indistinguishable from no observation. Erasing the kind once, here, is what
+     * makes that class of bug unavailable — there is no cast left to get wrong,
+     * and a third kind has exactly one place to be added.
+     *
+     * [degraded] is the part that is genuinely per-kind: conditions a kind
+     * raises about whether it can do its job at all.
+     */
+    private class Observed(
+        val phase: ServerPhase,
+        val ready: Boolean,
+        val draining: Boolean,
+        val drain: DrainStatus?,
+        val failure: FailureStatus?,
+        val conditions: List<StatusCondition>,
+        val players: PlayerOccupancy?,
+    ) {
+        /**
+         * Up and accepting, but unable to do its job.
+         *
+         * A capability condition that is *explicitly* `False` — present and false,
+         * never merely absent — so a kind that does not raise one is never
+         * degraded by omission. Today only a proxy raises these: a proxy with no
+         * registered backend is accepting players and routing them nowhere, and a
+         * proxy whose control endpoint is unreachable or speaks the wrong protocol
+         * cannot seal, transfer or deregister, which means no backend behind it
+         * can finish a drain.
+         */
+        val degraded: Boolean
+            get() =
+                conditions.any {
+                    it.type in CAPABILITY_CONDITIONS && it.status == ConditionStatus.FALSE
+                }
+
+        fun conditionIsTrue(type: ConditionType): Boolean =
+            conditions.any { it.type == type && it.status == ConditionStatus.TRUE }
+    }
+
+    private val CAPABILITY_CONDITIONS =
+        setOf(ConditionType.BACKENDS_RESOLVED, ConditionType.CONTROL_ENDPOINT_READY)
+
+    private fun observed(status: ServerStatus?): Observed? =
+        when (status) {
+            null -> {
+                null
+            }
+
+            is PaperServerStatus -> {
+                Observed(
+                    phase = status.phase,
+                    ready = status.ready,
+                    draining = status.draining,
+                    drain = status.drain,
+                    failure = status.failure,
+                    conditions = status.conditions,
+                    players = status.players,
+                )
+            }
+
+            is VelocityProxyStatus -> {
+                Observed(
+                    phase = status.phase,
+                    // The proxy's own readiness — accepting player connections —
+                    // and deliberately not widened to "and it has somewhere to send
+                    // them". That second fact is real and is what `DEGRADED`
+                    // carries; folding it in here would make `ready` disagree with
+                    // the field `:core` wrote and with the `READY` condition.
+                    ready = status.ready,
+                    draining = status.draining,
+                    drain = status.drain,
+                    failure = status.failure,
+                    conditions = status.conditions,
+                    players = status.players,
+                )
+            }
+        }
+
+    /** The maximum an operator declared, whatever the kind. Used when nothing has been observed. */
+    private fun declaredMaxPlayers(definition: ServerDefinition): Int =
+        when (definition) {
+            is PaperServerDefinition -> definition.spec.maxPlayers
+            is VelocityProxyDefinition -> definition.spec.maxPlayers
+        }
+
+    /**
      * The one derived view, so that every dashboard does not invent its own.
      *
      * `state` fuses the phase, the drain and the tombstone into a single badge.
@@ -446,7 +709,7 @@ internal object ServerJson {
      * badge must not be softened to say otherwise while a delete is outstanding.
      */
     fun displayState(stored: StoredServer): DisplayState {
-        val status = stored.status?.status as? PaperServerStatus
+        val status = observed(stored.status?.status)
         return when {
             stored.definition.terminating -> {
                 DisplayState.TERMINATING
@@ -484,21 +747,53 @@ internal object ServerJson {
 
             else -> {
                 when (status.phase) {
-                    ServerPhase.FAILED -> DisplayState.FAILED
-                    ServerPhase.UNKNOWN -> DisplayState.UNKNOWN
-                    ServerPhase.PENDING -> DisplayState.PENDING
-                    ServerPhase.IMAGE_PULLING, ServerPhase.CREATING, ServerPhase.STARTING -> DisplayState.STARTING
-                    ServerPhase.RUNNING -> if (status.ready) DisplayState.READY else DisplayState.RUNNING
-                    ServerPhase.DRAINING -> DisplayState.DRAINING
-                    ServerPhase.STOPPING -> DisplayState.STOPPING
-                    ServerPhase.STOPPED -> DisplayState.STOPPED
+                    ServerPhase.FAILED -> {
+                        DisplayState.FAILED
+                    }
+
+                    ServerPhase.UNKNOWN -> {
+                        DisplayState.UNKNOWN
+                    }
+
+                    ServerPhase.PENDING -> {
+                        DisplayState.PENDING
+                    }
+
+                    ServerPhase.IMAGE_PULLING, ServerPhase.CREATING, ServerPhase.STARTING -> {
+                        DisplayState.STARTING
+                    }
+
+                    // Three answers, not two. RUNNING is "up, not accepting";
+                    // DEGRADED is "accepting, and cannot do its job" — a proxy
+                    // routing to nothing is the case that forced the distinction,
+                    // and calling it READY would put a green badge on a front door
+                    // with nothing behind it.
+                    ServerPhase.RUNNING -> {
+                        when {
+                            !status.ready -> DisplayState.RUNNING
+                            status.degraded -> DisplayState.DEGRADED
+                            else -> DisplayState.READY
+                        }
+                    }
+
+                    ServerPhase.DRAINING -> {
+                        DisplayState.DRAINING
+                    }
+
+                    ServerPhase.STOPPING -> {
+                        DisplayState.STOPPING
+                    }
+
+                    ServerPhase.STOPPED -> {
+                        DisplayState.STOPPED
+                    }
                 }
             }
         }
     }
 
     private fun display(stored: StoredServer): Json.Obj {
-        val status = stored.status?.status as? PaperServerStatus
+        val status = observed(stored.status?.status)
         val state = displayState(stored)
         return jsonObject {
             put("state", state)
@@ -517,10 +812,7 @@ internal object ServerJson {
             // which is the one audience that has to.
             put(
                 "needsAttention",
-                stored.unreadable != null ||
-                    status?.conditions?.any {
-                        it.type == ConditionType.NEEDS_ATTENTION && it.status == ConditionStatus.TRUE
-                    } ?: false,
+                stored.unreadable != null || status?.conditionIsTrue(ConditionType.NEEDS_ATTENTION) ?: false,
             )
             // A flag as well as a state, and for the same reason `needsAttention`
             // is one: TERMINATING outranks UNREADABLE, so a terminating server
@@ -551,10 +843,10 @@ internal object ServerJson {
             put("drainBlocked", drainBlocked(status))
             put("drainState", status?.drain?.state)
             put("playersOnline", status?.players?.online)
-            put(
-                "playersMax",
-                status?.players?.max ?: (stored.definition.definition as? PaperServerDefinition)?.spec?.maxPlayers,
-            )
+            put("playersMax", status?.players?.max ?: declaredMaxPlayers(stored.definition.definition))
+            // Kind-specific facts, nested rather than flattened so the common
+            // object keeps one shape. Null for a kind that has none.
+            put("proxy", proxyFacts(stored.status?.status))
             put("detail", detail(stored, status, state))
         }
     }
@@ -567,8 +859,38 @@ internal object ServerJson {
      * fields — an aborted drain records in both — and the drain branch words it
      * better. See the precedence note on [detail].
      */
-    private fun passFailure(status: PaperServerStatus?): FailureStatus? =
-        status?.failure?.takeIf { it != status.drain?.failure }
+    private fun passFailure(status: Observed?): FailureStatus? = status?.failure?.takeIf { it != status.drain?.failure }
+
+    /**
+     * The proxy row's own headline numbers, or null for a kind that has none.
+     *
+     * A dashboard listing a fleet needs these to render a proxy row at all — how
+     * many backends matched, how many are in the routing table, whether the
+     * control endpoint is answering — and digging them out of `status.backends`
+     * per row is the sort of derivation that ends up wrong in one place. The
+     * counts are `:schema`'s derived properties, not arithmetic repeated here.
+     *
+     * `backendsMatched: 0` with a non-null object means the selector matched
+     * nothing; the whole object null means nothing has been observed yet. The two
+     * are different answers and the difference survives to the client.
+     */
+    private fun proxyFacts(status: ServerStatus?): Json =
+        when (status) {
+            is VelocityProxyStatus -> {
+                jsonObject {
+                    put("backendsMatched", status.backends?.matched)
+                    put("backendsRegistered", status.backends?.registered)
+                    put("backendsDestinations", status.backends?.destinations)
+                    put("backendsObserved", status.backends != null)
+                    put("controlReachable", status.control?.reachable)
+                    put("controlCompatible", status.control?.compatible)
+                }
+            }
+
+            else -> {
+                Json.Null
+            }
+        }
 
     /** The lead-in a terminating server's sentence carries, so every branch reads the same. */
     private fun terminating(state: DisplayState): String =
@@ -598,10 +920,7 @@ internal object ServerJson {
      * over-states brokenness — the safe way round for a sentence whose job is to
      * stop somebody being called.
      */
-    private fun drainBlocked(status: PaperServerStatus?): Boolean =
-        status?.conditions?.any {
-            it.type == ConditionType.DRAIN_BLOCKED && it.status == ConditionStatus.TRUE
-        } ?: false
+    private fun drainBlocked(status: Observed?): Boolean = status?.conditionIsTrue(ConditionType.DRAIN_BLOCKED) ?: false
 
     /**
      * The operator-facing sentence.
@@ -645,7 +964,7 @@ internal object ServerJson {
      */
     private fun detail(
         stored: StoredServer,
-        status: PaperServerStatus?,
+        status: Observed?,
         state: DisplayState,
     ): String =
         when {
@@ -725,6 +1044,13 @@ internal object ServerJson {
                 "draining (${status.drain?.state?.name?.lowercase()?.replace('_', ' ')})"
             }
 
+            // Above the caught-up line: "up and cannot do its job" is the more
+            // useful thing to say, and it is the sentence that explains a badge an
+            // operator has not seen before.
+            state == DisplayState.DEGRADED -> {
+                degradedDetail(status)
+            }
+
             !stored.caughtUp -> {
                 "the reconcile loop has not caught up with generation ${stored.definition.generation}"
             }
@@ -733,6 +1059,44 @@ internal object ServerJson {
                 ""
             }
         }
+
+    /**
+     * Why a server is up and not working.
+     *
+     * Reads the capability conditions rather than the status fields they were
+     * derived from, for the reason the whole module now does: one derivation, and
+     * the sentence cannot disagree with the badge that was computed from the same
+     * conditions.
+     */
+    private fun degradedDetail(status: Observed?): String {
+        val problems =
+            status
+                ?.conditions
+                .orEmpty()
+                .filter { it.type in CAPABILITY_CONDITIONS && it.status == ConditionStatus.FALSE }
+        val explained = problems.filter { it.message.isNotEmpty() }
+        return when {
+            explained.isNotEmpty() -> {
+                "running and accepting connections, but not able to do its job — " +
+                    explained.joinToString("; ") { it.message }
+            }
+
+            problems.isNotEmpty() -> {
+                "running and accepting connections, but not able to do its job: " +
+                    problems.joinToString(", ") {
+                        it.type.name
+                            .lowercase()
+                            .replace('_', ' ')
+                    } +
+                    " is not satisfied"
+            }
+
+            // Unreachable: the badge is only DEGRADED when one of these is false.
+            else -> {
+                "running and accepting connections, but not able to do its job"
+            }
+        }
+    }
 
     /**
      * The badge a dashboard renders. Derived; never stored, never authoritative.
@@ -763,6 +1127,24 @@ internal object ServerJson {
         STARTING,
         RUNNING,
         READY,
+
+        /**
+         * Up, accepting connections, and unable to do its job.
+         *
+         * Distinct from [RUNNING], which is "not accepting yet", and from
+         * [FAILED], which is "the loop has given up". A proxy whose selector
+         * matches no backend is accepting players and routing them nowhere; one
+         * whose control endpoint will not answer cannot seal, transfer or
+         * deregister, so no backend behind it can finish a drain. Both are up,
+         * both are broken, and neither is a failure the loop can act on — an
+         * operator has to label a server or fix an image.
+         *
+         * Deliberately general rather than a proxy-specific `NO_BACKENDS`: the
+         * badge says *up and not working*, and which capability is missing is in
+         * `detail` and in the conditions. A kind that later grows its own
+         * capability condition needs no new badge.
+         */
+        DEGRADED,
         DRAINING,
         TERMINATING,
         STOPPING,
