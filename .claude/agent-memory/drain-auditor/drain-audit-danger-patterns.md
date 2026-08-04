@@ -534,3 +534,43 @@ Related: [[standalone-paper-drain-shape]]
     a concurrent `PUT` can re-register and seal in the gap and have its seal
     erased. Cheap to fix, and the shape recurs — whenever a comment says "only
     after X", check that X and the thing after it are under the same lock.
+
+## Round 13: the widened escalation
+
+48. **When two escalation arms can both fire and one wins the message, audit the
+    2x2 of failure classes, not the 2 arms.** `NEEDS_ATTENTION` derives from a
+    drain arm and a pass arm, and the drain arm is checked first. Three of the
+    four class combinations are fine; the fourth is not. A *retryable* drain
+    failure beside a *permanent* pass failure renders the drain arm's "The loop
+    keeps retrying and the container keeps running", while
+    `isBlockedByPermanentFailure` gates the server out on the very next pass. The
+    alerting channel is the condition message, so the operator is told to wait by
+    the one surface an alert quotes. Whenever an arm wins by position rather than
+    by severity, work out which cell of the class matrix makes the winner's prose
+    false.
+49. **"Fixed at the class, not the instance" usually means relocated.** Wrapping a
+    positional `LOG.error(fmt, vararg Any?)` in a helper whose parameters are all
+    distinct types does stop *callers* swapping arguments — genuinely, and the
+    compiler proves it. It does not stop the helper body's own positional mapping
+    from being wrong, and it does nothing for every other multi-placeholder log in
+    the module. Test the claim by asking: which log line would be read first after
+    a world was lost? Here that is `DrainController`'s stop line, which still
+    passes `drain.worldSaved` and `contract.holdsWorldData` — two adjacent
+    `Boolean`s — positionally. The fix went to the line that was found broken, not
+    to the line whose breakage costs a world.
+50. **A new derivation that deliberately picks a different time anchor from the
+    existing one has just documented a defect in the existing one.** The pass arm
+    anchors on `failure.occurredAt` precisely so a four-hour block does not make
+    the first retryable hiccup fire instantly. `DrainStatus.escalated()` still
+    anchors on `drain.startedAt` and does exactly that. Correct not to move it
+    mid-change, but "the old arm keeps the anchor we just argued is wrong" has to
+    leave the review as a routed follow-up, not as a comment.
+51. **An end-to-end conformance test pins the direction it was written for.** The
+    `status.failure == drain.failure` identity has three dependents (`:core`
+    wording, `:api` `detail()` precedence, `:store` V5's drop). `AttentionTest`
+    pins the `:core` one; `DisplayConformanceTest` drives `:api` end to end for
+    the *pass-failure* direction only, and `:api`'s own unit test builds the
+    identity into its fixture, so it cannot observe the identity being broken
+    upstream. One red test is enough to stop a change, so the pin works — but when
+    a fact becomes load-bearing in a third place, check which dependents are
+    covered by a test that could actually see it break.

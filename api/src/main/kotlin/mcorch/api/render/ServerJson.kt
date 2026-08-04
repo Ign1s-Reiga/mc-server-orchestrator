@@ -536,8 +536,18 @@ internal object ServerJson {
             // coincidence of today's one block reason rather than the fact itself.
             //
             // It is the inverse of `needsAttention` in what it tells somebody to
-            // do — this one says *do not act* — so the two are never both true and
-            // a dashboard may show them as one tri-state without losing anything.
+            // do — this one says *do not act*.
+            //
+            // They are **not** mutually exclusive, and a dashboard must not show
+            // them as one tri-state. `needsAttention` was widened beyond drains,
+            // so a drain can be correctly waiting on players while the loop has
+            // separately given up reaching the node: the block is true, the
+            // escalation is true, and suppressing either would be the lie. The
+            // overlap comes from the pass arm — a failure recorded on the status
+            // rather than on the drain — and is reachable with no hand-edited
+            // data, because a node failure carries a blocked drain forward
+            // untouched. Order them and let the first win; `API.md` §7 has the
+            // priority chain.
             put("drainBlocked", drainBlocked(status))
             put("drainState", status?.drain?.state)
             put("playersOnline", status?.players?.online)
