@@ -82,7 +82,8 @@ class DrainBlockRenderingTest {
 
         val display = document["display"] as Map<*, *>
         display["drainBlocked"] shouldBe true
-        // The inverse flag, and they are never both true.
+        // False *here*, on a block with nothing else wrong — not because the two
+        // are exclusive. They are not: see the both-true test below.
         display["needsAttention"] shouldBe false
         // The badge is unchanged: the drain really has been requested and the
         // server really is on its way out, so softening it would be the lie in the
@@ -181,6 +182,68 @@ class DrainBlockRenderingTest {
         display["drainBlocked"] shouldBe true
     }
 
+    @Test
+    fun `drainBlocked and needsAttention can both be true, and both are rendered`() {
+        // This document used to claim in bold that they never were, and told
+        // dashboards to render them as a mutually exclusive tri-state on that
+        // basis. The claim is false, and false for the case that most needs
+        // attention: a drain correctly waiting on players while its node is
+        // unreachable. The block is accurate — people really are still connected —
+        // and the pass failure escalates on its own arm.
+        //
+        // Pinned here so an implementation that "optimises" one flag out of the
+        // other, on the strength of the retired claim, fails.
+        api.call("POST", "/api/v1/servers", ExampleDefinitions.valid("minimal.yaml")).status shouldBe 201
+        observe(blocked(), passFailure = nodeFailure(), escalated = true)
+
+        val display = api.call("GET", "/api/v1/servers/survival-01").json()["display"] as Map<*, *>
+
+        display["drainBlocked"] shouldBe true
+        display["needsAttention"] shouldBe true
+
+        // And the sentence names the pass failure rather than the reassurance, so
+        // the two flags and the prose tell one story.
+        val detail = display["detail"] as String
+        detail shouldNotContain "waiting, not stuck"
+        detail shouldContain "the node did not answer a status request within 20s"
+
+        // Control: the ordinary blocked server, same fixture minus the failure,
+        // raises only the one flag. Without this the assertions above would pass
+        // against a renderer that reported every blocked drain as needing a human.
+        observe(blocked())
+        val quiet = api.call("GET", "/api/v1/servers/survival-01").json()["display"] as Map<*, *>
+        quiet["drainBlocked"] shouldBe true
+        quiet["needsAttention"] shouldBe false
+    }
+
+    @Test
+    fun `the sentence and the attention message rank the two failures oppositely`() {
+        // Deliberate, and worth pinning because a client comparing them would
+        // otherwise read it as a bug. The condition answers "what is the worst
+        // thing outstanding" and takes the drain arm; `detail` answers "what is
+        // true now" and takes the newer pass failure.
+        api.call("POST", "/api/v1/servers", ExampleDefinitions.valid("minimal.yaml")).status shouldBe 201
+        observe(blockedAndFailed(), passFailure = nodeFailure(), escalated = true)
+
+        val document = api.call("GET", "/api/v1/servers/survival-01").json()
+        val display = document["display"] as Map<*, *>
+
+        // The sentence: the newest fact, which is why nothing has moved since.
+        (display["detail"] as String) shouldContain "the node did not answer a status request within 20s"
+
+        // The condition message, which an alert renders: the worst standing
+        // problem, which is the drain that aborted.
+        @Suppress("UNCHECKED_CAST")
+        val conditions = (document["status"] as Map<*, *>)["conditions"] as List<Map<String, Any?>>
+        val attention = conditions.single { it["type"] == "NEEDS_ATTENTION" }
+        attention["status"] shouldBe "TRUE"
+        (attention["message"] as String) shouldContain "the drain cannot finish on its own"
+
+        // Both are rendered, and they are not the same sentence. Asserting they
+        // matched would be asserting the bug.
+        (display["detail"] as String) shouldNotContain "the drain cannot finish on its own"
+    }
+
     private fun blocked(): DrainStatus =
         DrainStatus(
             state = DrainState.DRAIN_FAILED,
@@ -249,6 +312,16 @@ class DrainBlockRenderingTest {
          * `drain.failure` would miss the sequence entirely.
          */
         passFailure: FailureStatus? = null,
+        /**
+         * Whether `NEEDS_ATTENTION` is raised.
+         *
+         * Named rather than derived, because the threshold that decides it lives
+         * in `:core` and `:api` cannot call `:core` even in tests — see the note
+         * on the class. `DisplayConformanceTest` in `:app` is what checks the
+         * reconciler raises it on the right servers; this file's job is that the
+         * renderer surfaces whatever was raised.
+         */
+        escalated: Boolean = false,
     ) {
         val blocked = drain.blocked != null && drain.failure == null
         val status =
@@ -271,8 +344,17 @@ class DrainBlockRenderingTest {
                         ),
                         StatusCondition(
                             ConditionType.NEEDS_ATTENTION,
-                            if (blocked) ConditionStatus.FALSE else ConditionStatus.TRUE,
-                            "",
+                            if (escalated || !blocked) ConditionStatus.TRUE else ConditionStatus.FALSE,
+                            // The condition's own message, which ranks the *drain*
+                            // arm first — the opposite way round from `detail`. See
+                            // the test that pins the divergence.
+                            if (drain.failure != null) {
+                                "this server needs a human: the drain cannot finish on its own."
+                            } else if (escalated) {
+                                "this server needs a human: the loop could not complete a pass."
+                            } else {
+                                ""
+                            },
                             at,
                         ),
                     ),

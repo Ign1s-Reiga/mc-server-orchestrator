@@ -611,6 +611,15 @@ the flags are what you filter on, because `TERMINATING` outranks all three.
   condition is `TRUE`, *and* whenever `unreadable` is set. It reports and never
   authorises, so a drain failing for an hour is still `DRAINING` with the flag
   beside it, and `lastTransitionAt` on the condition is what an alert fires on.
+
+  **It is not a drain flag.** It escalates on two independent arms: a drain that
+  cannot finish, and a *pass* the loop could not complete — the latter with no
+  drain involved at all. The case that forced the second arm is a server carrying
+  a permanent failure with `phase: "RUNNING"` and no drain, which the loop has
+  stopped managing entirely and which otherwise sat in a fleet table looking
+  perfectly healthy. Both arms apply the same threshold: `PERMANENT` escalates
+  immediately, `RETRYABLE` only after a configured interval, so a transient blip
+  does not page anybody.
 - `unreadable` — **what is wrong.** True whenever the resource carries an
   `unreadable` mark, including when the badge says `TERMINATING`.
 - `drainBlocked` — **the drain is waiting on players.** True when a
@@ -637,22 +646,49 @@ filter and label with `unreadable`. A dashboard that only watched
 `needsAttention` would otherwise never see these servers, and that is the one
 audience that has to.
 
-**`drainBlocked` and `needsAttention` are never both true**, and that is the
-whole reason `drainBlocked` exists. A drain that is not advancing shows
-`drainState: "DRAIN_FAILED"` whether it is stuck or merely waiting — that state
-means *parked*, not *broken* — so those two badges alone are indistinguishable,
-and the only question an operator has about such a server is which of the two it
-is. Render it as a tri-state beside the badge:
+**`drainBlocked` and `needsAttention` can both be true, and a client must order
+them rather than treat them as exclusive.** An earlier version of this document
+claimed they never were, and told dashboards to render them as a tri-state on
+that basis. That was wrong, and wrong for exactly the case that most needs
+attention: a drain can be *correctly* waiting on players while its node is
+unreachable. The block is accurate — people really are still connected — and the
+pass failure escalates independently of it.
+
+Why the two are independent: `drainBlocked` is a fact about the *drain*, and
+`needsAttention` is no longer a drain flag at all. It escalates on
+`status.failure` too, so a server the loop has stopped acting on raises it whether
+or not a drain is involved. The two arms can be true at once and neither implies
+the other.
+
+A drain that is not advancing shows `drainState: "DRAIN_FAILED"` whether it is
+stuck or merely waiting — that state means *parked*, not *broken* — so the badge
+alone cannot answer the only question an operator has about such a server. Render
+the flags in priority order:
 
 ```ts
+// Ordered, not exclusive: both can be true at once, and then the first wins
+// because it is the one with an action attached.
 const drain =
   display.needsAttention ? 'needs a human'
-  // A failed pass leaves the block intact, so this has to come first — see
-  // the note on `drainBlocked` above.
-  : server.status?.failure ? 'not progressing'
   : display.drainBlocked ? 'waiting for players'
   : 'in progress';
 ```
+
+**Do not add a `status.failure` arm to that chain.** A previous revision of this
+document did, and it was a mistake worth naming: it made the dashboard derive
+"the loop has stopped moving this server" a fourth time, in TypeScript, with no
+threshold at all — so every transient blip rendered as a problem. That fact
+belongs in the condition, which applies the threshold (`PERMANENT` escalates
+immediately, `RETRYABLE` only after a configured interval), and `needsAttention`
+is how it reaches you. If you find yourself reading `status.failure` to decide
+what to *render*, the answer is already in a flag.
+
+There is one window this leaves, and it is deliberate: a *retryable* pass failure
+below the threshold shows `needsAttention: false` while `drainBlocked` is true, so
+the chip says "waiting for players". That is the threshold doing its job — a node
+that blips for one pass is not something to call anybody about. `display.detail`
+says so in prose immediately, which is the right strength of signal for a
+transient fault: a sentence, not an alarm.
 
 Do not infer the waiting case from `playersOnline > 0`. That was the only
 discriminator available before this flag, and it is a coincidence of today's one
@@ -682,6 +718,27 @@ This precedence is derived from the same `DRAIN_BLOCKED` condition that
 to: the flag read the condition and the sentence read `status.drain.blocked`
 directly, so a record carrying both a block and a drain failure rendered
 `drainBlocked: false` beside `detail: "waiting, not stuck"`.
+
+##### `detail` and the `NEEDS_ATTENTION` message rank failures oppositely, on purpose
+
+When a drain has aborted **and** a later, different pass failure is outstanding,
+these two describe different things, and a client comparing them will otherwise
+read it as a bug:
+
+| | answers | picks |
+|---|---|---|
+| `NEEDS_ATTENTION` condition message | *what is the worst thing outstanding?* | the **drain** failure |
+| `display.detail` | *what is true right now?* | the **pass** failure |
+
+Both are right for their question. An alert wants the worst standing problem,
+because that is what determines how much trouble the server is in; the sentence
+under a row wants the most recent fact, because that is what an operator is
+looking at the row to find out. A drain that aborted an hour ago is still the
+bigger problem; a node that stopped answering two minutes ago is why nothing has
+moved since.
+
+So: render `detail` as the row's sentence, and the condition's message where you
+explain the alert. Do not assert they match — they are not meant to.
 
 A blocked drain records **no failure**: `status.failure` and
 `status.drain.failure` are both `null`, and `status.drain.blocked` is set
