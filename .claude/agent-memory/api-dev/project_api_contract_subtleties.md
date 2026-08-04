@@ -150,4 +150,25 @@ beyond drains, and the doc had built render guidance on it.
 ordering stays correct when a flag's scope widens; an exclusivity claim does not,
 and any snippet built on it silently renders the wrong thing.
 
+**Never `as? ConcreteStatus` in the renderer.** A failed cast is indistinguishable
+from no observation, so the whole kind renders as `UNKNOWN` the day a second kind
+exists. Erase the kind once into a private view of what the badge and the sentence
+need, and let a `when` over the sealed type be the only place that knows.
+
+**Why:** `displayState` and `display` both cast to `PaperServerStatus`, and a
+`VelocityProxy` therefore rendered `UNKNOWN` with no error anywhere.
+
+**How to apply:** the same shape catches the next kind for free. And a throwing
+placeholder branch for an unrendered kind is only safe while nothing readable can
+be one — it stops being safe the moment `:store` accepts it, and the blast radius
+is the whole fleet list plus every open SSE stream, because both read every row.
+
+**A badge value should name the *shape* of the problem, not the kind.**
+`DEGRADED` (up, accepting, cannot do its job) rather than `NO_BACKENDS`; which
+capability is missing goes in `detail` and the conditions.
+
+**How to apply:** a new kind then needs no new badge, and a capability condition
+added later is rendered without touching `DisplayState`. Fire it only on a
+condition that is *explicitly* `False`, so kinds that raise none are unaffected.
+
 Related: [[api-module-decisions]], [[divergences-from-drain-audits]].

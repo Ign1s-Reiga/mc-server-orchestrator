@@ -8,6 +8,7 @@ import mcorch.api.http.Route
 import mcorch.api.json.Json
 import mcorch.api.json.jsonObject
 import mcorch.api.render.ServerJson
+import mcorch.schema.BackendRegistration
 import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
 import mcorch.schema.DrainBlockReason
@@ -15,6 +16,7 @@ import mcorch.schema.DrainPolicy
 import mcorch.schema.DrainState
 import mcorch.schema.FailureClass
 import mcorch.schema.FailureReason
+import mcorch.schema.ForwardingMode
 import mcorch.schema.SchemaVersion
 import mcorch.schema.ServerKind
 import mcorch.schema.ServerPhase
@@ -72,9 +74,11 @@ internal class MetaRoutes(
                         put("drainBlockReason", Json.strings(DrainBlockReason.entries.map { it.name }))
                         put("displayState", Json.strings(ServerJson.DisplayState.entries.map { it.name }))
                         put("statePart", Json.strings(StatePart.entries.map { it.name }))
+                        put("backendRegistration", Json.strings(BackendRegistration.entries.map { it.name }))
                         // Wire values: these go back into a definition document.
                         put("storageMode", Json.strings(StorageMode.supported()))
                         put("drainPolicy", Json.strings(DrainPolicy.supported()))
+                        put("forwardingMode", Json.strings(ForwardingMode.supported()))
                     },
                 )
                 put(
