@@ -128,4 +128,26 @@ whether two failure fields are the same event before ranking them: an aborted
 drain writes the same value to both, so a naive "newest wins" drops the better
 wording.
 
+**Never tell a client to derive a status fact in TypeScript.** If `API.md` needs
+`server.status?.failure` to decide what to *render*, the fact belongs in a
+condition and should reach the client as a flag.
+
+**Why:** I added `: server.status?.failure ? 'not progressing'` to the drain chip
+snippet, which made dashboards derive "the loop has stopped moving this server" a
+fourth time with no threshold — so a one-pass blip rendered as a problem. The
+eleventh-round audit cited that snippet as the strongest argument the fact
+belonged in `NEEDS_ATTENTION`, which then widened to cover it.
+
+**How to apply:** thresholds and precedence live server-side. A client snippet in
+`API.md` should read `display.*` flags almost exclusively; reaching into `status`
+to compute a judgement is the smell.
+
+**Invariants stated in bold in `API.md` age badly.** "`drainBlocked` and
+`needsAttention` are never both true" became false when `NEEDS_ATTENTION` widened
+beyond drains, and the doc had built render guidance on it.
+
+**How to apply:** prefer "order these, first wins" to "these are exclusive". An
+ordering stays correct when a flag's scope widens; an exclusivity claim does not,
+and any snippet built on it silently renders the wrong thing.
+
 Related: [[api-module-decisions]], [[divergences-from-drain-audits]].

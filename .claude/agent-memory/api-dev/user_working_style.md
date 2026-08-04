@@ -31,4 +31,11 @@ where the repo would have written a paragraph reads as under-explained.
 Commits are Conventional Commits, one per logical change, with a body that
 explains why. The branch is signed and gpg works.
 
+**Standing instruction: branch from the integrated tip, never merge it in.** My
+work is integrated onto the shared branch as rebased copies (same messages, new
+SHAs), so a merge finds a merge base hundreds of commits back and reports every
+shared file as an add/add conflict — 31 of them across four modules on one
+occasion. `git checkout -b <type>/<abstract> <integrated-branch>` is the way to
+start a round.
+
 Related: [[repo-testing-discipline]].
