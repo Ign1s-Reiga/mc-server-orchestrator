@@ -4,18 +4,25 @@ import io.kotest.matchers.booleans.shouldBeTrue
 import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.collections.shouldContain
 import io.kotest.matchers.collections.shouldHaveSize
+import io.kotest.matchers.collections.shouldNotBeEmpty
+import io.kotest.matchers.comparables.shouldBeGreaterThan
 import io.kotest.matchers.ints.shouldBeGreaterThan
 import io.kotest.matchers.ints.shouldBeLessThanOrEqual
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
+import io.kotest.matchers.string.shouldNotContain
 import mcorch.schema.ConditionStatus
 import mcorch.schema.DrainState
+import mcorch.schema.DrainStatus
 import mcorch.schema.FailureClass
 import mcorch.schema.FailureReason
+import mcorch.schema.StorageSpec
 import org.junit.jupiter.api.Test
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.toKotlinDuration
+import java.time.Duration as JavaDuration
 
 /**
  * The drain, with a proxy on the other end of it.
@@ -896,5 +903,252 @@ internal class ProxyDrainTest {
             harness.plugin.transfers.size shouldBeGreaterThan 1
             harness.nodeOf(leaving).stops.shouldBeEmpty()
             harness.plugin.deregistrations.shouldBeEmpty()
+        }
+
+    /**
+     * A block does not survive the pass that resumes past it.
+     *
+     * A block is a live claim that somebody is connected, and it is written by one
+     * function that always parks the drain in `DRAIN_FAILED` — so a block riding on
+     * any other state is stale by construction. It used to ride. Nothing but an
+     * abort, a fresh block, the container-is-down branch and a resume that was not
+     * merely re-deriving cleared it, and a *re-deriving* resume returned before the
+     * clearing line. The result is a drain that walks the rest of the protocol and
+     * arrives at `stopWorkload` still recorded as waiting for players — which `:api`
+     * renders as "waiting, not stuck" seconds before the container stops — and a
+     * `since` and `observations` that `recordBlock` then carries into the next
+     * genuine block, so "waiting since" points at a wait that had already ended.
+     *
+     * ## The scenario is the re-deriving resume, because that is the one that leaks
+     *
+     * The player is still online on the pass that resumes, so the ladder lands on
+     * `SEALED` and step 3 asks the scheduler for a destination — the one step that
+     * does no external work, and the one whose early return skipped the clearing. A
+     * resume that found the server already empty took a different path and cleared
+     * it, which is why a test that lets the player log off first proves nothing.
+     *
+     * It also pins the block's **wording**, which was wrong for every proxied backend
+     * that reached it: "there is no proxy to transfer them through" is a sentence
+     * about the standalone shape, and this is precisely the case where a proxy exists
+     * and cannot see the player.
+     */
+    @Test
+    fun `a block does not survive the resume that re-derives past it`() =
+        coreTest {
+            val leaving = backendDefinition("survival-01")
+            val destination = backendDefinition("survival-02", hostPort = 30002)
+            val harness = ProxyHarness(backends = listOf(leaving, destination))
+            val name = leaving.metadata.name
+            harness.bringUp()
+            harness.store.deleteDefinition(name)
+
+            // Empty at the proxy, so steps 3 and 4 pass straight through and the
+            // drain reaches `SAVING` without ever choosing a destination.
+            repeat(5) { harness.pass(name) }
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .state shouldBe DrainState.SAVING
+
+            // Somebody connects straight to the backend's own port. The proxy cannot
+            // see them and the ping can, which is the whole reason the ping is the
+            // gate — and the reason the message must not blame the absence of a proxy.
+            harness.nodeOf(leaving).online = 1
+            harness.pass(name)
+            val blocked =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+                    .blocked
+                    .shouldNotBeNull()
+            blocked.message shouldContain "connected straight to this server's own port"
+            blocked.message shouldNotContain "there is no proxy"
+
+            // The pass that resumes while they are *still* online: it re-derives a
+            // destination and does nothing else.
+            harness.pass(name)
+            val resumed =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            // The instrument is not vacuous: this really was the re-deriving resume.
+            resumed.state shouldBe DrainState.TARGET_RESOLVED
+            resumed.destination.shouldNotBeNull()
+            resumed.blocked shouldBe null
+
+            // And it stays gone for the rest of the drain, which now finishes.
+            harness.nodeOf(leaving).online = 0
+            val seen = mutableListOf<DrainStatus>()
+            repeat(8) {
+                harness.pass(name)
+                harness.status(name)?.drain?.let { drain -> seen += drain }
+            }
+            harness.nodeOf(leaving).stops shouldHaveSize 1
+            seen.filter { it.state == DrainState.STOPPING }.shouldNotBeEmpty()
+            seen.none { it.blocked != null }.shouldBeTrue()
+        }
+
+    /**
+     * A drain that recovers from a fault does not carry the failure to the stop.
+     *
+     * The failure now survives the resume — one good pass is not proof that a drain
+     * has recovered, which is what critical 2 of the fifteenth audit turned on — so
+     * the thing to pin is the other end: it is still gone by the time the drain does
+     * anything an operator would read a failure against. A status saying "the drain
+     * aborted; the server is still running" about a drain seconds from stopping the
+     * container is the same class of wrong answer as a stale block, one step louder.
+     */
+    @Test
+    fun `a recovered drain carries no stale failure into the stop`() =
+        coreTest {
+            val leaving = backendDefinition("survival-01")
+            val harness = ProxyHarness(backends = listOf(leaving))
+            val name = leaving.metadata.name
+            harness.bringUp()
+            harness.store.deleteDefinition(name)
+            repeat(4) { harness.pass(name) }
+
+            // One ping that does not answer: a retryable abort and nothing more.
+            harness.nodeOf(leaving).failOnce(
+                NodeOperation.EXEC,
+                harness.nodeOf(leaving).unreachable(NodeOperation.EXEC),
+            )
+            harness.pass(name)
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .failure
+                .shouldNotBeNull()
+                .failureClass shouldBe FailureClass.RETRYABLE
+
+            val seen = mutableListOf<DrainStatus>()
+            repeat(8) {
+                harness.pass(name)
+                harness.status(name)?.drain?.let { drain -> seen += drain }
+            }
+
+            harness.nodeOf(leaving).stops shouldHaveSize 1
+            val stopping = seen.filter { it.state == DrainState.STOPPING }
+            stopping.shouldNotBeEmpty()
+            stopping.forEach { it.failure shouldBe null }
+        }
+
+    /**
+     * A backend the proxy will not let go of asks for a human, and keeps asking.
+     *
+     * Critical 1 of the fifteenth audit, and the harm is entirely in the *report*:
+     * nothing is stopped, nobody is kicked, and the drain is correct to keep trying.
+     * What was lost is the escalation, which is the only mechanism the system has
+     * for saying "this has been stuck for a quarter of an hour and will not fix
+     * itself".
+     *
+     * The shape is an **ephemeral** backend behind a proxy that refuses `DELETE`.
+     * `save` returns early for a container with no world — it reads a label and
+     * issues nothing — and that early return reported `Progressed`, so the resume
+     * out of `DRAIN_FAILED` treated it as work and deleted the recorded failure. The
+     * next pass tried the deregistration, was refused, and recorded a *fresh*
+     * failure: `attempts` pinned at 1, `occurredAt` restamped every other pass, the
+     * fifteen-minute threshold unreachable for ever, and a `PUT`, a `DELETE` and two
+     * pings on the wire every second while it lasted.
+     *
+     * `BACKEND_OCCUPIED` is the refusal because it is the one the plugin actually
+     * has for a `DELETE`, and it is stable here in the way a real deployment
+     * produces: the proxy still counts somebody on this backend while its own Server
+     * List Ping reports empty, which is what a client connected straight to the
+     * backend port looks like. Every refusal code maps to `retryable = true` on
+     * purpose, so any of them does this.
+     *
+     * ## What is asserted, and why the anchor rather than the flag alone
+     *
+     * `occurredAt` is the value the escalation is measured from, so it is asserted
+     * directly. A test that only watched the flag would pass against a build that
+     * restamped the anchor but happened to cross the threshold anyway.
+     */
+    @Test
+    fun `a backend whose deregistration keeps being refused escalates instead of restamping`() =
+        coreTest {
+            val leaving = backendDefinition("survival-01", storage = StorageSpec.Ephemeral())
+            val harness =
+                ProxyHarness(
+                    backends = listOf(leaving),
+                    config = ReconcilerConfig(drainAttentionAfter = 10.minutes),
+                )
+            val name = leaving.metadata.name
+            harness.bringUp()
+
+            // The ping says empty and the proxy says occupied. Both are true of a
+            // player who connected to the backend's own port, and the `DELETE` the
+            // drain is about to issue is refused for as long as it lasts.
+            harness.nodeOf(leaving).online = 0
+            harness.plugin
+                .backend("survival-01")
+                .shouldNotBeNull()
+                .players = 2
+            harness.store.deleteDefinition(name)
+
+            // Twenty passes over twenty minutes. Only the backend is passed over:
+            // the proxy's own sweep would deregister it by a different route, and
+            // this is about the backend's own drain loop.
+            val attempts = mutableListOf<Int>()
+            repeat(20) {
+                harness.pass(name)
+                harness.clock.advance(1.minutes)
+                harness
+                    .status(name)
+                    ?.drain
+                    ?.failure
+                    ?.let { attempts += it.attempts }
+            }
+
+            // The instrument is not vacuous: the drain really did reach the
+            // deregistration and really was refused, every cycle.
+            harness.plugin.deregistrations.shouldBeEmpty()
+            attempts.size shouldBeGreaterThan 4
+
+            // The count rises rather than alternating 1, 1, 1. Asserted first and on
+            // the whole series, because the defect produced a *stable* 1 whatever the
+            // run length — and on some parities it produced no recorded failure at
+            // all on the pass a test happens to look at, which a single end-state
+            // assertion would report as an unrelated null.
+            attempts.distinct().size shouldBeGreaterThan 3
+
+            val drain =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            val failure = drain.failure.shouldNotBeNull()
+            failure.attempts shouldBeGreaterThan 3
+            failure.reason shouldBe FailureReason.DRAIN_TRANSFER_FAILED
+            failure.failureClass shouldBe FailureClass.RETRYABLE
+
+            // The anchor is the first occurrence and it has not moved since.
+            JavaDuration
+                .between(failure.occurredAt, harness.clock.instant())
+                .toKotlinDuration() shouldBeGreaterThan 10.minutes
+
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .attention()
+                .status shouldBe ConditionStatus.TRUE
+
+            // The flag is a report and nothing branches on it. The container was
+            // never stopped, the backend never left the routing table, and the
+            // delete is still outstanding — which is the correct outcome, and the
+            // reason the escalation is the only thing that can move this.
+            harness.nodeOf(leaving).stops.shouldBeEmpty()
+            drain.deregisteredAt shouldBe null
+            harness.plugin.backend("survival-01").shouldNotBeNull()
+            harness.store.getServer(name).shouldNotBeNull()
         }
 }

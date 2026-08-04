@@ -2,7 +2,9 @@ package mcorch.core
 
 import io.kotest.matchers.booleans.shouldBeFalse
 import io.kotest.matchers.booleans.shouldBeTrue
+import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.collections.shouldHaveSize
+import io.kotest.matchers.comparables.shouldBeGreaterThan
 import io.kotest.matchers.ints.shouldBeGreaterThan
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
@@ -27,6 +29,8 @@ import org.junit.jupiter.api.Test
 import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.toKotlinDuration
+import java.time.Duration as JavaDuration
 
 /**
  * The drain protocol.
@@ -1596,12 +1600,28 @@ internal class DrainTest {
         }
 
     /**
-     * The escalation withdraws itself when the drain gets somewhere.
+     * The escalation withdraws itself when the drain gets somewhere — one
+     * *ordinary* pass after it does.
      *
      * It is derived from the drain's recorded failure rather than latched, and a
      * pass that makes progress clears that failure — so there is no second thing
      * to remember to reset. A latched escalation would leave a finished drain
      * telling an operator to go and look at a server that no longer exists.
+     *
+     * ## Rewritten for the fifteenth audit: the resume itself no longer withdraws it
+     *
+     * This asserted that the *first* pass after the fix cleared the flag, and that
+     * pass is the resume out of `DRAIN_FAILED`. Clearing there is what critical 2
+     * of that audit turned on: a drain parked on a refused container stop resumes
+     * into `SAVING` every time the save evidence ages out, saves for real, and the
+     * save is genuine work — so the failure carrying the escalation anchor was
+     * deleted every cycle and the fifteen-minute threshold could not be reached by a
+     * stop that had been refused for six hours.
+     *
+     * The drain now proves it has recovered by completing one ordinary step *after*
+     * the resume, which is what this asserts in two halves. The behaviour that
+     * changed is a delay of one pass in the withdrawal, in the safe direction; what
+     * did not change is that it withdraws itself rather than needing a reset.
      */
     @Test
     fun `an escalated drain stops asking for a human once it can finish`() =
@@ -1628,10 +1648,25 @@ internal class DrainTest {
                 .attention()
                 .status shouldBe ConditionStatus.TRUE
 
-            // Somebody fixes the RCON password.
+            // Somebody fixes the RCON password. The next pass is the resume: it
+            // saves the world for real, and the flag stays up, because a resume that
+            // did work is exactly what a drain looping between a good save and a
+            // refused stop looks like.
             harness.node.onExec = { command -> harness.node.defaultExec(command) }
+            val savesBefore = harness.node.saves.size
             harness.pass(name)
+            // The premise, asserted rather than assumed: that pass really did send a
+            // save. Without this the assertion below would also pass against a build
+            // where the resume did nothing at all.
+            harness.node.saves shouldHaveSize savesBefore + 1
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .attention()
+                .status shouldBe ConditionStatus.TRUE
 
+            // The ordinary pass that follows is the proof, and it withdraws it.
+            harness.pass(name)
             harness
                 .status(name)
                 .shouldNotBeNull()
@@ -1767,5 +1802,104 @@ internal class DrainTest {
                 .lastSaveConfirmedAt
                 .shouldNotBeNull()
             harness.node.stops shouldHaveSize 1
+        }
+
+    /**
+     * A container stop the runtime keeps refusing asks for a human, however many
+     * times the drain has to save again while it waits.
+     *
+     * Critical 2 of the fifteenth audit, and the same root as the ephemeral case in
+     * `ProxyDrainTest` with a slower clock and no proxy in sight. A drain parked on
+     * a refused stop re-enters through the ladder, and once the save evidence has
+     * aged past `saveEvidenceMaxGap` the ladder lands on `SAVING` rather than
+     * `DEREGISTERED`. The save that follows is **real** — a `save-all flush` goes
+     * out and the server confirms it — so a rule that cleared the recorded failure
+     * whenever the resumed step did work cleared it here, every cycle. `attempts`
+     * went back to 1, `occurredAt` was restamped with it, and a stop refused for six
+     * hours reported three attempts and never reached the fifteen-minute threshold:
+     * the anchor destroyed nine times before it could fire.
+     *
+     * This is why [DrainController]'s rule is not "did the step do work" alone. The
+     * drain proves it has recovered by completing one ordinary step *after* the
+     * resume; the save is work, and it is not the step that is failing.
+     *
+     * Nothing here is a data-loss risk — no container is stopped and nobody is
+     * kicked — and the assertions say so. What is lost is the escalation.
+     */
+    @Test
+    fun `a stop the runtime keeps refusing escalates even though each resume saves for real`() =
+        coreTest {
+            val harness = Harness(config = ReconcilerConfig(drainAttentionAfter = 10.minutes))
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+
+            // The runtime refuses every stop, retryably: a containerd that is up and
+            // will not take the request.
+            harness.node.failAlways(NodeOperation.STOP, harness.node.unreachable(NodeOperation.STOP))
+            harness.store.deleteDefinition(name)
+
+            // The clock is moved the way `ReconcileLoop` would move it, because the
+            // spacing of the passes is the mechanism and not a detail: a pass that
+            // reports `Progressed` is requeued at the poll interval, and one that
+            // retries waits out a backoff. Forty-five seconds is that backoff once it
+            // has grown, and it is longer than the thirty the save evidence survives —
+            // so the resume after every refused stop finds the evidence gone and
+            // saves again for real.
+            //
+            // A fixed spacing measures the wrong thing in both directions. Two seconds
+            // throughout never expires the evidence and the drain never re-saves;
+            // forty-five throughout expires it *before the stop is ever attempted*, so
+            // the drain shuttles `DEREGISTERED` -> `SAVING` without ever calling the
+            // runtime, and a test written that way asserts against a scenario the
+            // reconcile loop cannot produce.
+            val attempts = mutableListOf<Int>()
+            repeat(40) {
+                val outcome = harness.pass(name)
+                harness.clock.advance(if (outcome is ReconcileOutcome.Progressed) 2.seconds else 45.seconds)
+                harness
+                    .status(name)
+                    ?.drain
+                    ?.failure
+                    ?.let { attempts += it.attempts }
+            }
+
+            // The instruments are not vacuous. The drain really did re-save on the
+            // way round — which is the whole difficulty, since that is genuine work —
+            // and it really did keep asking the runtime to stop the container.
+            harness.node.saves.size shouldBeGreaterThan 3
+            harness.node.calls.count { it == NodeOperation.STOP } shouldBeGreaterThan 3
+
+            attempts.size shouldBeGreaterThan 4
+            attempts.distinct().size shouldBeGreaterThan 3
+
+            val drain =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            val failure = drain.failure.shouldNotBeNull()
+            failure.attempts shouldBeGreaterThan 3
+            failure.reason shouldBe FailureReason.DRAIN_STALLED
+            failure.failureClass shouldBe FailureClass.RETRYABLE
+            JavaDuration
+                .between(failure.occurredAt, harness.clock.instant())
+                .toKotlinDuration() shouldBeGreaterThan 10.minutes
+
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .attention()
+                .status shouldBe ConditionStatus.TRUE
+
+            // No stop ever took, the container is still running, and the definition
+            // is still there. The escalation is the only thing that moved.
+            harness.node.stops.shouldBeEmpty()
+            harness.node.workload
+                .shouldBeInstanceOf<WorkloadObservation.Present>()
+                .state shouldBe WorkloadState.RUNNING
+            harness.store.getServer(name).shouldNotBeNull()
         }
 }

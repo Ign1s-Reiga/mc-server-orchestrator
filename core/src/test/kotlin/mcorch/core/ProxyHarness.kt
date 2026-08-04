@@ -17,10 +17,12 @@ import mcorch.schema.ResourceSpec
 import mcorch.schema.SchemaVersion
 import mcorch.schema.SecretRef
 import mcorch.schema.ServerDefinition
+import mcorch.schema.StorageSpec
 import mcorch.schema.VelocityProxyDefaults
 import mcorch.schema.VelocityProxyDefinition
 import mcorch.schema.VelocityProxySpec
 import mcorch.schema.VelocityProxyStatus
+import mcorch.schema.VolumeSpec
 import mcorch.store.StoredDefinition
 import mcorch.store.getOrThrow
 
@@ -172,11 +174,13 @@ internal fun backendDefinition(
     name: String,
     maxPlayers: Int = 20,
     hostPort: Int? = null,
+    storage: StorageSpec = StorageSpec.Persistent(VolumeSpec(resourceName("$name-world"))),
 ): PaperServerDefinition =
     paperDefinition(
         name = name,
         labels = mapOf(BACKEND_LABEL to BACKEND_POOL),
         maxPlayers = maxPlayers,
         hostPort = hostPort,
+        storage = storage,
         placement = PlacementSpec(node = nodeName("node-$name")),
     )
