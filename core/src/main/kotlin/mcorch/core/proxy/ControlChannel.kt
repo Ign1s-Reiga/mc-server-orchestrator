@@ -178,8 +178,9 @@ internal class ControlChannel(
                 // `NodeException` from a proxy call would be treating the proxy's
                 // health as the node's.
                 return ControlOutcome.Unavailable(
-                    detail = "the proxy control endpoint on port $port did not answer $verb $path: " +
-                        failure.message,
+                    detail =
+                        "the proxy control endpoint on port $port did not answer $verb $path: " +
+                            failure.message,
                     retryable = failure.retryable,
                 )
             }
@@ -201,9 +202,10 @@ internal class ControlChannel(
                 val code =
                     ControlErrorCode.entries.firstOrNull { it.name == error.string("code") }
                         ?: return ControlOutcome.Unavailable(
-                            detail = "the proxy refused $verb $path with a code this build does not know " +
-                                "(`${error.string("code")}`), which means it is speaking a protocol this " +
-                                "build does not",
+                            detail =
+                                "the proxy refused $verb $path with a code this build does not know " +
+                                    "(`${error.string("code")}`), which means it is speaking a protocol this " +
+                                    "build does not",
                             retryable = false,
                         )
                 ControlOutcome.Refused(code, error.string("message"))
@@ -214,8 +216,9 @@ internal class ControlChannel(
             // same plugin again gets the same body. The remedy is an image
             // upgrade, which is what `PROXY_PLUGIN_INCOMPATIBLE` tells an operator.
             ControlOutcome.Unavailable(
-                detail = "the proxy answered $verb $path with a body this build cannot read " +
-                    "(${malformed.message}); the plugin is speaking a protocol this build does not",
+                detail =
+                    "the proxy answered $verb $path with a body this build cannot read " +
+                        "(${malformed.message}); the plugin is speaking a protocol this build does not",
                 retryable = false,
             )
         }

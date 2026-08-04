@@ -84,56 +84,76 @@ internal class BackendLink(
 
     override suspend fun transfer(destination: ResourceName): TransferReport =
         when (val outcome = channel.transfer(backend, destination, TRANSFER_NOTICE)) {
-            is ControlOutcome.Answered ->
+            is ControlOutcome.Answered -> {
                 TransferReport.Sweeping(
                     remaining = outcome.value.remaining,
                     unmoved = outcome.value.unmoved,
                     finished = outcome.value.finished,
                 )
+            }
 
-            is ControlOutcome.Refused ->
+            is ControlOutcome.Refused -> {
                 when (outcome.code) {
                     // The destination stopped being one between step 3 and step 4.
                     // Not a failure: pick another.
                     ControlErrorCode.DESTINATION_UNKNOWN,
                     ControlErrorCode.DESTINATION_SEALED,
                     ControlErrorCode.TRANSFER_TO_SELF,
-                    -> TransferReport.DestinationLost("${outcome.code}: ${outcome.problem}")
+                    -> {
+                        TransferReport.DestinationLost("${outcome.code}: ${outcome.problem}")
+                    }
 
                     // Step 2 has not taken effect at the proxy this request reached.
                     // Retryable: the next pass re-asserts the seal before it gets
                     // here, which is the whole reason the seal is asserted on every
                     // pass rather than once.
-                    ControlErrorCode.SOURCE_NOT_SEALED ->
+                    ControlErrorCode.SOURCE_NOT_SEALED -> {
                         TransferReport.Refused("${outcome.code}: ${outcome.problem}", retryable = true)
+                    }
 
-                    else -> TransferReport.Refused("${outcome.code}: ${outcome.problem}", retryable = false)
+                    else -> {
+                        TransferReport.Refused("${outcome.code}: ${outcome.problem}", retryable = false)
+                    }
                 }
+            }
 
-            is ControlOutcome.Unavailable -> TransferReport.Unavailable(outcome.detail, outcome.retryable)
+            is ControlOutcome.Unavailable -> {
+                TransferReport.Unavailable(outcome.detail, outcome.retryable)
+            }
         }
 
     override suspend fun deregister(): SealOutcome =
         when (val outcome = channel.deregister(backend)) {
-            is ControlOutcome.Answered -> SealOutcome.Asserted(admits = false)
-            is ControlOutcome.Refused ->
+            is ControlOutcome.Answered -> {
+                SealOutcome.Asserted(admits = false)
+            }
+
+            is ControlOutcome.Refused -> {
                 when (outcome.code) {
                     // Somebody is connected through the proxy that the ping did not
                     // see. Retryable and never overridable: there is no force flag,
                     // and asking for one would be asking to spell the thing this
                     // endpoint exists to make unspellable.
-                    ControlErrorCode.BACKEND_OCCUPIED ->
+                    ControlErrorCode.BACKEND_OCCUPIED -> {
                         SealOutcome.Refused(outcome.problem, retryable = true)
+                    }
 
                     // Already gone. The loop may re-enter any state any number of
                     // times, and a deregistration that already happened is the state
                     // that was wanted.
-                    ControlErrorCode.BACKEND_UNKNOWN -> SealOutcome.Asserted(admits = false)
+                    ControlErrorCode.BACKEND_UNKNOWN -> {
+                        SealOutcome.Asserted(admits = false)
+                    }
 
-                    else -> outcome.asSealOutcome("deregistering the backend")
+                    else -> {
+                        outcome.asSealOutcome("deregistering the backend")
+                    }
                 }
+            }
 
-            is ControlOutcome.Unavailable -> outcome.asSealOutcome()
+            is ControlOutcome.Unavailable -> {
+                outcome.asSealOutcome()
+            }
         }
 
     override suspend fun reregister(): SealOutcome =
@@ -149,6 +169,7 @@ internal class BackendLink(
     override suspend fun observedPlayers(): Int? =
         when (val outcome = channel.state()) {
             is ControlOutcome.Answered -> outcome.value.backend(backend)?.players
+
             // Corroboration is optional by construction: a proxy that cannot answer
             // costs a log line, never a decision.
             else -> null

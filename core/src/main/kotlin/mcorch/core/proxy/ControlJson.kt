@@ -84,9 +84,18 @@ internal object ControlJson {
             skipWhitespace()
             if (exhausted) fail("expected a value")
             return when (raw[at]) {
-                '{' -> readObject(depth)
-                '[' -> readArray(depth)
-                '"' -> ControlString(readString())
+                '{' -> {
+                    readObject(depth)
+                }
+
+                '[' -> {
+                    readArray(depth)
+                }
+
+                '"' -> {
+                    ControlString(readString())
+                }
+
                 't' -> {
                     expectLiteral("true")
                     ControlBoolean(true)
@@ -102,7 +111,9 @@ internal object ControlJson {
                     ControlNull
                 }
 
-                else -> readNumber()
+                else -> {
+                    readNumber()
+                }
             }
         }
 
@@ -126,13 +137,18 @@ internal object ControlJson {
                 fields[name] = readValue(depth + 1)
                 skipWhitespace()
                 when (peek()) {
-                    ',' -> at++
+                    ',' -> {
+                        at++
+                    }
+
                     '}' -> {
                         at++
                         return ControlObject(fields)
                     }
 
-                    else -> fail("expected `,` or `}`")
+                    else -> {
+                        fail("expected `,` or `}`")
+                    }
                 }
             }
         }
@@ -149,13 +165,18 @@ internal object ControlJson {
                 items += readValue(depth + 1)
                 skipWhitespace()
                 when (peek()) {
-                    ',' -> at++
+                    ',' -> {
+                        at++
+                    }
+
                     ']' -> {
                         at++
                         return ControlArray(items)
                     }
 
-                    else -> fail("expected `,` or `]`")
+                    else -> {
+                        fail("expected `,` or `]`")
+                    }
                 }
             }
         }
@@ -166,8 +187,14 @@ internal object ControlJson {
             while (true) {
                 if (exhausted) fail("unterminated string")
                 when (val character = raw[at++]) {
-                    '"' -> return out.toString()
-                    '\\' -> out.append(readEscape())
+                    '"' -> {
+                        return out.toString()
+                    }
+
+                    '\\' -> {
+                        out.append(readEscape())
+                    }
+
                     else -> {
                         if (character < ' ') fail("unescaped control character in a string")
                         out.append(character)
@@ -179,12 +206,30 @@ internal object ControlJson {
         private fun readEscape(): Char {
             if (exhausted) fail("unterminated escape")
             return when (val marker = raw[at++]) {
-                '"', '\\', '/' -> marker
-                'n' -> '\n'
-                'r' -> '\r'
-                't' -> '\t'
-                'b' -> '\b'
-                'f' -> '\u000C'
+                '"', '\\', '/' -> {
+                    marker
+                }
+
+                'n' -> {
+                    '\n'
+                }
+
+                'r' -> {
+                    '\r'
+                }
+
+                't' -> {
+                    '\t'
+                }
+
+                'b' -> {
+                    '\b'
+                }
+
+                'f' -> {
+                    '\u000C'
+                }
+
                 'u' -> {
                     if (at + 4 > raw.length) fail("truncated \\u escape")
                     val hex = raw.substring(at, at + 4)
@@ -196,7 +241,9 @@ internal object ControlJson {
                     hex.toInt(16).toChar()
                 }
 
-                else -> fail("unknown escape `\\$marker`")
+                else -> {
+                    fail("unknown escape `\\$marker`")
+                }
             }
         }
 
@@ -296,13 +343,19 @@ internal data class ControlObject(
 
     fun strings(name: String): List<String> =
         when (val value = fields[name]) {
-            is ControlArray ->
+            is ControlArray -> {
                 value.items.map {
                     (it as? ControlString)?.value ?: refuse("`$name` must hold strings")
                 }
+            }
 
-            null -> refuse("field `$name` is required")
-            else -> refuse("field `$name` must be an array")
+            null -> {
+                refuse("field `$name` is required")
+            }
+
+            else -> {
+                refuse("field `$name` must be an array")
+            }
         }
 
     fun objectAt(name: String): ControlObject =

@@ -37,8 +37,7 @@ internal class PaperDrainSubject(
         handle: WorkloadHandle,
     ): ProbeOutcome = agent.probe(node, handle)
 
-    override fun contractOf(observation: WorkloadObservation.Present): WorkloadContract =
-        agent.contractOf(observation)
+    override fun contractOf(observation: WorkloadObservation.Present): WorkloadContract = agent.contractOf(observation)
 
     override suspend fun requestSave(
         node: Node,
@@ -88,8 +87,7 @@ internal class ProxyDrainSubject(
         handle: WorkloadHandle,
     ): ProbeOutcome = agent.probe(node, handle)
 
-    override fun contractOf(observation: WorkloadObservation.Present): WorkloadContract =
-        agent.contractOf(observation)
+    override fun contractOf(observation: WorkloadObservation.Present): WorkloadContract = agent.contractOf(observation)
 
     override suspend fun requestSave(
         node: Node,

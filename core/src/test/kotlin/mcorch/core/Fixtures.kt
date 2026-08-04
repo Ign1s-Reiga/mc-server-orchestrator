@@ -24,6 +24,7 @@ import mcorch.schema.SchemaVersion
 import mcorch.schema.SecretRef
 import mcorch.schema.StatusCondition
 import mcorch.schema.StorageSpec
+import mcorch.schema.VelocityProxyStatus
 import mcorch.schema.VolumeSpec
 import java.time.Clock
 import java.time.Instant
@@ -83,6 +84,11 @@ internal fun PaperServerStatus.attention(): StatusCondition = condition(Conditio
 /** Any condition, with the same insistence that it be present. */
 internal fun PaperServerStatus.condition(type: ConditionType): StatusCondition = conditions.single { it.type == type }
 
+/** The same two, for a proxy. Absence fails here for the same reason. */
+internal fun VelocityProxyStatus.attention(): StatusCondition = condition(ConditionType.NEEDS_ATTENTION)
+
+internal fun VelocityProxyStatus.condition(type: ConditionType): StatusCondition = conditions.single { it.type == type }
+
 internal fun resourceName(raw: String): ResourceName = ResourceName.of(raw).getOrThrow()
 
 internal fun nodeName(raw: String): NodeName = NodeName.of(raw).getOrThrow()
@@ -108,6 +114,7 @@ internal fun secretRef(
  */
 internal fun paperDefinition(
     name: String = "survival-01",
+    labels: Map<String, String> = emptyMap(),
     image: String = "docker.io/itzg/minecraft-server:2026.6.1",
     storage: StorageSpec = StorageSpec.Persistent(VolumeSpec(resourceName("$name-world"))),
     rcon: RconSpec = RconSpec.Enabled(passwordSecret = secretRef()),
@@ -121,7 +128,7 @@ internal fun paperDefinition(
 ): PaperServerDefinition =
     PaperServerDefinition(
         apiVersion = SchemaVersion.CURRENT,
-        metadata = ObjectMetadata(name = resourceName(name)),
+        metadata = ObjectMetadata(name = resourceName(name), labels = labels),
         spec =
             PaperServerSpec(
                 image = ImageRef.parse(image).getOrThrow(),

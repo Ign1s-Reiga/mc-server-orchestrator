@@ -3,6 +3,7 @@ package mcorch.core
 import mcorch.core.paper.ProbeOutcome
 import mcorch.core.paper.SaveOutcome
 import mcorch.core.paper.WorkloadContract
+import mcorch.schema.DrainState
 import mcorch.schema.ResourceName
 import kotlin.time.Duration
 
@@ -75,6 +76,43 @@ internal interface DrainSubject {
         contract: WorkloadContract,
     ): SaveOutcome
 }
+
+/**
+ * Whether a drain in this state is holding the workload out of the proxy's
+ * routing.
+ *
+ * **The one definition of the seal rule**, asked from two places that must not
+ * disagree: `DrainController`, which asserts it for the workload it is draining,
+ * and the proxy's own reconcile pass, which asserts it for *every* backend from
+ * stored state. The second is what makes the seal level-triggered in the sense
+ * that matters — it repairs a proxy restart, an orchestrator that died mid-drain,
+ * and a backend whose drain aborted **permanently**, where the backend's own
+ * passes have stopped and nothing else could.
+ *
+ * `DRAIN_FAILED` is deliberately not a sealing state. A drain that has stopped
+ * advancing is a drain that is not going to move those players, so holding the
+ * backend out of routing buys nothing and costs a running server no player can
+ * reach — permanently, if the abort was permanent.
+ *
+ * It is **not** `PaperServerStatus.drainInitiated`, which is the *destination
+ * eligibility* rule and answers a different question: a parked server takes
+ * players again but must never be handed somebody else's.
+ */
+internal fun DrainState.sealsBackend(): Boolean =
+    when (this) {
+        // Step 2 has not happened yet.
+        DrainState.DRAIN_REQUESTED -> false
+
+        DrainState.SEALED,
+        DrainState.TARGET_RESOLVED,
+        DrainState.TRANSFERRING,
+        DrainState.SAVING,
+        DrainState.DEREGISTERED,
+        DrainState.STOPPING,
+        -> true
+
+        DrainState.DRAIN_FAILED -> false
+    }
 
 /**
  * Drain step 2, and the reason it is spelled as an assertion rather than an

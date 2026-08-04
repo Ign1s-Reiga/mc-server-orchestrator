@@ -9,6 +9,7 @@ import mcorch.schema.PaperServerStatus
 import mcorch.schema.ResourceName
 import mcorch.schema.ServerDefinition
 import mcorch.schema.ServerStatus
+import mcorch.schema.VelocityProxyStatus
 import mcorch.store.ChangeFeed
 import mcorch.store.ChangeKind
 import mcorch.store.ConflictReason
@@ -217,7 +218,12 @@ internal class TestStore(
             if (states.isEmpty()) return@guarded emptyList()
             definitions.values.mapNotNull { definition ->
                 val status = statuses[definition.name] ?: return@mapNotNull null
-                val drain = (status.status as? PaperServerStatus)?.drain?.state
+                val drain =
+                    when (val recorded = status.status) {
+                        is PaperServerStatus -> recorded.drain?.state
+                        is VelocityProxyStatus -> recorded.drain?.state
+                        else -> null
+                    }
                 if (drain in states) StoredServer(definition, status) else null
             }
         }
@@ -246,6 +252,10 @@ internal class TestStore(
     /** The status as stored, for assertions. */
     suspend fun statusOf(name: ResourceName): PaperServerStatus? =
         guarded { statuses[name]?.status as? PaperServerStatus }
+
+    /** The same, for a proxy. */
+    suspend fun proxyStatusOf(name: ResourceName): VelocityProxyStatus? =
+        guarded { statuses[name]?.status as? VelocityProxyStatus }
 
     suspend fun recordedAt(name: ResourceName): Instant? = guarded { statuses[name]?.recordedAt }
 

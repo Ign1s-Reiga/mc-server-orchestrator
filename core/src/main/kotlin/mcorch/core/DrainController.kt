@@ -470,57 +470,86 @@ internal class DrainController(
                 // happens again either. The proxy's own reconcile sweep is what
                 // makes the restoration land in that case; this branch simply
                 // declines to re-assert.
-                requireEmpty(pass, drain) {
-                    // The furthest state the evidence still justifies. A drain
-                    // that has emptied the server and lost only its save goes
-                    // back to the save rather than round the whole machine,
-                    // which would make a dashboard read as though it were
-                    // making progress every fourth pass for as long as the save
-                    // keeps failing.
-                    //
-                    // `destination` is on the ladder for a reason that is not
-                    // cosmetic. Without it a drain whose *transfer* keeps failing
-                    // resumes at `SEALED`, re-resolves a destination it already
-                    // had, and reports `Progressed` — which makes `ReconcileLoop`
-                    // call `queue.succeeded` and reset the backoff. The next pass
-                    // transfers, fails, parks; the pass after that resolves again.
-                    // A two-second loop, for ever, issuing destination lookups and
-                    // **transfer requests at live players** with `attempts` pinned
-                    // at 1 and the backoff never growing. Resuming straight to
-                    // `TARGET_RESOLVED` makes the whole cycle one pass that ends in
-                    // an abort, so the backoff applies and the counter rises.
-                    val resume =
-                        when {
-                            drain.saveIsCurrent(observation.startedAt, now, evidenceGap) -> DrainState.DEREGISTERED
-                            drain.playersEvacuated -> DrainState.SAVING
-                            drain.destination != null -> DrainState.TARGET_RESOLVED
-                            else -> DrainState.SEALED
-                        }
-                    // Straight into that state, in this pass, against the probe
-                    // just taken. Returning here instead would report progress
-                    // for a pass that did nothing, and the loop reads that as a
-                    // reason to forget how long this has been failing.
-                    //
-                    // The recorded failure travels *with* it. If the resumed
-                    // state fails again, `recordFailure` needs the previous one
-                    // to carry the attempt count and the first-occurrence time
-                    // forward — clearing it here made every pass of a failing
-                    // drain report "attempt 1, first seen now", which is the
-                    // number the escalation is built on. It is cleared below
-                    // instead, on the passes that actually got somewhere.
-                    //
-                    // A recorded *block* travels the same way and for the same
-                    // reason: `recordBlock` needs it to keep "blocked since" from
-                    // resetting to now on every pass, which is the one number an
-                    // operator reads off a drain that is waiting.
-                    val resumed = step(pass, drain.moveTo(resume, now))
-                    if (resumed.drain.state == DrainState.DRAIN_FAILED) {
-                        resumed
-                    } else {
-                        resumed.copy(drain = resumed.drain.copy(failure = null, blocked = null))
-                    }
-                }
+                //
+                // The zero-player wrapper is only for a workload with no router.
+                // With one, players are the thing the resumed states exist to move,
+                // so blocking the resume on their absence would park a proxied drain
+                // for as long as anybody was playing — the same defect [requireEmpty]
+                // shrank to avoid, one level up. Safety is unchanged: every state
+                // this can resume into that touches the world or the container calls
+                // [requireEmpty] itself.
+                resume(pass, drain, gated = pass.subject.router == null)
             }
+        }
+    }
+
+    /**
+     * Re-enters a parked drain, and runs the state it resumes into in this same
+     * pass.
+     *
+     * [gated] is false exactly when there is a router. Players are then the thing
+     * the resumed states exist to move, so refusing to resume while anybody is
+     * connected would park a proxied drain for as long as people were playing.
+     */
+    private suspend fun resume(
+        pass: DrainPass,
+        drain: DrainStatus,
+        gated: Boolean,
+    ): DrainProgress = if (gated) requireEmpty(pass, drain) { resumeInto(pass, drain) } else resumeInto(pass, drain)
+
+    private suspend fun resumeInto(
+        pass: DrainPass,
+        drain: DrainStatus,
+    ): DrainProgress {
+        val observation = pass.observation
+        val now = pass.now
+        // The furthest state the evidence still justifies. A drain
+        // that has emptied the server and lost only its save goes
+        // back to the save rather than round the whole machine,
+        // which would make a dashboard read as though it were
+        // making progress every fourth pass for as long as the save
+        // keeps failing.
+        //
+        // `destination` is on the ladder for a reason that is not
+        // cosmetic. Without it a drain whose *transfer* keeps failing
+        // resumes at `SEALED`, re-resolves a destination it already
+        // had, and reports `Progressed` — which makes `ReconcileLoop`
+        // call `queue.succeeded` and reset the backoff. The next pass
+        // transfers, fails, parks; the pass after that resolves again.
+        // A two-second loop, for ever, issuing destination lookups and
+        // **transfer requests at live players** with `attempts` pinned
+        // at 1 and the backoff never growing. Resuming straight to
+        // `TARGET_RESOLVED` makes the whole cycle one pass that ends in
+        // an abort, so the backoff applies and the counter rises.
+        val resume =
+            when {
+                drain.saveIsCurrent(observation.startedAt, now, evidenceGap) -> DrainState.DEREGISTERED
+                drain.playersEvacuated -> DrainState.SAVING
+                drain.destination != null -> DrainState.TARGET_RESOLVED
+                else -> DrainState.SEALED
+            }
+        // Straight into that state, in this pass, against the probe
+        // just taken. Returning here instead would report progress
+        // for a pass that did nothing, and the loop reads that as a
+        // reason to forget how long this has been failing.
+        //
+        // The recorded failure travels *with* it. If the resumed
+        // state fails again, `recordFailure` needs the previous one
+        // to carry the attempt count and the first-occurrence time
+        // forward — clearing it here made every pass of a failing
+        // drain report "attempt 1, first seen now", which is the
+        // number the escalation is built on. It is cleared below
+        // instead, on the passes that actually got somewhere.
+        //
+        // A recorded *block* travels the same way and for the same
+        // reason: `recordBlock` needs it to keep "blocked since" from
+        // resetting to now on every pass, which is the one number an
+        // operator reads off a drain that is waiting.
+        val resumed = step(pass, drain.moveTo(resume, now))
+        return if (resumed.drain.state == DrainState.DRAIN_FAILED) {
+            resumed
+        } else {
+            resumed.copy(drain = resumed.drain.copy(failure = null, blocked = null))
         }
     }
 
@@ -571,9 +600,13 @@ internal class DrainController(
                 }
             }
 
-            is SealOutcome.Refused -> abortSeal(pass, drain, outcome.detail, outcome.retryable)
+            is SealOutcome.Refused -> {
+                abortSeal(pass, drain, outcome.detail, outcome.retryable)
+            }
 
-            is SealOutcome.Unavailable -> abortSeal(pass, drain, outcome.detail, outcome.retryable)
+            is SealOutcome.Unavailable -> {
+                abortSeal(pass, drain, outcome.detail, outcome.retryable)
+            }
         }
     }
 
@@ -754,7 +787,9 @@ internal class DrainController(
             // Same answer as `requireEmpty`, and it has to be: a probe that did not
             // answer is not a zero-player report, and nothing about a sweep being
             // in flight changes that.
-            is ProbeOutcome.Unanswered -> unansweredProbe(pass, drain, probe)
+            is ProbeOutcome.Unanswered -> {
+                unansweredProbe(pass, drain, probe)
+            }
 
             is ProbeOutcome.Joinable -> {
                 corroborate(pass, router, probe.online)
@@ -853,10 +888,20 @@ internal class DrainController(
             }
 
             is TransferReport.DestinationLost -> {
-                // Not a failure. The destination stopped being one — it went away,
-                // or it started draining itself — so the drain goes back and picks
-                // another rather than moving players onto a server they would have
-                // to be moved off again.
+                // The destination stopped being one — it went away, or it started
+                // draining itself — so the drain goes back and picks another rather
+                // than moving players onto a server they would have to be moved off
+                // again.
+                //
+                // **[ReconcileOutcome.Retry], never `Progressed`, and the attempt is
+                // counted.** This is the second shape of the hot loop and it is
+                // easier to reach than the first: the fleet says a server is a fine
+                // destination and the *proxy* says it is not — a registration the
+                // sweep has not caught up with — so step 3 keeps choosing it and
+                // step 4 keeps being refused, about once a second, for ever.
+                // Reporting progress on either half is what would make
+                // `ReconcileLoop` reset the backoff; counting the attempt is what
+                // eventually stops it asking at all.
                 LOG.info(
                     "destination `{}` is no longer eligible for server={}: {}. Choosing another",
                     destination,
@@ -864,9 +909,12 @@ internal class DrainController(
                     report.detail,
                 )
                 DrainProgress(
-                    drain = drain.moveTo(DrainState.SEALED, now).copy(destination = null),
+                    drain =
+                        drain
+                            .moveTo(DrainState.SEALED, now)
+                            .copy(destination = null, transferAttempts = drain.transferAttempts + 1),
                     occupancy = occupancy,
-                    outcome = ReconcileOutcome.Progressed("the destination is no longer eligible; choosing another"),
+                    outcome = ReconcileOutcome.Retry("the destination is no longer eligible: ${report.detail}"),
                 )
             }
 
@@ -1093,7 +1141,9 @@ internal class DrainController(
             // and let the next healthy pass re-send the save — silently
             // replacing "a human confirms the world state" with "the exec
             // channel flickered".
-            is ProbeOutcome.Unanswered -> unansweredProbe(pass, drain, probe)
+            is ProbeOutcome.Unanswered -> {
+                unansweredProbe(pass, drain, probe)
+            }
         }
 
     /**
@@ -1293,7 +1343,29 @@ internal class DrainController(
                 worldData = WorldDataHolding(contract.holdsWorldData),
             ),
         )
-        pass.node.stopWorkload(observation.handle, grace)
+        try {
+            pass.node.stopWorkload(observation.handle, grace)
+        } catch (failure: NodeException) {
+            // Caught here rather than allowed out to `Reconciler.nodeFailure`, and
+            // the reason is the compensation rather than the classification. By this
+            // point the backend has left the proxy's routing table, and an exception
+            // escaping the controller skips [abort] — which is the only thing that
+            // puts it back. The server would then be running, unreachable through
+            // the proxy, with the record still saying it was deregistered.
+            //
+            // It is also the more precise answer: a stop that the runtime refused is
+            // a drain that could not finish, not a pass that could not be completed.
+            return abort(
+                subject = pass.subject,
+                node = pass.node,
+                drain = drain,
+                occupancy = occupancy,
+                now = now,
+                reason = FailureReason.DRAIN_STALLED,
+                failureClass = if (failure.retryable) FailureClass.RETRYABLE else FailureClass.PERMANENT,
+                message = "the container stop was refused: ${failure.message}",
+            )
+        }
         return DrainProgress(
             drain = drain.moveTo(DrainState.STOPPING, now),
             occupancy = occupancy,

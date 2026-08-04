@@ -100,18 +100,26 @@ internal fun recordBlock(
 internal fun NodeException.asFailureReason(): FailureReason =
     when (operation) {
         NodeOperation.STATUS -> FailureReason.NODE_UNAVAILABLE
+
         NodeOperation.OBSERVE -> FailureReason.RUNTIME_UNREACHABLE
+
         NodeOperation.IMAGE -> FailureReason.IMAGE_PULL_FAILED
+
         NodeOperation.CREATE -> FailureReason.CONTAINER_CREATE_FAILED
+
         NodeOperation.START -> FailureReason.CONTAINER_START_FAILED
+
         NodeOperation.EXEC -> FailureReason.DRAIN_STALLED
+
         // Deliberately *not* `PROXY_CONTROL_UNREACHABLE`. This mapping is about
         // what a generic node call failing means, and the endpoint channel is not
         // reserved for the proxy plugin. Whoever knows which protocol it was
         // speaking classifies it — `ControlChannel` translates the proxy case at
         // its own edge, exactly as the `Node` boundary requires of everything else.
         NodeOperation.ENDPOINT -> FailureReason.RUNTIME_UNREACHABLE
+
         NodeOperation.STOP -> FailureReason.DRAIN_STALLED
+
         NodeOperation.REMOVE -> FailureReason.RUNTIME_UNREACHABLE
     }
 

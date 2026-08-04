@@ -287,7 +287,9 @@ public class Reconciler(
 
         return try {
             when (val placement = placeProxy(pass)) {
-                is Placement.Refused -> refuseProxyPlacement(pass, placement)
+                is Placement.Refused -> {
+                    refuseProxyPlacement(pass, placement)
+                }
 
                 is Placement.On -> {
                     val observation = placement.node.observe(pass.name)
@@ -327,7 +329,9 @@ public class Reconciler(
                 ),
             )
         return when (decision) {
-            is PlacementDecision.Unschedulable -> Placement.Refused(decision.problem, decision.message)
+            is PlacementDecision.Unschedulable -> {
+                Placement.Refused(decision.problem, decision.message)
+            }
 
             is PlacementDecision.Scheduled -> {
                 if (currentNode != null && currentNode != decision.node) {
@@ -405,14 +409,20 @@ public class Reconciler(
                         ) { ReconcileOutcome.Progressed("proxy container started") }
                     }
 
-                    WorkloadState.RUNNING -> awaitProxyReady(pass, node, observation, image)
+                    WorkloadState.RUNNING -> {
+                        awaitProxyReady(pass, node, observation, image)
+                    }
 
                     WorkloadState.EXITED -> {
                         val detail = observation.reason.ifBlank { observation.message }
                         val message =
                             "the proxy container exited with code ${observation.exitCode ?: "unknown"}" +
                                 if (detail.isBlank()) "" else " ($detail)"
-                        LOG.error("{} is down and nothing will restart it: {}", WorkloadRef(pass.name, node.name), message)
+                        LOG.error(
+                            "{} is down and nothing will restart it: {}",
+                            WorkloadRef(pass.name, node.name),
+                            message,
+                        )
                         val failure =
                             recordFailure(
                                 reason = FailureReason.CONTAINER_EXITED,
@@ -564,7 +574,7 @@ public class Reconciler(
         channel: ControlChannel,
     ): ControlEndpointStatus =
         when (val outcome = channel.version()) {
-            is ControlOutcome.Answered ->
+            is ControlOutcome.Answered -> {
                 ControlEndpointStatus(
                     reachable = true,
                     pluginApiVersion = outcome.value.pluginApiVersion,
@@ -574,16 +584,19 @@ public class Reconciler(
                     compatible = outcome.value.compatible,
                     lastContactAt = pass.now,
                 )
+            }
 
-            is ControlOutcome.Refused ->
+            is ControlOutcome.Refused -> {
                 ControlEndpointStatus(reachable = true, compatible = false, lastContactAt = pass.now)
+            }
 
-            is ControlOutcome.Unavailable ->
+            is ControlOutcome.Unavailable -> {
                 ControlEndpointStatus(
                     reachable = false,
                     compatible = false,
                     lastContactAt = pass.previous?.control?.lastContactAt,
                 )
+            }
         }
 
     /**
@@ -657,7 +670,13 @@ public class Reconciler(
         val statuses = mutableListOf<BackendStatus>()
         var problem: String? = null
         for (backend in matched) {
-            val admits = !backend.drainInitiated
+            // **`sealsBackend`, never `drainInitiated`.** They answer different
+            // questions and the plausible-looking one is wrong: `drainInitiated`
+            // means "has any drain record at all", which is the *destination
+            // eligibility* rule, and using it here would keep a backend whose drain
+            // has parked out of routing for ever — the running, invisible,
+            // unreachable server this level trigger exists to repair.
+            val admits = !backend.sealed
             when (val outcome = channel.assertBackend(backend.server, backend.address, admits)) {
                 is ControlOutcome.Answered -> {
                     statuses +=
@@ -670,7 +689,9 @@ public class Reconciler(
                                     // read path blocking, which the plugin author
                                     // ruled out.
                                     !backend.ready -> BackendRegistration.UNREACHABLE
+
                                     outcome.value.admitsNewPlayers -> BackendRegistration.REGISTERED
+
                                     else -> BackendRegistration.SEALED
                                 },
                             players =
@@ -711,24 +732,28 @@ public class Reconciler(
         registered?.backends?.filter { it.name.lowercase() !in wanted }?.forEach { stale ->
             ResourceName.of(stale.name).getOrNull()?.let { name ->
                 when (val outcome = channel.deregister(name)) {
-                    is ControlOutcome.Answered ->
+                    is ControlOutcome.Answered -> {
                         LOG.info(
                             "deregistered `{}` from proxy={}: no definition matches its backend selector any more",
                             name,
                             pass.name,
                         )
+                    }
 
                     // BACKEND_OCCUPIED, in practice. The plugin refusing is the
                     // guard working: somebody is connected, so nothing is removed.
-                    is ControlOutcome.Refused ->
+                    is ControlOutcome.Refused -> {
                         LOG.info(
                             "left `{}` registered with proxy={}: {}",
                             name,
                             pass.name,
                             outcome.problem,
                         )
+                    }
 
-                    is ControlOutcome.Unavailable -> Unit
+                    is ControlOutcome.Unavailable -> {
+                        Unit
+                    }
                 }
             }
         }
@@ -736,8 +761,12 @@ public class Reconciler(
         // The proxy's own login seal, from the same rule the drain uses. With every
         // backend sealed the login path has nowhere to deflect a joining player to
         // and admits them anyway, so a fleet-wide drain could never reach zero.
-        val proxyDraining = pass.previous?.drainInitiated == true
-        val anyAdmitting = matched.any { !it.drainInitiated }
+        val proxyDraining =
+            pass.previous
+                ?.drain
+                ?.state
+                ?.sealsBackend() == true
+        val anyAdmitting = matched.any { !it.sealed }
         channel.assertProxyAdmission(admits = !proxyDraining && anyAdmitting)
 
         val routing = BackendRoutingStatus(observedAt = pass.now, backends = statuses)
@@ -835,13 +864,21 @@ public class Reconciler(
         if (pass.stored.definition.terminating) {
             val verdict = writeProxyStatus(pass, status)
             if (verdict is WriteVerdict.Conflicted) return verdict.outcome
-            return when (val outcome = store.purge(pass.name, Precondition.AtVersion(pass.stored.definition.resourceVersion))) {
+            return when (
+                val outcome =
+                    store.purge(
+                        pass.name,
+                        Precondition.AtVersion(pass.stored.definition.resourceVersion),
+                    )
+            ) {
                 is WriteOutcome.Applied -> {
                     LOG.info("purged proxy={}: its workload is gone", pass.name)
                     ReconcileOutcome.Progressed("definition purged")
                 }
 
-                is WriteOutcome.Conflict -> ReconcileOutcome.Retry("the purge conflicted (${outcome.reason}); re-reading")
+                is WriteOutcome.Conflict -> {
+                    ReconcileOutcome.Retry("the purge conflicted (${outcome.reason}); re-reading")
+                }
             }
         }
         val cleared =
@@ -974,19 +1011,25 @@ public class Reconciler(
         }
         val outcome = store.putStatus(status = status, observedDefinition = pass.stored.definition.resourceVersion)
         return when (outcome) {
-            is WriteOutcome.Applied -> WriteVerdict.Written
-            is WriteOutcome.Conflict ->
+            is WriteOutcome.Applied -> {
+                WriteVerdict.Written
+            }
+
+            is WriteOutcome.Conflict -> {
                 when (outcome.reason) {
-                    ConflictReason.NOT_FOUND ->
+                    ConflictReason.NOT_FOUND -> {
                         WriteVerdict.Conflicted(
                             ReconcileOutcome.Settled("the definition was purged while this pass ran"),
                         )
+                    }
 
-                    else ->
+                    else -> {
                         WriteVerdict.Conflicted(
                             ReconcileOutcome.Retry("the observation was rejected (${outcome.reason}); re-reading"),
                         )
+                    }
                 }
+            }
         }
     }
 
@@ -1021,15 +1064,24 @@ public class Reconciler(
                 timeout = definition.spec.backends.drain.sealTimeout,
             )
 
-        /** Every server this proxy's selector matches, with what the fleet knows about each. */
+        /**
+         * Every server this proxy's selector matches, with what the fleet knows
+         * about each.
+         *
+         * `listAll`, never `listServers`, for the reason `ProxyFleet.readFleet`
+         * gives: the strict read throws for an undecodable row, and one of those on
+         * this path would stop the proxy asserting *any* backend — which is the
+         * level trigger that restores joins to a parked drain.
+         */
         suspend fun backends(store: Store): List<MatchedBackend> {
             val selector = definition.spec.backends.selector
-            return store.listServers().mapNotNull { row ->
+            return store.listAll().servers.mapNotNull { row ->
                 val backend = row.definition.definition as? PaperServerDefinition ?: return@mapNotNull null
                 if (!selector.matches(backend.metadata.labels)) return@mapNotNull null
                 val status = row.status?.status as? PaperServerStatus
                 MatchedBackend(
                     server = backend.metadata.name,
+                    sealed = status?.drain?.state?.sealsBackend() == true,
                     address =
                         "${status?.endpoint?.address ?: backend.metadata.name.value}:" +
                             "${backend.spec.network.hostPort ?: backend.spec.network.port}",
@@ -1088,6 +1140,14 @@ public class Reconciler(
     /** One server the proxy's selector matched, as the routing assertion needs it. */
     private class MatchedBackend(
         val server: ResourceName,
+        /**
+         * Whether this backend's own drain is holding it out of routing.
+         *
+         * From `DrainState.sealsBackend`, which is the one definition of that rule
+         * — the drain controller asserts the same thing for the workload it is
+         * draining, and the two must not be able to disagree.
+         */
+        val sealed: Boolean,
         /** `host:port` as the proxy must dial it. A backend address, never a player's. */
         val address: String,
         val maxPlayers: Int,

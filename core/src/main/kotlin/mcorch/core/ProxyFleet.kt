@@ -46,6 +46,41 @@ internal object ProxyFleet {
         ) : Resolution
     }
 
+    /**
+     * The fleet, tolerating rows this build cannot decode.
+     *
+     * **[Store.listAll], never [Store.listServers].** The strict read *throws* for
+     * a row whose desired state will not decode, and this call sits on the path of
+     * every ordinary pass of every server — so one hand-edited row would abort
+     * every pass in the fleet, on every resync, for as long as it stayed there.
+     * That is precisely the outage `UnreadableStateTest` exists to pin, and it is
+     * the test that caught this being reintroduced here.
+     *
+     * The degradation is quiet on purpose but not silent: an unreadable row might
+     * be a *proxy* that claims this server, in which case the server reconciles as
+     * standalone — no forwarding secret, no seal, a drain that blocks instead of
+     * transferring. Every one of those is safe; none of them is right; and all of
+     * them are better than a fleet that reconciles nothing.
+     */
+    private suspend fun readFleet(
+        store: Store,
+        server: ResourceName,
+    ): List<StoredServer> {
+        val listing = store.listAll()
+        if (listing.unreadable.isNotEmpty()) {
+            LOG.warn(
+                "server={} is being reconciled against a fleet with {} unreadable definition(s) in it. If one " +
+                    "of them is a proxy that claims this server it will be treated as standalone: no " +
+                    "forwarding secret, and a drain that waits for players rather than transferring them",
+                server,
+                listing.unreadable.size,
+            )
+        }
+        return listing.servers
+    }
+
+    private val LOG = org.slf4j.LoggerFactory.getLogger(ProxyFleet::class.java)
+
     /** One proxy, as much of it as the fleet read could see. */
     data class Binding(
         val definition: VelocityProxyDefinition,
@@ -97,13 +132,15 @@ internal object ProxyFleet {
     ): Resolution {
         val definition = stored.definition.definition as? PaperServerDefinition ?: return Resolution.Standalone
         val labels = definition.metadata.labels
-        val fleet = store.listServers()
+        val fleet = readFleet(store, stored.name)
         val claiming =
             fleet
                 .mapNotNull { it.definition.definition as? VelocityProxyDefinition to it }
                 .mapNotNull { (proxy, row) -> proxy?.let { it to row } }
-                .filter { (proxy, _) -> proxy.spec.backends.selector.matches(labels) }
-                .sortedBy { (proxy, _) -> proxy.metadata.name.value }
+                .filter { (proxy, _) ->
+                    proxy.spec.backends.selector
+                        .matches(labels)
+                }.sortedBy { (proxy, _) -> proxy.metadata.name.value }
         if (claiming.isEmpty()) return Resolution.Standalone
         if (claiming.size > 1) {
             val names = claiming.joinToString(", ") { (proxy, _) -> "`${proxy.metadata.name}`" }

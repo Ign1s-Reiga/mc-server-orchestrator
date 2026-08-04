@@ -559,32 +559,44 @@ private fun proxyEntries(proxy: ProxyConditions?): List<Triple<ConditionType, Co
             ConditionType.BACKENDS_RESOLVED,
             if (backends == null) ConditionStatus.UNKNOWN else resolved.toConditionStatus(),
             when {
-                backends == null -> "the selector has not been resolved yet"
-                !resolved ->
+                backends == null -> {
+                    "the selector has not been resolved yet"
+                }
+
+                !resolved -> {
                     "spec.backends.selector matches no server. Nobody can join through this proxy until a " +
                         "server carries the labels it names"
+                }
 
-                else ->
+                else -> {
                     "${backends.registered} of ${backends.matched} matched server(s) are in the routing " +
                         "table; ${backends.destinations} can receive a transfer"
+                }
             },
         ),
         condition(
             ConditionType.CONTROL_ENDPOINT_READY,
             if (control == null) ConditionStatus.UNKNOWN else endpointReady.toConditionStatus(),
             when {
-                control == null -> "the control endpoint has not been contacted yet"
-                !control.reachable ->
+                control == null -> {
+                    "the control endpoint has not been contacted yet"
+                }
+
+                !control.reachable -> {
                     "the control endpoint did not answer, so no backend behind this proxy can be sealed, " +
                         "transferred or deregistered — which means none of them can complete a drain"
+                }
 
-                !control.compatible ->
+                !control.compatible -> {
                     "the plugin answered and speaks control protocol " +
                         "`${control.pluginApiVersion}`, which this build does not. Upgrade the proxy image to " +
                         "one built from this revision; until then no backend behind this proxy can complete a " +
                         "drain"
+                }
 
-                else -> ""
+                else -> {
+                    ""
+                }
             },
         ),
     )
