@@ -920,22 +920,18 @@ internal class DrainController(
             }
         val failure = recordFailure(reason, failureClass, reported, now, drain.failure)
         if (needsAttention && permanent) {
-            LOG.error(
-                "server={} has a drain that stopped permanently after {} attempt(s); the container is still " +
-                    "running (answeringPlayers={}) and the loop will not try again — this needs a human: {}",
-                server,
-                occupancy != null,
-                failure.attempts,
-                message,
+            logPermanentEscalation(
+                server = server,
+                attempts = failure.attempts,
+                answeringPlayers = occupancy != null,
+                detail = message,
             )
         } else if (needsAttention) {
-            LOG.error(
-                "server={} has been unable to finish a drain for {} minutes ({} attempts); it keeps running and " +
-                    "the loop keeps trying, but this needs a human: {}",
-                server,
-                stuckFor.inWholeMinutes,
-                failure.attempts,
-                message,
+            logRetryableEscalation(
+                server = server,
+                stuckFor = stuckFor,
+                attempts = failure.attempts,
+                detail = message,
             )
         }
         val aborted =
@@ -957,6 +953,57 @@ internal class DrainController(
             occupancy = occupancy,
             sideEffectIssued = sideEffectIssued,
             outcome = outcome,
+        )
+    }
+
+    /**
+     * The escalation's only channel outside the dashboard, and the arguments are
+     * **named and typed** rather than positional.
+     *
+     * This line printed nonsense until it was fixed — the placeholders read
+     * (server, attempts, answeringPlayers, message) and the arguments were passed
+     * (server, answeringPlayers, attempts, message), so an operator grepping for
+     * the permanent case read *"stopped permanently after true attempt(s) … (
+     * answeringPlayers=1)"*. Nothing branches on it, which is exactly why it
+     * survived review: the retryable branch beside it was correct and the two
+     * looked alike.
+     *
+     * Both parameter lists are deliberately shaped so that the same mistake does
+     * not compile — every parameter differs in type from its neighbours. At the
+     * `LOG.error` varargs boundary everything is `Any?`, so the compiler has
+     * nothing to say about order; here it does. That is worth more than a test,
+     * because a test only covers the sites somebody remembered to write one for.
+     */
+    private fun logPermanentEscalation(
+        server: ResourceName,
+        attempts: Int,
+        answeringPlayers: Boolean,
+        detail: String,
+    ) {
+        LOG.error(
+            "server={} has a drain that stopped permanently after {} attempt(s); the container is still " +
+                "running (answeringPlayers={}) and the loop will not try again — this needs a human: {}",
+            server,
+            attempts,
+            answeringPlayers,
+            detail,
+        )
+    }
+
+    /** The other half. See [logPermanentEscalation] for why the parameters are typed. */
+    private fun logRetryableEscalation(
+        server: ResourceName,
+        stuckFor: Duration,
+        attempts: Int,
+        detail: String,
+    ) {
+        LOG.error(
+            "server={} has been unable to finish a drain for {} minutes ({} attempts); it keeps running and " +
+                "the loop keeps trying, but this needs a human: {}",
+            server,
+            stuckFor.inWholeMinutes,
+            attempts,
+            detail,
         )
     }
 

@@ -4,6 +4,8 @@ import mcorch.core.ExecOutcome
 import mcorch.core.ExecRequest
 import mcorch.core.ImageAvailability
 import mcorch.core.Node
+import mcorch.core.NodeException
+import mcorch.core.NodeOperation
 import mcorch.core.NodeStatus
 import mcorch.core.StorageRequest
 import mcorch.core.WorkloadHandle
@@ -69,9 +71,29 @@ internal class StubNode(
      */
     val stops: MutableList<WorkloadHandle> = mutableListOf()
 
+    /**
+     * Makes every later observation fail the way a node that has gone does.
+     *
+     * The one behaviour a conformance test cannot reach any other way: a
+     * `NodeException` out of the pass, which `Reconciler.nodeFailure` records on
+     * the *status* while carrying the drain record forward untouched. That is the
+     * only route to a status where the two failures are different events, which is
+     * the case the `:core` and `:api` discriminators must agree about.
+     */
+    fun stopAnswering() {
+        answering = false
+    }
+
+    private var answering = true
+
     override suspend fun status(): NodeStatus = NodeStatus(ready = true, detail = "ready")
 
-    override suspend fun observe(server: ResourceName): WorkloadObservation = workload
+    override suspend fun observe(server: ResourceName): WorkloadObservation {
+        if (!answering) {
+            throw NodeException.Rejected(name, NodeOperation.OBSERVE, "this node no longer hosts this workload")
+        }
+        return workload
+    }
 
     override suspend fun ensureImage(image: ImageRef): ImageAvailability {
         val reference = image.canonical

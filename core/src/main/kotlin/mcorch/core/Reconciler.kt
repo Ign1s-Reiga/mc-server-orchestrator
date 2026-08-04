@@ -194,7 +194,12 @@ public class Reconciler(
         failure: RuntimeException,
     ): ReconcileOutcome {
         val message = "the definition cannot be turned into a workload: ${failure.message}"
-        LOG.warn("server={} was rejected: {}", stored.name, message)
+        // Error, not warn: this is permanent by construction, so the loop is
+        // about to stop acting on this server until somebody edits it. Every site
+        // that records a PERMANENT `status.failure` logs at error for that one
+        // reason — it is the level an operator's alerting greps for, and it is the
+        // same set of sites the escalation now raises `NEEDS_ATTENTION` from.
+        LOG.error("server={} was rejected: {}", stored.name, message)
         val previous = stored.status?.status as? PaperServerStatus
         val status =
             draftStatus(
@@ -307,6 +312,10 @@ public class Reconciler(
                 now = pass.now,
                 previous = pass.previous?.failure,
             )
+        // Conditioned on the class, because the retryable refusal is an ordinary
+        // "not yet" — a node coming back, capacity arriving — and logging every
+        // one of those at error is how the level stops meaning anything.
+        if (permanent) LOG.error("server={} cannot be placed: {}", pass.name, refusal.message)
         val status =
             pass.draft(
                 phase = if (pass.previous?.runtime == null) ServerPhase.PENDING else ServerPhase.UNKNOWN,
@@ -433,6 +442,15 @@ public class Reconciler(
                                 now = pass.now,
                                 previous = pass.previous?.failure,
                             )
+                        // The container this loop brought up is down and nothing
+                        // is going to bring it back without a human. Permanent by
+                        // construction, so unconditional.
+                        LOG.error(
+                            "server={} node={} is down and nothing will restart it: {}",
+                            pass.name,
+                            node.name,
+                            message,
+                        )
                         write(pass, status(ServerPhase.STOPPED, failure)) { ReconcileOutcome.Failed(message) }
                     }
 
@@ -562,6 +580,11 @@ public class Reconciler(
                         now = pass.now,
                         previous = pass.previous?.failure,
                     )
+                // Conditioned: a probe channel that is merely not answering yet is
+                // the ordinary case on a server that is still generating a world.
+                if (!probe.retryable) {
+                    LOG.error("server={} cannot be probed for readiness: {}", pass.name, probe.detail)
+                }
                 write(pass, status(ServerPhase.UNKNOWN, ready = false, players = null, failure = failure)) {
                     if (probe.retryable) {
                         ReconcileOutcome.Retry(probe.detail)
@@ -690,6 +713,26 @@ public class Reconciler(
                 players = progress.occupancy ?: pass.previous?.players,
                 storage = storage,
                 drain = progress.drain,
+                // **A copy, and it must stay one.** Three separate consumers
+                // discriminate "this failure is the drain's own" by comparing
+                // these two values, and every one of them is silently wrong the
+                // moment this stops being the identical value:
+                //
+                // - `StatusDrafting.deriveConditions` computes `passFailure` as
+                //   `failure != drain.failure`, so a derived value here would put
+                //   every aborted drain through the *pass* arm of the escalation
+                //   and word it "the loop cannot complete a pass".
+                // - `:api`'s `ServerJson.detail` ranks a pass failure above the
+                //   drain's, so it would drop the "the drain aborted" framing for
+                //   every genuinely failed drain.
+                // - `:store` migration V5 drops the retired top-level failure on
+                //   the strength of the same fact being written twice.
+                //
+                // If this ever needs context added, add it to the failure the
+                // drain records — inside `DrainController.abort`, where the drain
+                // and the status stay one value — rather than by decorating it on
+                // the way past. `AttentionTest` pins the consequence rather than
+                // the line, so the guard survives a rewrite of this function.
                 failure = progress.drain.failure,
             )
 
@@ -752,7 +795,7 @@ public class Reconciler(
                 "created with persistent world data, and applying this edit means draining and replacing it. " +
                 "Whatever is in memory would be discarded rather than flushed. Revert spec.storage.mode; to " +
                 "retire this server instead, delete it — that drains and saves it first"
-        LOG.warn("server={} refused a storage mode change: {}", pass.name, message)
+        LOG.error("server={} refused a storage mode change: {}", pass.name, message)
         val failure =
             recordFailure(
                 // The drain that would apply this edit is refused before it
@@ -1106,7 +1149,15 @@ public class Reconciler(
                 now = pass.now,
                 previous = pass.previous?.failure,
             )
-        LOG.warn("node operation failed for server={}: {}", pass.name, failure.message)
+        // Conditioned on the class. A retryable node failure is a hiccup the loop
+        // is built to absorb and it happens on every node restart; a permanent one
+        // means the loop stops acting on this server until somebody intervenes,
+        // which is the same threshold `NEEDS_ATTENTION` fires on.
+        if (failure.retryable) {
+            LOG.warn("node operation failed for server={}: {}", pass.name, failure.message)
+        } else {
+            LOG.error("node operation failed permanently for server={}: {}", pass.name, failure.message)
+        }
         val status =
             pass.draft(
                 phase = if (pass.previous?.runtime == null) ServerPhase.PENDING else ServerPhase.UNKNOWN,
