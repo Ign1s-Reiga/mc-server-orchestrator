@@ -15,15 +15,19 @@ This is not a Kubernetes operator. There is no k8s, no CRDs registered against a
 ## Modules
 
 ```
-:schema     Server-definition types (the CRD equivalent) + YAML parsing and validation
-:cri        CRI client: generated stubs from .proto + a thin idiomatic wrapper
-:core       Reconcile loop, scheduler, node abstraction (the seam for future distribution)
-:store      State persistence behind an interface; a single-host implementation plugs in
-:api        REST/gRPC API server (the dashboard backend)
-:app        Wires everything into one runnable application
+:schema           Server-definition types (the CRD equivalent) + YAML parsing and validation
+:cri              CRI client: generated stubs from .proto + a thin idiomatic wrapper
+:core             Reconcile loop, scheduler, node abstraction (the seam for future distribution)
+:store            State persistence behind an interface; a single-host implementation plugs in
+:api              REST/gRPC API server (the dashboard backend)
+:app              Wires everything into one runnable application
+:velocity-plugin  The Velocity plugin, mounted into a proxy container — the control channel
+                  for drain steps 2, 4 and 6
 ```
 
 `:schema` and `:cri` are depended on widely. Breaking changes to either must update every consumer in the same change.
+
+`:velocity-plugin` is the odd one out and is meant to stay that way. Its code does not run in the orchestrator's process — the JAR it builds is loaded by Velocity inside the proxy container — so it depends on no other module here, and it is the only module whose dependency (`velocity-api`, `compileOnly`) does not come from Maven Central. The arrow that is allowed points inward: `:core` may depend on it for the wire contract in `mcorch.velocity.control`, which names no Velocity type, so that the protocol version has one definition rather than a copy in the reconciler. Do not give it a dependency on `:schema` or `:core`.
 
 ## The distribution seam
 
@@ -43,6 +47,7 @@ If a change makes one of these assume single-host in a way that a later distribu
 ./gradlew :cri:generateProto       # regenerate CRI stubs from .proto (see the generate-cri-stubs skill)
 ./gradlew spotlessApply            # format
 ./gradlew :app:run                 # run the orchestrator locally
+./gradlew :velocity-plugin:pluginJar   # build the proxy control plugin JAR (:core mounts this)
 
 scripts/dev/containerd-up.sh       # start a local containerd for integration work
 scripts/dev/containerd-down.sh

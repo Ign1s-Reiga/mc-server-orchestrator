@@ -12,17 +12,19 @@ plugins {
 // isolation, and this build is meant to stay parallel-friendly.
 //
 // Spotless is applied here as well as in the convention plugin because the
-// convention plugin only reaches the six modules. Without this, the root and
+// convention plugin only reaches the modules. Without this, the root and
 // buildSrc build scripts would never be formatted or checked.
 //
 // Module graph (see CLAUDE.md) — `./gradlew projects` prints it live:
 //
-//   :schema   server-definition types + YAML parsing/validation
-//   :cri      CRI client (generated stubs + idiomatic wrapper)
-//   :core     reconcile loop, scheduler, node abstraction
-//   :store    state persistence behind an interface
-//   :api      REST/gRPC API server (dashboard backend)
-//   :app      wires everything into one runnable application
+//   :schema           server-definition types + YAML parsing/validation
+//   :cri              CRI client (generated stubs + idiomatic wrapper)
+//   :core             reconcile loop, scheduler, node abstraction
+//   :store            state persistence behind an interface
+//   :api              REST/gRPC API server (dashboard backend)
+//   :app              wires everything into one runnable application
+//   :velocity-plugin  the Velocity control plugin, loaded by the proxy rather
+//                     than by this program — see its build file
 
 spotless {
     kotlinGradle {

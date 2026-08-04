@@ -1,0 +1,9 @@
+{
+  "id": "mcorch-control",
+  "name": "mcorch control",
+  "version": "1.0.0",
+  "description": "Orchestrator control channel: seal, transfer and deregister backends.",
+  "authors": [],
+  "dependencies": [],
+  "main": "mcorch.velocity.plugin.VelocityControlPlugin"
+}

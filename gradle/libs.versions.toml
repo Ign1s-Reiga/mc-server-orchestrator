@@ -44,6 +44,35 @@ slf4j = "2.0.17"
 snakeyamlEngine = "3.0.1"
 
 sqliteJdbc = "3.53.2.0"
+
+# The Velocity API the shipped control plugin (:velocity-plugin) compiles
+# against. Verified on repo.papermc.io 2026-08-04: 4.0.0 is the newest real
+# release (4.1.0 is SNAPSHOT-only, and most of the 3.x line was never published
+# as anything but a SNAPSHOT), so this is the newest pin under which the plugin
+# JAR is reproducible.
+#
+# This is not an ordinary compile pin. The JAR this module builds is loaded by
+# whichever Velocity the operator's proxy image runs, so the pin is a *runtime*
+# contract with an image nothing in this build can see. Velocity 4 is an API
+# break from 3.x; a 3.x proxy will not load a JAR compiled here. Bumping this
+# means re-running :app:integrationTest against a proxy image on the new line —
+# a compile against the new artifact proves nothing about the old one.
+#
+# 4.0.0's Gradle module metadata declares org.gradle.jvm.version = 25, which is
+# why :velocity-plugin needs no toolchain of its own: the proxy this JAR is
+# loaded into runs the same JVM the rest of this repo targets. That is a
+# property of *this* pin and not of Velocity generally — 3.5.1 declares 21 — so
+# a downgrade to the 3.x line is also a jvmTarget change in that module, and
+# Gradle will say so rather than silently producing bytecode the proxy cannot
+# load.
+#
+# velocity-api pulls Adventure 5.2.0, Gson 2.14.0, Guava, Guice, SnakeYAML and
+# slf4j-api transitively, and the proxy already has all of them. That is why the
+# dependency is `compileOnly` there and why the plugin JAR shades none of it:
+# two Adventure versions on one plugin classloader is a runtime failure that no
+# build here would catch.
+velocity = "4.0.0"
+
 spotless = "8.8.0"
 junit = "5.14.4"
 kotest = "6.1.5"
@@ -92,6 +121,11 @@ slf4j-simple = { module = "org.slf4j:slf4j-simple", version.ref = "slf4j" }
 snakeyaml-engine ={ module = "org.snakeyaml:snakeyaml-engine", version.ref = "snakeyamlEngine" }
 
 sqlite-jdbc = { module = "org.xerial:sqlite-jdbc", version.ref = "sqliteJdbc" }
+
+# compileOnly in :velocity-plugin and nowhere else. It is the only dependency in
+# this build that does not come from Maven Central — see the scoped papermc
+# repository in settings.gradle.kts.
+velocity-api = { module = "com.velocitypowered:velocity-api", version.ref = "velocity" }
 
 # --- proto codegen (consumed by :cri's protobuf block; see the skill) ---
 # protoc and protoc-gen-grpc-java resolve as native executables via the
