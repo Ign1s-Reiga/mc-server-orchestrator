@@ -38,6 +38,16 @@ by adding dead code, and treat "no failures **and** no test-count line" as a
 build failure to investigate rather than a pass. Check the exit status or the
 `BUILD` line, not just the failure list.
 
+**A negative assertion satisfied by a *downstream* guard proves nothing about the
+one you changed.** A test for "the proxy's player count does not move the gate"
+asserted no stop, no save, no deregistration — all three of which the `SAVING`
+gate delivers whatever the earlier step concluded. It passed against a build that
+believed the proxy. The sabotage is what found it: the fix is to assert on where
+the drain *ends up* (which failure it records, whether it records a block at all),
+because that is the first observable that differs. Generalise it — when the
+property you changed sits upstream of another guard, the negative assertions are
+about the downstream guard and you need a positive one about yours.
+
 ## When the check cannot exist, move it to the compiler
 
 Structured-logging argument order is untyped and untested anywhere in this repo —

@@ -14,3 +14,4 @@
 - [Cancellation exposure](project_cancellation-exposure.md) — what the save-record shield covers, the two windows left open on purpose, and why write-ahead was rejected on its merits.
 - [Derive from the consumer](feedback_derive-from-the-consumer.md) — a status field is judged by what reads it; two of my defects passed every `:core` test and needed a real dashboard.
 - [Unreadable state posture](project_unreadable-state-posture.md) — a bad definition row cost the fleet; a bad observation was already safe via `getServer`, and the loop's skip only buys reporting.
+- [Level-triggered seal](project_level-triggered-seal.md) — assert, never issue; `sealsBackend` against `drainInitiated`; what replaced "one guard for six states", and four rulings open to overruling.

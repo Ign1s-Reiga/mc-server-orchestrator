@@ -15,10 +15,17 @@ with players online there is **no drain destination**, so the drain aborts with
 goes unsaved (`failure-modes.md` item 4). There is nowhere to send them until a
 Velocity proxy kind exists.
 
-**How to apply:** when the Velocity/proxy kind arrives, those three states get
-real bodies — the state machine already traverses them as recorded no-ops, so it
-is a fill-in, not a reshape. Until then, do not add any "drain deadline" or
-"kick after N minutes" policy, however reasonable it sounds.
+**How to apply:** still true for a server nothing claims. Do not add any "drain
+deadline" or "kick after N minutes" policy, however reasonable it sounds.
+
+**The "it is a fill-in, not a reshape" claim in this memory was wrong, and the
+audit said so before any code existed.** Filling in steps 2–4 required moving the
+zero-player gate: `requireEmpty` wrapped `SEALED`, `TARGET_RESOLVED` and
+`TRANSFERRING`, and with bodies it aborts *precisely on the precondition that is
+supposed to trigger the work* — a destination search that refuses to run while
+players are online never runs. The gate now covers `SAVING` onward only; steps 3
+and 4 have the preconditions of the thing they do. See
+[[level-triggered-seal]].
 
 ## Follow-on calls I made that a human may still overrule
 
