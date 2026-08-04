@@ -15,6 +15,7 @@ import mcorch.schema.BackendRegistration
 import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
 import mcorch.schema.FailureClass
+import mcorch.schema.FailureReason
 import mcorch.schema.ServerPhase
 import org.junit.jupiter.api.Test
 import kotlin.time.Duration.Companion.minutes
@@ -330,6 +331,47 @@ internal class ProxyReconcileTest {
             failure.message shouldContain "front-01"
             failure.message shouldContain "front-02"
             failure.message shouldContain "different forwarding secrets"
+        }
+
+    /**
+     * A conflict refuses the create. It must never refuse the delete.
+     *
+     * The refusal returns before placement, so with no exemption a backend that two
+     * selectors start matching becomes **permanently undeletable** — with both
+     * proxies routing to it — until a human narrows a selector. An undeletable
+     * populated server is what produces a manual `crictl stop`, which is a container
+     * stopped with no save, so the refusal has to be scoped to the thing it is
+     * actually about: creating a container whose forwarding secret is ambiguous.
+     *
+     * A drain issues no create, so the ambiguity does not apply to it. It runs with
+     * no binding at all, which means it blocks on players rather than transferring
+     * them — the correct degradation, because sealing through one of the two proxies
+     * would leave the other routing new players in.
+     */
+    @Test
+    fun `a backend claimed by two proxies can still be deleted and drained`() =
+        coreTest {
+            val backend = backendDefinition("survival-01")
+            val harness = ProxyHarness(backends = listOf(backend))
+            harness.bringUp()
+
+            // A second proxy starts matching it after it is already running.
+            harness.declare(proxyDefinition(name = "front-02", node = "proxy-node"))
+            harness.pass(backend.metadata.name).shouldBeInstanceOf<ReconcileOutcome.Retry>()
+            harness
+                .status(backend.metadata.name)
+                .shouldNotBeNull()
+                .failure
+                .shouldNotBeNull()
+                .reason shouldBe FailureReason.FORWARDING_SECRET_UNAVAILABLE
+
+            // The operator gives up on it and deletes it. That must still work.
+            harness.store.deleteDefinition(backend.metadata.name)
+            repeat(12) { harness.pass(backend.metadata.name) }
+
+            harness.nodeOf(backend).saves shouldHaveSize 1
+            harness.nodeOf(backend).stops shouldHaveSize 1
+            harness.store.getServer(backend.metadata.name) shouldBe null
         }
 
     /**

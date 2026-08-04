@@ -143,7 +143,18 @@ public class Reconciler(
             } catch (failure: StoreException) {
                 return storeOutcome(stored.name, failure)
             }
-        if (fleet is ProxyFleet.Resolution.Conflicted) {
+        // A conflict refuses the *create*, never the *delete*. An operator who asked
+        // for a server to go away must be able to have it drained, and a drain
+        // issues no create — so the forwarding-secret ambiguity that makes the
+        // conflict unresolvable simply does not apply to it. Without this exemption a
+        // backend that two selectors start matching becomes permanently undeletable,
+        // with both proxies routing to it, until a human narrows a selector; and an
+        // undeletable populated server is what produces a manual `crictl stop`.
+        //
+        // It drains with `binding = null`, so it blocks on players rather than
+        // transferring them. That is the correct degradation: choosing one of the two
+        // proxies to seal through would leave the other routing new players in.
+        if (fleet is ProxyFleet.Resolution.Conflicted && !stored.definition.terminating) {
             return refuseConflictedProxies(stored, now, fleet)
         }
         val binding = (fleet as? ProxyFleet.Resolution.Behind)?.binding
@@ -670,6 +681,17 @@ public class Reconciler(
         val statuses = mutableListOf<BackendStatus>()
         var problem: String? = null
         for (backend in matched) {
+            val address = backend.address
+            if (address == null || backend.letGo) {
+                statuses +=
+                    BackendStatus(
+                        server = backend.server,
+                        registration = BackendRegistration.PENDING,
+                        drainInitiated = backend.drainInitiated,
+                        lastTransitionAt = pass.now,
+                    )
+                continue
+            }
             // **`sealsBackend`, never `drainInitiated`.** They answer different
             // questions and the plausible-looking one is wrong: `drainInitiated`
             // means "has any drain record at all", which is the *destination
@@ -677,7 +699,7 @@ public class Reconciler(
             // has parked out of routing for ever — the running, invisible,
             // unreachable server this level trigger exists to repair.
             val admits = !backend.sealed
-            when (val outcome = channel.assertBackend(backend.server, backend.address, admits)) {
+            when (val outcome = channel.assertBackend(backend.server, address, admits)) {
                 is ControlOutcome.Answered -> {
                     statuses +=
                         BackendStatus(
@@ -1082,9 +1104,23 @@ public class Reconciler(
                 MatchedBackend(
                     server = backend.metadata.name,
                     sealed = status?.drain?.state?.sealsBackend() == true,
+                    // Null until the loop knows which node the workload is on.
+                    // **Not asserted under a guessed hostname**: a registration at a
+                    // name that does not resolve is one the protocol will refuse to
+                    // correct — `ADDRESS_CONFLICT` is deliberately not an upsert — so
+                    // it wedges drain step 2 permanently, and players routed to it
+                    // get a connection failure while the fleet reports healthy. "Not
+                    // registered yet" is a state the protocol handles; that is not.
                     address =
-                        "${status?.endpoint?.address ?: backend.metadata.name.value}:" +
-                            "${backend.spec.network.hostPort ?: backend.spec.network.port}",
+                        status?.runtime?.node?.let {
+                            backendAddress(it, backend.spec.network.hostPort ?: backend.spec.network.port)
+                        },
+                    // Its own drain has let go of it and the container is about to
+                    // stop. Re-asserting would put the entry back between steps 6 and
+                    // 7 — sealed, so nothing routes there, but Velocity's own
+                    // fallback reconnect can land a player on a registered backend.
+                    // `holdSeal` skips for the same reason; this is the other half.
+                    letGo = status?.drain?.deregisteredAt != null,
                     maxPlayers = backend.spec.maxPlayers,
                     online = status?.players?.online,
                     ready = status?.ready == true,
@@ -1148,8 +1184,13 @@ public class Reconciler(
          * draining, and the two must not be able to disagree.
          */
         val sealed: Boolean,
-        /** `host:port` as the proxy must dial it. A backend address, never a player's. */
-        val address: String,
+        /**
+         * `host:port` as the proxy must dial it, or null when the loop does not yet
+         * know which node the workload is on. Never a player's address.
+         */
+        val address: String?,
+        /** Its own drain has deregistered it and the stop is next. Not re-asserted. */
+        val letGo: Boolean,
         val maxPlayers: Int,
         val online: Int?,
         val ready: Boolean,
