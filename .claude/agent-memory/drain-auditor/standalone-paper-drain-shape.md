@@ -377,3 +377,37 @@ desired definition rather than the running container.
   reports `BUILD FAILED` and writes no reports is indistinguishable from "nothing
   ran"; treating it as an unknown was correct. Never accept a signed count that
   cannot be traced to per-module XML.
+
+## Round 16 rulings: the alarm hysteresis
+
+- **The inversion (`derivedOnly` → `workDone`, default false) is right and the
+  claim about what it does and does not close checks out.** The implementer's
+  ruling — critical 1 closed, critical 2 not, because "a save says nothing about
+  a stop" — is correct: `save()`'s `Confirmed` branch does real work and must
+  claim it, so the failure-clearing rule cannot be `workDone` alone. Splitting
+  the backoff question (`workDone`) from the recovery question (`workDone &&
+  !resuming`) is the right split, and the stated reason (a drain that emptied
+  after a play session must not wait out a five-minute backoff) is the reason.
+  Do not re-propose a single rule for both.
+- **The hysteresis creates no stuck state *inside* `DrainState`.** A resume that
+  exits `DRAIN_FAILED` makes the next pass `resuming = false`, so the ordinary
+  step that clears the failure is always one pass away. The stuck state is one
+  level up, in `Reconciler`'s permanent-failure gate — see
+  [[drain-audit-danger-patterns]] item 67. Answer the state-machine question and
+  the gate question separately; they look like the same question.
+- **The once-per-cycle `save-all flush` on a parked drain is the correct
+  resolution and should not be suppressed.** The evidence genuinely expires
+  across a backoff longer than `saveEvidenceMaxGap`, invariant 3 requires a fresh
+  confirmation, `save-all flush` is idempotent, and the pass that issues it has
+  just confirmed zero players. It is only acceptable *because* the escalation now
+  fires; a re-save loop that told nobody would be item 63 again.
+- **A green targeted sabotage is not evidence that a test is sound; a targeted
+  sabotage and a whole-file revert prove different things.** Recorded as a
+  general rule after the fifth instrument-that-cannot-fail in this project. The
+  targeted sabotage proves the assertion is wired to the line it names; the
+  whole-file revert proves the assertion is not *already satisfied* by something
+  else in the scenario. A stale-block assertion passed a targeted sabotage
+  because a later `abort` had cleared the block anyway, and the revert only went
+  red on an unrelated wording assertion first. Require both, and when the revert
+  goes red on a different assertion than the one under test, that is not a pass —
+  re-run it with the other assertions removed.

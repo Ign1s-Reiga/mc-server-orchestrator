@@ -739,3 +739,52 @@ Related: [[standalone-paper-drain-shape]]
     running" about a drain seconds from `stopWorkload`. Whenever a clearing rule
     grows an exemption, ask what else the exempted branch was the *only* thing
     clearing.
+
+## Round 16: the hysteresis, and what a pass's own duration costs
+
+66. **A pass stamps its evidence at its own start, so the pass's *duration* is
+    charged to the evidence gap — and a save is the longest thing a pass does.**
+    `advance` takes one `now` at entry; `PlayerOccupancy(…, now)` and
+    `worldSavedAt = now` are both that instant, while `requestSave` runs after.
+    The next pass computes `now - lastProbedAt` (= the previous pass's *start*)
+    and voids the confirmation when it exceeds `saveEvidenceMaxGap` (30 s, a
+    `ReconcilerConfig` constant). So any server whose `save-all flush` takes
+    longer than ~30 s can never keep a confirmation: `SAVING` saves, `DEREGISTERED`
+    finds the evidence void and returns to `SAVING`, for ever, `Progressed` every
+    pass, no failure recorded, `NEEDS_ATTENTION` never raised, container never
+    stopped, delete never completes. The schema's own default `saveTimeout` is
+    **180 s** and `stopGracePeriod` defaults to 240 s, so a save far longer than
+    the gap is anticipated everywhere except here, and nothing cross-checks the
+    two — they live in different modules and one is per-server while the other is
+    per-loop. Structurally invisible to the suite: `FakeNode` never advances the
+    test clock inside an exec, so no test can produce a pass longer than a pass.
+    Whenever a freshness bound is compared against a timestamp, ask *when in the
+    pass that timestamp was taken* and what the pass does after taking it.
+67. **A `PERMANENT` failure that survives onto a drain no longer in
+    `DRAIN_FAILED` is a permanent freeze, because the gate is keyed on the class
+    and not on the state.** `Reconciler.Pass.isBlockedByPermanentFailure` returns
+    `Failed` with no status write for any non-terminating server whose *status*
+    failure is `PERMANENT` at the observed generation, and `status.failure` is a
+    copy of `drain.failure`. That was harmless while `resumeInto` cleared the
+    failure on every resume that did not re-abort: the operator's edit bumped the
+    generation, the gate opened for one pass, the resume cleared the failure and
+    the drain carried on. Round 15 (`derivedOnly`) and round 16 (`settleRecords`'s
+    `resuming` rule) each widened the set of resumes that *keep* the failure, so
+    the edit now buys exactly one step and the pass after it re-freezes — with
+    the drain parked in whatever state that step reached. The sharpest instance is
+    a `NodeException.Rejected` on `stopWorkload`: the recovery pass issues the
+    stop, the container goes down, and the loop is gated out before it can ever
+    run `awaitStopped` or `teardown`. Whenever a rule is added that *withholds*
+    clearing a failure, enumerate every consumer that treats the presence of that
+    failure as a reason to stop reconciling.
+68. **A retry that did not achieve its object may not claim it did work.**
+    `awaitStopped`'s re-issue branch sets `workDone = true` because the
+    `stopWorkload` RPC returned — but the branch is only reached *because* the
+    container is still running, i.e. the previous stop did not take. Under the
+    round-16 rule that claim deletes a recorded failure, so a `STOPPING` loop
+    against a container that will not die alternates "abort on a node blip"
+    with "re-issue and wipe the failure", pinning `attempts` at 1 for ever
+    (item 11 again, in the one state where the container is supposed to be going
+    away). The flag's own definition is "a request that left this process **and
+    came back with what it needed**"; a stop that came back and left the
+    container running did not.
