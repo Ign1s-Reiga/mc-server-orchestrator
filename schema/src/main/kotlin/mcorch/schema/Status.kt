@@ -420,10 +420,20 @@ public enum class ConditionType {
      * joinable, and the drain resumes on its own.
      *
      * Deliberately a separate signal from [NEEDS_ATTENTION] rather than a shade
-     * of it: this one says **do not act**, that one says **act**. They are never
-     * both true. Folding the two together is how the attention flag comes to fire
-     * on a busy evening every backoff interval, which is how an operator learns it
+     * of it: this one says **do not act** *about the drain*, that one says
+     * **act**. Folding the two together is how the attention flag comes to fire on
+     * a busy evening every backoff interval, which is how an operator learns it
      * means nothing.
+     *
+     * **They used to be documented as never both true, and that is no longer
+     * so.** [NEEDS_ATTENTION] is derived from the failure recorded on the *pass*
+     * as well as from the drain's own, and the two answer different questions: a
+     * drain can be quietly waiting for players while the node it is on has become
+     * unreachable, and both facts are then true and worth reporting. The
+     * disjointness that does still hold is the narrow one this condition is
+     * defined by — a drain is never simultaneously *blocked* and *failed* — and a
+     * dashboard that rendered the pair as one tri-state must show the attention
+     * flag separately.
      *
      * `False` rather than `Unknown` on a server with no drain at all, for the same
      * reason [NEEDS_ATTENTION] is: "nothing is blocked" is something the loop
@@ -478,19 +488,36 @@ public enum class ConditionType {
      * and keeps its container running: at a limit you stop trying, you do not
      * stop a Minecraft server (`failure-modes.md` item 7).
      *
-     * Set today by a drain that has failed permanently, and by one that has been
-     * failing retryably for longer than `ReconcilerConfig.drainAttentionAfter`.
+     * ## What raises it
+     *
+     * One rule, asked of two failures: the drain's own ([DrainStatus.failure])
+     * and the one recorded on the pass ([PaperServerStatus.failure]) when that is
+     * a different event from the drain's. Either escalates when it is
+     * **permanent** — the loop has stopped, which is the definition of this flag —
+     * or when it has been recurring for longer than
+     * `ReconcilerConfig.drainAttentionAfter`, measured from its own first
+     * occurrence.
+     *
+     * The second arm is what stops it being a drain flag. A refused definition
+     * edit, a pinned node that does not exist and a container that exited all
+     * record a permanent failure with **no drain at all**, and until this widened
+     * they showed an ordinary badge — `RUNNING`, even — with nothing beside it,
+     * on a server the loop had stopped observing. That is the same defect as the
+     * terminating-badge one below, with the lie pointing the quieter way.
+     *
      * **No [FailureReason] is exempt.** There used to be one, for the drain
      * waiting on players to log off, and it is gone because that drain now records
      * no failure at all ([DrainStatus.blocked]) — so this flag, which is false
-     * whenever [DrainStatus.failure] is null, stays quiet by the ordinary rule
+     * whenever there is no failure to escalate, stays quiet by the ordinary rule
      * instead of by an exception to it. The exemption was worth deleting on its
      * own: it was checked before the failure class to stop a future permanent
      * classification routing a healthy drain back in, and that ordering was a
      * second thing to get right in a rule that should not have had a first.
      *
-     * The name is deliberately general: a permanently failed bring-up is the
-     * obvious next thing to raise it, and doing so needs no schema change.
+     * It is *more* self-clearing than a drain-only flag would be, which is the
+     * answer to the alarm-fatigue objection: a pass that gets anywhere records no
+     * failure, so the flag goes with it, and a retryable failure is never
+     * escalated before the threshold however often it repeats.
      */
     NEEDS_ATTENTION,
 }

@@ -78,8 +78,10 @@ internal class MutableClock(
  * never derived at all is exactly the green-for-the-wrong-reason this suite has
  * been bitten by. Absence fails here.
  */
-internal fun PaperServerStatus.attention(): StatusCondition =
-    conditions.single { it.type == ConditionType.NEEDS_ATTENTION }
+internal fun PaperServerStatus.attention(): StatusCondition = condition(ConditionType.NEEDS_ATTENTION)
+
+/** Any condition, with the same insistence that it be present. */
+internal fun PaperServerStatus.condition(type: ConditionType): StatusCondition = conditions.single { it.type == type }
 
 internal fun resourceName(raw: String): ResourceName = ResourceName.of(raw).getOrThrow()
 

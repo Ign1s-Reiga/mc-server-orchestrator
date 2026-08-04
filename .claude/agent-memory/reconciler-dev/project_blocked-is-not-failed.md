@@ -27,7 +27,13 @@ audit findings. Deleting the exemption was judged worth more than it cost.
   so a field with one legal value would only invite the other.
 - `ConditionType.DRAIN_BLOCKED` is derived from `blocked != null && failure ==
   null`, and `display.drainBlocked` renders it. It is the inverse of
-  `NEEDS_ATTENTION` — *do not act* against *act* — and they are never both true.
+  `NEEDS_ATTENTION` in what it tells somebody to do — *do not act* against *act*.
+  **They are no longer disjoint** (superseded 2026-08-04, same day): the
+  attention flag now also fires on the failure recorded on the *pass*, and a drain
+  can be correctly waiting on players while the node it is on is unreachable. Both
+  are then true and both are honest — they answer *is the drain stuck* and *must
+  somebody act*. See [[escalation-ruling]]. Anything rendering the pair as one
+  tri-state is now wrong; `API.md` §7 still says otherwise.
 - `recordBlock` in `Failures.kt` carries `since`/`observations` forward exactly
   as `recordFailure` carries `occurredAt`/`attempts`.
 
