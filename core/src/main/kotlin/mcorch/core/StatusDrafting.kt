@@ -244,8 +244,12 @@ private fun drainMessage(
     drainAttention: Boolean,
 ): String {
     val state = "drain state ${drain.state}"
+    // The failure's own first occurrence, not `drain.startedAt`. A drain that
+    // waited four hours for players to log off and then hit a hiccup has not been
+    // "failing since" it started; see `escalates` for the same correction on the
+    // threshold this sentence accompanies.
     return if (drainAttention) {
-        "$state, failing since ${drain.startedAt} and not recovering on its own"
+        "$state, failing since ${drain.failure?.occurredAt} and not recovering on its own"
     } else {
         state
     }
@@ -297,16 +301,32 @@ private fun blockedMessage(block: DrainBlock?): String {
  *
  * ## The three arms
  *
- * The drain arm is checked first and its sentence is unchanged, so a stuck drain
- * reads today exactly as it did before the flag widened. When a pass failure
- * escalates *as well*, `:api`'s `detail()` renders that one separately — its
- * precedence is the opposite, and deliberately, because there the question is
- * "what is true now" rather than "what is the worst thing outstanding".
+ * The drain arm is checked first, so a stuck drain reads as it always did. When a
+ * pass failure escalates *as well*, `:api`'s `detail()` renders that one
+ * separately — its precedence is the opposite, and deliberately, because there the
+ * question is "what is true now" rather than "what is the worst thing
+ * outstanding".
  *
  * The two pass arms differ on whether there is a drain to talk about, and neither
  * says the drain failed: a drain that is merely blocked, on a server whose node
  * has gone away, has nothing wrong with it and the sentence must not imply
  * otherwise.
+ *
+ * ## The one cell where ranking by arm is wrong
+ *
+ * Rank by arm everywhere **except** a retryable drain failure sitting beside a
+ * permanent pass failure. That combination is reachable and it is the worst one
+ * to get wrong: a `REPLACEMENT` drain failing retryably past the threshold, then a
+ * permanent `NodeException` on the same pass. Ranking by arm renders *"The loop
+ * keeps retrying…"* while `Reconciler.Pass.isBlockedByPermanentFailure` gates the
+ * server off on the very next pass and nothing is ever attempted again. The pager
+ * quotes this condition rather than `:api`'s `detail()`, so the sentence here is
+ * the only thing an operator sees, and it tells them to wait.
+ *
+ * The rule is one-directional: a *permanent* drain failure still outranks a
+ * permanent pass failure, because both then say "nothing further will be
+ * attempted" and the drain's sentence carries the more specific remedy. Only the
+ * retryable-drain-versus-permanent-pass cell moves.
  */
 private fun attentionMessage(
     drain: DrainStatus?,
@@ -314,15 +334,35 @@ private fun attentionMessage(
     passFailure: FailureStatus?,
 ): String =
     when {
-        drainAttention -> drainAttentionMessage(drain)
+        drainAttention && !outrankedByPass(drain, passFailure) -> drainAttentionMessage(drain)
 
         passFailure != null -> passAttentionMessage(drain, passFailure)
+
+        // A drain arm that lost the cell above with no pass failure to render is
+        // not reachable — `outrankedByPass` is false whenever `passFailure` is
+        // null — but the drain sentence is the honest fallback rather than "".
+        drainAttention -> drainAttentionMessage(drain)
 
         // Unreachable: the condition is only true when one of the two arms is,
         // and both are covered above. "" rather than a claim, because a sentence
         // invented here would be the one thing on the status nothing derived.
         else -> ""
     }
+
+/**
+ * Whether the failure recorded on the *pass* has to be the one reported, even
+ * though the drain arm is also raised.
+ *
+ * True for exactly one cell of the class matrix: the drain's failure is
+ * [FailureClass.RETRYABLE] and the pass's is [FailureClass.PERMANENT]. See
+ * [attentionMessage] for why that cell alone moves.
+ */
+private fun outrankedByPass(
+    drain: DrainStatus?,
+    passFailure: FailureStatus?,
+): Boolean =
+    passFailure?.failureClass == FailureClass.PERMANENT &&
+        drain?.failure?.failureClass == FailureClass.RETRYABLE
 
 /** Today's sentence, for a drain that cannot finish on its own. */
 private fun drainAttentionMessage(drain: DrainStatus?): String {
@@ -359,8 +399,14 @@ private fun passAttentionMessage(
         if (drain != null) {
             // Not "the drain failed". It may be perfectly healthy and simply
             // waiting; what has gone wrong is upstream of it.
+            //
+            // The closing clause is mandatory here as it is in every other arm,
+            // and this is the arm where it is least optional: a reader who has
+            // just been told a drain exists and is not advancing has positive
+            // reason to believe a stop is imminent. It is the one arm the clause
+            // was missing from.
             "this server needs a human: the loop cannot complete a pass for this server, so its drain is " +
-                "not advancing; the container keeps running."
+                "not advancing; the container keeps running and is not being stopped by the orchestrator."
         } else if (permanent) {
             "this server needs a human: the loop has stopped acting on this server. The container is not " +
                 "being stopped by the orchestrator."

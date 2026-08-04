@@ -1561,19 +1561,19 @@ internal class DrainTest {
             val startedAt = MutableClock().instant()
 
             escalates(
-                startedAt = startedAt,
+                failingSince = startedAt,
                 failureClass = FailureClass.PERMANENT,
                 now = startedAt,
                 after = 10.minutes,
             ).shouldBeTrue()
             escalates(
-                startedAt = startedAt,
+                failingSince = startedAt,
                 failureClass = FailureClass.RETRYABLE,
                 now = startedAt.plusSeconds(9 * 60),
                 after = 10.minutes,
             ).shouldBeFalse()
             escalates(
-                startedAt = startedAt,
+                failingSince = startedAt,
                 failureClass = FailureClass.RETRYABLE,
                 now = startedAt.plusSeconds(10 * 60),
                 after = 10.minutes,

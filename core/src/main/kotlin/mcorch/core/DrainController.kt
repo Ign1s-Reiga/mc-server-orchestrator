@@ -122,10 +122,9 @@ internal class DrainController(
         val recorded = current ?: started(now)
         if (current == null) {
             LOG.info(
-                "drain started for server={} cause={} node={}",
-                definition.metadata.name,
+                "drain started for {} cause={}",
+                WorkloadRef(definition.metadata.name, node.name),
                 cause,
-                node.name,
             )
             return DrainProgress(
                 drain = recorded,
@@ -685,13 +684,17 @@ internal class DrainController(
         }
 
         val grace = definition.spec.lifecycle.stopGracePeriod
-        LOG.info(
-            "stopping server={} node={} gracePeriod={}s worldSaved={} worldData={}",
-            definition.metadata.name,
-            pass.node.name,
-            grace.inWholeSeconds,
-            drain.worldSaved,
-            contract.holdsWorldData,
+        // Through a typed record, because this is the line an investigator reads
+        // first after a world is lost and the two booleans used to be adjacent
+        // `Any?` arguments — a swap would have reported a save that never
+        // happened as confirmed. See [ContainerStopRecord].
+        LOG.stoppingContainer(
+            ContainerStopRecord(
+                workload = WorkloadRef(server = server, node = pass.node.name),
+                gracePeriod = grace,
+                save = WorldSaveEvidence(drain.worldSaved),
+                worldData = WorldDataHolding(contract.holdsWorldData),
+            ),
         )
         pass.node.stopWorkload(observation.handle, grace)
         return DrainProgress(
@@ -870,10 +873,16 @@ internal class DrainController(
         message: String,
         sideEffectIssued: Boolean = false,
     ): DrainProgress {
-        val stuckFor = JavaDuration.between(drain.startedAt, now).toKotlinDuration()
+        // The first pass that recorded *this* failure, not the first pass of the
+        // drain. Asked before `recordFailure` builds the failure, because the
+        // escalation decides the wording of the message that call is given — see
+        // [firstOccurrenceOf] for why the rule lives in one place rather than
+        // being restated here.
+        val failingSince = drain.failure.firstOccurrenceOf(reason, now)
+        val failingFor = JavaDuration.between(failingSince, now).toKotlinDuration()
         val needsAttention =
             escalates(
-                startedAt = drain.startedAt,
+                failingSince = failingSince,
                 failureClass = failureClass,
                 now = now,
                 after = attentionAfter,
@@ -910,8 +919,13 @@ internal class DrainController(
                 }
 
                 needsAttention -> {
-                    "this drain has been unable to finish for ${stuckFor.inWholeMinutes} minutes and is not " +
-                        "going to fix itself. The server keeps running and the loop keeps trying. $message"
+                    // "failing for", not "unable to finish for". The number is the
+                    // age of this *failure*, and a drain that spent four hours
+                    // legitimately waiting for players to log off has not been
+                    // unable to finish for four hours — it was doing the right
+                    // thing, and only the last few minutes are news.
+                    "this drain has been failing for ${failingFor.inWholeMinutes} minutes and is not going to " +
+                        "fix itself. The server keeps running and the loop keeps trying. $message"
                 }
 
                 else -> {
@@ -929,7 +943,7 @@ internal class DrainController(
         } else if (needsAttention) {
             logRetryableEscalation(
                 server = server,
-                stuckFor = stuckFor,
+                failingFor = failingFor,
                 attempts = failure.attempts,
                 detail = message,
             )
@@ -993,15 +1007,15 @@ internal class DrainController(
     /** The other half. See [logPermanentEscalation] for why the parameters are typed. */
     private fun logRetryableEscalation(
         server: ResourceName,
-        stuckFor: Duration,
+        failingFor: Duration,
         attempts: Int,
         detail: String,
     ) {
         LOG.error(
-            "server={} has been unable to finish a drain for {} minutes ({} attempts); it keeps running and " +
-                "the loop keeps trying, but this needs a human: {}",
+            "server={} has had a drain failing for {} minutes ({} attempts); it keeps running and the loop " +
+                "keeps trying, but this needs a human: {}",
             server,
-            stuckFor.inWholeMinutes,
+            failingFor.inWholeMinutes,
             attempts,
             detail,
         )
@@ -1104,16 +1118,33 @@ internal class DrainController(
  * That over-claim was removed from the operator-facing message and from
  * `StatusDrafting`, and it is not restated here — this is the sentence somebody
  * would otherwise copy back into one.
+ *
+ * ## [failingSince] is the failure's own first occurrence, on both arms
+ *
+ * It used to be `DrainStatus.startedAt` on the drain arm and
+ * `FailureStatus.occurredAt` on the pass arm, and the two answered different
+ * questions. A drain that is *blocked* — players online, which is the protocol
+ * working — records no failure and sits in `DRAIN_FAILED` for as long as people
+ * are playing, while `startedAt` never resets. So one retryable hiccup after a
+ * four-hour block was already past the threshold and escalated on the pass that
+ * recorded it, telling an operator the drain had been "unable to finish for 240
+ * minutes" about something that had gone wrong a second earlier. That is the
+ * alarm-fatigue outcome, reached by the back door.
+ *
+ * The anchor is therefore the instant this *failure* was first recorded, carried
+ * forward by `recordFailure` while the same reason keeps recurring and reset when
+ * a different one takes over. One arm, one anchor, one question: **how long has
+ * this problem been true.**
  */
 internal fun escalates(
-    startedAt: Instant,
+    failingSince: Instant,
     failureClass: FailureClass,
     now: Instant,
     after: Duration,
 ): Boolean =
     when (failureClass) {
         FailureClass.PERMANENT -> true
-        FailureClass.RETRYABLE -> JavaDuration.between(startedAt, now).toKotlinDuration() >= after
+        FailureClass.RETRYABLE -> JavaDuration.between(failingSince, now).toKotlinDuration() >= after
     }
 
 /**
@@ -1152,7 +1183,20 @@ internal fun DrainStatus.escalated(
 ): Boolean =
     failure?.let {
         escalates(
-            startedAt = startedAt,
+            // The **failure's** first occurrence, never [startedAt]. A drain can
+            // sit blocked for a whole play session with nothing wrong with it —
+            // that is the designed behaviour — and `startedAt` never resets, so
+            // anchoring here would mean the first retryable hiccup after a
+            // four-hour block escalated on the pass that recorded it, reporting
+            // "unable to finish for 240 minutes" about something that had been
+            // wrong for one second. That is the alarm-fatigue outcome the
+            // threshold exists to prevent, reached by the back door; the pass arm
+            // in [deriveConditions] was built to avoid exactly it and the drain
+            // arm now matches. `occurredAt` is carried forward by `recordFailure`
+            // while the same reason keeps recurring, so it still measures *how
+            // long this problem has been true* rather than how long ago the loop
+            // last looked.
+            failingSince = it.occurredAt,
             failureClass = it.failureClass,
             now = now,
             after = after,

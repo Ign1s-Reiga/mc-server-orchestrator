@@ -273,6 +273,10 @@ internal class AttentionTest {
             attention shouldContain "its drain is not advancing"
             // The drain has not failed and must not be described as having failed.
             attention shouldNotContain "the drain cannot finish on its own"
+            // Every arm has to say this, and this is the arm where a reader has
+            // the strongest positive reason to believe a stop is coming: they have
+            // just been told a drain exists and is not advancing.
+            attention shouldContain "not being stopped by the orchestrator"
 
             // The condition about the drain still describes the drain.
             status.condition(ConditionType.DRAINING).message shouldNotContain "not recovering on its own"
@@ -366,6 +370,145 @@ internal class AttentionTest {
             attention shouldContain "the drain cannot finish on its own"
             attention shouldNotContain "the loop cannot complete a pass"
             attention shouldNotContain "the loop has stopped acting on this server"
+
+            harness.node.stops.shouldBeEmpty()
+        }
+
+    /**
+     * The one cell of the class matrix where ranking by arm is wrong.
+     *
+     * A `REPLACEMENT` drain failing retryably past the threshold, then a permanent
+     * node failure on the next pass. Both arms escalate. Ranking by arm renders the
+     * drain's sentence — *"The loop keeps retrying and the container keeps
+     * running"* — and on the very next pass
+     * `Reconciler.Pass.isBlockedByPermanentFailure` returns before anything is
+     * observed and gates this server off for good.
+     *
+     * The pager quotes this condition rather than `:api`'s `detail()`, so that
+     * sentence is what an operator acts on, and it tells them to wait for a loop
+     * that has stopped. The remaining three cells still rank by arm.
+     */
+    @Test
+    fun `a retryable drain failure does not outrank a permanent pass failure`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+
+            // A definition edit that needs the container recreated: the drain that
+            // applies it is a REPLACEMENT, not a delete.
+            harness.store.putDefinition(paperDefinition(maxPlayers = 40))
+            // The exec channel is down, so the drain cannot confirm zero players
+            // and aborts *retryably* — the container is left running, correctly.
+            harness.node.failAlways(NodeOperation.EXEC, harness.node.unreachable(NodeOperation.EXEC))
+            repeat(3) { harness.pass(name) }
+            harness.clock.advance(20.minutes)
+            harness.pass(name)
+
+            val stuck = harness.status(name).shouldNotBeNull()
+            stuck.drain
+                .shouldNotBeNull()
+                .failure
+                .shouldNotBeNull()
+                .failureClass shouldBe FailureClass.RETRYABLE
+            // The premise: on its own, the drain arm is escalated and says so.
+            stuck.attention().status shouldBe ConditionStatus.TRUE
+            stuck.attention().message shouldContain "The loop keeps retrying"
+
+            // Now the node refuses permanently. The observation never happens, so
+            // the drain record is carried forward untouched beside a permanent
+            // failure recorded on the pass.
+            harness.node.failAlways(NodeOperation.OBSERVE, harness.node.rejected(NodeOperation.OBSERVE))
+            harness.pass(name).shouldBeInstanceOf<ReconcileOutcome.Failed>()
+
+            val status = harness.status(name).shouldNotBeNull()
+            status.drain
+                .shouldNotBeNull()
+                .failure
+                .shouldNotBeNull()
+                .failureClass shouldBe FailureClass.RETRYABLE
+            status.failure.shouldNotBeNull().failureClass shouldBe FailureClass.PERMANENT
+            status.attention().status shouldBe ConditionStatus.TRUE
+
+            val attention = status.attention().message
+            // The sentence that would send somebody away to wait.
+            attention shouldNotContain "The loop keeps retrying"
+            attention shouldContain "Nothing further will be attempted"
+            attention shouldContain "not being stopped by the orchestrator"
+
+            // The next pass is the one that proves the wording matters: the gate
+            // returns before anything is observed, so this status is the last one
+            // this server will ever have.
+            val calls = harness.node.calls.size
+            harness.pass(name).shouldBeInstanceOf<ReconcileOutcome.Failed>()
+            harness.node.calls shouldHaveSize calls
+            harness.node.stops.shouldBeEmpty()
+        }
+
+    /**
+     * The drain arm's own anchor, which is the same defect one level down.
+     *
+     * `DrainStatus.startedAt` never resets, and a drain sitting blocked for a whole
+     * play session is the protocol working. So a drain arm anchored on it reports
+     * the first retryable hiccup after four hours of healthy waiting as *"unable to
+     * finish for 240 minutes"*, on the pass that records it — the same alarm
+     * fatigue the pass arm was already corrected for.
+     *
+     * The threshold still fires. It fires from when this *failure* started.
+     */
+    @Test
+    fun `a drain failure after a long healthy block is not flagged by the drain's age`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.node.online = 3
+            harness.store.deleteDefinition(name)
+            // requested -> sealed -> blocked on players. Nothing is wrong.
+            repeat(3) { harness.pass(name) }
+            harness.clock.advance(4.hours)
+            harness.pass(name)
+
+            val blocked = harness.status(name).shouldNotBeNull()
+            blocked.drain
+                .shouldNotBeNull()
+                .blocked
+                .shouldNotBeNull()
+            blocked.drain?.failure shouldBe null
+            blocked.attention().status shouldBe ConditionStatus.FALSE
+            // The premise, asserted rather than assumed.
+            JavaDuration
+                .between(blocked.drain.shouldNotBeNull().startedAt, harness.clock.instant())
+                .toKotlinDuration()
+                .let { it > 1.hours }
+                .shouldBeTrue()
+
+            // Now something actually goes wrong, retryably: the probe channel dies,
+            // so zero players cannot be confirmed and the drain aborts.
+            harness.node.failAlways(NodeOperation.EXEC, harness.node.unreachable(NodeOperation.EXEC))
+            harness.pass(name).shouldBeInstanceOf<ReconcileOutcome.Retry>()
+
+            val fresh = harness.status(name).shouldNotBeNull()
+            fresh.drain
+                .shouldNotBeNull()
+                .failure
+                .shouldNotBeNull()
+                .failureClass shouldBe FailureClass.RETRYABLE
+            fresh.attention().status shouldBe ConditionStatus.FALSE
+            fresh.condition(ConditionType.DRAINING).message shouldNotContain "not recovering on its own"
+
+            // And it still escalates, from its own first occurrence.
+            harness.clock.advance(16.minutes)
+            harness.pass(name).shouldBeInstanceOf<ReconcileOutcome.Retry>()
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .attention()
+                .status shouldBe ConditionStatus.TRUE
 
             harness.node.stops.shouldBeEmpty()
         }

@@ -359,9 +359,8 @@ public class Reconciler(
             WorkloadObservation.Absent -> {
                 val created = node.ensureWorkload(pass.desired)
                 LOG.info(
-                    "created workload for server={} node={} sandbox={} container={}",
-                    pass.name,
-                    node.name,
+                    "created workload for {} sandbox={} container={}",
+                    WorkloadRef(pass.name, node.name),
                     created.handle.sandboxId,
                     created.handle.containerId,
                 )
@@ -446,9 +445,8 @@ public class Reconciler(
                         // is going to bring it back without a human. Permanent by
                         // construction, so unconditional.
                         LOG.error(
-                            "server={} node={} is down and nothing will restart it: {}",
-                            pass.name,
-                            node.name,
+                            "{} is down and nothing will restart it: {}",
+                            WorkloadRef(pass.name, node.name),
                             message,
                         )
                         write(pass, status(ServerPhase.STOPPED, failure)) { ReconcileOutcome.Failed(message) }
@@ -620,9 +618,8 @@ public class Reconciler(
         val availability = node.ensureImage(pass.definition.spec.image)
         if (availability.pulled) {
             LOG.info(
-                "pulled image for server={} node={} image={}",
-                pass.name,
-                node.name,
+                "pulled image for {} image={}",
+                WorkloadRef(pass.name, node.name),
                 pass.definition.spec.image.canonical,
             )
         }
@@ -854,9 +851,8 @@ public class Reconciler(
                 // players". Without it the drain refuses to touch the sandbox
                 // again and the delete never completes.
                 LOG.warn(
-                    "workload for server={} on node={} is partly removed: {}",
-                    pass.name,
-                    node.name,
+                    "workload for {} is partly removed: {}",
+                    WorkloadRef(pass.name, node.name),
                     removal.detail,
                 )
                 val partial =
@@ -866,9 +862,8 @@ public class Reconciler(
                 return write(pass, partial) { ReconcileOutcome.Retry(removal.detail) }
             }
             LOG.info(
-                "removed workload for server={} node={}; persistent storage is untouched",
-                pass.name,
-                node.name,
+                "removed workload for {}; persistent storage is untouched",
+                WorkloadRef(pass.name, node.name),
             )
             return write(pass, status) { ReconcileOutcome.Progressed("workload removed") }
         }

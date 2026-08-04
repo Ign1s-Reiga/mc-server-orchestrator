@@ -189,6 +189,25 @@ class DisplayConformanceTest {
                 display["drainState"] shouldBe "DRAIN_FAILED"
                 display["needsAttention"] shouldBe true
 
+                // The identity this case exists to guard, asserted in the
+                // direction that can actually break.
+                //
+                // `Reconciler.drain` writes `status.failure = progress.drain.failure`
+                // as a *copy*, and three consumers discriminate "this failure is the
+                // drain's own" by comparing the two values. `:api`'s `detail()` is
+                // one of them: it ranks a *pass* failure above the drain's, so the
+                // moment that assignment becomes a `?.copy(...)` the two stop being
+                // equal, every aborted drain routes through the pass arm, and this
+                // sentence silently becomes "the loop cannot complete a pass". Every
+                // other assertion above still passes — `needsAttention` is true
+                // either way, the badge is unchanged, and the phase is unchanged.
+                //
+                // `DrainBlockRenderingTest` asserts the negative half against a
+                // hand-built status (`shouldNotContain` on a blocked drain), which
+                // cannot see this: it never runs `Reconciler`, so it cannot observe
+                // the assignment that makes the positive half true.
+                (display["detail"] as String) shouldContain "the drain aborted"
+
                 assertPermanentFailureIsFlagged(api.status("stuck-01"), display)
                 assertNothingIsSilentlyStuck(display)
             }

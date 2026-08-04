@@ -27,7 +27,7 @@ internal fun recordFailure(
             reason = reason,
             failureClass = failureClass,
             message = message,
-            occurredAt = previous.occurredAt,
+            occurredAt = previous.firstOccurrenceOf(reason, now),
             attempts = previous.attempts + 1,
         )
     } else {
@@ -39,6 +39,23 @@ internal fun recordFailure(
             attempts = 1,
         )
     }
+
+/**
+ * When the failure a pass is *about to record* first occurred.
+ *
+ * The same carry-forward rule [recordFailure] applies, pulled out so a caller can
+ * ask it **before** the failure exists. [DrainController.abort] needs exactly
+ * that: the escalation threshold is measured from this instant, and the escalation
+ * decides the wording of the message that `recordFailure` is then given. Deriving
+ * it twice is how the anchor and the count come to disagree about the same event.
+ *
+ * A different [reason] starts over, because it is a different problem — the same
+ * discrimination `recordFailure` makes for [FailureStatus.attempts].
+ */
+internal fun FailureStatus?.firstOccurrenceOf(
+    reason: FailureReason,
+    now: Instant,
+): Instant = if (this != null && this.reason == reason) occurredAt else now
 
 /**
  * The same bookkeeping for a drain that is blocked rather than failing.
