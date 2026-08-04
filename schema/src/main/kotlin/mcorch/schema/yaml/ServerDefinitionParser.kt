@@ -153,6 +153,7 @@ public object ServerDefinitionParser {
             SchemaVersion.V1ALPHA1 -> {
                 when (kind) {
                     ServerKind.PAPER_SERVER -> PaperServerReader(sink).read(apiVersion, resolvedMetadata, specNode)
+                    ServerKind.VELOCITY_PROXY -> VelocityProxyReader(sink).read(apiVersion, resolvedMetadata, specNode)
                 }
             }
         }

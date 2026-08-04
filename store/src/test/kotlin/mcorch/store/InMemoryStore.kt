@@ -7,6 +7,7 @@ import mcorch.schema.PaperServerStatus
 import mcorch.schema.ResourceName
 import mcorch.schema.ServerDefinition
 import mcorch.schema.ServerStatus
+import mcorch.schema.VelocityProxyStatus
 import java.time.Clock
 import java.time.Instant
 
@@ -226,6 +227,7 @@ internal class InMemoryStore(
     private fun drainStateOf(status: ServerStatus): DrainState? =
         when (status) {
             is PaperServerStatus -> status.drain?.state
+            is VelocityProxyStatus -> status.drain?.state
         }
 
     private fun checkPrecondition(

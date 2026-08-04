@@ -20,6 +20,7 @@ import mcorch.schema.ServerPhase
 import mcorch.schema.ServerStatus
 import mcorch.schema.StatusCondition
 import mcorch.schema.StorageStatus
+import mcorch.schema.VelocityProxyStatus
 
 /**
  * Encodes and decodes observed state.
@@ -42,6 +43,7 @@ internal object StatusCodec {
         val writer = DocumentWriter()
         when (status) {
             is PaperServerStatus -> writePaperStatus(writer, status)
+            is VelocityProxyStatus -> throw notYetPersisted(ServerKind.VELOCITY_PROXY)
         }
         return writer.render()
     }
@@ -56,6 +58,7 @@ internal object StatusCodec {
         val reader = PropertyDocument.parse(encoded, what)
         return when (kind) {
             ServerKind.PAPER_SERVER -> readPaperStatus(name, apiVersion, reader, what)
+            ServerKind.VELOCITY_PROXY -> throw notYetPersisted(ServerKind.VELOCITY_PROXY)
         }
     }
 
@@ -63,6 +66,7 @@ internal object StatusCodec {
     fun drainStateOf(status: ServerStatus): DrainState? =
         when (status) {
             is PaperServerStatus -> status.drain?.state
+            is VelocityProxyStatus -> status.drain?.state
         }
 
     // ------------------------------------------------------------------ PaperServer

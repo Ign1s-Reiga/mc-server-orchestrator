@@ -87,45 +87,6 @@ public object JvmHeapPolicy {
     }
 }
 
-/**
- * Cross-field rules that would lose data if they were only checked at parse
- * time. They are stated once and enforced twice: the parser reports them as
- * violations (so they aggregate with everything else), and the constructors
- * refuse to build an object that breaks them (so no other module can invent
- * one).
- */
-internal object SpecInvariants {
-    fun heapProblem(
-        heapMax: MemoryQuantity,
-        containerMemory: MemoryQuantity,
-    ): String? {
-        val allowed = JvmHeapPolicy.maxAllowedHeap(containerMemory)
-        return if (heapMax <= allowed) {
-            null
-        } else {
-            "must leave headroom below the container memory limit: with " +
-                "spec.resources.memory=${containerMemory.render()} the largest heap is " +
-                "${allowed.render()}, found ${heapMax.render()}. A heap sized at the container limit is " +
-                "OOM-killed mid-tick with the world unsaved"
-        }
-    }
-
-    fun stopGraceProblem(
-        stopGracePeriod: Duration,
-        saveTimeout: Duration,
-    ): String? {
-        val minimum = saveTimeout + PaperServerDefaults.MIN_STOP_GRACE_MARGIN
-        return if (stopGracePeriod >= minimum) {
-            null
-        } else {
-            "must exceed spec.lifecycle.drain.saveTimeout (${DurationFormat.render(saveTimeout)}) by at least " +
-                "${DurationFormat.render(PaperServerDefaults.MIN_STOP_GRACE_MARGIN)}, so at least " +
-                "${DurationFormat.render(minimum)}, found ${DurationFormat.render(stopGracePeriod)}. " +
-                "A grace period shorter than the save timeout kills the container part-way through the save"
-        }
-    }
-}
-
 /** Which Paper build to run. The image supplies the launcher; this pins what it launches. */
 public data class PaperVersionSpec(
     val minecraftVersion: MinecraftVersion,
@@ -326,6 +287,13 @@ public data class PaperServerSpec(
     val lifecycle: LifecycleSpec = LifecycleSpec(),
     val placement: PlacementSpec = PlacementSpec(),
 ) : ServerSpec {
+    /**
+     * Persistent storage is the whole question: an ephemeral lobby has nothing
+     * to flush, a persistent server has a world in it. Derived rather than
+     * declared so the two cannot be set to disagree.
+     */
+    override val holdsWorldData: Boolean get() = storage is StorageSpec.Persistent
+
     init {
         require(eulaAccepted) {
             "eulaAccepted must be true: a Paper server refuses to start until the Minecraft EULA is accepted"

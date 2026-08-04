@@ -115,7 +115,7 @@ internal class PaperServerReader(
         val enabled = reader.boolean("enabled", default = false) ?: false
         val port = reader.port("port", default = PaperServerDefaults.RCON_PORT) ?: PaperServerDefaults.RCON_PORT
         val secretDeclared = reader.isPresent("passwordSecret")
-        val secret = reader.mapping("passwordSecret")?.let(::readSecretRef)
+        val secret = reader.secretRef("passwordSecret")
         reader.done()
 
         if (!enabled) return RconSpec.Disabled
@@ -134,16 +134,6 @@ internal class PaperServerReader(
             return RconSpec.Disabled
         }
         return RconSpec.Enabled(port = port, passwordSecret = secret)
-    }
-
-    private fun readSecretRef(reader: MappingReader): SecretRef? {
-        val name = reader.value("name", required = true, parse = ResourceName::of)
-        val key = reader.string("key", required = true)
-        if (key != null) {
-            SecretRef.keyProblem(key)?.let { reader.violation("key", it) }
-        }
-        reader.done()
-        return SecretRef(name ?: return null, key ?: return null)
     }
 
     private fun readResources(reader: MappingReader): ResourceSpec? {

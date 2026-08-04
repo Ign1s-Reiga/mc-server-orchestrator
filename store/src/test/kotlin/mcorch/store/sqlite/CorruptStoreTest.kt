@@ -238,13 +238,13 @@ class CorruptStoreTest {
      * A stored failure whose reason and class contradict each other is refused
      * rather than loaded.
      *
-     * `FailureStatus` refuses a permanent `DRAIN_NO_DESTINATION`: it means
-     * players are online, which resolves itself when they log off, and
-     * classifying it permanent would be a wedged drain that the attention
-     * condition also deliberately never flags. No code path writes that pair, so
-     * a row holding it was edited by hand — and this pins that the constructor
-     * invariant really does run on the way *in* from disk, not only in memory.
-     * The escalation's correctness now rests on that.
+     * `FailureStatus` refuses a permanent `DRAIN_NO_DESTINATION`: it means no
+     * server in the fleet had capacity, which is not a property of this server
+     * and resolves without anything about this server changing, so `PERMANENT` —
+     * *stop trying* — would wedge a drain the next pass could finish. No code
+     * path writes that pair, so a row holding it was edited by hand — and this
+     * pins that the constructor invariant really does run on the way *in* from
+     * disk, not only in memory. The escalation's correctness now rests on that.
      *
      * Refused, and never coerced: the contradiction is not repaired into a
      * `RETRYABLE` on the way through, which would be the first place in this
@@ -282,7 +282,7 @@ class CorruptStoreTest {
                 bad.status.shouldBeNull()
                 val unreadable = bad.unreadable.shouldNotBeNull()
                 unreadable.retryable shouldBe false
-                unreadable.reason shouldContain "resolves itself when they log off"
+                unreadable.reason shouldContain "is always RETRYABLE"
 
                 // The point read says the same thing, as a permanent failure.
                 val failure =
@@ -290,7 +290,7 @@ class CorruptStoreTest {
                         .exceptionOrNull()
                         .shouldBeInstanceOf<StoreException.Corrupt>()
                 failure.retryable shouldBe false
-                failure.message.shouldNotBeNull() shouldContain "resolves itself when they log off"
+                failure.message.shouldNotBeNull() shouldContain "is always RETRYABLE"
 
                 // And it cost exactly the one server: the other still loads.
                 store.state

@@ -1,0 +1,24 @@
+# Expected: spec.control.port — must differ from spec.network.port
+#
+# The control endpoint would otherwise share a listener with the port players
+# connect to.
+apiVersion: mcorch.dev/v1alpha1
+kind: VelocityProxy
+metadata:
+  name: proxy-01
+spec:
+  image: docker.io/itzg/mc-proxy:2026.6.1
+  resources:
+    memory: 1Gi
+  network:
+    port: 25577
+  control:
+    port: 25577
+  forwarding:
+    secret:
+      name: fleet-forwarding
+      key: modern-forwarding
+  backends:
+    selector:
+      matchLabels:
+        mcorch.dev/fleet: main

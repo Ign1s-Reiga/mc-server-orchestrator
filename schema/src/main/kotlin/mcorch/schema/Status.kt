@@ -78,7 +78,14 @@ public enum class FailureClass {
     PERMANENT,
 }
 
-/** Closed set of failure causes, so the API and the dashboard can key off them. */
+/**
+ * Closed set of failure causes, so the API and the dashboard can key off them.
+ *
+ * Closed, but not fixed: values are appended as kinds arrive, and `:api` serves
+ * the current set through `/meta` so a dashboard can render one it has not been
+ * taught. Removing or renaming a value is the breaking direction and needs a
+ * migration for stored rows.
+ */
 public enum class FailureReason {
     IMAGE_PULL_FAILED,
     IMAGE_REFERENCE_REJECTED,
@@ -90,10 +97,53 @@ public enum class FailureReason {
     VOLUME_UNAVAILABLE,
     NODE_UNAVAILABLE,
     RUNTIME_UNREACHABLE,
+
+    /**
+     * A destination was sought for this server's players and no server in the
+     * fleet had capacity for them.
+     *
+     * This is step 3 of the drain protocol failing on its own terms: the search
+     * ran and came back empty. It does **not** resolve itself — it needs an
+     * operator to add capacity or start a server — so it escalates like any other
+     * retryable drain failure once it has been true for long enough. It used to
+     * cover [DRAIN_AWAITING_ZERO_PLAYERS] as well, and inherited that reason's
+     * exemption from escalation; the pair are opposite news and are now opposite
+     * values.
+     */
     DRAIN_NO_DESTINATION,
+
+    /**
+     * The drain has nowhere to send anybody and is waiting for the players on
+     * this server to log off by themselves.
+     *
+     * There is no counterparty to transfer to: a standalone Paper server with no
+     * proxy in front of it, or the proxy's own drain, since a fleet has one front
+     * door. The protocol does not kick players to make progress, so the only
+     * correct behaviour is to keep the container running and keep looking.
+     *
+     * **This is the one reason that is never escalated.** It resolves itself
+     * when the last player logs off, and an attention flag that fires every
+     * backoff interval on a busy evening is one operators learn to ignore —
+     * which costs them the flag for the failures that do need a person. That
+     * exemption is only defensible because the state is transient, which is why
+     * it is also one of the reasons that may not be classified
+     * [FailureClass.PERMANENT]; see [FailureStatus].
+     */
+    DRAIN_AWAITING_ZERO_PLAYERS,
+
     DRAIN_TRANSFER_FAILED,
     DRAIN_SAVE_TIMEOUT,
     DRAIN_STALLED,
+
+    /** The Velocity plugin's control endpoint did not answer, so no backend can be sealed or deregistered. */
+    PROXY_CONTROL_UNREACHABLE,
+
+    /** The plugin speaks a control protocol this build of `:core` does not. See [ControlEndpointSpec]. */
+    PROXY_PLUGIN_INCOMPATIBLE,
+
+    /** The secret store could not supply [ForwardingSpec.secret], so no backend can be brought up. */
+    FORWARDING_SECRET_UNAVAILABLE,
+
     UNKNOWN,
 }
 
@@ -101,32 +151,46 @@ public enum class FailureReason {
  * A classified failure. [message] is operator-facing detail — it must not
  * contain player names, UUIDs or addresses.
  *
- * ## Why one pair is refused
+ * ## Why two reasons may not be permanent
  *
- * [FailureReason.DRAIN_NO_DESTINATION] means people are playing on a server that
- * was asked to go away. That is the drain protocol working as designed, and it
- * is the one failure the escalation deliberately never raises
- * [ConditionType.NEEDS_ATTENTION] for — an alarm that fires on a busy evening
- * every backoff interval is an alarm operators learn to ignore.
+ * [ALWAYS_RETRYABLE] holds the reasons a call site may not classify
+ * [FailureClass.PERMANENT]. `PERMANENT` is not a severity, it is an instruction:
+ * *stop trying*. For these two there is no version of stopping that is safer
+ * than continuing, because continuing costs a backoff interval and the container
+ * stays up either way.
  *
- * That suppression is only defensible because the condition **resolves itself
- * when they log off**, which is to say because it is retryable. Classified
- * `PERMANENT` it would become a wedged, unretried drain that is also never
- * flagged: silently the worst of both, and precisely the state the escalation
- * exists to surface. Until now nothing stopped a call site pairing them; it was
- * a convention held up by two call sites happening to agree, and a third would
- * have disabled the alarm without failing a test.
+ * - [FailureReason.DRAIN_NO_DESTINATION] — no server in the fleet had capacity.
+ *   Fleet capacity is not a property of this server and not a fixed one: it
+ *   returns when a player logs off somewhere else, when a scale-up lands, when an
+ *   operator starts a lobby. A permanent classification freezes a drain that the
+ *   next pass could have finished, and freezes it in the one state where the
+ *   container must keep running — so the cost of being wrong is unbounded and the
+ *   saving is one search per interval. (This reason *does* escalate: it needs a
+ *   person, it just does not need the loop to give up. The two are different
+ *   questions and are answered in different places.)
+ * - [FailureReason.DRAIN_AWAITING_ZERO_PLAYERS] — waiting for the last player to
+ *   leave. This one is additionally the reason the escalation never fires on, and
+ *   that exemption is only defensible while the state is transient. Classified
+ *   `PERMANENT` it would be a wedged, unretried drain that is also never
+ *   flagged: silently the worst of both, and precisely the state the escalation
+ *   exists to surface.
  *
- * So the pair is refused here, where the two fields meet, rather than guarded at
- * each site that builds one. It also makes the ordering inside
- * `mcorch.core.escalates` stop mattering: the case it is careful to exclude
- * before looking at the class can no longer be constructed.
+ * The pair is refused here, where the two fields meet, rather than guarded at
+ * each site that builds one — it was previously a convention held up by two call
+ * sites happening to agree, and a third would have broken it without failing a
+ * test. Call sites should still pass [FailureClass.RETRYABLE] as a literal
+ * rather than a computed value, so the check stays a backstop rather than the
+ * only thing deciding.
  *
- * This runs on decode as well as construction — `mcorch.store` rebuilds statuses
- * through their constructors on purpose — so a stored row carrying the pair is
- * reported as a corrupt row rather than loaded. That is the intended answer: no
- * code path writes one, so a row that has it was edited by hand, and a drain
- * decision taken on hand-edited state is worse than a loud refusal.
+ * It is one `require` over a set rather than one per reason on purpose. This
+ * runs on decode as well as construction — `mcorch.store` rebuilds statuses
+ * through their constructors — so every check here is paid by the widest read in
+ * the system, and a second one is a second way for a fleet read to abort.
+ *
+ * A stored row carrying a refused pair is reported as a corrupt row rather than
+ * loaded. That is the intended answer: no code path writes one, so a row that
+ * has it was edited by hand, and a drain decision taken on hand-edited state is
+ * worse than a loud refusal.
  */
 public data class FailureStatus(
     val reason: FailureReason,
@@ -136,12 +200,20 @@ public data class FailureStatus(
     val attempts: Int = 1,
 ) {
     init {
-        require(reason != FailureReason.DRAIN_NO_DESTINATION || failureClass == FailureClass.RETRYABLE) {
-            "a ${FailureReason.DRAIN_NO_DESTINATION} failure is always ${FailureClass.RETRYABLE}: it means " +
-                "players are online, which resolves itself when they log off. Classifying it " +
-                "${FailureClass.PERMANENT} would wedge the drain and suppress the attention condition at the " +
-                "same time"
+        require(failureClass == FailureClass.RETRYABLE || reason !in ALWAYS_RETRYABLE) {
+            "a $reason failure is always ${FailureClass.RETRYABLE}: what it is blocked on is not a property of " +
+                "this server and resolves without anything about this server changing. Classifying it " +
+                "${FailureClass.PERMANENT} would stop the loop retrying a drain the next pass could finish"
         }
+    }
+
+    public companion object {
+        /** Reasons that may only ever be [FailureClass.RETRYABLE]. See the note above. */
+        public val ALWAYS_RETRYABLE: Set<FailureReason> =
+            setOf(
+                FailureReason.DRAIN_NO_DESTINATION,
+                FailureReason.DRAIN_AWAITING_ZERO_PLAYERS,
+            )
     }
 }
 
@@ -292,6 +364,28 @@ public enum class ConditionType {
     WORLD_SAVED,
 
     /**
+     * The proxy's backend selector resolved to at least one registered backend.
+     *
+     * `False` is not a failure — the proxy is running and an operator may simply
+     * not have labelled a server yet — but it is the answer to "why can nobody
+     * join". A selector that matches nothing cannot be caught at parse time: it
+     * is checked against definitions the parse never sees. This is where it
+     * surfaces instead. See [BackendsSpec].
+     */
+    BACKENDS_RESOLVED,
+
+    /**
+     * The shipped Velocity plugin answered, and speaks a control protocol this
+     * build understands.
+     *
+     * `False` means seal, transfer and deregister are unavailable, which means
+     * no backend behind this proxy can complete a drain. See
+     * [ControlEndpointSpec] for why the protocol version is observed here rather
+     * than pinned in the spec.
+     */
+    CONTROL_ENDPOINT_READY,
+
+    /**
      * This server is not going to fix itself and a human has to look at it.
      *
      * A condition rather than a [FailureReason] on purpose. A reason answers
@@ -308,9 +402,12 @@ public enum class ConditionType {
      * stop a Minecraft server (`failure-modes.md` item 7).
      *
      * Set today only by a drain that has been failing retryably for longer than
-     * `ReconcilerConfig.drainAttentionAfter`, and never by one blocked on
-     * players being online — that is the protocol working, and an escalation
-     * that fires on a busy evening teaches operators to ignore the signal. The
+     * `ReconcilerConfig.drainAttentionAfter`, and never by one whose reason is
+     * [FailureReason.DRAIN_AWAITING_ZERO_PLAYERS] — that is the protocol working,
+     * and an escalation that fires on a busy evening teaches operators to ignore
+     * the signal. That exemption belongs to that reason alone: a
+     * [FailureReason.DRAIN_NO_DESTINATION] is a drain sitting blocked until
+     * somebody adds capacity, which is exactly what this flag is for. The
      * name is deliberately general: a permanently failed bring-up is the obvious
      * next thing to raise it, and doing so needs no schema change.
      */
@@ -358,6 +455,23 @@ public data class PaperServerStatus(
     /** True while a drain is in flight or has failed — the loop must not "heal" the server back to running. */
     public val draining: Boolean get() = drain != null && drain.state != DrainState.DRAIN_FAILED
 
+    /**
+     * Any drain has been started against this server, including one that
+     * aborted.
+     *
+     * **This, not [draining], is what decides whether a server may receive
+     * another server's players.** [draining] is deliberately false in
+     * [DrainState.DRAIN_FAILED], because the loop must be free to resume a drain
+     * from there — but a server sitting on a retryable abort is a server that
+     * will try to stop again on the next pass. Choosing it as a transfer
+     * destination moves players in and straight back out, and two servers
+     * draining at once can each select the other and neither ever reaches a stop.
+     *
+     * The two properties exist side by side because they answer different
+     * questions and the wrong one is the plausible-looking one.
+     */
+    public val drainInitiated: Boolean get() = drain != null
+
     public companion object {
         /** The status to record the moment a definition is accepted and nothing has been observed yet. */
         public fun pending(
@@ -366,6 +480,159 @@ public data class PaperServerStatus(
             at: Instant,
         ): PaperServerStatus =
             PaperServerStatus(
+                name = name,
+                observedGeneration = observedGeneration,
+                phase = ServerPhase.PENDING,
+                observedAt = at,
+                lastTransitionAt = at,
+            )
+    }
+}
+
+/**
+ * How the proxy currently routes to one backend.
+ *
+ * The four registered values are the drain protocol's own vocabulary, so a
+ * dashboard can show where a backend is without knowing the protocol: [SEALED]
+ * is step 2 and [DEREGISTERED] is step 6, and the gap between them is where the
+ * players are being moved.
+ */
+public enum class BackendRegistration {
+    /** Matches the selector; the proxy has not been told about it yet. */
+    PENDING,
+
+    /** In the routing table and taking new players. */
+    REGISTERED,
+
+    /** In the routing table, taking no new players. Existing players are still connected. Drain step 2. */
+    SEALED,
+
+    /** Removed from the routing table. Drain step 6. */
+    DEREGISTERED,
+
+    /** Matches the selector, but the proxy cannot open a connection to it. */
+    UNREACHABLE,
+}
+
+/**
+ * One backend, as this proxy sees it.
+ *
+ * [server] is a declared object's name. There is no field here for who is
+ * connected to it — [players] is a pair of counts, like everywhere else.
+ */
+public data class BackendStatus(
+    val server: ResourceName,
+    val registration: BackendRegistration,
+    val players: PlayerOccupancy? = null,
+    /**
+     * The backend carries a drain record of its own, aborted or in flight.
+     *
+     * Mirrored from [PaperServerStatus.drainInitiated] rather than from
+     * `draining`, and for the reason set out there: a backend on a retryable
+     * drain abort reads as not-draining and would otherwise look like a perfectly
+     * good destination for somebody else's players, moments before it tries to
+     * stop again.
+     */
+    val drainInitiated: Boolean = false,
+    val lastTransitionAt: Instant,
+) {
+    /**
+     * Whether this backend may be handed another server's players.
+     *
+     * The whole eligibility rule, in one place, so no caller re-derives it from
+     * [registration] alone and forgets [drainInitiated].
+     */
+    public val eligibleAsDestination: Boolean
+        get() = registration == BackendRegistration.REGISTERED && !drainInitiated
+}
+
+/** What the proxy's selector currently resolves to. Counts and server names only. */
+public data class BackendRoutingStatus(
+    val observedAt: Instant,
+    val backends: List<BackendStatus> = emptyList(),
+) {
+    /** Backends the selector matched, whatever state they are in. */
+    public val matched: Int get() = backends.size
+
+    /** Backends in the routing table, sealed or not. */
+    public val registered: Int
+        get() =
+            backends.count {
+                it.registration == BackendRegistration.REGISTERED || it.registration == BackendRegistration.SEALED
+            }
+
+    /** Backends that may receive a transfer right now. */
+    public val destinations: Int get() = backends.count { it.eligibleAsDestination }
+}
+
+/**
+ * Whether `:core` can reach the shipped Velocity plugin, and whether they speak
+ * the same protocol.
+ *
+ * [pluginApiVersion] is what the endpoint reported, not what anybody declared —
+ * [ControlEndpointSpec] explains why the spec does not pin it. [compatible] is
+ * this build's verdict on that report, kept as its own field so a dashboard can
+ * tell "did not answer" from "answered, wrong version": the remedies are
+ * different and only one of them is "upgrade the proxy image".
+ */
+public data class ControlEndpointStatus(
+    val reachable: Boolean,
+    val pluginApiVersion: String? = null,
+    val compatible: Boolean = false,
+    val lastContactAt: Instant? = null,
+)
+
+/**
+ * Observed state of a [VelocityProxyDefinition].
+ *
+ * It is not a [PaperServerStatus] with fields removed. There is no `storage` —
+ * a proxy holds no world, and a nullable storage block would invite a reader to
+ * conclude "not persistent yet" from an absence. What it has instead is the two
+ * observations only a proxy can make: what it is routing to
+ * ([backends]) and whether the control endpoint the drain protocol depends on is
+ * answering ([control]).
+ *
+ * [drain] is the same [DrainStatus] a server uses, deliberately. The drain state
+ * machine is one machine and a restarted loop has to resume either kind from the
+ * same record. A proxy drain simply never visits [DrainState.SAVING], so
+ * `saveRequestedAt` and `worldSavedAt` stay null on one — an honest gap, not a
+ * placeholder.
+ */
+public data class VelocityProxyStatus(
+    override val name: ResourceName,
+    override val observedGeneration: Long,
+    override val phase: ServerPhase,
+    override val observedAt: Instant,
+    val lastTransitionAt: Instant,
+    /** Accepting player connections. `phase == RUNNING` is necessary but not sufficient. */
+    val ready: Boolean = false,
+    val image: ImageStatus? = null,
+    val runtime: RuntimeIdentity? = null,
+    val endpoint: ServerEndpoint? = null,
+    val players: PlayerOccupancy? = null,
+    val backends: BackendRoutingStatus? = null,
+    val control: ControlEndpointStatus? = null,
+    val drain: DrainStatus? = null,
+    val failure: FailureStatus? = null,
+    val conditions: List<StatusCondition> = emptyList(),
+    override val apiVersion: SchemaVersion = SchemaVersion.CURRENT,
+) : ServerStatus {
+    override val kind: ServerKind get() = ServerKind.VELOCITY_PROXY
+
+    /** True while a drain is in flight or has failed — the loop must not "heal" the proxy back to running. */
+    public val draining: Boolean get() = drain != null && drain.state != DrainState.DRAIN_FAILED
+
+    /** Any drain has been started against this proxy, including one that aborted. See [PaperServerStatus.drainInitiated]. */
+    public val drainInitiated: Boolean get() = drain != null
+
+    public companion object {
+        /** The status to record the moment a definition is accepted and nothing has been observed yet. */
+        public fun pending(
+            name: ResourceName,
+            observedGeneration: Long,
+            at: Instant,
+        ): VelocityProxyStatus =
+            VelocityProxyStatus(
                 name = name,
                 observedGeneration = observedGeneration,
                 phase = ServerPhase.PENDING,

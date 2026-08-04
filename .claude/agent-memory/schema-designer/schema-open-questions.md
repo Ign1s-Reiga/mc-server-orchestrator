@@ -28,6 +28,22 @@ Contentious, flagged for overrule:
 - **`drain.policy` is an enum with exactly one value** (`waitForZeroPlayers`). It reads oddly but is
   an honest dispatch point for later policies, and it telegraphs that draining is an invariant.
 
+Added 2026-08-04 with `VelocityProxy` (see [[schema-velocity-proxy-decisions]]), same status —
+contentious, flagged for overrule:
+
+- **A proxy cannot be given persistent storage at all.** No plugin-data volume, no config volume. The
+  reason is strong (it is what keeps `holdsWorldData` a compile-time `false`, which is what keeps the
+  proxy stoppable), but an operator wanting a LuckPerms cache to survive a restart has no answer.
+- **The plugin's control-protocol version is not pinnable in the spec.** An operator who wants to run
+  an older proxy image against a newer `:core` cannot express it; they get a `compatible: false`
+  observation instead.
+- **`spec.control.hostPort` forces `spec.control.tokenSecret`.** Defensible, but it means the
+  simplest way to debug a control endpoint from outside the sandbox now requires a secret-store entry.
+- **`spec.backends.fallback` names servers that must *also* match the selector**, and nothing checks
+  that at parse time. A fallback that is not a backend parses and then never routes.
+- **The proxy-side timings are on the proxy, not on the backend.** One slow backend cannot have a
+  longer seal timeout than the rest of the fleet.
+
 Deliberately left out of v1alpha1 (do not assume these exist):
 
 - No free-form `env` map and no `serverProperties` block — an `env` map is precisely how a
@@ -38,5 +54,7 @@ Deliberately left out of v1alpha1 (do not assume these exist):
 - No `nodeSelector` (only an optional `placement.node` pin), no restart policy, no health-probe
   configuration, no cross-definition port or volume-name conflict checking (a single parse only sees
   one input).
-- The proxy-side drain handshake timeouts (seal, destination lookup, deregister) are reconciler
-  constants, not spec fields — they do not vary per server.
+- ~~The proxy-side drain handshake timeouts (seal, destination lookup, deregister) are reconciler
+  constants, not spec fields.~~ **Reversed 2026-08-04**: they are now `spec.backends.drain` on the
+  `VelocityProxy`. The original reasoning ("they do not vary per server") still holds and is exactly
+  why they sit on the proxy rather than on each backend.

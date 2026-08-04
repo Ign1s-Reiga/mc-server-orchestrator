@@ -30,11 +30,19 @@ public enum class SchemaVersion(
     }
 }
 
-/** The declarable kinds. One per server type; the parser dispatches on it. */
+/**
+ * The declarable kinds. One per server type; the parser dispatches on it.
+ *
+ * The wire value is what a document writes and what `:store` keys a stored row
+ * by, so adding an entry cannot disturb rows already on disk — an old row still
+ * decodes through the branch it always did. Removing or renaming one could, and
+ * would be a breaking change with a migration.
+ */
 public enum class ServerKind(
     public val wireValue: String,
 ) {
     PAPER_SERVER("PaperServer"),
+    VELOCITY_PROXY("VelocityProxy"),
     ;
 
     override fun toString(): String = wireValue
@@ -69,8 +77,32 @@ public data class PlacementSpec(
     val node: NodeName? = null,
 )
 
-/** Marker for the per-kind spec bodies, so [ServerDefinition] can stay generic. */
-public sealed interface ServerSpec
+/**
+ * The per-kind spec bodies, so [ServerDefinition] can stay generic.
+ *
+ * It carries exactly one member, and that member is here rather than in `:core`
+ * for a specific reason. [holdsWorldData] decides whether a drain has to confirm
+ * a completed world save before the container may be stopped — CLAUDE.md
+ * invariant 3 — and the safe answer to it is `true`. A kind that forgets to
+ * answer would either be defaulted to `true` and become unstoppable (a proxy has
+ * no save to confirm), or defaulted to `false` and stop with a world in it.
+ * Neither failure is one a reviewer reliably catches, so the question is asked
+ * by the compiler of every kind instead of by a convention in the workload
+ * builder.
+ */
+public sealed interface ServerSpec {
+    /**
+     * Whether a container built from this spec holds world data that must be
+     * flushed before it stops.
+     *
+     * This is what the desired state says. A drain is conducted against the
+     * *container*, which may have been created from an older spec, so `:core`
+     * records this on the workload's labels at create time
+     * (`Labels.WORLD_DATA`) and reads it back from there — it must not re-read
+     * this property to decide whether a running container holds a world.
+     */
+    public val holdsWorldData: Boolean
+}
 
 /**
  * A parsed, fully-defaulted, fully-validated definition. Every optional field

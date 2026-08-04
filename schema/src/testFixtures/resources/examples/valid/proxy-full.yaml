@@ -1,0 +1,66 @@
+# Every field a VelocityProxy accepts in mcorch.dev/v1alpha1, set explicitly.
+apiVersion: mcorch.dev/v1alpha1
+kind: VelocityProxy
+metadata:
+  name: proxy-02
+  labels:
+    tier: edge
+    region: eu-west
+spec:
+  # Pinned by digest. A tag works too, as long as it is not `latest`.
+  image: registry.example.com:5000/mc/velocity@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  maxPlayers: 2000
+  network:
+    # The port players type into their client.
+    port: 25577
+    hostPort: 25565
+  resources:
+    memory: 4Gi
+    cpu: "2000m"
+    heap:
+      max: 2Gi
+      min: 2Gi
+  forwarding:
+    # The only mode this orchestrator will run. `bungeecord` and `none` are
+    # rejected by name rather than left to an operator to get wrong.
+    mode: modern
+    secret:
+      name: fleet-forwarding
+      key: modern-forwarding
+  backends:
+    selector:
+      matchLabels:
+        mcorch.dev/fleet: main
+        tier: survival
+    # Where a player with no server goes, most-preferred first, and the order a
+    # draining backend's players are offered. Naming a server here does not
+    # enrol it — it still has to match the selector above.
+    fallback:
+      - lobby-01
+      - lobby-02
+    # The proxy's part of a *backend's* drain. These were reconciler constants
+    # until a proxy existed to be the counterparty. The transfer timeout is not
+    # here: it scales with the players on one server, so it stays on that
+    # server's spec.lifecycle.drain.playerTransferTimeout.
+    drain:
+      sealTimeout: 15s
+      destinationTimeout: 45s
+      deregisterTimeout: 15s
+  control:
+    # Where :core reaches the shipped Velocity plugin to seal, transfer and
+    # deregister. Unpublished, so no token is needed; set `hostPort` here and
+    # `tokenSecret` stops being optional.
+    port: 8375
+  lifecycle:
+    # Draining the proxy itself. There is nowhere to transfer to — a fleet has
+    # one front door — so it seals its listener and waits for the last player to
+    # log off. There is deliberately no timeout on that wait: the only way to
+    # spell one is "disconnect them".
+    drain:
+      policy: waitForZeroPlayers
+      sealTimeout: 15s
+    stopGracePeriod: 90s
+    startupTimeout: 3m
+  placement:
+    # Optional pin. Omit it and the scheduler chooses.
+    node: node-a

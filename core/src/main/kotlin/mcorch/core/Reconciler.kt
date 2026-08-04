@@ -19,6 +19,7 @@ import mcorch.schema.ServerEndpoint
 import mcorch.schema.ServerPhase
 import mcorch.schema.StorageSpec
 import mcorch.schema.StorageStatus
+import mcorch.schema.VelocityProxyDefinition
 import mcorch.store.ConflictReason
 import mcorch.store.Precondition
 import mcorch.store.Store
@@ -105,7 +106,23 @@ public class Reconciler(
         // Exhaustive on purpose: a new server kind must not compile until the
         // loop has been taught what to do with it.
         return when (val definition = stored.definition.definition) {
-            is PaperServerDefinition -> reconcilePaper(stored, definition)
+            is PaperServerDefinition -> {
+                reconcilePaper(stored, definition)
+            }
+
+            // `VelocityProxy` is declarable and fully validated in `:schema`; the
+            // loop has not been taught it yet. Settling — rather than failing — is
+            // deliberate: a pass that does nothing is trivially idempotent and
+            // creates no container, whereas an outcome that looks like a failure
+            // would put a proxy into backoff for a state that is not the
+            // operator's doing. It also cannot reach here in practice today,
+            // because `:store` refuses to hold the kind at all.
+            is VelocityProxyDefinition -> {
+                ReconcileOutcome.Settled(
+                    "`${definition.metadata.name}` is a ${definition.kind.wireValue}, which this build " +
+                        "validates but does not yet reconcile",
+                )
+            }
         }
     }
 

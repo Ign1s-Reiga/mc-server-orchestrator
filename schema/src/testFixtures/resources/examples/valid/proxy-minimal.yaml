@@ -1,0 +1,33 @@
+# The smallest VelocityProxy that parses.
+#
+# Everything omitted defaults to the safe side: modern forwarding (the only
+# forwarding this orchestrator will run), a control endpoint that is *not*
+# published off the sandbox and therefore needs no token, drain-before-stop
+# waiting for zero players, and a JVM heap sized to leave the container headroom
+# so a proxy cannot be OOM-killed with the whole fleet connected to it.
+#
+# There is no `storage` block and there is no way to ask for one. A proxy holds
+# no world, and a proxy that claimed to would become one the orchestrator could
+# never stop: it has no save to confirm.
+apiVersion: mcorch.dev/v1alpha1
+kind: VelocityProxy
+metadata:
+  name: proxy-01
+spec:
+  image: docker.io/itzg/mc-proxy:2026.6.1
+  resources:
+    memory: 1Gi
+  forwarding:
+    # Coordinates into the secret store. The value never appears in a definition,
+    # and the same reference is what reaches the backends: a PaperServer matching
+    # the selector below is handed this secret by the reconciler, so neither side
+    # carries the material and the backend never names the proxy.
+    secret:
+      name: fleet-forwarding
+      key: modern-forwarding
+  backends:
+    # A PaperServer carrying this label is a backend of this proxy. An empty
+    # selector is rejected: it would enrol the entire fleet.
+    selector:
+      matchLabels:
+        mcorch.dev/fleet: main

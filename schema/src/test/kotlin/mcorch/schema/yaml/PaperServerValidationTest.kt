@@ -10,75 +10,17 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestFactory
 
 /**
- * Every malformed example is rejected, and rejected *for the right field*.
+ * Every malformed `PaperServer` example is rejected, and rejected *for the right
+ * field*, plus the document-level rejections that are not per-kind.
  *
- * A test that only asserts "parsing failed" would pass while the message sends
- * an operator to the wrong line, so each case pins the field path and a
- * distinctive part of the problem text.
+ * The proxy's cases live in [VelocityProxyValidationTest]; `ExampleCoverageTest`
+ * is what makes sure an example added to `invalid/` lands in one of the two
+ * rather than sitting unexercised.
  */
 class PaperServerValidationTest {
-    private data class Case(
-        val file: String,
-        val field: String,
-        val problemContains: String,
-    )
-
-    private val cases =
-        listOf(
-            Case("unknown-field.yaml", "spec.persistance", "unknown field"),
-            Case("inline-secret.yaml", "spec.network.rcon.password", "inline secrets are not supported"),
-            Case("rcon-without-secret.yaml", "spec.network.rcon.passwordSecret", "is required when rcon is enabled"),
-            Case("heap-exceeds-memory.yaml", "spec.resources.heap.max", "must leave headroom"),
-            Case(
-                "grace-below-save-timeout.yaml",
-                "spec.lifecycle.stopGracePeriod",
-                "must exceed spec.lifecycle.drain.saveTimeout",
-            ),
-            Case("port-out-of-range.yaml", "spec.network.port", "must be between 1 and 65535"),
-            Case("rcon-port-conflict.yaml", "spec.network.rcon.port", "must differ from spec.network.port"),
-            Case("image-latest.yaml", "spec.image", "`latest`"),
-            Case("image-unpinned.yaml", "spec.image", "must be pinned to a tag or a digest"),
-            Case("bad-name.yaml", "metadata.name", "must be lowercase"),
-            Case("eula-not-accepted.yaml", "spec.eulaAccepted", "must be true"),
-            Case("ephemeral-with-volume.yaml", "spec.storage.volume", "must not be set when"),
-            Case("missing-required.yaml", "spec.image", "is required"),
-            Case("duplicate-key.yaml", "spec.resources.memory", "is declared more than once"),
-            Case("explicit-null.yaml", "spec.storage", "must not be null"),
-            Case("yaml-1-1-boolean.yaml", "spec.eulaAccepted", "not a boolean"),
-            Case("reserved-mount-path.yaml", "spec.storage.mountPath", "system path"),
-            Case("unknown-api-version.yaml", "apiVersion", "must be one of"),
-            Case("bad-duration.yaml", "spec.lifecycle.drain.saveTimeout", "expected a duration"),
-            Case("memory-too-small.yaml", "spec.resources.memory", "must be at least 1Gi"),
-            Case("many-problems.yaml", "spec.strage", "did you mean `storage`?"),
-        )
-
-    private fun violationsOf(file: String): List<SchemaViolation> {
-        val result = ServerDefinitionParser.parse(Fixtures.load("invalid/$file"), file)
-        return result.shouldBeInstanceOf<ParseResult.Invalid>().violations
-    }
-
     @TestFactory
     fun `each invalid example is rejected with a violation on the offending field`(): List<DynamicTest> =
-        cases.map { case ->
-            DynamicTest.dynamicTest(case.file) {
-                val violations = violationsOf(case.file)
-                val match = violations.singleOrNull { it.field == case.field }
-                requireNotNull(match) {
-                    "expected a violation on `${case.field}`, got: ${violations.map(SchemaViolation::render)}"
-                }
-                if (!match.problem.contains(case.problemContains)) {
-                    throw AssertionError(
-                        "${case.file}: expected the problem on `${case.field}` to mention " +
-                            "\"${case.problemContains}\", got \"${match.problem}\"",
-                    )
-                }
-            }
-        }
-
-    @Test
-    fun `every invalid example is covered by a case`() {
-        Fixtures.names("invalid") shouldContainExactlyInAnyOrder cases.map { it.file }.distinct()
-    }
+        rejectionTests(CASES)
 
     @Test
     fun `violations carry the line they were found on`() {
@@ -137,7 +79,7 @@ class PaperServerValidationTest {
         val yaml =
             """
             apiVersion: mcorch.dev/v1alpha1
-            kind: VelocityProxy
+            kind: BungeeCord
             metadata:
               name: proxy-01
             spec: {}
@@ -146,5 +88,49 @@ class PaperServerValidationTest {
         val violations = ServerDefinitionParser.parse(yaml).shouldBeInstanceOf<ParseResult.Invalid>().violations
         val kindViolation = violations.single { it.field == "kind" }
         kindViolation.problem.contains("`PaperServer`") shouldBe true
+        kindViolation.problem.contains("`VelocityProxy`") shouldBe true
+    }
+
+    internal companion object {
+        val CASES: List<ValidationCase> =
+            listOf(
+                ValidationCase("unknown-field.yaml", "spec.persistance", "unknown field"),
+                ValidationCase(
+                    "inline-secret.yaml",
+                    "spec.network.rcon.password",
+                    "inline secrets are not supported",
+                ),
+                ValidationCase(
+                    "rcon-without-secret.yaml",
+                    "spec.network.rcon.passwordSecret",
+                    "is required when rcon is enabled",
+                ),
+                ValidationCase("heap-exceeds-memory.yaml", "spec.resources.heap.max", "must leave headroom"),
+                ValidationCase(
+                    "grace-below-save-timeout.yaml",
+                    "spec.lifecycle.stopGracePeriod",
+                    "must exceed spec.lifecycle.drain.saveTimeout",
+                ),
+                ValidationCase("port-out-of-range.yaml", "spec.network.port", "must be between 1 and 65535"),
+                ValidationCase(
+                    "rcon-port-conflict.yaml",
+                    "spec.network.rcon.port",
+                    "must differ from spec.network.port",
+                ),
+                ValidationCase("image-latest.yaml", "spec.image", "`latest`"),
+                ValidationCase("image-unpinned.yaml", "spec.image", "must be pinned to a tag or a digest"),
+                ValidationCase("bad-name.yaml", "metadata.name", "must be lowercase"),
+                ValidationCase("eula-not-accepted.yaml", "spec.eulaAccepted", "must be true"),
+                ValidationCase("ephemeral-with-volume.yaml", "spec.storage.volume", "must not be set when"),
+                ValidationCase("missing-required.yaml", "spec.image", "is required"),
+                ValidationCase("duplicate-key.yaml", "spec.resources.memory", "is declared more than once"),
+                ValidationCase("explicit-null.yaml", "spec.storage", "must not be null"),
+                ValidationCase("yaml-1-1-boolean.yaml", "spec.eulaAccepted", "not a boolean"),
+                ValidationCase("reserved-mount-path.yaml", "spec.storage.mountPath", "system path"),
+                ValidationCase("unknown-api-version.yaml", "apiVersion", "must be one of"),
+                ValidationCase("bad-duration.yaml", "spec.lifecycle.drain.saveTimeout", "expected a duration"),
+                ValidationCase("memory-too-small.yaml", "spec.resources.memory", "must be at least 1Gi"),
+                ValidationCase("many-problems.yaml", "spec.strage", "did you mean `storage`?"),
+            )
     }
 }

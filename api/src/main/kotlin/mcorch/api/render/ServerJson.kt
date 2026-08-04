@@ -19,11 +19,15 @@ import mcorch.schema.RuntimeIdentity
 import mcorch.schema.SecretRef
 import mcorch.schema.ServerDefinition
 import mcorch.schema.ServerEndpoint
+import mcorch.schema.ServerKind
 import mcorch.schema.ServerPhase
 import mcorch.schema.ServerStatus
 import mcorch.schema.StatusCondition
 import mcorch.schema.StorageSpec
 import mcorch.schema.StorageStatus
+import mcorch.schema.VelocityProxyDefinition
+import mcorch.schema.VelocityProxyStatus
+import mcorch.store.StoreException
 import mcorch.store.StoredServer
 import mcorch.store.Unreadable
 import mcorch.store.UnreadableServer
@@ -80,7 +84,34 @@ internal object ServerJson {
                     put("spec", spec(definition.spec))
                 }
             }
+
+            is VelocityProxyDefinition -> {
+                throw notYetRendered(definition.kind)
+            }
         }
+
+    /**
+     * A kind this module has not been taught to render.
+     *
+     * `VelocityProxy` is declarable and fully validated in `:schema` and is
+     * neither reconciled nor persisted yet — `:store` refuses to hold one — so
+     * nothing this module reads from the store can currently be one, and these
+     * branches are unreachable rather than merely unimplemented. They exist
+     * because the sealed hierarchies made the compiler ask, and a partial
+     * rendering would be worse than a refusal: this object's contract is that it
+     * emits *every* field of every type, which is what makes "no player identity
+     * and no secret material" checkable instead of promised. A half-rendered
+     * proxy would quietly break that guarantee.
+     *
+     * Raised as a [StoreException.Unsupported] so it travels the path this module
+     * already has for "the store held something this build cannot work with",
+     * rather than as an unhandled 500.
+     */
+    private fun notYetRendered(kind: ServerKind): StoreException =
+        StoreException.Unsupported(
+            "this build cannot render a `${kind.wireValue}`: the kind is declarable and validated, but its " +
+                "API representation has not been implemented yet",
+        )
 
     private fun spec(spec: PaperServerSpec): Json.Obj =
         jsonObject {
@@ -215,6 +246,10 @@ internal object ServerJson {
                     putOrNull("failure", status.failure, ::failure)
                     putArray("conditions", status.conditions, ::condition)
                 }
+            }
+
+            is VelocityProxyStatus -> {
+                throw notYetRendered(status.kind)
             }
         }
 

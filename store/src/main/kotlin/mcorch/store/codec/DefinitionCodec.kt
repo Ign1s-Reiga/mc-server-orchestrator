@@ -25,6 +25,7 @@ import mcorch.schema.ServerKind
 import mcorch.schema.ServerSpec
 import mcorch.schema.StorageMode
 import mcorch.schema.StorageSpec
+import mcorch.schema.VelocityProxySpec
 import mcorch.schema.VolumeSpec
 import mcorch.store.StoreException
 
@@ -67,6 +68,7 @@ internal object DefinitionCodec {
         val writer = DocumentWriter()
         when (spec) {
             is PaperServerSpec -> writePaperSpec(writer, spec)
+            is VelocityProxySpec -> throw notYetPersisted(ServerKind.VELOCITY_PROXY)
         }
         return writer.render()
     }
@@ -86,6 +88,10 @@ internal object DefinitionCodec {
                     metadata = metadata,
                     spec = readPaperSpec(PropertyDocument.parse(encodedSpec, what), what),
                 )
+            }
+
+            ServerKind.VELOCITY_PROXY -> {
+                throw notYetPersisted(ServerKind.VELOCITY_PROXY)
             }
         }
     }
@@ -312,6 +318,28 @@ internal inline fun <T> rebuilding(
     } catch (failure: IllegalArgumentException) {
         throw StoreException.Corrupt("$what: stored value no longer satisfies the schema: ${failure.message}", failure)
     }
+
+/**
+ * A kind `:schema` can parse but this module has not been taught to hold.
+ *
+ * `VelocityProxy` landed in `:schema` with its validation complete and its
+ * reconcile and persistence paths still to be written. The sealed hierarchies
+ * made the compiler point at every site that has to learn it, and these branches
+ * are the honest placeholder for the ones in this module: refuse loudly, at the
+ * boundary, rather than encode a partial row that a later codec would have to
+ * guess at.
+ *
+ * [StoreException.Unsupported] and not [StoreException.Failed] on purpose — it is
+ * the same shape of answer as an on-disk layout this build does not understand:
+ * non-retryable, surfaced, and fixed by a build that knows the kind. Replacing
+ * these with real branches is `store-dev`'s half of the handoff; nothing in
+ * `:schema` needs to change for it.
+ */
+internal fun notYetPersisted(kind: ServerKind): StoreException =
+    StoreException.Unsupported(
+        "this build cannot store a `${kind.wireValue}`: the kind is declarable and validated, but its " +
+            "persistence has not been implemented yet",
+    )
 
 /** Keys beginning with [prefix]. Used for the open-ended maps (labels). */
 internal fun DocumentReader.keysUnder(prefix: String): List<String> = keys().filter { it.startsWith(prefix) }.sorted()

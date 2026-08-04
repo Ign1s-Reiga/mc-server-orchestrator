@@ -1,0 +1,21 @@
+# Expected: spec.forwarding.mode — must be one of `modern`
+#
+# Legacy BungeeCord forwarding sends the player's identity as an unauthenticated
+# header. It is expressible in Velocity and it is not expressible here.
+apiVersion: mcorch.dev/v1alpha1
+kind: VelocityProxy
+metadata:
+  name: proxy-01
+spec:
+  image: docker.io/itzg/mc-proxy:2026.6.1
+  resources:
+    memory: 1Gi
+  forwarding:
+    mode: bungeecord
+    secret:
+      name: fleet-forwarding
+      key: modern-forwarding
+  backends:
+    selector:
+      matchLabels:
+        mcorch.dev/fleet: main
