@@ -35,33 +35,50 @@ definition of a permanent abort. It left exactly the unconfirmable-save and
 never-re-sent-`DRAIN_SAVE_TIMEOUT` states unflagged, and it was caught only by
 pointing a real dashboard at a real orchestrator.
 
-Two consequences worth keeping:
+One consequence worth keeping:
 
 - **A permanent failure escalates immediately, and must.**
   `isBlockedByPermanentFailure` returns before a non-terminating server is
   observed and writes no status, so a permanent abort can be the last status ever
   written. A threshold not crossed by then is never re-evaluated — a timer would
   not delay the signal, it would delete it.
-- **Order the exclusion before the class check.** `DRAIN_NO_DESTINATION` must
-  never escalate; with the class tested first, a future permanent classification
-  at either call site would route players-being-online straight back in.
 
-**Better than ordering: make the premise unconstructable.** The exclusion is only
-defensible because players logging off resolves it — i.e. because that reason is
-retryable — and `FailureStatus` took reason and class as independent arguments.
-So a permanent `DRAIN_NO_DESTINATION` would have been a wedged drain that was
-*also* silently unflagged, and nothing stopped a third call site pairing them.
-`FailureStatus.init` now refuses the pair, which retires the ordering question
-entirely. The general move: when a rule's justification depends on a combination
-never occurring, forbid the combination at the type rather than defend the order
-you check things in. It costs nothing in `:store` — statuses are rebuilt through
-their constructors, so a hand-edited row becomes `StoreException.Corrupt`, which
-is the established answer here.
+## The exempt reason is gone, and so is the whole mechanism
+
+**Superseded 2026-08-04.** `escalates()` used to take a `FailureReason` and
+return false for the players-online one. Two rounds of patching that exemption —
+ordering it before the class check, then making a permanent
+`DRAIN_NO_DESTINATION` unconstructable so the premise held — both survive only as
+history. The exemption is deleted; `escalates` takes no reason at all.
+
+What replaced it: a drain waiting on players records `DrainStatus.blocked` and
+**no failure**, and `escalated()` was already false when `failure == null`. The
+special case did not need a better guard, it needed the state it guarded to stop
+existing. That is the move worth generalising — **if a rule needs an exception
+for a case that is not really an instance of it, the case is mis-modelled.**
+Recording "everything is fine" as a failure was the actual defect; the exemption
+was a symptom being maintained.
+
+`FailureStatus.init` still refuses `DRAIN_NO_DESTINATION` + `PERMANENT`, but it
+now stands on the capacity case alone: *stop trying* buys nothing when what you
+are blocked on is not a property of this server. The general lesson from that
+round still holds where it applies — forbid an impossible combination at the type
+rather than defending the order you check things in, and it costs nothing in
+`:store` because a hand-edited row becomes `StoreException.Corrupt`. Do not add a
+second `require` to a decoded type, though: every one is paid by the widest fleet
+read, which is why `DrainStatus` does *not* enforce blocked/failure disjointness.
 
 Related: the prose has to branch too. Telling an operator "the loop keeps
 retrying" about a drain that has permanently stopped is how they wait instead of
 acting — and the permanent text must not assert *joinability* either, since one
 of the aborts it covers is reached precisely because a probe could not answer.
+
+The same trap caught the *blocked* prose one level up in `:api`. `detail()`
+matched `TERMINATING && drain != null` before anything else, so a delete on a
+server people were playing on rendered as "delete requested; draining (drain
+failed)" — the exact question the new flag answers, answered wrongly. A new
+branch has to be inserted ahead of every existing branch it is a special case of,
+not merely added; only the `:app` end-to-end test saw it.
 
 ## Known-and-accepted, so they are not re-found
 

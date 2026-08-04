@@ -29,6 +29,15 @@ appear does. That has already caught a version of a leak test where the needle
 was never findable at all, so the security assertion passed for the wrong
 reason.
 
+**A sabotage that does not compile reads as a passing suite.** `if (false && …)`
+to disable a branch is rejected by this build's compiler settings, and the run
+printed no "tests completed" line and left the previous XML in place — so
+grepping for failures showed none, and the test looked green against the
+sabotage. Two rules from it: sabotage by *changing a value* (`since = now`), never
+by adding dead code, and treat "no failures **and** no test-count line" as a
+build failure to investigate rather than a pass. Check the exit status or the
+`BUILD` line, not just the failure list.
+
 **Why:** each produces a confident green that means nothing, and the cost lands
 on whoever trusts it next. Two rounds of diagnosis here went after the wrong
 component partly on the strength of results that had not actually run.
