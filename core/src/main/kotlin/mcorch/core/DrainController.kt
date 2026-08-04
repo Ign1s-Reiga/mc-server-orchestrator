@@ -870,20 +870,25 @@ internal class DrainController(
                             .moveTo(into, now)
                             .copy(transferAttempts = drain.transferAttempts + 1, playersEvacuated = false),
                     occupancy = occupancy,
-                    // Waiting, not Progressed: a sweep in flight is something that
-                    // changes by itself, and reporting progress on every pass of it
-                    // would reset the backoff that the retry limit is measured
-                    // against.
+                    // **Never `Progressed`, whatever the sweep says.** A sweep in
+                    // flight is something that changes by itself, so `Waiting` is the
+                    // honest outcome — but the reason it must not be `Progressed`
+                    // even on a sweep the proxy calls finished is sharper than that:
+                    // `remaining` is the *proxy's* count, and it is zero for a
+                    // backend whose players connected straight to its own port.
+                    // Reporting progress on it would make `ReconcileLoop` reset the
+                    // backoff on every pass of a drain that is getting nowhere, which
+                    // is the hot loop wearing the proxy's number — and it would say
+                    // "every player has been moved" about a server two people are
+                    // playing on. Only the ping advances this state, in
+                    // [awaitEvacuated].
                     outcome =
-                        if (report.remaining == 0 && report.finished) {
-                            ReconcileOutcome.Progressed("every player has been moved to `$destination`")
-                        } else {
-                            ReconcileOutcome.Waiting(
-                                "moving ${report.remaining} player(s) to `$destination` " +
-                                    "(${report.unmoved} still to re-try)",
-                                POLL,
-                            )
-                        },
+                        ReconcileOutcome.Waiting(
+                            "asked proxy=${router.proxy} to move this server's players to `$destination`; the " +
+                                "proxy reports ${report.remaining} still on it (${report.unmoved} move(s) to " +
+                                "re-try). The Server List Ping is what decides when this server is empty",
+                            POLL,
+                        ),
                 )
             }
 

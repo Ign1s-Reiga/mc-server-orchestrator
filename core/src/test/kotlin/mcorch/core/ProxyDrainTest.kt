@@ -242,6 +242,28 @@ internal class ProxyDrainTest {
                 .players
                 .shouldNotBeNull()
                 .online shouldBe 2
+
+            // The discriminating assertions, and they are the ones that can
+            // actually go red.
+            //
+            // The three negatives above are satisfied by the `SAVING` gate whatever
+            // step 4 concluded — a drain that *had* believed the proxy would still
+            // not stop, save or deregister, and this test would pass having proved
+            // nothing. What differs is where the drain ends up. Believing the proxy
+            // makes step 4 conclude the server is empty, walk to `SAVING`, and be
+            // stopped there by the ping — which records a **block** and no failure.
+            // Not believing it keeps step 4 asking until the limit, which records
+            // `DRAIN_TRANSFER_FAILED` and no block.
+            val drain =
+                harness
+                    .status(leaving.metadata.name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            drain.failure.shouldNotBeNull().reason shouldBe FailureReason.DRAIN_TRANSFER_FAILED
+            drain.blocked shouldBe null
+            drain.transferAttempts shouldBeGreaterThan 1
+            harness.plugin.transfers.size shouldBeGreaterThan 1
         }
 
     /**
