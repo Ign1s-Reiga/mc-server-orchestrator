@@ -85,6 +85,48 @@ Two states the thirteenth audit found, both ending in a manual `crictl stop`:
 `transferAttempts` survives as a report. **A counter nothing gates on cannot
 wedge anything**, which is the only reason it is safe to keep.
 
+### A duration needs an anchor, and an anchor is a field that can be absent
+
+The price of choosing a clock over a counter, and it cost three rounds. A counter
+starts at zero by construction; an anchor can be missing, stale or restamped, and
+each of those is a different wedge:
+
+- `enteredStateAt` **restamps** on park-and-resume — allowance handed back every
+  cycle, for ever.
+- `sealRequestedAt` **can be absent**: it is written at one site with `holdSeal`
+  above it, and nothing re-enters `DRAIN_REQUESTED`, so one blink of the control
+  endpoint meant the drain never had an anchor at all. It was also **stamped too
+  early** — everything between step 2 and step 4 spent step 4's budget, including
+  an orchestrator restart, since it is persisted.
+
+`DrainStatus.transferStartedAt` is the answer: stamped on entry to the step it
+bounds, never cleared, and passed to `exhausted` as a **non-null argument** so
+the function cannot look it up and cannot fall back. Three rules that generalise
+to any anchored bound:
+
+1. Stamp at the entry to the step being bounded, not at an earlier step that
+   happens to have a convenient field.
+2. No `?:` in the consumer. A missing anchor must **stamp**, never substitute —
+   a fallback is what made two of these silent.
+3. Treat it like `saveRequestedAt`: one load-bearing field, covered by a test
+   that drives the path where the ordinary stamp does not happen.
+
+### "Did the pass make progress" is not "did the pass avoid failing"
+
+`resumeInto` cleared the recorded failure whenever the resumed state did not
+itself re-abort. Once step 3 had a body, asking the `Scheduler` for a destination
+satisfied that — so a drain whose transfers kept being refused wiped its own
+failure every other pass: `attempts` pinned at 1, `occurredAt` restamped,
+`escalates()` never true, and `queue.succeeded` on the `Progressed` held the
+backoff at the poll interval.
+
+**Re-deriving state is not progress.** Nothing left the process and the drain
+knows exactly what it knew before, so how long it has been failing is still true
+and must survive. `DrainProgress.derivedOnly` marks the one step that qualifies,
+and a resume that only re-derived neither clears the failure nor reports
+progress. The level-triggered seal is deliberately *not* covered by that flag —
+it runs every pass by design and would make it always false.
+
 ## The address had two derivations, and they disagreed for the window that matters
 
 The proxy sweep read `status.endpoint.address` (written by `awaitJoinable`,
@@ -117,6 +159,11 @@ registered yet" is a state a protocol handles; "registered wrongly" often is not
 3. **The proxy sweep deregisters registrations whose selector no longer
    matches.** That is step 6 performed by a sweep, and it is safe only because
    the plugin refuses `DELETE` with `BACKEND_OCCUPIED` and has no force flag.
+   `wanted` must therefore be matched names **plus `ServerListing.unreadable`
+   names**: dropping the unreadable half keeps `listAll`'s tolerance and throws
+   away the part that made it safe, turning "this build cannot describe that
+   server" into a destructive call against a live backend. A NULL-named row
+   cannot be matched to a registration and is still swept — named, not fixed.
 4. **At the transfer limit the abort is `RETRYABLE` and escalates by the ordinary
    threshold**, with no exemption added to `escalates()`. Adding one is the
    mechanism that produced two earlier audit findings.

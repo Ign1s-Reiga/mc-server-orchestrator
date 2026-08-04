@@ -383,6 +383,32 @@ public data class DrainStatus(
     /** When the server confirmed a *completed* save. Never when one was merely asked for. */
     val worldSavedAt: Instant? = null,
     val deregisteredAt: Instant? = null,
+    /**
+     * When this drain first entered drain step 4, and the anchor its allowance is
+     * measured from.
+     *
+     * **Set once and never cleared.** It is the single load-bearing field of step
+     * 4, in the way [saveRequestedAt] is of step 5, and it earns that description
+     * the same way: the bound on how long the loop keeps asking a proxy to move
+     * players is a *duration*, and a duration needs an anchor that no later pass can
+     * move.
+     *
+     * Two anchors were tried before this field existed and both produced a drain
+     * that could never finish. [enteredStateAt] restamps whenever the drain parks
+     * and resumes, so the allowance was handed back in full on every cycle — the
+     * loop asked for two minutes, parked for one pass, asked for two minutes again,
+     * for ever, clearing its own failure each time so nothing ever escalated.
+     * [sealRequestedAt] does not restamp but is stamped at step *2*, so it was
+     * absent on every path that reached step 4 without a bodied `DRAIN_REQUESTED`
+     * pass, and — when present — spent step 4's budget on everything between: a
+     * destination search parked on a full fleet, a flapping control endpoint, or
+     * simply an orchestrator restart, after which a drain could return with an
+     * anchor hours old and abort having asked nobody to move.
+     *
+     * Null means step 4 has not been reached. A reader must not substitute another
+     * instant for it: the correct response to a missing anchor is to stamp one.
+     */
+    val transferStartedAt: Instant? = null,
     val transferAttempts: Int = 0,
     /** Where players were sent. A server name, never a player. */
     val destination: ResourceName? = null,

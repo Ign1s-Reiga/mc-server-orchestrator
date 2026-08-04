@@ -9,10 +9,12 @@ import io.kotest.matchers.ints.shouldBeLessThanOrEqual
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
+import mcorch.schema.ConditionStatus
 import mcorch.schema.DrainState
 import mcorch.schema.FailureClass
 import mcorch.schema.FailureReason
 import org.junit.jupiter.api.Test
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 
 /**
@@ -659,6 +661,205 @@ internal class ProxyDrainTest {
                 ?.failure shouldBe null
             harness.plugin.deregistrations shouldContain "survival-01"
             harness.nodeOf(leaving).stops shouldHaveSize 1
+        }
+
+    /**
+     * A drain that could not seal on its one step-2 pass still stops asking.
+     *
+     * `sealRequestedAt` is written at exactly one place and `holdSeal` runs above
+     * it, so a single `Unavailable` on the drain's one bodied `DRAIN_REQUESTED`
+     * pass — the control endpoint blinking, which this design treats as expected —
+     * meant the stamp never happened. Nothing re-enters `DRAIN_REQUESTED`: the
+     * resume ladder tops out at `SEALED`, and `started()` needs no drain record at
+     * all. So the anchor was absent for the life of that drain, `exhausted` fell
+     * back to `enteredStateAt`, and the bound could never trip: ~2 minutes of
+     * asking, one pass parked, the allowance handed back in full, for ever, with
+     * `failure` cleared each cycle so nothing escalated. Sealed, unjoinable,
+     * transfer requests firing at live players, and a delete that never completes.
+     *
+     * The anchor is stamped on entry to step 4 instead, which every path takes.
+     */
+    @Test
+    fun `a drain whose first seal was refused still reaches the transfer bound`() =
+        coreTest {
+            val leaving = backendDefinition("survival-01")
+            val destination = backendDefinition("survival-02", hostPort = 30002)
+            val harness = ProxyHarness(backends = listOf(leaving, destination))
+            harness.bringUp()
+
+            harness.nodeOf(leaving).online = 3
+            harness.plugin
+                .backend("survival-01")
+                .shouldNotBeNull()
+                .players = 3
+            harness.store.deleteDefinition(leaving.metadata.name)
+
+            // Pass one records the drain and returns. Pass two is the only bodied
+            // `DRAIN_REQUESTED` pass this drain will ever have — and the endpoint is
+            // down for exactly that one.
+            harness.pass(leaving.metadata.name)
+            harness.plugin.unreachable = true
+            harness.pass(leaving.metadata.name)
+            harness.plugin.unreachable = false
+
+            // The premise, asserted rather than assumed: step 2 never stamped, and
+            // the drain will never revisit the state that would.
+            harness
+                .status(leaving.metadata.name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .sealRequestedAt shouldBe null
+
+            repeat(30) {
+                harness.pass(leaving.metadata.name)
+                harness.clock.advance(10.seconds)
+            }
+
+            val drain =
+                harness
+                    .status(leaving.metadata.name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            // Step 4 stamped its own anchor, and it is still null at step 2.
+            drain.sealRequestedAt shouldBe null
+            drain.transferStartedAt.shouldNotBeNull()
+            // And the bound trips, which is the whole point.
+            drain.state shouldBe DrainState.DRAIN_FAILED
+            drain.failure.shouldNotBeNull().reason shouldBe FailureReason.DRAIN_TRANSFER_FAILED
+            harness.nodeOf(leaving).stops.shouldBeEmpty()
+        }
+
+    /**
+     * Everything before step 4 must not spend step 4's allowance.
+     *
+     * The knob is `spec.lifecycle.drain.playerTransferTimeout` and it is documented
+     * as how long step 4 gets. Anchored at step *2* it was how long everything after
+     * step 2 gets — a destination search parked on a full fleet, a flapping control
+     * endpoint, or simply an orchestrator restart, since the anchor is persisted. A
+     * drain that waited out its allowance before a destination existed then aborted
+     * on its first `TARGET_RESOLVED` pass **having asked nobody to move**, and the
+     * fleet silently degraded to the standalone wait-for-zero posture while the
+     * proxy sweep kept re-admitting joiners.
+     */
+    @Test
+    fun `a long wait for capacity does not spend the transfer allowance`() =
+        coreTest {
+            val leaving = backendDefinition("survival-01")
+            val destination = backendDefinition("survival-02", hostPort = 30002)
+            // Both are known to the harness so both have a node, but only the first
+            // is declared: the second arrives later, which is the scenario.
+            val harness = ProxyHarness(backends = listOf(leaving, destination))
+            harness.declare(harness.proxyDefinition)
+            harness.declare(leaving)
+            repeat(6) {
+                harness.pass(leaving.metadata.name)
+                harness.pass(harness.proxyDefinition.metadata.name)
+            }
+
+            harness.nodeOf(leaving).online = 3
+            harness.plugin
+                .backend("survival-01")
+                .shouldNotBeNull()
+                .players = 3
+            harness.store.deleteDefinition(leaving.metadata.name)
+
+            // No sibling exists, so step 3 finds no capacity and the drain parks —
+            // for far longer than the whole transfer allowance.
+            repeat(6) {
+                harness.pass(leaving.metadata.name)
+                harness.clock.advance(60.seconds)
+            }
+            harness
+                .status(leaving.metadata.name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .failure
+                .shouldNotBeNull()
+                .reason shouldBe FailureReason.DRAIN_NO_DESTINATION
+            harness.plugin.sweepsStarted.shouldBeEmpty()
+
+            // An operator adds capacity. The drain must now actually try.
+            harness.declare(destination)
+            repeat(6) { harness.pass(destination.metadata.name) }
+            harness.pass(harness.proxyDefinition.metadata.name)
+            harness.plugin.backend("survival-02").shouldNotBeNull()
+
+            repeat(4) { harness.pass(leaving.metadata.name) }
+
+            // It asked. Anchored at step 2 it would have aborted here without ever
+            // calling the proxy.
+            harness.plugin.sweepsStarted shouldContain "survival-01"
+            harness.nodeOf(leaving).stops.shouldBeEmpty()
+        }
+
+    /**
+     * A destination the fleet offers and the proxy refuses must escalate.
+     *
+     * Danger pattern 34, reopened by step 3 gaining a body. The resume ladder picks
+     * `SEALED` when `destination` is null, `secureDestination` asks the scheduler,
+     * gets an answer and reports `Progressed` — so the resume cleared the recorded
+     * failure on every other pass. `recordFailure` then saw no previous one each
+     * time: `attempts` pinned at 1, `occurredAt` restamped, `escalates()` never
+     * true, and `queue.succeeded` on the `Progressed` held the backoff at the poll
+     * interval. A permanently stuck drain that never asks for help, at two seconds
+     * a cycle, with admission flapping as `sealsBackend` alternated.
+     *
+     * The stable trigger is a sibling the fleet reports `ready` while the proxy will
+     * not accept it — here, one the proxy has no registration for.
+     */
+    @Test
+    fun `a destination the proxy keeps refusing accumulates and escalates`() =
+        coreTest {
+            val leaving = backendDefinition("survival-01")
+            val destination = backendDefinition("survival-02", hostPort = 30002)
+            val harness = ProxyHarness(backends = listOf(leaving, destination))
+            harness.bringUp()
+
+            harness.nodeOf(leaving).online = 3
+            harness.plugin
+                .backend("survival-01")
+                .shouldNotBeNull()
+                .players = 3
+            // The fleet still says `survival-02` is a healthy, joinable backend; the
+            // proxy has no registration for it. Nothing here re-registers it, because
+            // only a proxy pass would and this test runs none.
+            harness.plugin.backends.remove("survival-02")
+            harness.store.deleteDefinition(leaving.metadata.name)
+
+            val outcomes = mutableListOf<ReconcileOutcome>()
+            repeat(14) {
+                outcomes += harness.pass(leaving.metadata.name)
+                harness.clock.advance(2.minutes)
+            }
+
+            val drain =
+                harness
+                    .status(leaving.metadata.name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            val failure = drain.failure.shouldNotBeNull()
+            failure.reason shouldBe FailureReason.DRAIN_TRANSFER_FAILED
+
+            // The three things the cycle destroyed, in the order they matter.
+            failure.attempts shouldBeGreaterThan 2
+            harness
+                .status(leaving.metadata.name)
+                .shouldNotBeNull()
+                .attention()
+                .status shouldBe ConditionStatus.TRUE
+            // Once the cycle starts, no pass reports progress — so `ReconcileLoop`
+            // never calls `queue.succeeded` and the backoff keeps growing. The
+            // drain's opening passes are genuine progress and are dropped.
+            outcomes
+                .dropWhile { it is ReconcileOutcome.Progressed }
+                .none { it is ReconcileOutcome.Progressed }
+                .shouldBeTrue()
+
+            harness.nodeOf(leaving).stops.shouldBeEmpty()
         }
 
     /**

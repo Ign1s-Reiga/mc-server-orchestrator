@@ -334,6 +334,51 @@ internal class ProxyReconcileTest {
         }
 
     /**
+     * A backend this build cannot read is exempt from the sweep, not swept.
+     *
+     * The routing sweep reads `listAll` rather than `listServers` precisely so one
+     * undecodable row cannot break it — but it then discarded the `unreadable` half,
+     * which is the part that made the tolerance safe. An unreadable row is not "a
+     * server that went away"; it is a server this build cannot describe, and the
+     * garbage collector turns that absence into an outbound `DELETE` against a
+     * backend that is running perfectly well and full of players.
+     *
+     * `DefinitionCodec` deliberately widens the population of rows that land in
+     * `unreadable`, so this is the one consumer that converts that widening into a
+     * destructive call. The exemption is exactly as wide as the ignorance, and it
+     * lapses the moment the row is repaired.
+     *
+     * `BACKEND_OCCUPIED` is what keeps the blast radius small — the plugin refuses
+     * to deregister a backend with anybody on it — which is why this is a warning
+     * and not a critical. It is also why the assertion below is on the *empty*
+     * backend: that is the case the plugin's own guard does not cover.
+     */
+    @Test
+    fun `an unreadable definition does not make the sweep deregister its backend`() =
+        coreTest {
+            val backend = backendDefinition("survival-01")
+            val harness = ProxyHarness(backends = listOf(backend))
+            harness.bringUp()
+            harness.plugin.backend("survival-01").shouldNotBeNull()
+
+            // The row is still there and the container is still running; this build
+            // simply cannot decode the spec document any more. The definition
+            // disappears from `servers` and appears in `unreadable`.
+            harness.store.hide(backend.metadata.name)
+            harness.pass(harness.proxyDefinition.metadata.name)
+
+            harness.plugin.deregistrations.shouldBeEmpty()
+            harness.plugin.backend("survival-01").shouldNotBeNull()
+
+            // Repaired: the row decodes again, and nothing was lost in between.
+            harness.store.unhide(backend.metadata.name)
+            harness.pass(harness.proxyDefinition.metadata.name)
+
+            harness.plugin.deregistrations.shouldBeEmpty()
+            harness.plugin.backend("survival-01").shouldNotBeNull()
+        }
+
+    /**
      * A conflict refuses the create. It must never refuse the delete.
      *
      * The refusal returns before placement, so with no exemption a backend that two

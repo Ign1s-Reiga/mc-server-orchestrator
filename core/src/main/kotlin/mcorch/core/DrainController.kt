@@ -546,11 +546,34 @@ internal class DrainController(
         // resetting to now on every pass, which is the one number an
         // operator reads off a drain that is waiting.
         val resumed = step(pass, drain.moveTo(resume, now))
-        return if (resumed.drain.state == DrainState.DRAIN_FAILED) {
-            resumed
-        } else {
-            resumed.copy(drain = resumed.drain.copy(failure = null, blocked = null))
+        if (resumed.drain.state == DrainState.DRAIN_FAILED) return resumed
+        // **A resume that only re-derived state clears nothing.**
+        //
+        // Clearing on any resume that did not immediately re-abort was right while
+        // step 3 had no body. With one, the ladder picks `SEALED` whenever
+        // `destination` is null, `secureDestination` asks the scheduler, gets an
+        // answer and reports `Progressed` — so a drain whose transfers keep being
+        // refused wiped its own failure on every other pass. `recordFailure` then
+        // saw `previous = null` each time: `attempts` pinned at 1, `occurredAt`
+        // restamped, `escalates()` never true, and `queue.succeeded` on the
+        // `Progressed` kept the backoff at the poll interval. A stuck drain that
+        // never asks for help, at two seconds a cycle, with admission flapping once
+        // per cycle as `sealsBackend` alternates.
+        //
+        // Asking the scheduler is not progress for this purpose. Nothing left this
+        // process, nothing about the server changed, and the drain knows exactly
+        // what it knew before — so how long it has been failing is still true and
+        // must survive. A pass that *did* something keeps the old behaviour and
+        // clears, which is what makes the escalation self-clearing.
+        if (resumed.derivedOnly) {
+            return resumed.copy(
+                // Downgraded from `Progressed` for the same reason: a pass that only
+                // re-derived must not tell `ReconcileLoop` the server made progress,
+                // because that resets the backoff this cycle needs to grow.
+                outcome = ReconcileOutcome.Retry(resumed.outcome.detail),
+            )
         }
+        return resumed.copy(drain = resumed.drain.copy(failure = null, blocked = null))
     }
 
     /** Everything one pass established before it looked at the drain's state. */
@@ -665,7 +688,10 @@ internal class DrainController(
         val probe = pass.probe
         if (probe is ProbeOutcome.Joinable && probe.online == 0) {
             return DrainProgress(
-                drain = drain.moveTo(DrainState.TARGET_RESOLVED, now).copy(playersEvacuated = true),
+                drain =
+                    drain
+                        .moveTo(DrainState.TARGET_RESOLVED, now)
+                        .copy(playersEvacuated = true, transferStartedAt = drain.transferStartedAt ?: now),
                 occupancy = occupancy,
                 outcome = ReconcileOutcome.Progressed("no destination needed: the server is empty"),
             )
@@ -683,8 +709,20 @@ internal class DrainController(
                     drain =
                         drain
                             .moveTo(DrainState.TARGET_RESOLVED, now)
-                            .copy(destination = choice.destination, playersEvacuated = false),
+                            .copy(
+                                destination = choice.destination,
+                                playersEvacuated = false,
+                                // Step 4's allowance starts here, on the first entry
+                                // and never again. See `DrainStatus.transferStartedAt`.
+                                transferStartedAt = drain.transferStartedAt ?: now,
+                            ),
                     occupancy = occupancy,
+                    // **Re-derived, not done.** Choosing a destination asks the
+                    // scheduler and nothing else — no request leaves this process —
+                    // so a resume whose only work was this has learned nothing that
+                    // would justify forgetting how long the drain has been failing.
+                    // See the `DRAIN_FAILED` branch, which is what reads this.
+                    derivedOnly = true,
                     outcome = ReconcileOutcome.Progressed("destination secured: ${choice.destination}"),
                 )
             }
@@ -827,11 +865,24 @@ internal class DrainController(
                         outcome = ReconcileOutcome.Progressed(emptyDetail),
                     )
                 } else {
-                    // Somebody is still on, so anything this drain had saved is
-                    // behind whatever they are doing.
+                    // **A missing anchor is stamped, never substituted.** Every
+                    // ordinary path stamps on entry to `TARGET_RESOLVED`, but three
+                    // reachable ones do not go through a bodied step-3 pass — a
+                    // `holdSeal` that aborted on the drain's one `DRAIN_REQUESTED`
+                    // pass, a router that appeared only after the proxy's runtime was
+                    // observed, and a conflicted-proxy delete that drained with no
+                    // router at all. A fallback to a restamping instant would leave
+                    // exactly those drains unable ever to finish, which is what a
+                    // previous version of this class did while asserting it could
+                    // not happen. Stamping costs one allowance; substituting costs
+                    // the drain.
+                    val anchored =
+                        drain.forgetSaveEvidence().let {
+                            if (it.transferStartedAt == null) it.copy(transferStartedAt = now) else it
+                        }
                     issueTransfer(
                         pass = pass,
-                        drain = drain.forgetSaveEvidence(),
+                        drain = anchored,
                         router = router,
                         destination = destination,
                         into = DrainState.TRANSFERRING,
@@ -863,7 +914,10 @@ internal class DrainController(
     ): DrainProgress {
         val occupancy = pass.occupancy
         val now = pass.now
-        exhausted(pass, drain)?.let { limit ->
+        // Typed rather than looked up, so this function cannot be reached without
+        // an anchor and cannot invent one. `transferStep` has just stamped it.
+        val anchor = drain.transferStartedAt ?: now
+        exhausted(pass, anchor)?.let { limit ->
             // `failure-modes.md` item 7, and the line somebody writes after "2 of 6
             // transfers were refused" is a disconnect. At the limit the loop stops
             // *trying*; it does not kick and it does not stop the container.
@@ -930,32 +984,37 @@ internal class DrainController(
 
             is TransferReport.DestinationLost -> {
                 // The destination stopped being one — it went away, or it started
-                // draining itself — so the drain goes back and picks another rather
-                // than moving players onto a server they would have to be moved off
-                // again.
+                // draining itself — so the drain lets go of it and a later pass
+                // picks another, rather than moving players onto a server they would
+                // have to be moved off again.
                 //
-                // **[ReconcileOutcome.Retry], never `Progressed`, and the attempt is
-                // counted.** This is the second shape of the hot loop and it is
-                // easier to reach than the first: the fleet says a server is a fine
-                // destination and the *proxy* says it is not — a registration the
-                // sweep has not caught up with — so step 3 keeps choosing it and
-                // step 4 keeps being refused, about once a second, for ever.
-                // Reporting progress on either half is what would make
-                // `ReconcileLoop` reset the backoff; counting the attempt is what
-                // eventually stops it asking at all.
+                // **It aborts rather than stepping quietly back to `SEALED`.** The
+                // fleet saying a sibling is a fine destination while the proxy keeps
+                // refusing it is stable — an `ADDRESS_CONFLICT` on that sibling will
+                // do it — and without a recorded failure the drain simply cycled
+                // `SEALED` → `TARGET_RESOLVED` → refused → `SEALED` at the poll
+                // interval, with `secureDestination` reporting `Progressed` every
+                // other pass so `ReconcileLoop` reset the backoff and nothing ever
+                // escalated. Recording it is what makes the attempt count rise, the
+                // backoff grow and a human eventually get called.
                 LOG.info(
                     "destination `{}` is no longer eligible for server={}: {}. Choosing another",
                     destination,
                     pass.server,
                     report.detail,
                 )
-                DrainProgress(
-                    drain =
-                        drain
-                            .moveTo(DrainState.SEALED, now)
-                            .copy(destination = null, transferAttempts = drain.transferAttempts + 1),
+                abort(
+                    subject = pass.subject,
+                    node = pass.node,
+                    drain = drain.copy(destination = null, transferAttempts = drain.transferAttempts + 1),
                     occupancy = occupancy,
-                    outcome = ReconcileOutcome.Retry("the destination is no longer eligible: ${report.detail}"),
+                    now = now,
+                    reason = FailureReason.DRAIN_TRANSFER_FAILED,
+                    failureClass = FailureClass.RETRYABLE,
+                    message =
+                        "proxy=${router.proxy} will not accept `$destination` as a destination for this " +
+                            "server's players: ${report.detail}. Another is chosen on the next pass; nobody is " +
+                            "disconnected and the container is not stopped",
                 )
             }
 
@@ -1011,6 +1070,18 @@ internal class DrainController(
      * times this drain has asked — and nothing branches on it. That is the whole of
      * its remit: a counter nothing gates on cannot wedge anything.
      *
+     * ## The anchor is an argument, not a lookup
+     *
+     * [transferStartedAt] is passed in and is not nullable, so this function cannot
+     * be reached without an anchor and cannot invent one. That is deliberate and it
+     * is the third anchor this bound has had. `enteredStateAt` restamps on every
+     * park-and-resume, so the allowance was handed back in full every cycle;
+     * `sealRequestedAt` does not restamp but is stamped at step *2*, so it was
+     * missing on three reachable paths and — when present — spent step 4's budget on
+     * a destination search, a flapping control endpoint or an orchestrator restart.
+     * A `?:` fallback here is what made both of those silent, so there is none: a
+     * missing anchor is stamped by [transferStep] before this is called.
+     *
      * ## Only reachable with players online
      *
      * [transferStep] takes the zero-player exit before calling anything that
@@ -1020,26 +1091,11 @@ internal class DrainController(
      */
     private fun exhausted(
         pass: DrainPass,
-        drain: DrainStatus,
+        transferStartedAt: Instant,
     ): String? {
         val online = pass.occupancy?.online ?: 0
         val allowance = pass.subject.playerTransferTimeout + PER_PLAYER_TRANSFER_ALLOWANCE * online
-        // Anchored on the seal, not on `enteredStateAt`. A drain that reaches this
-        // bound parks in `DRAIN_FAILED`, and the resume ladder re-enters
-        // `TARGET_RESOLVED` on the next pass — which restamps `enteredStateAt` and
-        // hands the allowance back in full. The drain would then alternate: two
-        // minutes of asking, one pass parked, two minutes of asking, for ever, with
-        // the resume clearing `failure` each time so the escalation never
-        // accumulates and an operator never sees a stable signal.
-        //
-        // `sealRequestedAt` is stamped once, when step 2 first asserted, and nothing
-        // clears it. It also measures the better quantity: not "how long since we
-        // last re-entered this state" but **how long this server has been sealed and
-        // failing to empty**, which is what an operator is being asked to act on. It
-        // is null only when there is no seal at all, and this is unreachable without
-        // a router — so the fallback is for completeness, not for a real case.
-        val since = drain.sealRequestedAt ?: drain.enteredStateAt
-        val waited = JavaDuration.between(since, pass.now).toKotlinDuration()
+        val waited = JavaDuration.between(transferStartedAt, pass.now).toKotlinDuration()
         return if (waited > allowance) {
             "players have been moving for ${waited.inWholeSeconds}s, past the " +
                 "${allowance.inWholeSeconds}s allowed for $online player(s)"
@@ -2089,6 +2145,22 @@ internal data class DrainProgress(
      * deleted out from under a running container.
      */
     val containerDown: Boolean = false,
+    /**
+     * This step advanced the recorded state without asking anything of the server
+     * or the proxy.
+     *
+     * There is one such step — choosing a destination, which consults the
+     * [Scheduler] and nothing else — and it exists as a flag because the
+     * `DRAIN_FAILED` resume has to tell that apart from work. A resume that only
+     * re-derived must not clear the recorded failure and must not report progress:
+     * doing either lets a drain whose transfers keep failing reset its own attempt
+     * count and its own backoff on every other pass, so it can be stuck for ever
+     * without escalating. See the `DRAIN_FAILED` branch.
+     *
+     * The level-triggered seal assertion is deliberately *not* covered by this. It
+     * runs on every pass by design and would make the flag always false.
+     */
+    val derivedOnly: Boolean = false,
     val outcome: ReconcileOutcome,
 )
 
