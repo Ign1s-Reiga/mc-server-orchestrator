@@ -589,3 +589,45 @@ executable change this round (`git diff` of the round is three KDoc lines in
   `DrainController.kt:41` and in the `DrainWiringTest` bullet, with the containerd
   2.3.3 precedent, and my re-read of `WorkloadView.kt:171-196` and
   `LocalNode.kt:558-563` confirms the description is exact.
+
+## Round 25 rulings: the seal waiver, and the pre-flight's aim
+
+Audited at `079f9dd` (`feat/velocity-proxy-kind` = `fix/save-evidence-stamping`).
+No critical. `DrainController.stop`, `awaitStopped`, `mayStop`, `requireEmpty`,
+`letGoAndStop`, `Reconciler.teardown`/`teardownProxy` and `LocalNode.removeWorkload`
+are byte-identical to round 24.
+
+- **`sealIsPrecondition` is narrow by construction, not by enumeration, and the
+  construction is one line in `Reconciler`.** The waiver fires only when
+  `router == null` and the pass read a fresh `PlayerReading.Empty`.
+  `PaperDrainSubject(seal = link, router = link)` (`Reconciler.drain`) gives every
+  Paper subject `seal != null ⟺ router != null`, so a standalone server
+  short-circuits at `NothingToSeal` before `abortSeal` and a backend always parks.
+  `ProxyDrainSubject` is the only reachable waiver. That equality is the whole
+  narrowness argument and nothing in the types enforces it — re-check it whenever
+  `PaperDrainSubject`'s construction moves.
+- **The `sealRequestedAt`/`workDone` claim checks out.** `sealed = hold ==
+  SealHold.Asserted`, `Asserted` comes only from `SealOutcome.Asserted` with
+  `!admits`, `DRAIN_REQUESTED` is entered once (the resume ladder tops out at
+  `SEALED`), and `sealRequestedAt` has no gating reader anywhere — `:store` and
+  `:api` carry it, nothing branches on it. So the `else null` erases nothing.
+- **The RETRYABLE/PERMANENT split for the pre-flight and the token branch:
+  sustained**, on the mechanism rather than the preference — see
+  [[drain-audit-danger-patterns]] item 108. Note the cost that is not stated: a
+  RETRYABLE failure escalates only after `drainAttentionAfter`, where PERMANENT
+  fires at once (round 8's rule), and the round-8 justification — "the documented
+  remedy is a human" — is true of both new cases too.
+- **`anyAdmitting` being false for an empty fleet is functional, not a drain
+  concern.** With no backends registered a joining player has nowhere to be sent
+  anyway; the seal changes "no available servers" into a refused login and
+  self-corrects the moment a backend enrols. The drain-relevant half of that same
+  expression is that `assertBackends` is the *only* assertor of `admits = true` —
+  item 110.
+- **The backend-behind-a-dead-proxy exit is real, with two qualifications.**
+  `ProxyFleet.resolve` reads the fleet fresh each pass, so losing the claim makes
+  the subject standalone and `holdSeal` returns `NothingToSeal`. But (a) deleting
+  the proxy *definition* is not enough on its own — a tombstoned row still claims
+  the backend until `teardownProxy` purges it, which needs the proxy's own
+  aggregate count to reach zero; and (b) `spec.backends.selector` is **not** in
+  `canonicalSpec`, so narrowing the selector un-claims the backend instantly with
+  no container operation at all. (b) is the remedy to document.

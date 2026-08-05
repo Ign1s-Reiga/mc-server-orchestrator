@@ -1246,3 +1246,68 @@ Related: [[standalone-paper-drain-shape]]
     Whenever a create gains a new permanent refusal, ask what the *replacement*
     sequence has already destroyed by the time it fires, and whether the same
     question could have been asked before the teardown committed.
+
+## Round 25: the pre-flight, and the hash input with no revert
+
+107. **A pre-flight is only as good as the subset of the create it re-runs, and the
+     subset it re-runs is decided by which helper was convenient.**
+     `LocalNode.checkWorkload` answers `Node.checkWorkload` with `mountsFor(spec)`,
+     and its KDoc promises "the same derivation the create runs". The create is
+     `sandboxSpecFor` + `containerSpecFor`, and `containerSpecFor` also calls
+     `resolveSecrets`, which throws `NodeException.Rejected` (permanent) for a
+     `SecretRef` that is not in the store. So the pre-flight covers the plugin
+     asset — which appears in **no** spec hash and therefore cannot trigger a
+     replacement — and misses `forwarding.secret` and `control.token`, whose
+     *coordinates* are in `VelocityWorkloadPlanner.canonicalSpec`. One operator
+     edit repointing a token at a secret that does not exist yet is: hash moves →
+     `REPLACEMENT` → blocker says yes → seal, drain to zero, stop, remove → create
+     throws `Rejected` → `PERMANENT` → `isBlockedByPermanentFailure` freezes the
+     proxy with no container. Whenever a "can this be built" question is added,
+     enumerate the create's refusals and cross them against the hash: the ones
+     that matter are exactly the intersection, and a pre-flight that misses the
+     intersection is decoration.
+108. **A permanent freeze is lifted only by a generation bump, so a remedy that is
+     not a definition edit cannot lift one.** `isBlockedByPermanentFailure` is
+     `previous.observedGeneration == stored.definition.generation && PERMANENT &&
+     (drain == null || DRAIN_FAILED)`, minus `terminating`. That is the whole
+     argument for classifying a pre-flight refusal `RETRYABLE` when the remedy is
+     "stage a file" or "re-align a token" — and it is stronger than the reason the
+     code gives ("needs no definition change"), which reads as a preference.
+     Corollary in the other direction: the same rule means an operator who fixes
+     the *cause* of a permanent create failure without touching the YAML gets
+     nothing; they have to make a second, meaningless edit to be believed.
+109. **A hash input that lives in source rather than in a definition deletes the
+     operator's cancel.** `VELOCITY_BUILD` is in `canonicalSpec` and appears in no
+     YAML, so once the container label and the constant disagree `proxyDrainCause`
+     returns `REPLACEMENT` on every pass for ever. Before, a proxy replacement was
+     always a definition edit, and reverting it made the cause null, ran
+     `convergeProxy`, and reopened the login path. Whenever a constant joins a spec
+     hash, ask what the operator types to cancel the replacement it triggers — and
+     if the answer is "edit the orchestrator", the constant belongs in the schema
+     with a default, or the hash needs a version so old rows are grandfathered.
+110. **A seal whose only un-asserter sits on the converge path becomes permanent
+     the moment the drain cause is one converge can never clear.**
+     `assertProxyAdmission(admits = true)` is reachable from exactly one place —
+     `Reconciler.assertBackends`, called from `awaitProxyReady`, i.e. `cause ==
+     null`. `DrainController.holdSeal` asserts `admits = false` on every pass of a
+     proxy drain. So a proxy drain that blocks (players online) or parks (any
+     abort) is a fleet with no logins, and a drain whose cause cannot be cleared is
+     a fleet with no logins for ever, on a container that is running and healthy.
+     Danger-pattern 33's compensation obligation, unpaid for the *proxy's own*
+     seal: `abort` restores a backend's registration and restores nothing here.
+     Whenever a level trigger is the only compensator, check that the state it
+     compensates from can still reach the path the trigger lives on.
+111. **Moving a refusal out of a type `init` closes the freeze and opens a
+     teardown-then-fail, and the check is which kind got the pre-flight.** Round 24
+     rightly moved `StorageRequest.Persistent.mountPath`'s `require` to
+     `HostPaths.checkMountPlan` (item 104 closed). But `storage.mountPath` is in
+     `PaperWorkload.specHash`, and `Reconciler.reconcilePaper` has **no**
+     `replacementBlocker` — so the same bad value that used to freeze a running
+     server with its container untouched now drains it, stops it, removes it and
+     then permanently fails the create. Same for `rcon.secret`, and for the
+     *proxy's* `forwarding.secret`, which is in **every backend's** hash. The world
+     survives (nothing deletes a volume directory) so it is availability rather
+     than data loss, but it is the exact sequence the new pre-flight exists to
+     prevent, on the kind that holds worlds. When a refusal is relocated from
+     "before the pass" to "at the create", check every kind whose hash carries the
+     value, not just the one the fix was written for.
