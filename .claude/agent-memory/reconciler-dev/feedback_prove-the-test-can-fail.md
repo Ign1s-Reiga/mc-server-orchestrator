@@ -76,6 +76,21 @@ the test asserts against a state the reconcile loop cannot produce. Advance by t
 poll interval after a `Progressed` and by a grown backoff after a `Retry` — the
 alternation is the mechanism in every backoff-related drain defect so far.
 
+The exception, and it needs saying in the docstring: **a requeue delay is a
+floor, not a schedule.** When the defect *is* the loop arriving late — a
+saturated orchestrator taking 40 seconds to get round to one server, which is
+longer than a save confirmation survives — a fixed spacing is the mechanism, and
+modelling the alternation would model the case that is not the problem.
+
+**A sabotage that changes nothing is a finding about the code, not the test.**
+Removing a stamp in `advance` reddened no test, and the reason was not a weak
+test: the consumer already produced the anchor and wrote it back, so the earlier
+line could not be observed *by construction*. The right response is to delete the
+line rather than to invent a test for it — and deleting it turned out to fix a
+real misdiagnosis, because stamping earlier made the anchor older than the cycle
+it measured. Two lines writing one field is the same smell as two derivations of
+one fact.
+
 **Do not key a test on a constant the fix will change.** A discriminator written
 against `MAX_TRANSFER_ATTEMPTS` turns red when the limit is corrected, for a
 reason unrelated to what the test is about. Key on the facts that actually differ
