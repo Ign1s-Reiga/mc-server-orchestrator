@@ -208,6 +208,17 @@ retired version, in the header, which is the string read first. The identifiers
 are what the tooling sees; the sentences are what a human uses to decide whether
 a green run means anything.
 
+**A test that first demonstrates the defect inherits every rule the defect rests
+on.** Round 25's pin-exit test asserts the login path is *shut* while the
+replacement drain waits, before asserting the operator's lever reopens it — so a
+mutation that released the seal on a *block* reddened it as well as the case
+written for that rule, and the run reported MISCAUGHT. The extra red was a true
+dependency, not noise: with the seal released on a block there was never a
+blackout to have an exit from. Declare the full red set in the mutation entry and
+say why, and keep a second entry that isolates the rule on its own — weakening
+the demonstration half to make one mutation tidy would delete the evidence that
+the defect is real.
+
 ## When the check cannot exist, move it to the compiler
 
 Structured-logging argument order is untyped and untested anywhere in this repo —

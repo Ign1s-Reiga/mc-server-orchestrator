@@ -234,11 +234,39 @@ Three things worth carrying:
   `requireEmpty` re-reading on the stopping pass is the guarantee. Saying so is
   what makes the waiver defensible rather than a loosening.
 
+## "It lapses on its own" is a sentence about a third party
+
+Round 25, and it is the limit of the whole level-triggered design. The reason an
+abort needs no unseal edge is that **somebody else** re-asserts: a backend's
+admission is stated by the *proxy's* pass, every pass, from `sealsBackend()`,
+including for a backend whose permanent abort has stopped its own passes.
+
+A subject that seals **itself** has no such party. The proxy's own re-assertion
+lives in `assertBackends`, which only a non-draining pass reaches, and a drain
+whose cause persists takes the draining branch for ever; a permanent abort stops
+the passes altogether. So `DrainController.abort` releases the seal of a subject
+with a seal and **no router** — the same shape `sealIsPrecondition` keys on, and
+stated as *"is there anything else that asserts this workload's admission"* so a
+future self-sealing subject gets it without being named.
+
+**`blocked` deliberately does not**, and that asymmetry is the interesting part:
+a block is the protocol working, the drain is waiting for the last player to log
+off, and the seal is *the mechanism of that wait*. Releasing it there refills the
+population the drain is waiting to drain and a delete on a busy fleet could never
+complete. The general test — does this effect exist to *cause* the condition the
+step is waiting for? Then a "consistency" compensation on the waiting path
+removes the reason the wait can end.
+
 ## Rulings I made that a human may overrule
 
 1. **`DRAIN_FAILED` unseals.** A blocked-with-a-proxy drain therefore takes new
    players while parked. The alternative is an invisible running server, which
    the audit named as the harm.
+5. **A parked proxy drain flaps its own seal**, because the abort releases and
+   the next pass's resume re-asserts. Accepted: the window is one backoff and it
+   is the residual `requireEmpty` already re-reads for. The alternative — release
+   only on a *permanent* abort — leaves a retryable park sealed for however long
+   the fault lasts, which is the same harm with a slower clock.
 2. **More than one proxy claiming a backend is a retryable failure on the
    *backend's* status**, and the container is not created while it holds. The
    refusal is **exempt for a terminating definition** — it returns before

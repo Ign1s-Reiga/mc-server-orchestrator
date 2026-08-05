@@ -152,6 +152,27 @@ Two things to carry:
   enforcement point and it is invisible to a grep for the thing you want to
   detect.
 
+## A remedy names a property, not a layer
+
+Round 25 offered two fixes and asked for one with a reason. The chosen one was
+*"make it an operator-settable field with a default"* — and "field" reads as the
+server-definition YAML, which would have been a lockstep `:schema` + `:store` +
+`:core` change for a value that has nothing to do with one server.
+
+The properties the remedy actually asked for were: a default, settable, still
+hash-bearing, revertable. A `ReconcilerConfig` entry plus an environment variable
+in `:app` satisfies all four in one module. **Pick the layer whose lifetime
+matches the value**: this one tracks `:velocity-plugin`'s compile target, so it
+belongs to the orchestrator build rather than to a proxy document, and a
+per-proxy field would have invited a pin the bundled plugin cannot load. Say
+which layer you chose and what it costs — here, reverting needs a restart and
+bumps no generation, so it does not lift a permanent failure.
+
+The other half of picking one of two: **say what the one you rejected leaves
+open.** (a) would have exempted containers created before the entry existed and
+left the mechanism live for every future bump, and it adds a second derivation of
+the canonical spec — the shape that has produced repeated defects here.
+
 ## Arguing to leave something open
 
 When escalating a known hole rather than fixing it, **argue from what is at

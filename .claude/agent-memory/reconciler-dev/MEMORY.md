@@ -18,3 +18,4 @@
 - [Level-triggered seal](project_level-triggered-seal.md) — assert, never issue; anchor rules; why a seal binds only a subject with a transfer; rulings open to overruling.
 - [Record where no work happens](project_record-where-no-work-happens.md) — the third critical from "did work ⇒ recovered", and why the fix was placement rather than a narrower rule.
 - [Invariants need an enforcement point](feedback_invariants-need-an-enforcement-point.md) — pin wiring by shape and every premise of an unreachability argument; two gates need a side-effect assertion.
+- [Replacement needs an exit](project_replacement-exit.md) — a hash input no operator can edit closes the fleet's login path; the lever chosen, the one refused, and the wait still unbounded.
