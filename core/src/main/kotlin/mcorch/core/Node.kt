@@ -82,6 +82,34 @@ public interface Node {
     public suspend fun ensureImage(image: ImageRef): ImageAvailability
 
     /**
+     * Whether this node could build [spec], asked *before* something irreversible
+     * is done on the assumption that it can.
+     *
+     * ## The question exists because the answer arrived too late once
+     *
+     * A hash-bearing edit to a proxy is a replacement: drain to zero, stop, remove,
+     * then create. Every one of those steps is correct and the last one is where
+     * the node discovers it has no copy of the control plugin to mount — so the
+     * front door is already gone and the loop has just learned, permanently, that
+     * it cannot build another. Nothing stages that artefact for an ordinary
+     * install, so it is the default state rather than an unlucky one.
+     *
+     * Returns normally when the workload could be built, and throws exactly what
+     * [ensureWorkload] would have thrown otherwise. It is deliberately **not** a
+     * second copy of the checks: an implementation answers this by running the same
+     * derivation the create runs and discarding the result, so a rule that gains a
+     * new case gains it in both places at once or in neither.
+     *
+     * Cheap and side-effect free: it creates nothing, and it must not — the caller
+     * is a pass that has decided to do nothing yet.
+     *
+     * A node that cannot answer without contacting a runtime may throw
+     * [NodeException.Unreachable], which the caller requeues; "I could not check"
+     * is never "yes".
+     */
+    public suspend fun checkWorkload(spec: WorkloadSpec)
+
+    /**
      * Brings the workload described by [spec] into existence, or adopts the one
      * already there. Does **not** start it.
      *
@@ -368,6 +396,27 @@ public data class WorkloadSpec(
     val ports: List<PortRequest> = emptyList(),
     val labels: Map<String, String> = emptyMap(),
 ) {
+    // What a **planner** can get wrong, and deliberately not what an *operator* or
+    // a *stored row* can.
+    //
+    // The distinction is not stylistic. A `require` here throws out of
+    // `Reconciler`'s `Pass` construction, which happens before the delete exemption
+    // and lands in `rejectDefinition` — a `PERMANENT` failure recorded with no
+    // exemption for a terminating definition. So a rule enforced here about a value
+    // an operator supplies makes the server **permanently unreconcilable, drain and
+    // delete included**: exactly the undeletable-populated-server state that ends
+    // in a manual `crictl stop`. And a `require` cannot be made to know whether the
+    // definition it came from is on its way out.
+    //
+    // Every check below is therefore about a value the planners derive from *code*
+    // — a blank hash, a blank hostname, two assets at one path, all of which are
+    // closed sets in this repository and none of which any YAML or store row can
+    // reach. Freezing on one of those is correct: the repair is a code change.
+    //
+    // Rules about operator-supplied paths — that a persistent mount is absolute,
+    // that an asset does not shadow it — live in `HostPaths`, which refuses the
+    // *create* through `NodeException.Rejected` and leaves the drain able to run.
+    // See `StorageRequest.Persistent`.
     init {
         require(specHash.isNotBlank()) { "specHash must not be blank" }
         require(hostname.isNotBlank()) { "hostname must not be blank" }
@@ -411,12 +460,31 @@ public sealed interface StorageRequest {
     public data class Persistent(
         /** Names the claim. Deliberately not a host path — that would pin the server to a node. */
         val volume: ResourceName,
+        /**
+         * Where the world appears inside the container. Absolute — but **not
+         * checked here**, and the absence is deliberate.
+         *
+         * This value comes from `spec.storage.mountPath`, so it is operator data
+         * that also arrives by a second route: a stored row read back through
+         * `DefinitionCodec`, which does not re-run the reader's validation. An
+         * `init` check would therefore throw out of `Reconciler`'s `Pass`
+         * construction — before the delete exemption — and record a `PERMANENT`
+         * failure that no drain and no delete can get past. A row that bypassed the
+         * reader would freeze a *world-holding* server rather than merely failing
+         * its create, and an undeletable populated server is what produces a manual
+         * `crictl stop`.
+         *
+         * `HostPaths` refuses it instead, as a `NodeException.Rejected` on the
+         * create. Same permanence, same message, and the drain still runs — a
+         * container that already exists is drained against its own labels and never
+         * asks this type anything. See `WorkloadSpec`'s `init` for the split.
+         *
+         * `AssetMount.directory` keeps its `init` checks for the opposite reason:
+         * it is derived from a planner constant and a closed enum, so no definition
+         * and no store row can reach it.
+         */
         val mountPath: String,
-    ) : StorageRequest {
-        init {
-            require(mountPath.startsWith("/")) { "mountPath must be absolute, got: $mountPath" }
-        }
-    }
+    ) : StorageRequest
 
     public data object Ephemeral : StorageRequest
 }

@@ -73,8 +73,20 @@ internal object HostPaths {
      * [LocalNode]'s alone). The whole point of moving it is that this function
      * *is* nameable from a test.
      *
+     * ## It is also where the *plan* is checked, not just the filesystem
+     *
+     * Two rules about operator-supplied paths are enforced here rather than in
+     * `WorkloadSpec`'s `init`, and the difference is which failures are survivable.
+     * A `require` in the type throws out of `Reconciler`'s `Pass` construction,
+     * which sits above the delete exemption, so it freezes the drain of a server
+     * that may hold a world and have players on it. A refusal here fails the
+     * *create* — which is the operation that is actually wrong — and leaves the
+     * drain, the stop and the teardown able to run, because none of them asks this
+     * function anything. See `StorageRequest.Persistent.mountPath`.
+     *
      * @throws NodeException.Rejected if an asset the workload needs is not on
-     *   this node. Permanent: see [rejected].
+     *   this node, or if the mounts the spec asks for cannot be built coherently.
+     *   Permanent: see [rejected].
      */
     fun mounts(
         node: NodeName,
@@ -85,6 +97,7 @@ internal object HostPaths {
         buildList {
             when (val storage = spec.storage) {
                 is StorageRequest.Persistent -> {
+                    checkMountPlan(node, spec, storage)
                     add(
                         HostMount(
                             containerPath = storage.mountPath,
@@ -112,6 +125,50 @@ internal object HostPaths {
                 )
             }
         }
+
+    /**
+     * The two rules about where a persistent world lands, checked where refusing
+     * costs a create rather than a delete.
+     *
+     * **Absolute.** A relative `containerPath` is not something the runtime can
+     * bind; it reaches CRI and fails there, with a message about a mount rather
+     * than about a definition.
+     *
+     * **Not shadowed by an artefact, and not shadowing one.** `AssetMount` and
+     * `StorageRequest.Persistent` both carry paths that are now genuinely honoured,
+     * and nothing had ever checked one against the other. Overlapping bind mounts
+     * are resolved by an ordering this code does not choose, so the outcomes are a
+     * read-only artefact sitting on top of a world directory, or a writable world
+     * hiding the control plugin — and the second is the silent one, a proxy that
+     * starts perfectly and has no control endpoint. Neither planner can spell it
+     * today, which is exactly why the rule is written down before a third one is.
+     */
+    private fun checkMountPlan(
+        node: NodeName,
+        spec: WorkloadSpec,
+        storage: StorageRequest.Persistent,
+    ) {
+        val world = storage.mountPath
+        if (!world.startsWith("/")) {
+            throw NodeException.Rejected(
+                node,
+                NodeOperation.CREATE,
+                "`${spec.server}` asks for its world at `$world`, which is not an absolute path. Nothing can be " +
+                    "mounted there, so no container is created — the definition's `spec.storage.mountPath` has " +
+                    "to start with `/`. Any container that already exists is unaffected and can still be drained",
+            )
+        }
+        val shadowed = spec.assets.map { it.destination }.filter { it == world || it.startsWith("$world/") }
+        if (shadowed.isNotEmpty()) {
+            throw NodeException.Rejected(
+                node,
+                NodeOperation.CREATE,
+                "`${spec.server}` would have $shadowed mounted at or under its world mount `$world`. One of the " +
+                    "two would hide the other and which one is not this orchestrator's decision, so no container " +
+                    "is created: either the artefact or `spec.storage.mountPath` has to move",
+            )
+        }
+    }
 
     /**
      * The file on this host backing an asset, refusing rather than mounting a
