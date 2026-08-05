@@ -370,6 +370,26 @@ internal class SaveEvidenceTest {
         contradicted.drain.playersEvacuated.shouldBeTrue()
         contradicted.occupancy shouldBe progress(confirmed, online = 1).occupancy
 
+        // No narrowing, stated rather than inherited. The assertion above would go
+        // red under `|| drain.playersEvacuated` — but only because [drain] happens
+        // to hand back a drain that claims it, which is coverage by fixture default
+        // and lasts exactly as long as nobody edits the default. The condition is
+        // the two facts *this pass* established, a count it observed and a
+        // confirmation it is about to write down, and nothing else the drain is
+        // carrying: every field below is one a step in the pass may be about to act
+        // on, which is why none of them may excuse the record.
+        listOf(
+            confirmed.copy(playersEvacuated = false),
+            confirmed.copy(saveRequestedAt = at),
+            confirmed.copy(resaveForcedAt = start),
+            confirmed.copy(state = DrainState.STOPPING),
+        ).forEach { record ->
+            progress(record, online = 1)
+                .dropSaveContradictedByPlayers()
+                .drain.worldSaved
+                .shouldBeFalse()
+        }
+
         // A zero reading corroborates the confirmation rather than contradicting
         // it, and voiding here would make every healthy drain save for ever.
         progress(confirmed, online = 0) shouldBe progress(confirmed, online = 0).dropSaveContradictedByPlayers()

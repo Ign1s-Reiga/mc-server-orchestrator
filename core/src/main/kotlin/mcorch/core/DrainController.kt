@@ -35,7 +35,10 @@ import java.time.Duration as JavaDuration
  *   for a server with world data, a *confirmed* save. How many there are is not
  *   stated here — see the two gates below, and `DrainWiringTest`, which asserts
  *   that each one sits behind `mayStop` and that no other file in this module's
- *   main sources calls the stop at all.
+ *   main sources decides to call the stop at all. That scan covers
+ *   [Node.removeWorkload] too: it is the other way a container ends, it is what a
+ *   rescheduling path reaches, and the drain does not call it — `Reconciler`'s
+ *   teardowns do, once this controller has reported the container down.
  * - **A drain that cannot finish leaves the server running.** Every failure path
  *   lands on [DrainState.DRAIN_FAILED], and there is no edge from there to
  *   [DrainState.STOPPING]. Reaching a retry limit means the loop stops trying,
@@ -3276,6 +3279,18 @@ internal fun DrainStatus.readPlayers(
  * twentieth audit demonstrated exactly that by mutation. A rule no input can
  * exercise has to be asserted on the rule itself, which needs the rule to be
  * something a test can call. `SaveEvidenceTest` calls this one.
+ *
+ * ## What the extraction cost, and where that is paid
+ *
+ * Inline, the clause could only be applied to the drain its reading came from.
+ * Here the receiver and the argument are supplied separately, so
+ * `recorded.adoptSaveClause(reading)` is well-typed and would hand the pass back a
+ * confirmation [dropUnusableSaveEvidence] has just taken away for want of a
+ * witness. Nothing in the type system refuses it; giving every [PlayerReading] a
+ * drain of its own would, and that is the collapse [readPlayers] deliberately does
+ * not make — silence means different things to its three callers. So the guard is
+ * the call site's shape instead: `DrainWiringTest` asserts this is applied to the
+ * same name [readPlayers] was called on, and the red-proof mutates it there.
  */
 internal fun DrainStatus.adoptSaveClause(reading: PlayerReading): DrainStatus =
     when (reading) {

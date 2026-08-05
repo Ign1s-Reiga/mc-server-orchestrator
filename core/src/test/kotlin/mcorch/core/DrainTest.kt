@@ -1329,6 +1329,110 @@ internal class DrainTest {
             harness.node.saves shouldHaveSize 1
         }
 
+    /**
+     * The third arm of `STOPPING`'s gate, and the one with a world in it: a stop is
+     * not re-issued at a container that restarted underneath the drain.
+     *
+     * The two tests above are about the player count. This one is about the other
+     * half of the same `if`, `mayStop`, which had **no behavioural coverage in
+     * `STOPPING` at all** until the twenty-first audit went looking: narrowing the
+     * gate to `!mayStop(…) && !drain.playersEvacuated` kept the token, the call
+     * count and the enclosing function, so `DrainWiringTest` stayed green — and
+     * `playersEvacuated` is true of every drain that has reached this state, so the
+     * narrowed gate is an unconditional re-issue.
+     *
+     * What that costs is a world. The stop does not take; an operator restarts the
+     * container by hand; players join the new process and build. The confirmation
+     * this drain is holding is about the process that is gone, which is exactly what
+     * [DrainStatus.saveIsCurrent] compares against the container's start time, and
+     * the re-issued stop would take the new session's world with it — the grace
+     * period is a safety net, not a save.
+     *
+     * The probe is **silent** here on purpose, and that is the whole difficulty: a
+     * container that has just been restarted has not finished booting, so the
+     * occupied arm cannot fire and `requireEmpty` is deliberately not in the way
+     * (`STOPPING` lets silence through, which the test above pins). The gate is the
+     * only thing left standing.
+     *
+     * The correct answer is not to give up either: the drain goes back for another
+     * save and re-issues the stop once it has one, so the last assertion is about
+     * *ordering* rather than about a refusal.
+     */
+    @Test
+    fun `a stop is not re-issued at a container that restarted underneath the drain`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.store.deleteDefinition(name)
+
+            // The stop is issued and does not take: the container is still running
+            // on the next pass, which is what brings the re-issue into play.
+            harness.node.onStop = { present -> present }
+            repeat(7) { harness.pass(name) }
+            harness.node.stops shouldHaveSize 1
+            harness.node.saves shouldHaveSize 1
+            val stopping =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            stopping.state shouldBe DrainState.STOPPING
+            // The confirmation this drain reached the stop on. It is about to stop
+            // describing the container in front of it.
+            stopping.worldSaved.shouldBeTrue()
+            stopping.playersEvacuated.shouldBeTrue()
+
+            // An operator restarts it by hand. Same workload, new process: whatever
+            // was in memory is gone, and anything somebody does from here is not on
+            // disk. Five seconds, so nothing here turns on the evidence ageing out —
+            // the container's start time is what makes the confirmation worthless.
+            harness.clock.advance(5.seconds)
+            val present = harness.node.workload.shouldBeInstanceOf<WorkloadObservation.Present>()
+            harness.node.workload = present.copy(startedAt = harness.clock.instant())
+            // …and it is still booting, so its Server List Ping does not answer.
+            harness.node.joinable = false
+
+            val outcome = harness.pass(name)
+
+            // No second stop at a container this drain has never saved.
+            harness.node.stops shouldHaveSize 1
+            val resaving =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            resaving.state shouldBe DrainState.SAVING
+            resaving.worldSaved.shouldBeFalse()
+            // Nothing is wrong and nobody is being waited on: one forced re-save is
+            // the protocol working, and it must not read as either.
+            resaving.failure shouldBe null
+            resaving.blocked shouldBe null
+            // The pass says which gate refused, because "Progressed" on its own is
+            // what a re-issued stop reports too.
+            outcome.detail shouldContain "the stop is not re-issued until the world is saved again"
+
+            // It finishes booting. The drain saves again and only *then* re-issues
+            // the stop, which is the ordering the gate exists for — a refusal that
+            // never lifted would be a server nobody can retire.
+            harness.node.joinable = true
+            var savesWhenReStopped: Int? = null
+            repeat(8) {
+                harness.pass(name)
+                if (savesWhenReStopped == null && harness.node.stops.size > 1) {
+                    savesWhenReStopped = harness.node.saves.size
+                }
+                harness.clock.advance(2.seconds)
+            }
+            // The instrument is not vacuous: a second stop really was reached, and
+            // the second save came first.
+            savesWhenReStopped.shouldNotBeNull() shouldBe 2
+        }
+
     @Test
     fun `an RCON client that never reached the server may try again`() =
         coreTest {
