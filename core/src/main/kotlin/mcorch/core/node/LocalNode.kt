@@ -86,6 +86,15 @@ import kotlin.time.toJavaDuration
  * A [StorageRequest.Persistent] volume becomes a host directory under
  * [volumeRoot], created if it is not there and **never removed by this class**.
  * That is what makes the world survive the container (CLAUDE.md invariant 2).
+ *
+ * ## Assets
+ *
+ * [mcorch.core.AssetMount] is where an artefact this orchestrator ships becomes
+ * a path: **this class is the only thing that knows one**, and it knows it
+ * because [LocalNodeConfig.assetRoot] told it. A caller asks for
+ * [mcorch.core.WorkloadAsset.VELOCITY_CONTROL_PLUGIN] and never learns where the
+ * file is; a distributed node would answer the same request out of its own
+ * store.
  */
 public class LocalNode internal constructor(
     override val name: NodeName,
@@ -93,6 +102,7 @@ public class LocalNode internal constructor(
     private val secrets: SecretStore,
     private val volumeRoot: Path,
     private val logRoot: Path,
+    private val assetRoot: Path,
     private val sandboxNamespace: String,
     private val cgroupParent: String?,
 ) : Node,
@@ -675,21 +685,22 @@ public class LocalNode internal constructor(
                 ),
         )
 
+    /**
+     * The workload's mounts, as CRI wants them.
+     *
+     * A field copy and nothing else. Every decision — which storage gets a
+     * directory, where an asset comes from, whether a missing one is a failure —
+     * belongs to [HostPaths.mounts], which is in this module's own types and can
+     * therefore be tested. This function is where those decisions used to live,
+     * and where one of them was silently dropped.
+     */
     private fun mountsFor(spec: WorkloadSpec): List<VolumeMount> =
-        when (val storage = spec.storage) {
-            is StorageRequest.Persistent -> {
-                listOf(
-                    VolumeMount(
-                        containerPath = storage.mountPath,
-                        hostPath = volumePathFor(storage.volume).toString(),
-                    ),
-                )
-            }
-
-            // The one case with no mount, and the only one that may skip it.
-            is StorageRequest.Ephemeral -> {
-                emptyList()
-            }
+        HostPaths.mounts(name, volumeRoot, assetRoot, spec).map { mount ->
+            VolumeMount(
+                containerPath = mount.containerPath,
+                hostPath = mount.hostPath,
+                readOnly = mount.readOnly,
+            )
         }
 
     /**
@@ -738,7 +749,11 @@ public class LocalNode internal constructor(
         HostPaths.prepare(name, volumeRoot, logRoot, spec)
     }
 
-    private fun volumePathFor(volume: ResourceName): Path = HostPaths.volumePath(volumeRoot, volume)
+    // There is deliberately no `volumePathFor` here any more. It existed for the
+    // mount derivation that used to live in this file, and leaving a
+    // volume-root-to-path helper lying about is an invitation to rebuild that
+    // derivation beside the one in `HostPaths` — which is exactly the shape the
+    // dropped plugin mount was written in.
 
     private fun logDirectoryFor(server: ResourceName): Path = HostPaths.logDirectory(logRoot, server)
 
@@ -896,6 +911,7 @@ public class LocalNode internal constructor(
                 secrets = secrets,
                 volumeRoot = config.volumeRoot,
                 logRoot = config.logRoot,
+                assetRoot = config.assetRoot,
                 sandboxNamespace = config.sandboxNamespace,
                 cgroupParent = config.cgroupParent,
             )
@@ -917,6 +933,18 @@ public data class LocalNodeConfig(
     val volumeRoot: Path,
     /** Root of the container log directories. */
     val logRoot: Path,
+    /**
+     * Where this host keeps the artefacts the orchestrator ships into
+     * containers, by [mcorch.core.WorkloadAsset.fileName].
+     *
+     * Deliberately has no default, and deliberately is not derived from
+     * anything. It is a deployment fact — where the install put the plugin JAR —
+     * and a default would be a guess that reads as working right up until a
+     * proxy comes up without its control plugin. A workload that asks for an
+     * asset which is not here is refused at create time rather than started
+     * without it.
+     */
+    val assetRoot: Path,
     /** Groups this orchestrator's sandboxes. Not a Kubernetes namespace; nothing resolves it anywhere. */
     val sandboxNamespace: String = "mcorch",
     /**

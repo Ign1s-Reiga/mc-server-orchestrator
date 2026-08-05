@@ -348,6 +348,16 @@ public data class WorkloadSpec(
      */
     val specHash: String,
     val storage: StorageRequest,
+    /**
+     * Artefacts this orchestrator ships that have to be inside the container.
+     *
+     * Coordinates, exactly like [secretEnv]: an [AssetMount] names *what* is
+     * needed and *where in the container* it goes, and the node resolves it to
+     * whatever it has locally at the moment it builds the container. No path on
+     * any host appears here, so a workload spec stays something a remote node
+     * could satisfy from its own copy.
+     */
+    val assets: List<AssetMount> = emptyList(),
     val resources: ResourceRequest,
     val hostname: String,
     val env: Map<String, String> = emptyMap(),
@@ -361,6 +371,9 @@ public data class WorkloadSpec(
     init {
         require(specHash.isNotBlank()) { "specHash must not be blank" }
         require(hostname.isNotBlank()) { "hostname must not be blank" }
+        require(assets.distinctBy { it.destination }.size == assets.size) {
+            "two assets must not be mounted at the same path: ${assets.map { it.destination }}"
+        }
         require(env.keys.none { it.isBlank() }) { "environment variable names must not be blank" }
         require(secretEnv.keys.none { it.isBlank() }) { "environment variable names must not be blank" }
         require(env.keys.none { it in secretEnv.keys }) {
@@ -371,7 +384,8 @@ public data class WorkloadSpec(
     /** Environment *values* are redacted, the same way the runtime's own spec redacts them. */
     override fun toString(): String =
         "WorkloadSpec(server=$server, kind=$kind, image=${image.canonical}, specHash=$specHash, " +
-            "storage=$storage, resources=$resources, hostname=$hostname, env=${env.keys.sorted()}=<redacted>, " +
+            "storage=$storage, assets=$assets, resources=$resources, hostname=$hostname, " +
+            "env=${env.keys.sorted()}=<redacted>, " +
             "secretEnv=${secretEnv.keys.sorted()}=<from secret store>, command=$command, args=$args, " +
             "ports=$ports, labels=$labels)"
 }
@@ -382,19 +396,93 @@ public data class WorkloadSpec(
  * [Persistent] outlives the container: removing and recreating the workload
  * keeps the world. [Ephemeral] is the only case that skips it, and only
  * explicitly-disposable kinds may ask for it (CLAUDE.md invariant 2).
+ *
+ * ## Only [Persistent] carries a path, and that is the point
+ *
+ * [Ephemeral] used to carry a `mountPath` too, and the single-host node
+ * discarded it — a field that every planner filled in, that no implementation
+ * read, and that read like configuration in every test that asserted on it.
+ * That is how the proxy's control plugin came to be "mounted" at a path nothing
+ * ever mounted anything at. A path in this type is now a path that is honoured;
+ * ephemeral means the container's own writable layer and nothing else. Anything
+ * that has to be *put* somewhere inside the container is an [AssetMount].
  */
 public sealed interface StorageRequest {
-    public val mountPath: String
-
     public data class Persistent(
         /** Names the claim. Deliberately not a host path — that would pin the server to a node. */
         val volume: ResourceName,
-        override val mountPath: String,
-    ) : StorageRequest
+        val mountPath: String,
+    ) : StorageRequest {
+        init {
+            require(mountPath.startsWith("/")) { "mountPath must be absolute, got: $mountPath" }
+        }
+    }
 
-    public data class Ephemeral(
-        override val mountPath: String,
-    ) : StorageRequest
+    public data object Ephemeral : StorageRequest
+}
+
+/**
+ * An artefact this orchestrator ships, and where it belongs inside a container.
+ *
+ * ## Why this is not a host path
+ *
+ * The control plugin has to be inside the proxy container or every backend
+ * behind that proxy is undrainable — so *something* has to carry a JAR from
+ * where the build put it to where Velocity reads plugins from. Naming that file
+ * in a [WorkloadSpec] would put a build-output path into the reconcile loop's
+ * vocabulary and make the spec unsatisfiable by any node that does not share
+ * this filesystem. So the loop names the [asset] and the node answers with its
+ * own copy: the single-host node bind-mounts a file it was configured with, and
+ * a distributed node would ship the bytes to its host first. Neither is visible
+ * here, which is the test of whether this seam is honest (CLAUDE.md invariant
+ * 7).
+ *
+ * ## Read-only, always
+ *
+ * There is no writable variant and there is no reason to add one. These are
+ * artefacts the orchestrator ships and the container consumes; a container that
+ * could rewrite one would be a container that can change what the next one
+ * loads.
+ */
+public data class AssetMount(
+    val asset: WorkloadAsset,
+    /**
+     * The **directory** inside the container the asset is placed in. The file
+     * name is the asset's own ([WorkloadAsset.fileName]) — a caller does not get
+     * to rename an artefact it does not own.
+     */
+    val directory: String,
+) {
+    init {
+        require(directory.startsWith("/")) { "directory must be absolute, got: $directory" }
+        require(!directory.endsWith("/")) { "directory must not have a trailing slash, got: $directory" }
+    }
+
+    /** Where the file lands inside the container. */
+    public val destination: String get() = "$directory/${asset.fileName}"
+}
+
+/**
+ * The artefacts this orchestrator can put inside a container.
+ *
+ * A closed set, so "which JAR" is a compile-time question. [fileName] is part of
+ * the identity rather than a caller's choice: Velocity discovers plugins by
+ * scanning for `*.jar`, so an artefact that arrived under the wrong name is an
+ * artefact that silently does not load — which is the failure this whole type
+ * exists to end.
+ */
+public enum class WorkloadAsset(
+    public val fileName: String,
+) {
+    /**
+     * The Velocity plugin `:velocity-plugin` builds — the control channel drain
+     * steps 2, 4 and 6 run through.
+     *
+     * A proxy without it comes up perfectly well, serves players, and has no
+     * control endpoint; every backend behind it is then undrainable, which is a
+     * fleet-wide property no single server's status would report.
+     */
+    VELOCITY_CONTROL_PLUGIN("mcorch-velocity-control.jar"),
 }
 
 /** Container limits. The JVM heap that has to fit inside them is already in the environment. */

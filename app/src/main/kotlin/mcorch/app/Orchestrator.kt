@@ -137,6 +137,7 @@ public class Orchestrator private constructor(
                                 runtimeEndpoint = config.runtimeEndpoint,
                                 volumeRoot = config.volumeRoot,
                                 logRoot = config.logRoot,
+                                assetRoot = config.assetRoot,
                                 sandboxNamespace = config.sandboxNamespace,
                                 cgroupParent = config.cgroupParent,
                             ),

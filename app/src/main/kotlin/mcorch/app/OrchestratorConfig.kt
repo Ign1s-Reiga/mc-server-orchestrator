@@ -30,6 +30,19 @@ public data class OrchestratorConfig(
     val volumeRoot: Path,
     /** Container logs live here. */
     val logRoot: Path,
+    /**
+     * Where the deployment put the artefacts this orchestrator mounts into
+     * containers — today just the Velocity control plugin JAR, under the name
+     * [mcorch.core.WorkloadAsset.VELOCITY_CONTROL_PLUGIN] expects.
+     *
+     * Separate from [dataDirectory] as a matter of what it is: state belongs to
+     * the deployment, artefacts belong to the *build* that produced this
+     * process, and the two have different lifetimes on upgrade. It is still
+     * defaulted underneath the data directory, because a single-host install has
+     * one place to put things and a missing artefact is refused loudly at create
+     * time rather than producing a proxy with no control endpoint.
+     */
+    val assetRoot: Path,
     val sandboxNamespace: String = DEFAULT_SANDBOX_NAMESPACE,
     /** See [LocalNodeConfig.cgroupParent]: its shape depends on the runtime's cgroup driver. */
     val cgroupParent: String? = LocalNodeConfig.DEFAULT_CGROUP_PARENT,
@@ -39,6 +52,7 @@ public data class OrchestratorConfig(
         public const val DATA_VARIABLE: String = "MCORCH_DATA_DIR"
         public const val NODE_VARIABLE: String = "MCORCH_NODE_NAME"
         public const val CGROUP_VARIABLE: String = "MCORCH_CGROUP_PARENT"
+        public const val ASSET_VARIABLE: String = "MCORCH_ASSET_DIR"
 
         public const val DEFAULT_SANDBOX_NAMESPACE: String = "mcorch"
         public const val DEFAULT_NODE_NAME: String = "local"
@@ -73,6 +87,9 @@ public data class OrchestratorConfig(
                 dataDirectory = data,
                 volumeRoot = data.resolve("volumes"),
                 logRoot = data.resolve("logs"),
+                assetRoot =
+                    environment[ASSET_VARIABLE]?.takeIf { it.isNotBlank() }?.let { Path.of(it) }
+                        ?: data.resolve("assets"),
                 cgroupParent =
                     environment[CGROUP_VARIABLE]?.takeIf { it.isNotBlank() }
                         ?: LocalNodeConfig.DEFAULT_CGROUP_PARENT,

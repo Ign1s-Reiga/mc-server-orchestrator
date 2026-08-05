@@ -68,8 +68,16 @@ internal object PaperWorkloadPlanner {
 
                 // The only branch allowed to skip a volume, and only because
                 // the operator asked for `ephemeral` by name.
+                //
+                // `declared.mountPath` is deliberately dropped rather than
+                // carried: nothing mounts anything for an ephemeral workload, so
+                // a path here would be a value no implementation reads. The
+                // server writes into the container's own layer at whatever path
+                // its image uses, and the declared one still contributes to the
+                // spec hash — an operator who changes it gets a fresh container,
+                // which is the only observable this ever had.
                 is StorageSpec.Ephemeral -> {
-                    StorageRequest.Ephemeral(mountPath = declared.mountPath)
+                    StorageRequest.Ephemeral
                 }
             }
 

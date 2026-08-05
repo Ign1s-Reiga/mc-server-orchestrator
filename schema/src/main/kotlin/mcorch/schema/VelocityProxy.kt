@@ -41,7 +41,46 @@ public data class VelocityProxyDefinition(
 
 /** Defaults in one place, so the parser, the tests and the reconciler cannot drift apart. */
 public object VelocityProxyDefaults {
-    /** Velocity's own default listener. This is the port players type into their client. */
+    /**
+     * The port the proxy **image** binds players on, which is the port this
+     * orchestrator has to declare.
+     *
+     * ## It is not Velocity's own default, and the difference is the whole note
+     *
+     * A bare Velocity 4.0.0 generates a `velocity.toml` binding `0.0.0.0:25565`,
+     * and PaperMC's documentation says the same. This constant is 25577 anyway,
+     * and 25577 is right — because the proxy never generates that file. The image
+     * installs a stock `velocity.toml` before Velocity starts (`DOWNLOAD_DEFAULTS`
+     * in `itzg/mc-proxy`'s entrypoint, fetched from a third-party defaults
+     * repository), and that file says `bind = "0.0.0.0:25577"`. What Velocity
+     * would have chosen for itself never happens.
+     *
+     * That was verified the expensive way: set to 25565 on the strength of the
+     * release's own default, a real proxy under `:app:integrationTest` came up
+     * healthy, loaded its plugin, answered its control endpoint — and never became
+     * ready, because a Server List Ping to 25565 inside the sandbox was refused
+     * for five minutes. The evidence for 25565 was about a Velocity nobody runs
+     * here.
+     *
+     * ## Why a wrong value costs so much
+     *
+     * Nothing configures Velocity's bind: there is no `VELOCITY_PORT` in the image
+     * and Velocity reads no port from the environment (see
+     * `VelocityWorkloadPlanner`'s environment contract). So this value is not a
+     * request — it is a *claim about the image*, used to map the published port
+     * and to aim the readiness ping. A wrong claim is a proxy that never reports
+     * ready and a host port that reaches nothing.
+     *
+     * ## What makes it fragile, and the way out
+     *
+     * It tracks a config file the image downloads from a repository this project
+     * does not control, so it has to be re-verified whenever the image tag moves —
+     * the integration suite is what does that. The durable fix is for the
+     * orchestrator to own `velocity.toml` (the image syncs `/config` into
+     * `/server` with environment interpolation *before* it installs defaults), at
+     * which point `spec.network.port` becomes a real request and this becomes an
+     * ordinary default. That is a larger change than the one that found this.
+     */
     public const val PLAYER_PORT: Int = 25577
 
     /**

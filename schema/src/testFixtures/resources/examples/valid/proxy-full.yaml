@@ -11,8 +11,13 @@ spec:
   image: registry.example.com:5000/mc/velocity@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
   maxPlayers: 2000
   network:
-    # The port players type into their client.
+    # The port Velocity listens on inside the container. Nothing configures
+    # Velocity's own `bind`, so this is a claim about the image rather than a
+    # request: it has to be the port that image's velocity.toml actually binds,
+    # or the proxy is published on a port nothing answers on and never reports
+    # ready.
     port: 25577
+    # The port players type into their client.
     hostPort: 25565
   resources:
     memory: 4Gi

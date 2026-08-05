@@ -8,6 +8,7 @@ import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.types.shouldBeInstanceOf
 import kotlinx.coroutines.test.runTest
 import mcorch.schema.DrainState
+import mcorch.schema.VelocityProxyDefaults
 import mcorch.store.Fixtures
 import mcorch.store.ServerListing
 import mcorch.store.StatePart
@@ -258,7 +259,11 @@ class CorruptStoreTest {
                 directory,
                 """
                 UPDATE server_definition
-                   SET spec_doc = replace(spec_doc, 'control.port=8375', 'control.port=25577')
+                   SET spec_doc = replace(
+                         spec_doc,
+                         'control.port=8375',
+                         'control.port=${VelocityProxyDefaults.PLAYER_PORT}'
+                       )
                  WHERE name = 'edge-02'
                 """.trimIndent(),
             )

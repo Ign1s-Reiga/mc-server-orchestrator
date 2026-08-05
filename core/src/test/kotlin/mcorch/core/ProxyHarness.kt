@@ -43,6 +43,16 @@ internal fun proxyDefinition(
     selector: Map<String, String> = mapOf(BACKEND_LABEL to BACKEND_POOL),
     fallback: List<ResourceName> = emptyList(),
     controlPort: Int = VelocityProxyDefaults.CONTROL_PORT,
+    /**
+     * Coordinates of the control endpoint's bearer token, or null for an
+     * endpoint that is not published and needs none.
+     *
+     * Null by default because that is the schema's default, and because the
+     * interesting assertion is about the *pair*: a token declared here has to
+     * reach both `:core`'s outbound calls and the plugin's own environment, and
+     * for a while it reached only the first.
+     */
+    tokenSecret: SecretRef? = null,
     maxPlayers: Int = 200,
 ): VelocityProxyDefinition =
     VelocityProxyDefinition(
@@ -62,7 +72,7 @@ internal fun proxyDefinition(
                         selector = BackendSelector(selector),
                         fallback = fallback,
                     ),
-                control = ControlEndpointSpec(port = controlPort),
+                control = ControlEndpointSpec(port = controlPort, tokenSecret = tokenSecret),
                 maxPlayers = maxPlayers,
                 network = ProxyNetworkSpec(hostPort = 25577),
                 placement = PlacementSpec(node = nodeName(node)),

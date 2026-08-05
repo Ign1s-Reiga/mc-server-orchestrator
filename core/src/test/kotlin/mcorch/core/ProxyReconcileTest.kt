@@ -5,6 +5,7 @@ import io.kotest.matchers.booleans.shouldBeTrue
 import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.collections.shouldContain
 import io.kotest.matchers.collections.shouldHaveSize
+import io.kotest.matchers.collections.shouldNotBeEmpty
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
@@ -16,7 +17,9 @@ import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
 import mcorch.schema.FailureClass
 import mcorch.schema.FailureReason
+import mcorch.schema.SecretRef
 import mcorch.schema.ServerPhase
+import mcorch.store.getOrThrow
 import org.junit.jupiter.api.Test
 import kotlin.time.Duration.Companion.minutes
 
@@ -191,6 +194,128 @@ internal class ProxyReconcileTest {
             created.specHash shouldBe
                 mcorch.core.paper.PaperWorkloadPlanner
                     .specHash(unmatched)
+        }
+
+    /**
+     * The container the *loop* creates carries the control channel, twice over.
+     *
+     * Both halves of this were missing at once and neither was visible from any
+     * status: the plugin JAR was requested as storage and dropped by the node, and
+     * the token the plugin authenticates with was never put in the container — so
+     * `:core` sent a bearer token to an endpoint that had been told nothing and
+     * would serve anyone who reached the port. The planner's own unit tests are
+     * `VelocityWorkloadPlannerTest`; this asserts the workload that reached a node
+     * through a real reconcile pass, which is what a planner nobody wired would
+     * still fail.
+     *
+     * The second half is idempotency, on the same scenario rather than as a
+     * separate one: the asset is not part of the spec hash — it is constant for
+     * the kind — so a pass that recreated a container over it would be a silent
+     * restart of a proxy with players on it.
+     */
+    @Test
+    fun `the proxy container the loop creates carries the plugin and the token, once`() =
+        coreTest {
+            val token = SecretRef.of("front-01-control", "token").getOrThrow()
+            val harness = ProxyHarness(proxy = proxyDefinition(tokenSecret = token))
+            harness.bringUp()
+
+            val created = harness.proxyNode.creates.single()
+            created.assets.single().asset shouldBe WorkloadAsset.VELOCITY_CONTROL_PLUGIN
+            created.assets.single().directory shouldBe VelocityWorkloadPlanner.PLUGIN_DIRECTORY
+            // Coordinates, never material — and in `secretEnv`, so nothing that
+            // renders a spec can print it.
+            created.secretEnv[VelocityWorkloadPlanner.CONTROL_TOKEN] shouldBe token
+            created.env.containsKey(VelocityWorkloadPlanner.CONTROL_TOKEN).shouldBeFalse()
+            // The same reference the loop authenticates with. Two fields that could
+            // disagree would be an endpoint refusing its own orchestrator.
+            harness.proxyDefinition.spec.control.tokenSecret shouldBe token
+
+            harness.sweep()
+            harness.sweep()
+
+            harness.proxyNode.creates shouldHaveSize 1
+            harness.proxyNode.stops.shouldBeEmpty()
+        }
+
+    /**
+     * A node that cannot supply the plugin refuses the proxy, permanently.
+     *
+     * This is the composition the fix rests on, and each half is pinned where it
+     * lives: `WorkloadMountsTest` asserts that a node with no artefact throws
+     * `Rejected` rather than mounting a hole, and this asserts what a `Rejected`
+     * on a *proxy* create does — surfaces as `PERMANENT`, keeps the operator's
+     * message, and stops being attempted. Starting a proxy without its control
+     * endpoint would be the worse outcome: it serves players perfectly and every
+     * backend behind it is undrainable.
+     */
+    @Test
+    fun `a node that cannot supply the plugin refuses the proxy rather than starting one without it`() =
+        coreTest {
+            val harness = ProxyHarness()
+            val name = harness.proxyDefinition.metadata.name
+            harness.proxyNode.failAlways(
+                NodeOperation.CREATE,
+                NodeException.Rejected(
+                    harness.proxyNode.name,
+                    NodeOperation.CREATE,
+                    "`front-01` needs the VELOCITY_CONTROL_PLUGIN artefact and node does not have it: every " +
+                        "backend behind it would be undrainable",
+                ),
+            )
+            harness.declareAll()
+
+            harness.pass(name).shouldBeInstanceOf<ReconcileOutcome.Failed>()
+
+            val status = harness.proxyStatus().shouldNotBeNull()
+            val failure = status.failure.shouldNotBeNull()
+            failure.failureClass shouldBe FailureClass.PERMANENT
+            failure.reason shouldBe FailureReason.CONTAINER_CREATE_FAILED
+            failure.message shouldContain "undrainable"
+            harness.proxyNode.starts.shouldBeEmpty()
+
+            // "Stops retrying" has to be a side effect, not an outcome: the node is
+            // not asked again.
+            val attempts = harness.proxyNode.calls.count { it == NodeOperation.CREATE }
+            harness.pass(name)
+            harness.pass(name)
+            harness.proxyNode.calls.count { it == NodeOperation.CREATE } shouldBe attempts
+        }
+
+    /**
+     * The other side of the same classification: a node that is merely down.
+     *
+     * A proxy is the one workload whose absence blocks every drain in the fleet, so
+     * a transient failure must not be allowed to look permanent — that would freeze
+     * the status and stop the routing sweep that restores joins to a parked
+     * backend.
+     */
+    @Test
+    fun `a proxy create that fails transiently requeues and gets through on the next pass`() =
+        coreTest {
+            val harness = ProxyHarness()
+            val name = harness.proxyDefinition.metadata.name
+            harness.proxyNode.failOnce(NodeOperation.CREATE, harness.proxyNode.unreachable(NodeOperation.CREATE))
+            harness.declareAll()
+
+            // The proxy path ensures the image and creates in the same pass, so
+            // the armed fault lands on the first one.
+            harness.pass(name).shouldBeInstanceOf<ReconcileOutcome.Retry>()
+
+            harness.proxyNode.creates.shouldBeEmpty()
+            harness
+                .proxyStatus()
+                .shouldNotBeNull()
+                .failure
+                .shouldNotBeNull()
+                .failureClass shouldBe FailureClass.RETRYABLE
+
+            harness.pass(name)
+            harness.proxyNode.creates shouldHaveSize 1
+            harness.proxyNode.creates
+                .single()
+                .assets
+                .shouldNotBeEmpty()
         }
 
     /**

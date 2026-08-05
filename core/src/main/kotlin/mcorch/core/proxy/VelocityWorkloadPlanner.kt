@@ -1,9 +1,11 @@
 package mcorch.core.proxy
 
+import mcorch.core.AssetMount
 import mcorch.core.Labels
 import mcorch.core.PortRequest
 import mcorch.core.ResourceRequest
 import mcorch.core.StorageRequest
+import mcorch.core.WorkloadAsset
 import mcorch.core.WorkloadSpec
 import mcorch.schema.VelocityProxyDefinition
 import mcorch.velocity.control.ControlProtocol
@@ -30,36 +32,103 @@ import java.security.MessageDigest
  * compiler asks every kind the question, and re-deriving the answer in the planner
  * would put it back to being a convention.
  *
- * **The plugin JAR is mounted.** Velocity loads plugins from a directory, so the
- * JAR the orchestrator built has to be visible inside the container. Without it
- * the proxy comes up perfectly well and has no control endpoint, which is the
- * failure mode where every backend behind it becomes undrainable.
+ * **The plugin JAR is delivered, and the endpoint is told its token.** Velocity
+ * loads plugins from a directory, so the JAR the orchestrator built has to be
+ * inside the container — as an [AssetMount], which is a request a node has to
+ * satisfy or refuse. Without it the proxy comes up perfectly well and has no
+ * control endpoint, which is the failure mode where every backend behind it
+ * becomes undrainable. Both halves of that sentence were false for a while: the
+ * JAR was requested as storage and dropped by the node, and the token the plugin
+ * authenticates with was never put in the container at all, so a published
+ * endpoint served anyone who reached the port while `:core` politely sent a
+ * bearer token it ignored.
  *
- * **The forwarding secret is a coordinate.** [WorkloadSpec.secretEnv] carries the
- * reference; the node resolves it at the moment it hands it to the runtime. There
- * is no field in this file that could hold the material and no log line that could
- * print it (CLAUDE.md invariant 4).
+ * **The forwarding secret and the control token are coordinates.**
+ * [WorkloadSpec.secretEnv] carries the references; the node resolves them at the
+ * moment it hands them to the runtime. There is no field in this file that could
+ * hold either material and no log line that could print one (CLAUDE.md invariant
+ * 4).
  */
 internal object VelocityWorkloadPlanner {
     const val PLAYER_PORT_NAME: String = "player"
     const val CONTROL_PORT_NAME: String = "control"
 
     /**
-     * Where the proxy image expects plugins. `itzg/mc-proxy` and the stock
-     * Velocity layout both read `/server/plugins`.
+     * The image's plugin **staging** directory, not Velocity's plugin directory.
      *
-     * **Unverified against a real image**, like the Paper image contract beside
-     * it. An integration test against real containerd is what turns it from
-     * plausible into true, and it is one constant so it is one place to correct.
+     * Verified against `itzg/mc-proxy` (`scripts/run-bungeecord.sh`, image
+     * `2026.7.1-java25`): the entrypoint does `cp -ru /plugins $BUNGEE_HOME`
+     * before it starts the proxy, and `BUNGEE_HOME` is `/server`. So a JAR
+     * mounted at `/plugins` arrives in `/server/plugins`, which is where
+     * Velocity — whose working directory is `/server` — scans.
+     *
+     * **`/server/plugins` is the wrong answer and this constant used to hold
+     * it.** Mounting into `/server` is not merely redundant: the same entrypoint
+     * runs `chown -R bungeecord:bungeecord $BUNGEE_HOME` under `set -e`, and
+     * chowning a read-only bind mount fails, so the container would exit during
+     * startup. The staging directory is outside `BUNGEE_HOME` and is only ever
+     * read.
      */
-    const val PLUGIN_DIRECTORY: String = "/server/plugins"
+    const val PLUGIN_DIRECTORY: String = "/plugins"
 
-    /** The environment contract of the proxy image. */
+    /**
+     * The environment contract of the proxy image, verified against
+     * `itzg/mc-proxy` `2026.7.1-java25`'s entrypoint.
+     *
+     * ## What is *not* here, and why
+     *
+     * `VELOCITY_PORT` and `VELOCITY_MAX_PLAYERS` were, and neither exists. The
+     * image's entrypoint reads no such variable and Velocity itself takes both
+     * from `velocity.toml` (`bind`, `show-max-players`), which the image
+     * downloads a stock copy of. They looked like configuration in every test
+     * that asserted on them and configured nothing at all.
+     *
+     * The consequence is worth stating plainly, because it is a live limitation
+     * rather than a tidy-up: **this build cannot move the port Velocity listens
+     * on.** The image installs a stock `velocity.toml` before the proxy starts
+     * and that file decides the bind. `spec.network.port` still decides the port
+     * mapping and the readiness ping, so it is a *claim about the image* — a
+     * definition that names anything else is a proxy that never becomes ready,
+     * visibly as `READINESS_TIMEOUT` rather than silently.
+     * `VelocityProxyDefaults.PLAYER_PORT` is that claim and carries the evidence
+     * for it.
+     *
+     * Making the port genuinely configurable means owning `velocity.toml`: the
+     * image syncs `/config` into `/server` with environment interpolation, and it
+     * does so *before* it installs its defaults with `--skip-existing`, so a file
+     * placed there wins. That is the shape of the fix and it is a larger change
+     * than this one, not something to smuggle in here.
+     */
+    const val TYPE: String = "TYPE"
+
+    /**
+     * Selects the proxy the image runs. **Without it the image runs
+     * BungeeCord**, which is its documented default — a proxy that starts
+     * perfectly, ignores modern forwarding, and cannot load a Velocity plugin,
+     * so the control endpoint never exists and every backend behind it is
+     * undrainable.
+     */
+    const val TYPE_VELOCITY: String = "VELOCITY"
+
     const val FORWARDING_SECRET: String = "VELOCITY_FORWARDING_SECRET"
     const val FORWARDING_MODE: String = "VELOCITY_FORWARDING_MODE"
-    const val PLAYER_PORT: String = "VELOCITY_PORT"
-    const val MAX_PLAYERS: String = "VELOCITY_MAX_PLAYERS"
     const val CONTROL_PORT: String = "MCORCH_CONTROL_PORT"
+
+    /**
+     * The control endpoint's bearer token, read by the plugin from the
+     * environment ([mcorch.velocity.control.ControlConfig.ENV_TOKEN]).
+     *
+     * **Secret material, so it travels in [WorkloadSpec.secretEnv]** and never
+     * in `env` — the same rule the forwarding secret follows (CLAUDE.md
+     * invariant 4). The plugin treats an absent token as "no authentication
+     * required", which is legitimate only for an endpoint that is not published;
+     * the schema is what pairs `control.hostPort` with `control.tokenSecret`, and
+     * this is the wire that made that pairing mean anything. Before it, `:core`
+     * sent a bearer token to an endpoint that had been told nothing, so the
+     * endpoint served whoever reached the port.
+     */
+    const val CONTROL_TOKEN: String = "MCORCH_CONTROL_TOKEN"
+
     const val INIT_MEMORY: String = "INIT_MEMORY"
     const val MAX_MEMORY: String = "MAX_MEMORY"
 
@@ -71,12 +140,19 @@ internal object VelocityWorkloadPlanner {
             kind = definition.kind,
             image = spec.image,
             specHash = specHash(definition),
-            // A proxy holds no world, so the mount is the plugin directory and
-            // nothing else. This is the branch CLAUDE.md invariant 2 exempts by
-            // name — "only disposable lobbies and minigame instances may be
-            // treated as ephemeral" — and a proxy qualifies for the stronger
-            // reason that there is no `storage` block in its schema to ask.
-            storage = StorageRequest.Ephemeral(mountPath = PLUGIN_DIRECTORY),
+            // A proxy holds no world. This is the branch CLAUDE.md invariant 2
+            // exempts by name — "only disposable lobbies and minigame instances
+            // may be treated as ephemeral" — and a proxy qualifies for the
+            // stronger reason that there is no `storage` block in its schema to
+            // ask.
+            //
+            // The plugin JAR is *not* storage and never was. It used to be
+            // spelled as an ephemeral mount at the plugin directory, which the
+            // node discarded, so the class note below was describing something
+            // that did not happen.
+            storage = StorageRequest.Ephemeral,
+            // The control channel, in the only form that reaches the container.
+            assets = listOf(AssetMount(WorkloadAsset.VELOCITY_CONTROL_PLUGIN, PLUGIN_DIRECTORY)),
             resources =
                 ResourceRequest(
                     memoryBytes = spec.resources.memory.bytes,
@@ -85,15 +161,26 @@ internal object VelocityWorkloadPlanner {
             hostname = name.value,
             env =
                 buildMap {
+                    // First, because without it none of the rest is a Velocity
+                    // proxy at all. See [TYPE_VELOCITY].
+                    put(TYPE, TYPE_VELOCITY)
                     put(FORWARDING_MODE, spec.forwarding.mode.wireValue)
-                    put(PLAYER_PORT, spec.network.port.toString())
-                    put(MAX_PLAYERS, spec.maxPlayers.toString())
                     put(CONTROL_PORT, spec.control.port.toString())
                     put(INIT_MEMORY, jvmMemory(spec.resources.heap.min.bytes))
                     put(MAX_MEMORY, jvmMemory(spec.resources.heap.max.bytes))
                 },
             // Coordinates, never material.
-            secretEnv = mapOf(FORWARDING_SECRET to spec.forwarding.secret),
+            secretEnv =
+                buildMap {
+                    put(FORWARDING_SECRET, spec.forwarding.secret)
+                    // Absent when the operator declared no token, which the
+                    // schema allows only for an endpoint that is not published.
+                    // The plugin reads absence as "no authentication", so the
+                    // two have to agree — and they do, because both are this one
+                    // field: `ControlChannel` sends the token from
+                    // `spec.control.tokenSecret` and this is the same reference.
+                    spec.control.tokenSecret?.let { put(CONTROL_TOKEN, it) }
+                },
             ports =
                 buildList {
                     add(
