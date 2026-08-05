@@ -247,9 +247,10 @@ internal class DrainWiringTest {
      * [DrainController.stop] re-asserts `mayStop` itself, and that re-assertion is
      * the only gate in this controller with no scenario behind it — narrow it and
      * every test in the suite stays green. The class note above says why that is
-     * acceptable, in the form of a claim about this source: `stop` has **one**
-     * caller, and that caller is reached from a branch that has already asked
-     * `mayStop`. Both halves are asserted here rather than asserted in prose,
+     * acceptable, in the form of a claim about this source, and the claim has
+     * **three** premises: `stop` has one caller; that caller is reached from a
+     * branch that has already asked `mayStop`; and what reaches `stop` is what that
+     * branch asked about. All three are asserted here rather than asserted in prose,
      * because a KDoc that counts call sites is what was wrong the last three times.
      *
      * What goes red if a future edit routes into the stop from somewhere else is
@@ -258,11 +259,45 @@ internal class DrainWiringTest {
      * condition is now behaviour somebody can narrow, and it needs a scenario in
      * `DrainTest` like the other two.
      *
-     * The second half is a *presence* check, deliberately, and the same shape as
-     * the gate assertion below: that the state which reaches `letGoAndStop` asks
-     * `mayStop` at all, not that the question is the whole of its condition. The
-     * content of that branch is the one gate a scenario can reach, so `DrainTest`
-     * is where it is held.
+     * ## The third premise is the one that decides whether the backstop is alive
+     *
+     * `stop(pass, drain)` and `stop(pass, drain.copy(…))` are both well-typed, and
+     * under the second the backstop is answering a question about a drain nothing
+     * upstream ever tested — which makes it a live gate rather than dead code, and a
+     * live gate no scenario can reach is one somebody can narrow invisibly. The pass
+     * is as load-bearing as the drain: `mayStop` takes the workload contract, the
+     * container's start time and the clock, and all three are read off the pass at
+     * both ends, so "the same question with the same arguments" is a claim about
+     * both parameters. The call is therefore required to forward `letGoAndStop`'s
+     * own parameters, unchanged and in order, with the names read off its
+     * declaration — *following* them the way `a pass is stepped with the drain the
+     * pass-entry reading voided` follows its receiver, rather than restating a
+     * literal `drain` here.
+     *
+     * ## The gate half is a presence check, and what actually covers it
+     *
+     * That the state which reaches `letGoAndStop` asks `mayStop` at all is asserted;
+     * that the question is the whole of its condition is not. The scan's unit is
+     * `step` — one function over eight states — so a `mayStop(` in *any* arm
+     * satisfies it, and the `DEREGISTERED` arm could drop its own gate with this
+     * test green. Tightening it to the arm was the alternative and was not taken:
+     * an arm has no boundary the language gives a handle on, so pinning one means
+     * pinning a range of lines, which is a maintained list wearing a test's clothes
+     * and reddens on a rewrap.
+     *
+     * What makes that acceptable is not the scan's tightness but what the two gates
+     * are to each other. A stop reaches the runtime only if the arm's gate **and**
+     * this backstop both allow it, so neither weakened alone loses a world; only the
+     * composite does. The assertion for a composite is one that reads what reached
+     * the node rather than which refusal was recorded, and `DrainTest`'s
+     * `stops.shouldBeEmpty()` is exactly that — two of its scenarios turn on this
+     * gate in particular (`a drain that keeps re-saving and never reaches the stop
+     * asks for a human` and `a long stop grace period does not delay the report of a
+     * drain that keeps re-saving`, both passes where `mayStop` is false at
+     * `DEREGISTERED`). **Those assertions must not be rewritten into an assertion
+     * about the failure the drain recorded.** A refusal's wording names which gate
+     * spoke, and can be satisfied by the gate that is not the one under test; a
+     * runtime that was never asked to stop cannot be.
      *
      * Both counts are counts *in this file*, so both declarations have to be
      * `private` for either to mean anything — an `internal suspend fun stop` can be
@@ -286,6 +321,17 @@ internal class DrainWiringTest {
         calls shouldHaveSize 1
         withClue("the one call to `stop` is no longer inside `letGoAndStop`") {
             (calls.single() in rangeOf("letGoAndStop")) shouldBe true
+        }
+
+        // …and it is handed what its caller was handed, whole. Both parameters:
+        // `mayStop`'s other three arguments are all read off the pass, so a
+        // substituted pass changes the question exactly as a substituted drain does.
+        // The names come off the declaration rather than being written here, so this
+        // follows the parameters instead of restating them.
+        val forwarded = parametersOf(rangeOf("letGoAndStop"))
+        withClue("expected to read two parameters off `letGoAndStop`") { forwarded shouldHaveSize 2 }
+        withClue("`stop` is handed something other than the pass and drain `letGoAndStop` was given") {
+            codeOf(LINES[calls.single()]) shouldContain "stop(${forwarded.joinToString(", ")})"
         }
 
         // …and that caller is itself entered from one place. A second entry is a
@@ -438,6 +484,21 @@ internal class DrainWiringTest {
          * The name alone is not enough — a same-named private wrapper is the
          * evasion this exists to refuse — so it has to be an `override`, which only
          * a type implementing the interface can write.
+         *
+         * ## What an `override` is trusted with, and what nobody checks
+         *
+         * A *decorator* is an override and so contributes no entry:
+         * `override suspend fun stopWorkload(handle, grace) =
+         * delegate.stopWorkload(handle, ZERO)` passes this classifier while having
+         * changed the one argument that keeps a world on disk.
+         * [Node.stopWorkload]'s "strictly positive" is a KDoc promise enforced in
+         * `LocalNode` alone, so the single thing this scan cannot see is the seam
+         * CLAUDE.md exists to protect. It is not a live defect: there is one
+         * implementation, it is not a decorator, and a decorator is not something a
+         * single-host build has a reason to write. When a second [Node] lands — a
+         * remote one, or anything wrapping another — the check to add is that every
+         * implementation passes its own `gracePeriod` through unmodified, which is a
+         * different claim from this one and needs its own assertion.
          */
         fun performs(verb: String): Boolean = name == verb && declaration.contains("override ")
     }
@@ -521,6 +582,9 @@ internal class DrainWiringTest {
         /** The name a `<receiver>.<call>(…)` expression is applied to. */
         val RECEIVER = Regex("""^(\w+)\.""")
 
+        /** `<name>: <Type>,` — one parameter, on its own line, as this project formats them. */
+        val PARAMETER = Regex("""^\s*(\w+):\s*\S""")
+
         /**
          * Any `return`, including `x ?: return y`, `if (c) return y` and a labelled
          * `return@advance`. A labelled return out of a lambda would be flagged too
@@ -594,6 +658,33 @@ internal class DrainWiringTest {
                     "expected a `val <name> = <value>` binding, found: ${line.trim()}"
                 }
             return Binding(name = match.groupValues[1], value = match.groupValues[2].trim())
+        }
+
+        /**
+         * The parameter names of the function whose body is [range], in order.
+         *
+         * Read off the declaration for the same reason [callee] reads a receiver off
+         * an expression: an assertion that *follows* a name survives the name
+         * changing and still refuses a substitution, where one that restates the
+         * literal `drain` only refuses the substitution.
+         */
+        fun parametersOf(range: IntRange): List<String> {
+            val declaration = LINES[range.first]
+            // One parameter per line is this project's formatting, and the scan
+            // depends on it. A single-line declaration would make the `takeWhile`
+            // below walk into the body, so it is refused rather than misread.
+            check(codeOf(declaration).trimEnd().endsWith("(")) {
+                "expected one parameter per line, found: ${declaration.trim()}"
+            }
+            return LINES
+                .slice(range)
+                .drop(1)
+                .takeWhile { !it.trimStart().startsWith(")") }
+                .map { line ->
+                    requireNotNull(PARAMETER.find(codeOf(line))) {
+                        "expected a `<name>: <Type>,` parameter, found: ${line.trim()}"
+                    }.groupValues[1]
+                }
         }
 
         /** The name an expression is applied to, so an assertion can follow it rather than restate it. */

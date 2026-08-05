@@ -4,8 +4,10 @@
 # `core/src/test/kotlin/mcorch/core/DrainWiringTest.kt` asserts the *shape* of
 # DrainController's safety claims — that each rule is applied unconditionally, that
 # the value it produces is the value that leaves, and that every call which ends a
-# container is decided in one file. `SaveEvidenceTest` asserts what the rules
-# themselves do, and `DrainTest` asserts the one stop gate a scenario can reach. A
+# container is decided at a call site named there. The unit used to be the *file*,
+# and D15 is the mutation that retired that claim: the one path the assertion exists
+# for lands in a file the list already carried. `SaveEvidenceTest` asserts what the
+# rules themselves do, and `DrainTest` asserts the stop gates a scenario can reach. A
 # structural test cannot be sabotaged behaviourally, so its red-proof has to
 # sabotage the wiring, and one sabotage is not enough: these assertions fail
 # independently of each other, and four of the mutations below restored round 18's
@@ -47,8 +49,14 @@
 #            its condition unpinned is that its one caller has just asked the same
 #            question. That argument is about this source, so it is pinned and this
 #            is the edit that expires it.
-#            Its other precondition — step 7 being private — has no mutation, and
-#            the reason is written beside where one would go.
+#   D17      the same argument's third premise: that the *same* drain, and the same
+#            pass, reach the backstop. A caller that hands `stop` anything else has
+#            made it a live gate whose narrowing no scenario can see. The mutation
+#            is small on purpose — it costs almost nothing at runtime and costs the
+#            whole unreachability argument.
+#            The argument's remaining precondition — step 7 being private, so
+#            callers in this file are all the callers — has no mutation, and the
+#            reason is written beside where one would go.
 #   C1..C3   controls: the rule deleted outright, once per assertion arm. If these
 #            do not redden, the harness is not reaching the assertions at all.
 #   S1       the self-test. See below.
@@ -72,6 +80,14 @@
 # A mutation that no longer applies is a failure too, and a deliberate one: it
 # means the source it was written against has moved, and whether the defect it
 # describes is still expressible has to be decided by a human rather than assumed.
+#
+# **A precondition the compiler already refuses gets no mutation, and the reason is
+# written where the mutation would have gone.** That is the convention, not an
+# exception made once: an entry that cannot compile leaves no report, `judge` reads
+# no report as UNKNOWN, and the run would count a failure that proves nothing about
+# the assertion. The written reason is what tells the next reader that the gap is a
+# ruling rather than an oversight, and what to write the day the compiler stops
+# refusing it.
 #
 #   ./scripts/dev/drain-wiring-mutations.sh          run all of them, and S1
 #   ./scripts/dev/drain-wiring-mutations.sh D3 C1    run some
@@ -194,6 +210,19 @@ SECOND_WAY_IN='    private suspend fun stopWithoutTheLadder(
     ): DrainProgress = stop(pass, drain)
 
 '"$STOP_DECLARATION"
+# The one call into step 7. The backstop asks `mayStop` about whatever arrives here,
+# and the argument that nothing can reach its refusal is that the `DEREGISTERED` arm
+# has just asked the same question — of the same drain, off the same pass.
+STOP_CALL='        if (router == null || drain.deregisteredAt != null) return stop(pass, drain)'
+# The backstop handed a drain nobody upstream tested. The edit itself is the sort a
+# careful person makes while tidying the record — the `Asserted` branch below stamps
+# `deregisteredAt`, so why not this one — and its runtime cost is small: on this path
+# there is no router, so it records a deregistration from a proxy that was never
+# there. What it costs is the whole unreachability argument, because the question
+# `mayStop` answers inside `stop` is no longer the question `step` asked. A backstop
+# answering a different question is a live gate, and a live gate nothing can reach is
+# one somebody can narrow with every test in the suite green.
+DRAIN_SUBSTITUTED='        if (router == null || drain.deregisteredAt != null) return stop(pass, drain.copy(deregisteredAt = now))'
 
 # name @@ file @@ class @@ testcases that must redden (";"-separated) @@ literal @@ replacement
 #
@@ -261,6 +290,11 @@ MUTATIONS=(
     # The claim that `stop`'s own `mayStop` needs no scenario is an argument about
     # this source, not about inputs. This is what expires it.
     "D16@@$CONTROLLER@@$WIRING@@$BACKSTOP@@$STOP_DECLARATION@@$SECOND_WAY_IN"
+    # The same argument's third premise, and the one that decides whether the
+    # backstop is dead code or a gate: what reaches it is what the branch above it
+    # asked about. Pinned by following `letGoAndStop`'s own parameter names rather
+    # than by restating them, so a rename stays green and this does not.
+    "D17@@$CONTROLLER@@$WIRING@@$BACKSTOP@@$STOP_CALL@@$DRAIN_SUBSTITUTED"
     # There is deliberately no mutation for that argument's other precondition —
     # that step 7 is private, so callers in this file are all the callers. The
     # obvious edit does not compile: `internal suspend fun stop` "exposes its
