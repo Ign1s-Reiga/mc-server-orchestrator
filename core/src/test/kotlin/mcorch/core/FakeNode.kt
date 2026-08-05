@@ -113,6 +113,21 @@ internal class FakeNode(
     }
 
     /**
+     * Lifts every fault armed against [operation].
+     *
+     * The operator half of a repair. A node fault that a human fixes — a
+     * permission corrected, a wedged runtime restarted — is not expressible with
+     * [failOnce] alone, because that decides in advance how many passes the fault
+     * lasts; a gate that only lifts on a definition change needs the fault to
+     * outlive an arbitrary number of passes and then stop.
+     */
+    fun clearFailures(operation: NodeOperation) {
+        alwaysFailures.remove(operation)
+        onceFailures.remove(operation)
+        rawFailures.remove(operation)
+    }
+
+    /**
      * Throws something that is *not* a [NodeException], the way a node
      * implementation does when a failure escapes its own translation — an
      * `IOException` from creating a host directory, say.

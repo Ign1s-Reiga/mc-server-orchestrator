@@ -1097,7 +1097,12 @@ public class Reconciler(
             val failed =
                 previous != null &&
                     previous.observedGeneration == stored.definition.generation &&
-                    previous.failure?.failureClass == FailureClass.PERMANENT
+                    previous.failure?.failureClass == FailureClass.PERMANENT &&
+                    // The same clause, for the same reason, on the proxy path.
+                    // See the note on the Paper pass: a permanent failure on a
+                    // drain that is not parked has been moved past, and treating
+                    // it as live freezes the drain one step short of finishing.
+                    previous.drain.let { it == null || it.state == DrainState.DRAIN_FAILED }
             return failed && !stored.definition.terminating
         }
 
@@ -2271,7 +2276,27 @@ public class Reconciler(
             val failed =
                 previous != null &&
                     previous.observedGeneration == stored.definition.generation &&
-                    previous.failure?.failureClass == FailureClass.PERMANENT
+                    previous.failure?.failureClass == FailureClass.PERMANENT &&
+                    // ...and the drain is actually parked on it.
+                    //
+                    // [DrainController.abort] is the only writer of a permanent
+                    // drain failure and it always moves to `DRAIN_FAILED`, so a
+                    // permanent failure sitting on a drain in any other state is
+                    // one the drain has already moved past — retained on purpose
+                    // by `settleRecords`' hysteresis, which keeps the escalation
+                    // anchor across a resume.
+                    //
+                    // Without this clause that retention armed this gate, and the
+                    // sixteenth audit's second critical was the result: an
+                    // operator edits the definition to repair a permanently
+                    // failed drain, the generation moves, the gate opens for
+                    // exactly one pass, that pass stops the container and moves to
+                    // `STOPPING` — and then the retained failure is written at the
+                    // new generation, the gate closes again, and `awaitStopped`
+                    // and `teardown` never run. Container stopped, workload never
+                    // removed, replacement never created, status frozen quoting a
+                    // node fault the operator had already fixed.
+                    previous.drain.let { it == null || it.state == DrainState.DRAIN_FAILED }
             // A delete request is a human intervening, and it lifts the gate for
             // as long as the delete is outstanding — not just until the drain
             // starts.

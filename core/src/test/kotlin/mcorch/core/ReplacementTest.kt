@@ -41,6 +41,63 @@ internal class ReplacementTest {
             harness.node.pulls shouldHaveSize 2
         }
 
+    /**
+     * The sixteenth audit's second critical: the drain advanced exactly one pass
+     * after the repair and then froze with the container stopped.
+     *
+     * `settleRecords`' hysteresis keeps a failure across a resume so the
+     * escalation anchor is not restamped. It kept the `PERMANENT` class with it,
+     * and `isBlockedByPermanentFailure` reads that class — so the pass that
+     * resumed, stopped the container and moved to `STOPPING` wrote the retained
+     * failure at the *new* generation, closing the gate behind itself.
+     * `awaitStopped` and `teardown` never ran: workload never removed, sandbox
+     * never reclaimed, replacement never created, and the status frozen quoting
+     * a node fault the operator had already fixed.
+     *
+     * Asserting on the removal and the replacement rather than on the failure
+     * being cleared, because a cleared failure is not what an operator was
+     * promised — a running replacement is, and the audit asked for it that way.
+     */
+    @Test
+    fun `an operator edit that repairs a refused stop finishes the replacement`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.node.creates shouldHaveSize 1
+
+            // Rejected, not Timeout: a refusal the loop classifies PERMANENT, so
+            // the gate arms rather than the drain simply retrying.
+            harness.node.failAlways(
+                NodeOperation.STOP,
+                NodeException.Rejected(harness.node.name, NodeOperation.STOP, "the runtime refused the stop"),
+            )
+            harness.declare(paperDefinition(image = "docker.io/itzg/minecraft-server:2026.7.0"))
+            harness.settle(name, limit = 14)
+
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                ?.state shouldBe DrainState.DRAIN_FAILED
+            harness.node.removals shouldHaveSize 0
+            harness.node.creates shouldHaveSize 1
+
+            // The operator fixes the node and edits the definition, which is the
+            // documented remedy and the only thing that lifts the gate.
+            harness.node.clearFailures(NodeOperation.STOP)
+            harness.declare(paperDefinition(image = "docker.io/itzg/minecraft-server:2026.7.1"))
+            harness.settle(name, limit = 24)
+
+            // The whole point: it got all the way through, not one step in.
+            harness.node.removals shouldHaveSize 1
+            harness.node.creates shouldHaveSize 2
+            harness.node.creates[1]
+                .image.canonical shouldBe "docker.io/itzg/minecraft-server:2026.7.1"
+        }
+
     @Test
     fun `a replacement never happens under live players`() =
         coreTest {

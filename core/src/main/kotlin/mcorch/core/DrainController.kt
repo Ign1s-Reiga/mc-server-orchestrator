@@ -639,7 +639,33 @@ internal class DrainController(
         return copy(
             drain =
                 drain.copy(
-                    failure = if (workDone && !resuming) null else drain.failure,
+                    failure =
+                        when {
+                            workDone && !resuming -> null
+
+                            // Retained for its escalation anchor — `attempts` and
+                            // `occurredAt` — but not for its class.
+                            //
+                            // A resume that did real work has *disproved* the
+                            // permanence: the step that was refused just
+                            // succeeded. Carrying `PERMANENT` forward from there
+                            // states something the pass has evidence against, and
+                            // `Reconciler.isBlockedByPermanentFailure` reads that
+                            // class to decide whether to stop reconciling the
+                            // server at all. Belt and braces with the parked
+                            // clause on the gate itself: either alone closes the
+                            // sixteenth audit's second critical, and the two
+                            // together mean neither a future reader of the class
+                            // nor a future caller of the gate can reopen it.
+                            //
+                            // The anchor survives, so a drain that fails again
+                            // keeps counting from when the trouble started rather
+                            // than from the resume — which is the whole reason the
+                            // hysteresis exists.
+                            workDone && resuming -> drain.failure?.recoverable()
+
+                            else -> drain.failure
+                        },
                     blocked = null,
                 ),
         )

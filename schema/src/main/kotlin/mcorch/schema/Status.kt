@@ -191,6 +191,22 @@ public data class FailureStatus(
         }
     }
 
+    /**
+     * The same failure with its permanence dropped and its anchor kept.
+     *
+     * For the one caller that has evidence against the class it is carrying: a
+     * drain that resumed and completed a step has *disproved* the permanence of
+     * whatever refused that step. [attempts] and [occurredAt] survive, because
+     * how long this trouble has been true is not what the resume disproved, and
+     * they are what the escalation threshold measures.
+     *
+     * Only ever widens what the loop is willing to retry, so it cannot make a
+     * `PERMANENT` failure out of a `RETRYABLE` one and cannot violate the
+     * [ALWAYS_RETRYABLE] rule above.
+     */
+    public fun recoverable(): FailureStatus =
+        if (failureClass == FailureClass.RETRYABLE) this else copy(failureClass = FailureClass.RETRYABLE)
+
     public companion object {
         /** Reasons that may only ever be [FailureClass.RETRYABLE]. See the note above. */
         public val ALWAYS_RETRYABLE: Set<FailureReason> = setOf(FailureReason.DRAIN_NO_DESTINATION)
