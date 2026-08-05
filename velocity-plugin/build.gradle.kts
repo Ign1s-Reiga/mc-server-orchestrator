@@ -97,6 +97,23 @@ val pluginJar =
 
 tasks.named("assemble") { dependsOn(pluginJar) }
 
+// How another module gets the *plugin* JAR without getting it on a classpath.
+//
+// `:app`'s integration suite has to stage a real artefact where a node looks for
+// one, and the only honest source is the task that builds it. It travels through
+// its own configuration rather than through `runtimeElements` for the reason the
+// note above gives: the thin `jar` is what consumers compile and run against, and
+// a fat one arriving on `:app`'s runtime classpath would put a second
+// kotlin-stdlib there and let classpath order decide which wins.
+val controlPlugin: Configuration by configurations.creating {
+    isCanBeConsumed = true
+    isCanBeResolved = false
+}
+
+artifacts {
+    add(controlPlugin.name, pluginJar)
+}
+
 // A plugin JAR that Velocity cannot load fails in a way no unit test reaches:
 // the classes are all correct and the *packaging* is wrong. These are the three
 // packaging mistakes that produce a proxy which starts fine and simply has no

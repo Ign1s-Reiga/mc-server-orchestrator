@@ -11,6 +11,7 @@ import mcorch.app.OrchestratorConfig
 import mcorch.core.Node
 import mcorch.core.ReconcileLoopConfig
 import mcorch.core.ReconcilerConfig
+import mcorch.core.WorkloadAsset
 import mcorch.core.WorkloadObservation
 import mcorch.core.WorkloadState
 import mcorch.schema.NodeName
@@ -18,10 +19,12 @@ import mcorch.schema.PaperServerStatus
 import mcorch.schema.ResourceName
 import mcorch.schema.SecretRef
 import mcorch.schema.ServerDefinition
+import mcorch.schema.VelocityProxyStatus
 import mcorch.store.SecretValue
 import mcorch.store.getOrThrow
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.PosixFilePermissions
 import kotlin.io.path.createDirectories
 import kotlin.time.Duration
@@ -61,6 +64,10 @@ internal class ContainerdHarness(
                     // unwritable from inside the container.
                     volumeRoot = shared(root.resolve("volumes")),
                     logRoot = shared(root.resolve("logs")),
+                    // The artefacts a real install would have put beside the
+                    // binary. Populated from the build's own output rather than
+                    // from a path written here — see [assets].
+                    assetRoot = assets(root.resolve("assets")),
                     sandboxNamespace = SANDBOX_NAMESPACE,
                 ),
             // Tight enough that a test does not spend its life waiting on a
@@ -99,6 +106,9 @@ internal class ContainerdHarness(
 
     suspend fun status(name: ResourceName): PaperServerStatus? =
         store.getServer(name)?.status?.status as? PaperServerStatus
+
+    suspend fun proxyStatus(name: ResourceName): VelocityProxyStatus? =
+        store.getServer(name)?.status?.status as? VelocityProxyStatus
 
     suspend fun node(): Node =
         orchestrator.nodes.node(nodeName)
@@ -156,14 +166,33 @@ internal class ContainerdHarness(
             store
                 .listServers()
                 .joinToString("; ") { server ->
-                    val status = server.status?.status as? PaperServerStatus
-                    val drain = status?.drain
-                    "${server.name}: phase=${status?.phase} ready=${status?.ready} " +
-                        "drain=${drain?.state}${drain?.failure?.let { " (${it.reason})" } ?: ""}" +
-                        status
-                            ?.failure
-                            ?.let { " failure=${it.reason}/${it.failureClass} x${it.attempts}: ${it.message}" }
-                            .orEmpty()
+                    // Both kinds, because a proxy that is waiting on something
+                    // prints as `phase=null` through a Paper-only cast — which
+                    // reads as "the store knows nothing about it" and sends the
+                    // next hour of diagnosis to the wrong component.
+                    when (val status = server.status?.status) {
+                        is PaperServerStatus -> {
+                            val drain = status.drain
+                            "${server.name}: phase=${status.phase} ready=${status.ready} " +
+                                "drain=${drain?.state}${drain?.failure?.let { " (${it.reason})" } ?: ""}" +
+                                status.failure
+                                    ?.let { " failure=${it.reason}/${it.failureClass} x${it.attempts}: ${it.message}" }
+                                    .orEmpty()
+                        }
+
+                        is VelocityProxyStatus -> {
+                            "${server.name}: phase=${status.phase} ready=${status.ready} " +
+                                "control=${status.control?.reachable}/${status.control?.compatible} " +
+                                "drain=${status.drain?.state}" +
+                                status.failure
+                                    ?.let { " failure=${it.reason}/${it.failureClass} x${it.attempts}: ${it.message}" }
+                                    .orEmpty()
+                        }
+
+                        null -> {
+                            "${server.name}: nothing observed yet"
+                        }
+                    }
                 }.ifEmpty { "no servers are stored" }
         }.getOrElse { "the store did not answer: ${it.message}" }
 
@@ -264,8 +293,19 @@ internal class ContainerdHarness(
          * [Store.listServers] no longer mentions.
          */
         val PROBE_NAMES: List<ResourceName> =
-            listOf("it-bringup", "it-noop", "it-drain", "it-replace", "it-nosave", "it-lobby")
+            listOf("it-bringup", "it-noop", "it-drain", "it-replace", "it-nosave", "it-lobby", "it-proxy")
                 .map { ResourceName.of(it).getOrThrow() }
+
+        /**
+         * The system property the build hands this suite the plugin JAR through.
+         *
+         * A *property*, set by `app/build.gradle.kts` from the `pluginJar` task's
+         * own output, rather than a path written in this file. The whole point of
+         * [mcorch.core.AssetMount] is that no build-output path appears in the
+         * orchestrator; repeating one here would put it back in the only place
+         * that could then verify it.
+         */
+        const val PLUGIN_JAR_PROPERTY: String = "mcorch.plugin.jar"
 
         fun endpoint(): String = System.getenv(ENDPOINT_VARIABLE)?.takeIf { it.isNotBlank() } ?: DEFAULT_ENDPOINT
 
@@ -290,6 +330,38 @@ internal class ContainerdHarness(
             path.createDirectories()
             runCatching {
                 Files.setPosixFilePermissions(path, PosixFilePermissions.fromString("rwxrwxrwx"))
+            }
+            return path
+        }
+
+        /**
+         * Stages this build's own plugin JAR the way an install would.
+         *
+         * Copied rather than pointed at, under the name
+         * [mcorch.core.WorkloadAsset.VELOCITY_CONTROL_PLUGIN] expects, so the run
+         * exercises the same lookup a deployment does — including the file name,
+         * which Velocity's `*.jar` scan makes load-bearing.
+         *
+         * Fails loudly when the property is missing. A suite that quietly skipped
+         * the asset would report green on the one defect it exists for: the
+         * proxy would come up perfectly well, with no control endpoint.
+         */
+        private fun assets(path: Path): Path {
+            shared(path)
+            val source =
+                System.getProperty(PLUGIN_JAR_PROPERTY)?.takeIf { it.isNotBlank() }?.let { Path.of(it) }
+                    ?: error(
+                        "$PLUGIN_JAR_PROPERTY is not set. `app/build.gradle.kts` sets it from " +
+                            ":velocity-plugin:pluginJar; run these through `./gradlew :app:integrationTest`",
+                    )
+            check(Files.isRegularFile(source)) { "no plugin JAR at $source" }
+            val staged = path.resolve(WorkloadAsset.VELOCITY_CONTROL_PLUGIN.fileName)
+            Files.copy(source, staged, StandardCopyOption.REPLACE_EXISTING)
+            // Readable by whatever the image runs as. The proxy image copies it
+            // as root before dropping privileges, but a 0600 artefact is a
+            // failure that would look exactly like a plugin that did not load.
+            runCatching {
+                Files.setPosixFilePermissions(staged, PosixFilePermissions.fromString("rw-r--r--"))
             }
             return path
         }

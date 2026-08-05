@@ -3,7 +3,11 @@ package mcorch.app.it
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.runBlocking
+import mcorch.schema.BackendSelector
+import mcorch.schema.BackendsSpec
+import mcorch.schema.ControlEndpointSpec
 import mcorch.schema.DrainSpec
+import mcorch.schema.ForwardingSpec
 import mcorch.schema.HeapSpec
 import mcorch.schema.ImageRef
 import mcorch.schema.LifecycleSpec
@@ -14,12 +18,16 @@ import mcorch.schema.ObjectMetadata
 import mcorch.schema.PaperServerDefinition
 import mcorch.schema.PaperServerSpec
 import mcorch.schema.PaperVersionSpec
+import mcorch.schema.ProxyLifecycleSpec
+import mcorch.schema.ProxyNetworkSpec
 import mcorch.schema.RconSpec
 import mcorch.schema.ResourceName
 import mcorch.schema.ResourceSpec
 import mcorch.schema.SchemaVersion
 import mcorch.schema.SecretRef
 import mcorch.schema.StorageSpec
+import mcorch.schema.VelocityProxyDefinition
+import mcorch.schema.VelocityProxySpec
 import mcorch.schema.VolumeSpec
 import mcorch.store.getOrThrow
 import kotlin.time.Duration
@@ -70,6 +78,73 @@ internal fun resourceName(raw: String): ResourceName = ResourceName.of(raw).getO
 internal const val PAPER_IMAGE: String = "docker.io/itzg/minecraft-server:2026.6.1"
 
 internal fun rconSecret(server: String): SecretRef = SecretRef.of("$server-rcon", "password").getOrThrow()
+
+/**
+ * The proxy image, pinned to a real tag on the JVM the plugin is built for.
+ *
+ * `-java25` is not cosmetic: `velocity-api` 4.0.0 declares `jvm.version = 25`, so
+ * the plugin JAR this repo builds targets 25 and will not link on the image's
+ * older-JVM variants. A run against `:2026.7.1` alone is a run against whatever
+ * default that tag carries.
+ */
+internal const val PROXY_IMAGE: String = "docker.io/itzg/mc-proxy:2026.7.1-java25"
+
+internal fun forwardingSecret(proxy: String): SecretRef = SecretRef.of("$proxy-forwarding", "modern").getOrThrow()
+
+internal fun controlToken(proxy: String): SecretRef = SecretRef.of("$proxy-control", "token").getOrThrow()
+
+/**
+ * Secret material for one run, generated rather than written.
+ *
+ * Never a literal, and not only because CLAUDE.md invariant 4 says the forwarding
+ * secret may not appear in a fixture: a committed control token is a committed
+ * credential for an endpoint that can move every player in a fleet. Generated per
+ * run, it exists in the secret store and in this process and nowhere else.
+ */
+internal fun generatedSecret(): String =
+    java.util.UUID
+        .randomUUID()
+        .toString()
+        .replace("-", "")
+
+/**
+ * A proxy whose control endpoint is inside the sandbox and needs a token to talk
+ * to.
+ *
+ * Unpublished on purpose — that is the schema's default and the safe one — so
+ * `:core` reaches the endpoint through the [mcorch.core.Node] abstraction, which
+ * is the path a drain uses. The token is declared anyway: an endpoint reachable
+ * from anything on this host is one worth authenticating, and it is the half of
+ * the control channel that was missing entirely.
+ */
+internal fun velocityProxy(
+    name: String,
+    image: String = PROXY_IMAGE,
+    hostPort: Int? = null,
+    selector: Map<String, String> = mapOf(PROXY_POOL_LABEL to name),
+    startupTimeout: Duration = 5.minutes,
+): VelocityProxyDefinition =
+    VelocityProxyDefinition(
+        apiVersion = SchemaVersion.CURRENT,
+        metadata = ObjectMetadata(name = resourceName(name)),
+        spec =
+            VelocityProxySpec(
+                image = ImageRef.parse(image).getOrThrow(),
+                resources =
+                    ResourceSpec(
+                        memory = MemoryQuantity.ofBytes(2L * MemoryQuantity.GIB).getOrThrow(),
+                        heap = HeapSpec(max = MemoryQuantity.ofBytes(1L * MemoryQuantity.GIB).getOrThrow()),
+                    ),
+                forwarding = ForwardingSpec(secret = forwardingSecret(name)),
+                backends = BackendsSpec(selector = BackendSelector(selector)),
+                control = ControlEndpointSpec(tokenSecret = controlToken(name)),
+                network = ProxyNetworkSpec(hostPort = hostPort),
+                lifecycle = ProxyLifecycleSpec(startupTimeout = startupTimeout),
+            ),
+    )
+
+/** A label no other fixture carries, so a proxy's selector matches only what a test gave it. */
+internal const val PROXY_POOL_LABEL: String = "mcorch.example/proxy-pool"
 
 /**
  * A deliberately small Paper server.
