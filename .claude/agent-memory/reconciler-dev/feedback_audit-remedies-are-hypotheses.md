@@ -86,6 +86,21 @@ what tells you which copies are already correctly scoped by their subject
 (`PaperWorkloadPlanner`'s is, because its parameter is a `PaperServerDefinition`)
 so you do not churn them.
 
+## A remedy that moves a defect gives it a new address
+
+Round 20's sharpest mutation was a *narrowed* predicate — `is Occupied &&
+!playersEvacuated` — written inline at a call site where no test could see it.
+The fix was to extract the predicate into a function so a unit test could call
+it. That is the right move, and it means the same defect can now be written in
+two places: at the call site (wrapped in a condition) and inside the function
+(narrowed). Both had to be red-proved, and they are caught by different tests —
+a structural one and a behavioural one.
+
+**When a remedy relocates a defect, mutate it at its new address too.** The
+question to ask of any extraction is "where can this be written now that it
+could not be written before", and the answer belongs in the red-proof rather than
+in the commit message.
+
 ## Arguing to leave something open
 
 When escalating a known hole rather than fixing it, **argue from what is at

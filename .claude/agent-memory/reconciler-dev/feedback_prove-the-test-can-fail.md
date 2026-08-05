@@ -1,6 +1,6 @@
 ---
 name: prove-the-test-can-fail
-description: Before trusting a green run, prove the check could have gone red — Gradle skips up-to-date tasks, virtual time hides races, and some checks belong in the type system instead
+description: Before trusting a green run, prove the check could have gone red — Gradle skips up-to-date tasks, virtual time hides races, a mutation set beats one sabotage, and some checks belong in the type system instead
 metadata:
   type: feedback
 ---
@@ -124,6 +124,28 @@ against `MAX_TRANSFER_ATTEMPTS` turns red when the limit is corrected, for a
 reason unrelated to what the test is about. Key on the facts that actually differ
 between the two behaviours — the state the drain lands in, whether it recorded a
 block — not on which of two failures a limit happened to produce.
+
+## A mutation set, and a verdict read from the report
+
+One sabotage proves one assertion. When a test carries several independent claims
+— a structural test usually does — the honest red-proof is a **set of mutations,
+each expected to redden exactly one named test**, kept as a script that applies
+them to a working copy and restores it (`scripts/dev/drain-wiring-mutations.sh`
+is the one for the drain wiring). Two things make it worth the trouble:
+
+- **Deletions are the easy half.** A deleted line reddens almost anything; what
+  slips through is the *plausible edit* — a narrowed predicate, an early return
+  inserted above a rule. Write the mutations a careful person would actually make
+  after reading the comments, and keep the deletions only as controls that the
+  harness reaches the assertions at all.
+- **"Exactly one test went red" is the load-bearing result.** It says the
+  assertions are independent and none is carrying another. Print the failing test
+  names, not a pass/fail.
+
+**Read the verdict from the JUnit XML, never from the build's exit status.** A
+mutation that fails to compile also exits non-zero, and counting that as "caught"
+is the non-compiling-sabotage trap above pointing the other way. No report is an
+unknown; a report with no `<failure>` is a green.
 
 ## When the check cannot exist, move it to the compiler
 

@@ -1,6 +1,6 @@
 ---
 name: invariants-need-an-enforcement-point
-description: An invariant held by every call site doing the right thing is not enforced — collapse it into one function whose return type carries it, distrust any comment counting call sites, and pin wiring that no input can exercise by asserting on the source
+description: An invariant held by every call site doing the right thing is not enforced — collapse it into one function whose return type carries it, distrust any comment counting call sites, and pin wiring that no input can exercise by asserting on the source (shapes only: unconditional application, exits, gates, and classification rather than lists)
 metadata:
   type: feedback
 ---
@@ -110,6 +110,38 @@ replace the adoption with the unvoided drain, add a third `stopWorkload` site as
 a dead private function. Each reddened exactly one test and nothing else — which
 is simultaneously the red-proof and the evidence for the finding that motivated
 the test. Report both halves; "only this test failed" is the load-bearing half.
+
+## What a structural pin may carry, and what it may not
+
+Round 20 mutated the real source four ways and **every one stayed green** against
+the pins above while restoring round 18's critical. The division of labour that
+came out of it is the durable part:
+
+- **A rule's content is behavioural; only "it is applied unconditionally" is a
+  shape.** Following a bound name survives renames and rewraps — which is what it
+  was sold on — and is no defence at all against a predicate wrapped round the
+  call site or narrowed inside it. Assert the binding's *right-hand side is the
+  call and nothing else*, which is a short expression to pin, and put the rule
+  itself in a function a unit test can call with every input. If the rule has
+  nowhere a test can reach it, that is the finding: extract it.
+- **An exit is a `return` token, not a line that starts with one.** `?: return x`
+  and `if (c) return x` are exits and a prefix match sees neither. Strip string
+  literals and trailing comments before any keyword scan, or the keyword gets
+  found in prose.
+- **Assert the gate, not the location.** "Two calls, one in each of these two
+  functions" says nothing about what stands above them. "Every call site's
+  enclosing function also calls `mayStop`" survives a third legitimate site being
+  added correctly, and refuses one added carelessly.
+- **Classify, never enumerate.** A file-set scan written as a literal list of
+  paths is a maintained list wearing a test's clothes, and the next `Node`
+  implementation has to be edited past it — which is exactly the seam this
+  project protects. The honest form: a file that names `stopWorkload(` either
+  *declares or overrides* it, or it is a caller, and there is one caller.
+
+Scope matters as much as shape: a claim written "in this codebase" pinned by a
+scan of one file is false in the direction that matters, because a stop added to
+a teardown or a rescheduling path is outside the scanned file *by construction*
+and is precisely what a drain audit goes looking for.
 
 ## A borrowed constant carries the guarantees of the type it came from
 
