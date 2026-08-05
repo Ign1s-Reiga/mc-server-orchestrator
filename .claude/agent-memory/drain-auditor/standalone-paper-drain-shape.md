@@ -445,3 +445,44 @@ desired definition rather than the running container.
   pacing is ever wanted, the place is `resumeInto`'s `workDone` rule for a drain
   already carrying `resaveForcedAt`, not the failure rule kept separate in rounds
   15 and 16.
+
+## Round 19 rulings: the record-level rule, and what it does not reach
+
+Audited at `0061f5c` (both `feat/velocity-proxy-kind` and `fix/save-evidence-stamping`).
+No critical. The two `stopWorkload` sites, `mayStop`, `letGoAndStop`, `teardown`
+and `LocalNode.removeWorkload` are unchanged by the round-19 diff.
+
+- **The four-state claim is genuinely retired, not relocated.** The old exemption
+  was safe only because `worldSavedAt` was provably null in `SEALED`,
+  `TARGET_RESOLVED`, `TRANSFERRING` and `SAVING`. With the pass-entry adoption,
+  for every state, `pass.occupancy.online > 0` implies the drain handed to that
+  state has `worldSavedAt == null` — by one expression, not by an enumeration.
+  The only writer of `worldSavedAt` (`save`'s `Confirmed` → re-probe
+  `Empty`/`Unanswered`) sits behind `requireEmpty`, so no pass can mint a
+  confirmation while its own occupancy is positive. Do not re-derive; re-check
+  only if a state gains a body above its gate or `save` gains a second writer.
+- **The "net repairs the record, adoption governs the decision" ruling holds**,
+  and the condition under which they stop agreeing is a step that reads
+  `saveIsCurrent`/`mayStop` before `requireEmpty`. There is exactly one today —
+  `resumeInto`'s ladder, ungated for a router-bearing subject — and it cannot
+  reach a stop. See [[drain-audit-danger-patterns]] items 79 and 81 for the two
+  residuals: the pair is jointly pinned and individually unpinned, and the net is
+  unreachable so it can only ever be pinned structurally.
+- **`DrainSubject.saveTimeout` does not weaken the Node/Scheduler/Store seam.**
+  It is a per-workload spec value with one reader, node-independent, resolved
+  from the definition the same way `stopGracePeriod` and `playerTransferTimeout`
+  already were; `Node.kt`'s change is KDoc only. `Duration.ZERO` for the proxy is
+  inert in practice — an unlabelled proxy container reads `holdsWorldData = true`
+  (`VelocityProxyAgent.contractOf`), so `goingRoundInCircles` *is* reachable for
+  one, but only on a first lap where `circling == 0`, and the `SAVING` pass after
+  it aborts `PERMANENT` on `SaveOutcome.Unconfirmable`. It becomes a live
+  30-second bound the day a proxy gains a save channel.
+- **The fixture root cause generalises and belongs with the instrument rules.**
+  *A fixture whose defaults are derived from one another cannot fail a test that
+  confuses them.* `Fixtures.paperDefinition` had `stopGracePeriod = saveTimeout + 60s`
+  hard-wired, so every `:core` test moved the two together and the substitution in
+  `goingRoundInCircles` was untestable. This sits beside the round-16 rule (a
+  targeted sabotage and a whole-file revert prove different things) and the
+  round-18 one ("unobservable in this harness" is usually a claim about the
+  default fixture) — all three are the same family: the instrument's *defaults*
+  are part of what it can express.

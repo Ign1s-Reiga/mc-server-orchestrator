@@ -900,3 +900,67 @@ Related: [[standalone-paper-drain-shape]]
     inherits that split. It is also operator-settable up to
     `MAX_STOP_GRACE_PERIOD` (2 h), so a bound sized from it can silently become
     thirty times the quantity it was meant to cover.
+
+## Round 19: two enforcement points that agree, and the pin that covers neither
+
+79. **Two guards for one rule, jointly pinned and individually unpinned, is a
+    guard with a one-line half-life.** The pass-entry adoption
+    (`advance`/`advanceOnce`'s `if (reading is Occupied) drain.unconfirmWorldSave()`)
+    and the exit net (`DrainProgress.dropSaveContradictedByPlayers`, asserted on
+    the single return) both close round 18's critical, and *either alone* keeps
+    the whole suite green. The implementer's own sabotage found this. The
+    distinction is real and correctly stated — the net repairs what is
+    **written**, the adoption governs what is **decided**, and no repair of a
+    record can un-stop a container — but "today nothing decides to stop before the
+    gate" is an enumeration, and the same enumeration was wrong in rounds 17 and
+    18. Consequence: a future reader who profiles the pair will find one deletable
+    with 765 green tests, and only a docstring stands in the way. When you accept
+    a defence-in-depth pair, ask which half a green suite would let somebody
+    delete, and whether the *surviving* half is the one that governs the decision.
+    The net in particular is unreachable by construction, so it can never be
+    scenario-tested; its wiring into the single exit needs a structural pin
+    (the repo has the precedent: `TransferNeverKicksTest` greps module sources).
+80. **An invariant asserted over the value a function returns is not asserted over
+    the value the caller writes.** `dropSaveContradictedByPlayers` is keyed on
+    `DrainProgress.occupancy`, and its KDoc justifies itself by "`Reconciler`
+    writes them onto one observed status side by side". `Reconciler` actually
+    writes `players = progress.occupancy ?: pass.previous?.players`, so on any
+    pass whose probe did not answer the recorded pair is *carried-forward count*
+    beside *this pass's drain*, which the net never sees. Unreachable today only
+    because a confirmation can only be minted under a fresh zero reading. Whenever
+    a rule is moved to "the point the pass is recorded", check that the point
+    chosen is the one that produces the fields actually persisted, not the one
+    that produces the object handed to the persister.
+81. **The one function that consults the save confirmation before any zero-player
+    gate is `resumeInto`'s ladder, and for a proxied subject the resume is
+    ungated.** `resume(pass, drain, gated = subject.router == null)` — with a
+    router, `resumeInto` runs with no `requireEmpty` above it and reads
+    `saveIsCurrent` to choose the re-entry state. It cannot reach a stop, because
+    every state it can land in re-gates (`DEREGISTERED` → `holdSeal` →
+    `requireEmpty`), but it is the concrete answer to "what decides on the
+    confirmation before the gate", and it is the thing to re-check whenever a
+    state's body changes. The class KDoc's "no path reaches `stopWorkload` except
+    through `requireEmpty` followed by `mayStop`" (item 57, open since round 13)
+    remains false for `awaitStopped`, which gates on an inline `readPlayers` and
+    deliberately lets an *unanswered* probe through — and that sentence now sits
+    beside a second single-point claim added in round 19.
+82. **A per-subject quantity replacing a per-loop one closes the overstatement at
+    the sites that were edited and leaves it at the site that stops the
+    container.** Round 19 correctly re-scoped "the schema guarantees the grace
+    period exceeds the save timeout" to `PaperServer` in `DrainSubject.kt` and
+    `Node.kt`, and introduced `DrainSubject.saveTimeout` (one reader:
+    `goingRoundInCircles`). `DrainController.stop`'s own KDoc — the KDoc on **the
+    only container stop in this codebase** — still states it unqualified, as does
+    `LocalNode`'s non-positive-grace error message. When a claim is re-scoped,
+    grep the claim's *words*, not the files the change touched.
+83. **A bound that shrinks is still a bound that can misdiagnose, and the
+    anchor's clearing rule decides how badly.** `goingRoundInCircles` moved from
+    `evidenceGap + stopGracePeriod` to `evidenceGap + saveTimeout` — strictly
+    smaller for every `PaperServer`, since the schema forces
+    `stopGracePeriod >= saveTimeout + MIN_STOP_GRACE_MARGIN`. Safe (report-only,
+    `RETRYABLE`, container untouched) but the false-positive rate goes *up*, and
+    `resaveForcedAt` is cumulative: it is stamped once and cleared only by
+    `forgetSaveEvidence`, i.e. only by an observed player. So `circling` can be
+    hours on a drain whose first lap cleared normally, and the message reports
+    that number as "has not cleared on its own in Xs". Whenever a duration bound
+    is retuned, check what resets its anchor and whether the success path does.
