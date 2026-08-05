@@ -411,3 +411,37 @@ desired definition rather than the running container.
   red on an unrelated wording assertion first. Require both, and when the revert
   goes red on a different assertion than the one under test, that is not a pass —
   re-run it with the other assertions removed.
+
+## Round 17 rulings: the re-probe, the anchor and the three questions asked
+
+- **The `NonCancellable` re-probe is the right side of the trade, for a reason
+  the code does not give.** Ruled at the seventeenth audit. The region is one SLP
+  ping bounded by `PaperServerAgent.PROBE_TIMEOUT` (10 s) and by `:cri`'s
+  `withDeadlineAfter`, so a shutdown waits ten seconds, not the 180 s save
+  timeout `Main` promises never to wait out. What it buys is invariant 5 — the
+  save is not repeated across a cancellation — **not** the permanent wedge the
+  comment claims, which that branch cannot reach (see
+  [[drain-audit-danger-patterns]] item 72). Do not widen the shield on the
+  strength of the wedge argument, and do not narrow it: the round-7 "prefer the
+  benign repeat" ruling was about the *exec*, not about a record already in hand.
+- **`containerIsDown` keeping the recorded failure: confirmed.** The pass ran no
+  step, so it has no evidence about why the drain was failing, and clearing a
+  permanent `DRAIN_SAVE_TIMEOUT` there erases the one record an operator arrives
+  looking for. The sixteenth audit's harm through it is independently closed by
+  the parked clause on the gate, since that branch moves to `STOPPING` and a
+  non-`DRAIN_FAILED` drain no longer arms `isBlockedByPermanentFailure`. Do not
+  re-open.
+- **`settleRecords` clearing `blocked` unconditionally: the finding stays open,
+  and the grounds offered for closing it are wrong.** The conclusion (do not
+  narrow, do not add a third carrier on speculation) is right; the argument
+  ("clearing only on `workDone` cannot fire") is false for a proxied drain that
+  resumes into `secureDestination`'s `Chosen`, which is the file's one documented
+  `workDone = false` branch. Leave the behaviour, fix the sentence.
+- **The escalation reports the re-save cycle; it does not pace it.** Ruled that
+  the once-per-cycle `save-all flush` is still permissible — idempotent, on a
+  server a probe just confirmed empty, and now escalated — but the premise "the
+  lap is bounded" does not hold: `abort → Retry` alternating with
+  `resume → save → Progressed` resets `WorkQueue.succeeded` every other pass. If
+  pacing is ever wanted, the place is `resumeInto`'s `workDone` rule for a drain
+  already carrying `resaveForcedAt`, not the failure rule kept separate in rounds
+  15 and 16.

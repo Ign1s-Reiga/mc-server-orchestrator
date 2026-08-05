@@ -788,3 +788,74 @@ Related: [[standalone-paper-drain-shape]]
     away). The flag's own definition is "a request that left this process **and
     came back with what it needed**"; a stop that came back and left the
     container running did not.
+
+## Round 17: the re-probe that closed one hole and opened another
+
+69. **A re-probe added to make a timestamp honest becomes a new reader of the
+    player count, and a reader of that count that does not void the confirmation
+    is a stop authorised over an observed play session.** `save()`'s `Confirmed`
+    branch re-pings after `save-all flush` returns and stamps the occupancy from
+    it. `requireEmpty`'s KDoc maintains a *count* of the sites that read a
+    positive count and void the evidence — `requireEmpty`, `transferStep`,
+    `awaitStopped` — and the re-probe is a fourth that reads one and voids
+    nothing. Same family as item 14 (check every call site against the
+    justification, not the name), arriving from the opposite direction: not a new
+    caller of the voider, a new *reader of the trigger* with no call to it. When a
+    step gains a second probe, ask what the first probe's branch does with
+    `online > 0` and whether the second one does it too.
+70. **The two halves of the save-evidence rule are carried by fields whose names
+    say the opposite, and only one of them is load-bearing.**
+    `saveIsCurrent` returns on `!confirmed.isBefore(containerStartedAt)` whenever
+    the runtime reports a start time — which is every running container — and
+    never consults the age, so `worldSavedAt` carries *no* freshness. The whole
+    freshness half of `dropUnusableSaveEvidence` is `watched`, i.e.
+    `now - lastProbedAt <= maxGap`, i.e. the **occupancy** instant. And
+    `lastProbedAt` advances on any probe that *answered*, whatever it counted. So
+    "the chain of zero-player observations is unbroken" is implemented as "some
+    probe answered recently" plus "each positive count voided at its own call
+    site" — a distributed invariant with no single enforcement point. Before
+    trusting any rule that names `worldSavedAt`, check whether the property is
+    actually on `PlayerOccupancy.observedAt`.
+71. **A cycle bound must not reuse a freshness constant, because one honest cycle
+    contains the thing the freshness constant is shorter than.**
+    `goingRoundInCircles` aborts when `now - resaveForcedAt > evidenceGap` (30 s),
+    but one legitimate lap is *goingRoundInCircles → SAVING → save → DEREGISTERED
+    → stop*, and the save alone is bounded by `spec.lifecycle.drain.saveTimeout`
+    (180 s by default). So any server whose save outruns 30 s aborts on its second
+    genuine forced re-save with a message asserting a defect ("it does not clear
+    on its own") that then clears on its own two passes later. Exactly round 16's
+    critical 1 in a new place: a per-loop 30 s constant applied to a per-server
+    quantity floored by a 180 s one. The two live in different modules and nothing
+    cross-checks them.
+72. **A `NonCancellable` justified by a consequence its own branch cannot
+    produce.** The shield around `save()`'s re-probe is argued as "a cancelled
+    pass loses the confirmation, the next pass reads `saveRequestedAt != null`
+    with no `worldSavedAt`, aborts `PERMANENT` and wedges the drain". Provably
+    impossible there: `save()` returns `abort(PERMANENT)` at the
+    `saveRequestedAt != null` check *above*, so the field is always null on the
+    `Confirmed` path. The real cost of losing the record is one repeated
+    idempotent flush — the benign repeat ruled acceptable at round 7 — and the
+    real benefit is invariant 5. The trade still lands (the region is bounded by
+    a gRPC `withDeadlineAfter` of 10 s), but a shield whose stated reason is
+    wrong will be widened next time by the same reasoning. Read the guard clauses
+    above a branch before believing what a comment says that branch can leave
+    behind.
+73. **"That narrowing cannot fire" has to be checked branch by branch, and the
+    file's own KDoc is not evidence.** `settleRecords` declines to clear `blocked`
+    only on `workDone` because "every branch of `secureDestination` and
+    `transferStep` that leaves `DRAIN_FAILED` claims `workDone`".
+    `DestinationChoice.Chosen` is documented eight hundred lines away as
+    "**Re-derived, not done**, so `workDone` is left false" and is exactly the
+    branch a proxied drain resumes into from a block with `destination == null`.
+    The conclusion survives; the argument does not. A "the rule would change
+    nothing" claim is a claim about a set of branches — enumerate them.
+74. **Adding an abort to a `Progressed` cycle reports it without pacing it.**
+    Item 8/34, reopened by construction: the new lap is
+    *abort → `Retry`* alternating with *resume → save → `Progressed`*, and
+    `ReconcileLoop.requeue` calls `queue.succeeded` on `Progressed`, so the
+    attempt counter the backoff reads is cleared every other pass and the flush
+    rate stays at `stepInterval`. The escalation still fires, because it is
+    anchored on `resaveForcedAt`/`firstOccurrenceOf` rather than on `attempts`.
+    Whenever a new abort is placed on a cycle whose *resume* does real work, state
+    separately what it does to the report and what it does to the rate — they are
+    now decided by different fields.
