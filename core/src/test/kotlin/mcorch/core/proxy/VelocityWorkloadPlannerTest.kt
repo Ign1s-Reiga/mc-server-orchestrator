@@ -54,6 +54,48 @@ internal class VelocityWorkloadPlannerTest {
     }
 
     /**
+     * The Velocity the container downloads is pinned, and pinned to the API the
+     * mounted plugin was compiled against.
+     *
+     * Unset, the image takes whatever upstream published most recently, at
+     * *container start*. A restart after a breaking upstream release then produces
+     * a proxy that is `RUNNING`, `ready` and serving players with a plugin that
+     * failed to load — and because no field of the definition moved, no spec-hash
+     * input moved either, so the loop cannot notice or repair it. That is the
+     * twenty-fourth audit's critical arriving on a timer rather than by an
+     * operator's mistake.
+     *
+     * ## The property this asserts is not "the string is 4.0.0"
+     *
+     * It is that the constant equals the `velocity` version in
+     * `gradle/libs.versions.toml`, which is the `velocity-api` `:velocity-plugin`
+     * compiles against. The value comes from the build (`core/build.gradle.kts`
+     * sets the system property) rather than being written here, so this test cannot
+     * be satisfied by editing it to match a stale constant. An absent property is a
+     * failure and not a skip: a test that quietly stops checking is the shape of
+     * gap this exists to close.
+     */
+    @Test
+    fun `the Velocity build is pinned, hash-bearing, and matches the plugin's compile target`() {
+        val fromCatalog =
+            checkNotNull(System.getProperty("mcorch.velocityApiVersion")) {
+                "the build must supply `mcorch.velocityApiVersion` from libs.versions.toml; without it this " +
+                    "assertion cannot run and the two pins can drift apart unnoticed"
+            }
+        VelocityWorkloadPlanner.VELOCITY_BUILD shouldBe fromCatalog
+
+        val spec = VelocityWorkloadPlanner.plan(proxyDefinition())
+        spec.env[VelocityWorkloadPlanner.VELOCITY_VERSION] shouldBe fromCatalog
+
+        // In the hash, so bumping the pin recreates every proxy through the ordinary
+        // replacement drain instead of leaving running containers on a Velocity the
+        // plugin cannot load against. Asserted on the hash's *input*: there is no
+        // definition to vary that would move a constant, and comparing a hash with
+        // itself is an assertion that cannot fail.
+        VelocityWorkloadPlanner.canonicalSpec(proxyDefinition()) shouldContain "velocity.build=$fromCatalog"
+    }
+
+    /**
      * The token, as coordinates, in the only channel that is allowed to carry
      * one.
      *
@@ -125,6 +167,11 @@ internal class VelocityWorkloadPlannerTest {
      * by a variable nothing consumed, which is exactly how the wrong default port
      * survived: it looked configured. Set-membership rather than a contains
      * check, so re-adding one fails here rather than passing quietly.
+     *
+     * `VELOCITY_VERSION` joined the set in the same change that pinned it. It is
+     * the counter-example to the rule above and belongs here for that reason: the
+     * image's entrypoint genuinely reads it, and leaving it out is what let the
+     * Velocity inside a running proxy be decided by upstream's release schedule.
      */
     @Test
     fun `the environment carries nothing the image does not read`() {
@@ -133,6 +180,7 @@ internal class VelocityWorkloadPlannerTest {
         spec.env.keys shouldBe
             setOf(
                 VelocityWorkloadPlanner.TYPE,
+                VelocityWorkloadPlanner.VELOCITY_VERSION,
                 VelocityWorkloadPlanner.FORWARDING_MODE,
                 VelocityWorkloadPlanner.CONTROL_PORT,
                 VelocityWorkloadPlanner.INIT_MEMORY,

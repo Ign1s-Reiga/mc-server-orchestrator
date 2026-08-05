@@ -48,6 +48,19 @@ import kotlin.time.Duration.Companion.seconds
  */
 internal class ContainerdHarness(
     root: Path,
+    /**
+     * What gets staged as the control-plugin artefact, or null for this build's
+     * own JAR.
+     *
+     * The override exists for one scenario and it is worth naming: a proxy whose
+     * plugin **does not load**. That state is not reachable by withholding the
+     * artefact — the node refuses the create, correctly — so the only way to a
+     * real, running, joinable proxy with no control endpoint is to give it a JAR
+     * Velocity does not recognise. It is the shape an upstream Velocity release
+     * or a bad artefact produces, and until it could be built here it was the one
+     * critical no integration run could reach.
+     */
+    private val controlPluginJar: Path? = null,
 ) : AutoCloseable {
     private val nodeName: NodeName = NodeName.of("integration").getOrThrow()
 
@@ -67,7 +80,7 @@ internal class ContainerdHarness(
                     // The artefacts a real install would have put beside the
                     // binary. Populated from the build's own output rather than
                     // from a path written here — see [assets].
-                    assetRoot = assets(root.resolve("assets")),
+                    assetRoot = assets(root.resolve("assets"), controlPluginJar),
                     sandboxNamespace = SANDBOX_NAMESPACE,
                 ),
             // Tight enough that a test does not spend its life waiting on a
@@ -293,8 +306,16 @@ internal class ContainerdHarness(
          * [Store.listServers] no longer mentions.
          */
         val PROBE_NAMES: List<ResourceName> =
-            listOf("it-bringup", "it-noop", "it-drain", "it-replace", "it-nosave", "it-lobby", "it-proxy")
-                .map { ResourceName.of(it).getOrThrow() }
+            listOf(
+                "it-bringup",
+                "it-noop",
+                "it-drain",
+                "it-replace",
+                "it-nosave",
+                "it-lobby",
+                "it-proxy",
+                "it-mute-proxy",
+            ).map { ResourceName.of(it).getOrThrow() }
 
         /**
          * The system property the build hands this suite the plugin JAR through.
@@ -346,10 +367,14 @@ internal class ContainerdHarness(
          * the asset would report green on the one defect it exists for: the
          * proxy would come up perfectly well, with no control endpoint.
          */
-        private fun assets(path: Path): Path {
+        private fun assets(
+            path: Path,
+            override: Path?,
+        ): Path {
             shared(path)
             val source =
-                System.getProperty(PLUGIN_JAR_PROPERTY)?.takeIf { it.isNotBlank() }?.let { Path.of(it) }
+                override
+                    ?: System.getProperty(PLUGIN_JAR_PROPERTY)?.takeIf { it.isNotBlank() }?.let { Path.of(it) }
                     ?: error(
                         "$PLUGIN_JAR_PROPERTY is not set. `app/build.gradle.kts` sets it from " +
                             ":velocity-plugin:pluginJar; run these through `./gradlew :app:integrationTest`",

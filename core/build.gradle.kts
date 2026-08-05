@@ -38,3 +38,20 @@ dependencies {
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.slf4j.api)
 }
+
+// One decision written in two places, and this is what stops them drifting.
+//
+// `VelocityWorkloadPlanner.VELOCITY_BUILD` pins the Velocity the *proxy container*
+// downloads; `libs.versions.velocity` pins the velocity-api `:velocity-plugin`
+// compiles the mounted JAR against. A plugin compiled against one API line and
+// loaded by a proxy on another does not load, and the proxy starts perfectly
+// anyway — so the failure is a fleet with no control endpoint, discovered when
+// somebody tries to drain something.
+//
+// Neither module can read the other's value at runtime (a compileOnly coordinate
+// is not on any classpath), so the build hands the catalog's version to the test
+// that asserts on the constant. A bump to one that forgets the other fails
+// `:core:test` rather than an integration run against a real proxy.
+tasks.test {
+    systemProperty("mcorch.velocityApiVersion", libs.versions.velocity.get())
+}

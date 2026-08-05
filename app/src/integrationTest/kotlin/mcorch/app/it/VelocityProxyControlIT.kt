@@ -12,13 +12,17 @@ import mcorch.core.WorkloadObservation
 import mcorch.core.WorkloadState
 import mcorch.schema.ServerPhase
 import mcorch.schema.VelocityProxyDefaults
+import mcorch.store.getOrThrow
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.api.io.TempDir
+import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.TimeUnit
+import java.util.jar.JarOutputStream
+import java.util.zip.ZipEntry
 import kotlin.time.Duration.Companion.seconds
 
 /**
@@ -150,6 +154,87 @@ internal class VelocityProxyControlIT {
             val ready = harness.proxyStatus(name).shouldNotBeNull()
             ready.phase shouldBe ServerPhase.RUNNING
             ready.endpoint.shouldNotBeNull().port shouldBe VelocityProxyDefaults.PLAYER_PORT
+        }
+
+    /**
+     * The twenty-fourth audit's critical, against a real proxy: **a front door
+     * whose plugin did not load could never be drained, replaced or deleted.**
+     *
+     * ## Why this scenario needs a real container
+     *
+     * `ProxyDrainTest` fakes an endpoint that does not answer, and that is a fair
+     * model of the mechanism. What it cannot model is the *state a deployment
+     * actually reaches*: a proxy that is healthy by every measure an operator has —
+     * running, joinable, `ready = true`, players connected — and simply has no
+     * control endpoint, because the JAR in its plugin directory is not something
+     * Velocity recognises. The audit's phrase for it was "this critical on a
+     * timer": an upstream Velocity release the plugin cannot load against produces
+     * exactly this, on the next restart, with nothing in the definition changed.
+     * (`VELOCITY_VERSION` is pinned and hash-bearing now, which is what closes the
+     * release half; this is the half about what the loop does when it happens
+     * anyway.)
+     *
+     * Withholding the artefact would not reach it. The node refuses that create,
+     * correctly, so there is no container — and the whole point is that there *is*
+     * one, running and serving. Hence a JAR with no `velocity-plugin.json`:
+     * Velocity scans, does not recognise it, and starts perfectly without it.
+     *
+     * ## What the assertions separate
+     *
+     * `ready` is established *first* and deliberately: it is what makes this the
+     * dangerous state rather than a broken container, and it is also the control
+     * for the negative below — a proxy that never came up would satisfy "no control
+     * endpoint" for the wrong reason. Then the delete has to complete. Against the
+     * old code it does not: the drain aborts at step 2 on every pass, at zero
+     * players, and the definition is never purged.
+     */
+    @Test
+    fun `a proxy whose plugin never loaded is still joinable, and can still be deleted`() =
+        integrationTest {
+            val definition = velocityProxy(name = "it-mute-proxy")
+            val name = definition.metadata.name
+            // A JAR Velocity does not recognise, in the place the loop puts the
+            // control plugin. Not a corrupt file: a perfectly valid archive with no
+            // plugin descriptor, which is what an artefact from the wrong build, or
+            // a plugin that failed to link, looks like from the proxy's side.
+            val mute = root.resolve("not-a-plugin.jar")
+            JarOutputStream(Files.newOutputStream(mute)).use { jar ->
+                jar.putNextEntry(ZipEntry("README"))
+                jar.write("no velocity-plugin.json, so Velocity ignores this".toByteArray())
+                jar.closeEntry()
+            }
+            harness.close()
+            harness = ContainerdHarness(root, controlPluginJar = mute)
+
+            harness.putSecret(forwardingSecret("it-mute-proxy"), generatedSecret())
+            harness.putSecret(controlToken("it-mute-proxy"), generatedSecret())
+            harness.declare(definition)
+            harness.start(this)
+
+            // The dangerous state, established rather than assumed: this proxy is
+            // a working front door. Players can join it right now.
+            harness.await("the proxy to become joinable") {
+                harness.proxyStatus(name)?.ready == true
+            }
+            val serving = harness.proxyStatus(name).shouldNotBeNull()
+            serving.phase shouldBe ServerPhase.RUNNING
+            // And it has no control channel at all, which is the fault under test.
+            // `readControl` reports this from a real `GET /v1/version` that nothing
+            // answered.
+            serving.control
+                .shouldNotBeNull()
+                .reachable
+                .shouldBeFalse()
+
+            // Now the operator asks for it to go away, with nobody connected.
+            harness.store.deleteDefinition(name).getOrThrow()
+
+            harness.await("the proxy container to be gone") {
+                harness.observe(name) is WorkloadObservation.Absent
+            }
+            harness.await("the definition to be purged") {
+                harness.store.getServer(name) == null
+            }
         }
 
     private companion object {

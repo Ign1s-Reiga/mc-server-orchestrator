@@ -14,6 +14,7 @@ import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.string.shouldNotContain
 import mcorch.schema.ConditionStatus
+import mcorch.schema.DrainBlockReason
 import mcorch.schema.DrainState
 import mcorch.schema.DrainStatus
 import mcorch.schema.FailureClass
@@ -540,6 +541,153 @@ internal class ProxyDrainTest {
 
             harness.nodeOf(leaving).stops.shouldBeEmpty()
             harness.nodeOf(leaving).saves.shouldBeEmpty()
+        }
+
+    /**
+     * The twenty-fourth audit's critical: **a proxy whose control endpoint is dead
+     * could never be drained, replaced or deleted — at zero players, for ever.**
+     *
+     * The test above is its mirror and both are correct. A *backend* that cannot be
+     * sealed parks, because carrying on would transfer players into a queue
+     * refilling behind them. A *proxy* has no transfer: `ProxyDrainSubject.router`
+     * is null and its drain is seal-then-wait-for-zero, exactly the standalone
+     * `PaperServer` shape. A standalone survives a dead proxy because it has no seal
+     * at all and short-circuits; a proxy always has a seal object, so it aborted at
+     * step 2 on every pass of every state — `DRAIN_REQUESTED` → abort → resume →
+     * zero players → `SEALED` → abort — and there was no exit. Recreating it is a
+     * `REPLACEMENT` drain through the same endpoint, and deleting it takes the same
+     * path and never purges. What was left was a running, joinable, permanently
+     * undeletable front door and an operator reaching for `crictl stop`.
+     *
+     * ## The shape is ordinary, which is why it was critical rather than historical
+     *
+     * The proxy image's Velocity version was unpinned, so a breaking upstream
+     * release would have produced exactly this on the next restart: `RUNNING`,
+     * `ready = true`, serving players, plugin failed to load, no spec-hash input
+     * moved. (`VELOCITY_VERSION` is pinned and hash-bearing in the same change, so
+     * that state is now one the loop can drift *out of*.) The asset going missing
+     * between two creates, and a control-token rotation, reach it the same way.
+     *
+     * ## What the assertions separate
+     *
+     * `stops` is the load-bearing one: a drain that merely reported a nicer failure
+     * would satisfy everything else. The plugin's counters are the discriminator for
+     * the *shape* — nothing was sealed, transferred or deregistered, because nothing
+     * could be, and the drain did not pretend otherwise. `sealRequestedAt` is the
+     * one an over-eager fix fails: waiving the seal must not stamp the instant a
+     * dashboard reads as "new joins are stopped".
+     */
+    @Test
+    fun `a proxy at zero players whose control endpoint is dead can still be stopped`() =
+        coreTest {
+            val harness = ProxyHarness()
+            val name = harness.proxyDefinition.metadata.name
+            harness.bringUp()
+            harness
+                .proxyStatus()
+                .shouldNotBeNull()
+                .ready
+                .shouldBeTrue()
+
+            // The plugin stops answering — it failed to load, or the JAR is gone —
+            // and the operator asks for the proxy to go away. Nobody is connected:
+            // `FakeNode.online` is 0, so the Server List Ping the gate reads answers
+            // zero on every pass. The proxy itself is perfectly healthy otherwise.
+            harness.plugin.unreachable = true
+            // Taken after the bring-up, because a proxy asserts its own login
+            // admission on every converge pass and this fleet has no backends.
+            // What the drain must not do is add to it.
+            val assertsBefore = harness.plugin.proxyAsserts.size
+            harness.store.deleteDefinition(name)
+
+            repeat(10) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+
+            // The exit exists. Both halves: stopped, and then taken away.
+            harness.proxyNode.stops shouldHaveSize 1
+            harness.proxyNode.removals.shouldNotBeEmpty()
+            harness.store.getServer(name) shouldBe null
+
+            // Nothing was claimed that did not happen: no seal landed at the wire,
+            // and no transfer or deregistration was invented to get past the step.
+            harness.plugin.proxyAsserts shouldHaveSize assertsBefore
+            harness.plugin.transfers.shouldBeEmpty()
+            harness.plugin.deregistrations.shouldBeEmpty()
+        }
+
+    /**
+     * The waiver is for the subject with nowhere to send anybody, **and only while
+     * it is empty**.
+     *
+     * With players on, the seal is doing real work: it is what lets the wait for
+     * zero end rather than run against a population that keeps climbing. So a proxy
+     * that cannot seal *and* has somebody connected still parks, with
+     * `PROXY_CONTROL_UNREACHABLE` on its status telling an operator to go and look —
+     * and nothing is stopped.
+     *
+     * The number is chosen: one player, and they never leave. A scenario that let
+     * them log off would end in the test above and prove nothing about this branch.
+     *
+     * ## The assertion that is about *this* branch, and the one that is not
+     *
+     * "Nothing was stopped" is delivered by `requireEmpty` whatever step 2
+     * concluded, so on its own it would pass against a build that waived the seal
+     * unconditionally. The discriminator is the **recorded failure on the pass that
+     * aborts**: a waived seal reports `Progressed` and records nothing, and the two
+     * builds are otherwise indistinguishable — both end parked and blocked, because
+     * a proxied wait for zero is what happens either way once the failure has been
+     * settled into a block.
+     */
+    @Test
+    fun `a proxy with players online still parks when its control endpoint is dead`() =
+        coreTest {
+            val harness = ProxyHarness()
+            val name = harness.proxyDefinition.metadata.name
+            harness.bringUp()
+
+            harness.proxyNode.online = 1
+            harness.plugin.unreachable = true
+            harness.store.deleteDefinition(name)
+
+            // Pass one starts the drain and performs no step; pass two is the one
+            // that runs step 2 and cannot.
+            harness.pass(name)
+            harness.clock.advance(2.seconds)
+            harness.pass(name)
+
+            val aborted =
+                harness
+                    .proxyStatus()
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            aborted.state shouldBe DrainState.DRAIN_FAILED
+            // Not stamped: the record must not claim a seal that is not in place.
+            aborted.sealRequestedAt shouldBe null
+            val failure = aborted.failure.shouldNotBeNull()
+            failure.reason shouldBe FailureReason.PROXY_CONTROL_UNREACHABLE
+            failure.failureClass shouldBe FailureClass.RETRYABLE
+
+            // It keeps waiting rather than escalating into anything destructive: the
+            // block is the protocol working, so no failure rides with it.
+            repeat(6) {
+                harness.clock.advance(2.seconds)
+                harness.pass(name)
+            }
+            val waiting =
+                harness
+                    .proxyStatus()
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            waiting.state shouldBe DrainState.DRAIN_FAILED
+            waiting.blocked.shouldNotBeNull().reason shouldBe DrainBlockReason.AWAITING_ZERO_PLAYERS
+
+            harness.proxyNode.stops.shouldBeEmpty()
+            harness.proxyNode.removals.shouldBeEmpty()
+            harness.store.getServer(name).shouldNotBeNull()
         }
 
     /**

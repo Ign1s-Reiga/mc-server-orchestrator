@@ -538,8 +538,14 @@ internal class DrainController(
                 // records when this drain *first* got the seal in place, for a
                 // dashboard; nothing gates on it, and nothing may, because a
                 // gate would be the event-shaped seal wearing a timestamp.
-                holdSeal(pass, drain)?.let { return it }
-                val sealed = pass.subject.seal != null
+                val hold = holdSeal(pass, drain)
+                hold.abortOrNull?.let { return it }
+                // Three answers, not two. A waived seal asked the proxy and was not
+                // answered, so it stamps no `sealRequestedAt` and claims no work:
+                // treating it as `Asserted` would put a "sealed at" instant on a
+                // dashboard for a seal that is not in place, which is the one thing
+                // an operator would read this field to rule out.
+                val sealed = hold == SealHold.Asserted
                 DrainProgress(
                     drain =
                         drain
@@ -552,30 +558,37 @@ internal class DrainController(
                     // this today; it is the honest answer rather than a convenient
                     // one, because the next reader will take it for the rule.
                     workDone = sealed,
-                    outcome = ReconcileOutcome.Progressed(if (sealed) SEALED_AT_PROXY else NO_PROXY_SEAL),
+                    outcome =
+                        ReconcileOutcome.Progressed(
+                            when (hold) {
+                                SealHold.Asserted -> SEALED_AT_PROXY
+                                SealHold.Waived -> WAIVED_PROXY_SEAL
+                                else -> NO_PROXY_SEAL
+                            },
+                        ),
                 )
             }
 
             // Step 3: secure a destination.
             DrainState.SEALED -> {
-                holdSeal(pass, drain)?.let { return it }
+                holdSeal(pass, drain).abortOrNull?.let { return it }
                 secureDestination(pass, drain)
             }
 
             // Step 4: move the players.
             DrainState.TARGET_RESOLVED -> {
-                holdSeal(pass, drain)?.let { return it }
+                holdSeal(pass, drain).abortOrNull?.let { return it }
                 startTransfer(pass, drain)
             }
 
             DrainState.TRANSFERRING -> {
-                holdSeal(pass, drain)?.let { return it }
+                holdSeal(pass, drain).abortOrNull?.let { return it }
                 awaitEvacuated(pass, drain)
             }
 
             // Step 5: save the world and wait for completion.
             DrainState.SAVING -> {
-                holdSeal(pass, drain)?.let { return it }
+                holdSeal(pass, drain).abortOrNull?.let { return it }
                 requireEmpty(pass, drain) {
                     save(pass, drain)
                 }
@@ -583,7 +596,7 @@ internal class DrainController(
 
             // Step 6: deregister the backend, then step 7.
             DrainState.DEREGISTERED -> {
-                holdSeal(pass, drain)?.let { return it }
+                holdSeal(pass, drain).abortOrNull?.let { return it }
                 requireEmpty(pass, drain) {
                     if (drain.mayStop(contract, observation.startedAt, now, evidenceGap)) {
                         letGoAndStop(pass, drain)
@@ -860,6 +873,33 @@ internal class DrainController(
         )
     }
 
+    /**
+     * What one pass established about drain step 2.
+     *
+     * A value rather than a nullable [DrainProgress] because `DRAIN_REQUESTED` has
+     * to tell [Asserted] from [Waived] — it stamps `sealRequestedAt` and claims
+     * [DrainProgress.workDone] on the strength of a `PUT` that landed, and both are
+     * false of a pass that gave up on the seal and carried on. Every other caller
+     * wants only [abortOrNull].
+     */
+    private sealed interface SealHold {
+        /** There is nothing that could stop new joins, or step 6 has already run. */
+        data object NothingToSeal : SealHold
+
+        /** A `PUT` went out and the proxy confirmed the workload no longer admits. */
+        data object Asserted : SealHold
+
+        /** See [sealIsPrecondition]: the seal could not be asserted and did not have to be. */
+        data object Waived : SealHold
+
+        data class Aborted(
+            val progress: DrainProgress,
+        ) : SealHold
+
+        /** The abort to return from the step, or null when the drain may carry on. */
+        val abortOrNull: DrainProgress? get() = (this as? Aborted)?.progress
+    }
+
     /** Everything one pass established before it looked at the drain's state. */
     private class DrainPass(
         val subject: DrainSubject,
@@ -876,13 +916,14 @@ internal class DrainController(
     /**
      * Step 2, on every pass of every state that depends on it.
      *
-     * Returns null when the seal is in place — or when there is nothing that could
-     * seal, which is the standalone shape — and a [DrainProgress] abort when the
-     * proxy would not or could not confirm it. Failing to hold the seal is a real
-     * abort rather than a warning: an unsealed backend keeps taking players, so a
-     * drain that carried on would be transferring into a queue that refills behind
-     * it, which is the state the protocol's own `SOURCE_NOT_SEALED` exists to make
-     * unreachable.
+     * Failing to hold the seal is a real abort rather than a warning **for a
+     * workload that has somewhere to send its players**: an unsealed backend keeps
+     * taking players, so a drain that carried on would be transferring into a queue
+     * that refills behind it, which is the state the protocol's own
+     * `SOURCE_NOT_SEALED` exists to make unreachable. That sentence is the whole
+     * justification for the abort, and it is a sentence about a *transfer* — see
+     * [sealIsPrecondition] for the subject the sentence is false about, and for the
+     * critical it produced.
      *
      * Skipped once the backend has been deregistered. `PUT /v1/backends/{name}`
      * asserts registration *and* admission, so asserting a seal after step 6 would
@@ -891,13 +932,13 @@ internal class DrainController(
     private suspend fun holdSeal(
         pass: DrainPass,
         drain: DrainStatus,
-    ): DrainProgress? {
-        val seal = pass.subject.seal ?: return null
-        if (drain.deregisteredAt != null) return null
+    ): SealHold {
+        val seal = pass.subject.seal ?: return SealHold.NothingToSeal
+        if (drain.deregisteredAt != null) return SealHold.NothingToSeal
         return when (val outcome = seal.assertAdmission(admits = false)) {
             is SealOutcome.Asserted -> {
                 if (!outcome.admits) {
-                    null
+                    SealHold.Asserted
                 } else {
                     // The proxy accepted the call and reports the workload still
                     // admitting. Nothing in the protocol produces that, so it means
@@ -917,24 +958,42 @@ internal class DrainController(
         }
     }
 
+    /**
+     * The one place a failed step 2 decides between parking the drain and letting it
+     * through, so that the waiver has a single enforcement point rather than one per
+     * abort branch.
+     */
     private suspend fun abortSeal(
         pass: DrainPass,
         drain: DrainStatus,
         detail: String,
         retryable: Boolean = true,
-    ): DrainProgress =
-        abort(
-            subject = pass.subject,
-            node = pass.node,
-            drain = drain,
-            occupancy = pass.occupancy,
-            now = pass.now,
-            reason = FailureReason.PROXY_CONTROL_UNREACHABLE,
-            failureClass = if (retryable) FailureClass.RETRYABLE else FailureClass.PERMANENT,
-            message =
-                "new joins could not be stopped at the proxy, so the drain is not going further: $detail. " +
-                    "The server keeps running and keeps taking players",
+    ): SealHold {
+        val reading = drain.readPlayers(pass.probe, pass.now)
+        if (!sealIsPrecondition(pass.subject.router, reading)) {
+            LOG.warn(
+                "server={} could not assert its login seal and is empty, so the drain carries on without it: {}. " +
+                    "Nothing is stopped on that alone — the zero-player gate before the stop is what decides",
+                pass.server,
+                detail,
+            )
+            return SealHold.Waived
+        }
+        return SealHold.Aborted(
+            abort(
+                subject = pass.subject,
+                node = pass.node,
+                drain = drain,
+                occupancy = pass.occupancy,
+                now = pass.now,
+                reason = FailureReason.PROXY_CONTROL_UNREACHABLE,
+                failureClass = if (retryable) FailureClass.RETRYABLE else FailureClass.PERMANENT,
+                message =
+                    "new joins could not be stopped at the proxy, so the drain is not going further: $detail. " +
+                        "The server keeps running and keeps taking players",
+            ),
         )
+    }
 
     /**
      * Step 3: somewhere for the players to go.
@@ -2725,6 +2784,9 @@ internal class DrainController(
             "no proxy to seal: a standalone server accepts joins until it stops"
         private const val SEALED_AT_PROXY =
             "new joins stopped at the proxy; the players already connected stay connected"
+        private const val WAIVED_PROXY_SEAL =
+            "new joins could not be stopped and the workload is empty, so the drain continues without a seal; " +
+                "the zero-player gate before the stop is what decides"
 
         /**
          * Added to `spec.lifecycle.drain.playerTransferTimeout` per player.
@@ -3260,6 +3322,53 @@ internal fun DrainStatus.readPlayers(
             PlayerReading.Unanswered(probe)
         }
     }
+
+/**
+ * Whether a drain step 2 that could not be asserted must park the drain.
+ *
+ * ## The abort's own justification names a step this subject does not have
+ *
+ * `holdSeal` aborts because "a drain that carried on would be transferring into a
+ * queue that refills behind it". That is a sentence about a **transfer**, and a
+ * subject with no [DrainRouter] has none: its drain is seal-then-wait-for-zero,
+ * and the thing that decides whether the container may stop is `requireEmpty`
+ * followed by `mayStop`, exactly as for a standalone `PaperServer` — which has no
+ * seal at all and is stopped safely every day on that basis. For those subjects
+ * the seal is an **optimisation** (it stops the population climbing back while the
+ * drain waits), not a precondition, and this pass has just read zero players off
+ * the workload's own Server List Ping.
+ *
+ * ## The critical it closes
+ *
+ * A `VelocityProxy` always has a seal object and never a router, so the null-seal
+ * short-circuit that saves the standalone server could not save it. A proxy whose
+ * plugin is absent or failed to load therefore aborted at step 2 on **every** pass
+ * of every state, at zero players, for ever: `DRAIN_REQUESTED` → abort → resume →
+ * `requireEmpty` passes on zero → `SEALED` → abort. Delete, replacement and
+ * relocation all take that path, and the only repair — recreating the proxy — is
+ * itself a replacement drain through the endpoint that does not answer. The exit
+ * left to an operator was a manual `crictl stop` of a running, joinable front
+ * door, which is the chain this codebase exists to make unnecessary.
+ *
+ * ## Why the reading is part of the question
+ *
+ * With anybody online the seal is doing real work — it is what lets the wait end —
+ * so a proxy that cannot seal *and* has players still parks, with
+ * `PROXY_CONTROL_UNREACHABLE` on its status telling an operator to go and look.
+ * The waiver applies only on a fresh [PlayerReading.Empty]; silence is not a
+ * zero-player report here any more than it is anywhere else in this file, so
+ * [PlayerReading.Unanswered] parks too.
+ *
+ * The residual risk is exactly the standalone server's: somebody may connect
+ * between this reading and the stop. Nothing in this codebase has ever claimed to
+ * close that window — `requireEmpty` re-reads on the pass that stops, and that is
+ * the guarantee — so the waiver takes on no risk that the accepted shape does not
+ * already carry.
+ */
+internal fun sealIsPrecondition(
+    router: DrainRouter?,
+    reading: PlayerReading,
+): Boolean = router != null || reading !is PlayerReading.Empty
 
 /**
  * The drain a pass is stepped and recorded against, given what its probe read.

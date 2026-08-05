@@ -110,6 +110,47 @@ internal object VelocityWorkloadPlanner {
      */
     const val TYPE_VELOCITY: String = "VELOCITY"
 
+    /**
+     * The Velocity build the image downloads, pinned.
+     *
+     * ## An unpinned proxy is the critical on a timer
+     *
+     * The image resolves this to `latest` when it is unset, so the Velocity inside
+     * a proxy container is decided at *container start* by whatever upstream had
+     * published that morning — while the plugin mounted into it was compiled
+     * against one API, and Velocity 4 is already an API break from 3.x. The day
+     * upstream cuts the next one, a restarted proxy comes up `RUNNING`,
+     * `ready = true` and serving players, with a plugin that failed to load and no
+     * control endpoint. Nothing in the definition moved, so nothing in the spec
+     * hash moved, so the loop could not tell that the workload it is looking at is
+     * no longer the workload it asked for.
+     *
+     * Two properties follow from pinning it *and* putting it in [specHash], and
+     * both are needed:
+     *
+     * - the version cannot change underneath a running proxy, so the state is not
+     *   entered by an upstream release;
+     * - changing this constant is a spec-hash change, so every proxy is drained and
+     *   recreated onto the new build by the ordinary replacement path. "The plugin
+     *   cannot load against this Velocity" becomes a state the loop can drift *out
+     *   of* rather than only into.
+     *
+     * ## It tracks the plugin's compile target, and a test says so
+     *
+     * The value is `velocity` in `gradle/libs.versions.toml` — the `velocity-api`
+     * `:velocity-plugin` compiles against. A JAR compiled against 4.0.0 is loaded
+     * by whichever Velocity the operator's image runs, so these two are one
+     * decision written in two places, and a comment asking the next reader to keep
+     * them in step is not an enforcement point. `VelocityWorkloadPlannerTest` reads
+     * the catalog's value out of a system property the build supplies and fails if
+     * they differ, so a bump to one that forgets the other does not compile a green
+     * suite.
+     */
+    const val VELOCITY_VERSION: String = "VELOCITY_VERSION"
+
+    /** See [VELOCITY_VERSION]. Pinned to the `velocity-api` `:velocity-plugin` compiles against. */
+    const val VELOCITY_BUILD: String = "4.0.0"
+
     const val FORWARDING_SECRET: String = "VELOCITY_FORWARDING_SECRET"
     const val FORWARDING_MODE: String = "VELOCITY_FORWARDING_MODE"
     const val CONTROL_PORT: String = "MCORCH_CONTROL_PORT"
@@ -164,6 +205,10 @@ internal object VelocityWorkloadPlanner {
                     // First, because without it none of the rest is a Velocity
                     // proxy at all. See [TYPE_VELOCITY].
                     put(TYPE, TYPE_VELOCITY)
+                    // Second, and for a related reason: `TYPE` decides that this is
+                    // Velocity at all, and this decides *which* Velocity. Unset, the
+                    // image takes the newest published build at container start.
+                    put(VELOCITY_VERSION, VELOCITY_BUILD)
                     put(FORWARDING_MODE, spec.forwarding.mode.wireValue)
                     put(CONTROL_PORT, spec.control.port.toString())
                     put(INIT_MEMORY, jvmMemory(spec.resources.heap.min.bytes))
@@ -241,29 +286,47 @@ internal object VelocityWorkloadPlanner {
      * running proxy keeps the secret it was created with until something else
      * recreates it. That is the same rule the Paper planner follows for RCON, and
      * it is what stops a rotation restarting the whole fleet at once.
+     *
+     * Two entries are not read off the definition at all — the Velocity build and
+     * the control protocol — and they are the two that decide whether the mounted
+     * plugin can *load and be spoken to*. A hash that named only operator-supplied
+     * fields could not tell a running proxy from one built against a different
+     * Velocity, which is precisely the state that made a proxy undrainable. See
+     * [VELOCITY_VERSION].
      */
     fun specHash(definition: VelocityProxyDefinition): String {
-        val spec = definition.spec
-        val canonical =
-            buildList {
-                add("kind=${definition.kind.wireValue}")
-                add("image=${spec.image.canonical}")
-                add("memory=${spec.resources.memory.bytes}")
-                add("cpu=${spec.resources.cpu?.millicores ?: "unset"}")
-                add("heap.max=${spec.resources.heap.max.bytes}")
-                add("heap.min=${spec.resources.heap.min.bytes}")
-                add("network.port=${spec.network.port}")
-                add("network.hostPort=${spec.network.hostPort ?: "none"}")
-                add("control.port=${spec.control.port}")
-                add("control.hostPort=${spec.control.hostPort ?: "none"}")
-                add("control.token=${spec.control.tokenSecret?.let { "${it.name}/${it.key}" } ?: "none"}")
-                add("forwarding.mode=${spec.forwarding.mode.wireValue}")
-                add("forwarding.secret=${spec.forwarding.secret.name}/${spec.forwarding.secret.key}")
-                add("maxPlayers=${spec.maxPlayers}")
-                add("plugin.protocol=${ControlProtocol.VERSION}")
-            }.joinToString("\n")
-        val digest = MessageDigest.getInstance("SHA-256").digest(canonical.toByteArray(Charsets.UTF_8))
+        val digest = MessageDigest.getInstance("SHA-256").digest(canonicalSpec(definition).toByteArray(Charsets.UTF_8))
         return digest.take(HASH_BYTES).joinToString("") { "%02x".format(it) }
+    }
+
+    /**
+     * What [specHash] digests, before it is digested.
+     *
+     * Separate so a test can assert *membership* rather than only that two hashes
+     * differ. Most entries here are checked by varying the definition, which a
+     * constant like the Velocity build has no way to express — and "the hash is
+     * equal to itself" is an assertion that cannot fail.
+     */
+    fun canonicalSpec(definition: VelocityProxyDefinition): String {
+        val spec = definition.spec
+        return buildList {
+            add("kind=${definition.kind.wireValue}")
+            add("image=${spec.image.canonical}")
+            add("velocity.build=$VELOCITY_BUILD")
+            add("memory=${spec.resources.memory.bytes}")
+            add("cpu=${spec.resources.cpu?.millicores ?: "unset"}")
+            add("heap.max=${spec.resources.heap.max.bytes}")
+            add("heap.min=${spec.resources.heap.min.bytes}")
+            add("network.port=${spec.network.port}")
+            add("network.hostPort=${spec.network.hostPort ?: "none"}")
+            add("control.port=${spec.control.port}")
+            add("control.hostPort=${spec.control.hostPort ?: "none"}")
+            add("control.token=${spec.control.tokenSecret?.let { "${it.name}/${it.key}" } ?: "none"}")
+            add("forwarding.mode=${spec.forwarding.mode.wireValue}")
+            add("forwarding.secret=${spec.forwarding.secret.name}/${spec.forwarding.secret.key}")
+            add("maxPlayers=${spec.maxPlayers}")
+            add("plugin.protocol=${ControlProtocol.VERSION}")
+        }.joinToString("\n")
     }
 
     private const val HASH_BYTES = 16
