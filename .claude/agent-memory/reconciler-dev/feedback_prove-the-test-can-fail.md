@@ -109,6 +109,16 @@ the code comment was quietly wrong about which one carried the safety until the
 sabotage said so. Treat a sabotage that leaves a test green as a claim about the
 code to go and check, not as a weak test.
 
+**"Unobservable in this harness" is a claim about the fixture, not about the
+harness.** I ruled that the gap between `confirmedAt` and `observedAt` in the
+save-confirming pass could not be pinned, and an auditor endorsed it; both of us
+had read what `FakeNode.defaultExec` does today rather than what `onExec` can
+express. It routes **every** command, `mc-monitor` included, so a ping that costs
+five seconds makes the two instants five seconds apart on the recorded status and
+a fused single read fails the assertion. Before writing "this cannot be tested",
+name the seam the fixture already has for the neighbouring case — here, the same
+hook another test uses to make a save take sixty seconds.
+
 **Do not key a test on a constant the fix will change.** A discriminator written
 against `MAX_TRANSFER_ATTEMPTS` turns red when the limit is corrected, for a
 reason unrelated to what the test is about. Key on the facts that actually differ

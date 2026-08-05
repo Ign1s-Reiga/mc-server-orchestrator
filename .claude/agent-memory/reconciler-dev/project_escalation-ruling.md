@@ -73,6 +73,18 @@ retrying" about a drain that has permanently stopped is how they wait instead of
 acting — and the permanent text must not assert *joinability* either, since one
 of the aborts it covers is reached precisely because a probe could not answer.
 
+**A failure message states the measured fact, never the prognosis** (ruled round
+18). `goingRoundInCircles` said a re-saving drain "does not clear on its own",
+which is the opposite of what its own `RETRYABLE` class means — `resumeInto`
+re-enters on the next pass and the cycle ends when its cause does. What an
+operator does when told a drain will not clear is intervene on the container,
+and the only intervention available there is `crictl stop`, which is a container
+stopped with no save. **A false diagnostic in this codebase is a data-loss
+vector one human step removed.** The wording that replaced it says how long it
+has been going on, what the loop will keep doing meanwhile, and which two
+observations would explain it. Generalise it to any message an escalation puts
+in front of a person: a prognosis is read as an instruction.
+
 The same trap caught the *blocked* prose one level up in `:api`. `detail()`
 matched `TERMINATING && drain != null` before anything else, so a delete on a
 server people were playing on rendered as "delete requested; draining (drain
