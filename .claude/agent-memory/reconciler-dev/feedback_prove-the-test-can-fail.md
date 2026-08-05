@@ -91,6 +91,24 @@ real misdiagnosis, because stamping earlier made the anchor older than the cycle
 it measured. Two lines writing one field is the same smell as two derivations of
 one fact.
 
+**Pick the scenario's numbers so that only the guard under test can pass it.**
+A drain test for "a player joined during the save" let them build for *sixty*
+seconds before logging off — and sixty seconds is longer than
+`saveEvidenceMaxGap`, so `dropUnusableSaveEvidence` voided the confirmation and
+the world was protected whatever the branch under test did. The sabotage passed.
+Ten seconds — inside the gap — made the same assertion fail on its own. When a
+scenario has two guards in series, every duration in it is a choice about which
+one you are testing; write the reason for the number in the test.
+
+**One fix can contain two independent claims, and a single sabotage proves only
+one.** Sabotaging the voiding in `readPlayers` left the data-loss scenario green,
+because in that branch the protection is *which branch is taken*, not what it
+voids — the confirmation was never written, so there was nothing to void.
+Sabotaging the re-probe reddened it. Both are real and both needed pinning, and
+the code comment was quietly wrong about which one carried the safety until the
+sabotage said so. Treat a sabotage that leaves a test green as a claim about the
+code to go and check, not as a weak test.
+
 **Do not key a test on a constant the fix will change.** A discriminator written
 against `MAX_TRANSFER_ATTEMPTS` turns red when the limit is corrected, for a
 reason unrelated to what the test is about. Key on the facts that actually differ

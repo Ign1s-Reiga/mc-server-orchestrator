@@ -47,12 +47,17 @@ Two things this round also settled, both open to overruling:
   else, because that branch never leaves `STOPPING`. The lap that does leave
   (back to `SAVING` for a fresh save) restamps it, and is measured by the re-save
   anchor instead.
-- **`settleRecords` still clears `blocked` unconditionally.** Narrowing it to
-  `workDone` cannot fire — both `blocked` call sites call `forgetSaveEvidence`,
-  so the ladder resumes into `SEALED`/`TARGET_RESOLVED` and every branch out of
-  those claims the flag — and keeping the record while the drain progresses
-  renders "waiting, not stuck" on a drain that is transferring. Preserving
-  `DrainBlock.since` across an interruption needs a carrier that is not the
+- **`settleRecords` still clears `blocked` unconditionally.** The decision holds;
+  the reason I first gave for it was false and round 17 caught it. I said
+  narrowing to `workDone` "cannot fire". It fires for exactly one pass:
+  `DestinationChoice.Chosen` is re-derived rather than done and claims no
+  `workDone`, and it is precisely where a proxied drain resumes from a block with
+  no destination recorded. One pass of "waiting, not stuck" on a drain that just
+  secured a destination is still the misreading the clear exists to stop, so the
+  answer did not change — but **a "cannot fire" claim about a rule with an
+  enumerated set of branches is the shape that keeps being wrong here**, and it
+  is worth checking the set rather than asserting it. Preserving
+  `DrainBlock.since` across an interruption still needs a carrier that is not the
   current block record, whose reset faces the same undecidable question.
 
 See [[level-triggered-seal]] for the hysteresis this sits beside,
