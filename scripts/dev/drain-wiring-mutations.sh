@@ -14,7 +14,9 @@
 #
 # Each mutation is applied to a working copy of one source file, the test class
 # that must catch it is run, and the file is restored — mutated source is never
-# committed and never survives this script, including on failure or interrupt.
+# committed and never survives this script, including on failure or interrupt. The
+# JUnit reports those runs leave behind are removed on the way out for the same
+# reason: they describe mutated source, and nothing in an XML report says so.
 #
 #   D1..D4   the wiring defects the twentieth audit demonstrated. DrainWiringTest.
 #   D5       the same narrowing written where the fix moved the predicate to. It is
@@ -35,6 +37,18 @@
 #            whole file onto the "performs it" side of the classifier.
 #   D14      a *removal* decided outside Reconciler. `removeWorkload` ends a
 #            container too, and the scan was keyed on `stopWorkload` alone.
+#   D15      a *second* removal decided inside Reconciler, which is where a
+#            rescheduling path lands — the file D14 avoids by construction. Pinning
+#            the deciding *files* left this one green while D14 was caught, so the
+#            18/18 result was honest about what it ran and not evidence for the
+#            claim. The unit is the call site.
+#   D16      a second route into step 7. `DrainController.stop` re-asserts `mayStop`
+#            as a backstop that no scenario can reach, and the argument for leaving
+#            its condition unpinned is that its one caller has just asked the same
+#            question. That argument is about this source, so it is pinned and this
+#            is the edit that expires it.
+#            Its other precondition — step 7 being private — has no mutation, and
+#            the reason is written beside where one would go.
 #   C1..C3   controls: the rule deleted outright, once per assertion arm. If these
 #            do not redden, the harness is not reaching the assertions at all.
 #   S1       the self-test. See below.
@@ -81,7 +95,8 @@ DRAIN=mcorch.core.DrainTest
 EXIT='nothing leaves advance that has not been through the record-level rule'
 CALLER='advanceOnce is private and advance is its only caller'
 STEPPED='a pass is stepped with the drain the pass-entry reading voided'
-DECIDED='the calls that end a container are decided in one file each'
+DECIDED='the calls that end a container are decided at the sites named here'
+BACKSTOP='stop has one caller, reached from a branch that has already asked mayStop'
 ADOPTS='a pass entry adopts the confirmation clause of its reading and no more'
 RECORDS='a recorded pass cannot carry a confirmed save beside a player count'
 RESTARTED='a stop is not re-issued at a container that restarted underneath the drain'
@@ -152,6 +167,33 @@ private suspend fun makeRoomOnAnotherNode(
 ) {
     node.removeWorkload(handle)
 }'
+# The same path, in the file it would really be written in. Rescheduling is
+# reconcile-loop work, so it lands in `Reconciler.kt` — which is already on the
+# deciding-files list, so a scan whose unit is the file cannot see this at all. D14
+# is caught by construction and says nothing about it.
+REMOVE_IN_RECONCILER="$RECONCILER_TAIL"'
+
+private suspend fun relocateWorkload(
+    node: Node,
+    handle: WorkloadHandle,
+) {
+    node.removeWorkload(handle)
+}'
+# Step 7's declaration, as an anchor to put a second caller in front of. It has to
+# be inside the class — `CONTROLLER_TAIL` is the end of the *file*, past the class,
+# where a top-level function cannot see a private member at all.
+STOP_DECLARATION='    private suspend fun stop(
+        pass: DrainPass,'
+# A second way into step 7, which is what the backstop'"'"'s unreachability argument
+# says does not exist. `stop` re-asserts `mayStop` itself and no scenario can reach
+# that re-assertion, so the argument for leaving its *content* unpinned is that
+# nothing routes here except a branch that has already asked. This is that routing.
+SECOND_WAY_IN='    private suspend fun stopWithoutTheLadder(
+        pass: DrainPass,
+        drain: DrainStatus,
+    ): DrainProgress = stop(pass, drain)
+
+'"$STOP_DECLARATION"
 
 # name @@ file @@ class @@ testcases that must redden (";"-separated) @@ literal @@ replacement
 #
@@ -212,6 +254,19 @@ MUTATIONS=(
         val recorded = again.dropSaveContradictedByPlayers()"
     "D13@@$RECONCILER@@$WIRING@@$DECIDED@@$RECONCILER_TAIL@@$STOP_WRAPPER"
     "D14@@$CONTROLLER@@$WIRING@@$DECIDED@@$CONTROLLER_TAIL@@$REMOVE_ELSEWHERE"
+    # D14's shape one file over, in the file rescheduling actually reaches. A
+    # deciding-*files* assertion is green against this: the list is already
+    # `[Reconciler.kt]` and stays it however many removals are decided there.
+    "D15@@$RECONCILER@@$WIRING@@$DECIDED@@$RECONCILER_TAIL@@$REMOVE_IN_RECONCILER"
+    # The claim that `stop`'s own `mayStop` needs no scenario is an argument about
+    # this source, not about inputs. This is what expires it.
+    "D16@@$CONTROLLER@@$WIRING@@$BACKSTOP@@$STOP_DECLARATION@@$SECOND_WAY_IN"
+    # There is deliberately no mutation for that argument's other precondition —
+    # that step 7 is private, so callers in this file are all the callers. The
+    # obvious edit does not compile: `internal suspend fun stop` "exposes its
+    # 'private-in-class' parameter type 'DrainPass'", so widening it means widening
+    # `DrainPass` in the same change, which is not a quiet edit. The assertion stays
+    # because that day may come; the compiler is what refuses it today.
     "C1@@$CONTROLLER@@$WIRING@@$EXIT@@$RULE@@val recorded = progress"
     "C2@@$CONTROLLER@@$WIRING@@$STEPPED@@$ADOPTION@@val observed = drain"
     "C3@@$CONTROLLER@@$RULES@@$ADOPTS@@$CLAUSE@@is PlayerReading.Occupied -> this"
@@ -227,8 +282,20 @@ restore() {
     done
 }
 
+# The reports this script leaves behind describe *mutated* source, and a JUnit XML
+# carries nothing that says so. One was read as a regression on clean source before
+# a re-run showed it was this script's last mutation. They go on the way out, with
+# the same trap that restores the source: this script's own printed verdict is the
+# record of the run, and it names the tests it reddened.
+discard_reports() {
+    for class in "$WIRING" "$RULES" "$DRAIN"; do
+        rm -f -- "$RESULTS/TEST-$class.xml"
+    done
+}
+
 cleanup() {
     restore
+    discard_reports
     rm -rf -- "$BACKUP_DIR"
 }
 trap cleanup EXIT INT TERM

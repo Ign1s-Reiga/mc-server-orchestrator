@@ -59,10 +59,22 @@ import kotlin.io.path.readText
  * stop-bearing function is asserted below; that it is the whole of the condition —
  * rather than `!mayStop(…) && !playersEvacuated`, which the twenty-first audit
  * demonstrated — is behaviour, and `DrainTest` carries it for the one gate that is
- * reachable. [DrainController.stop]'s own gate is deliberately unreachable through
- * the state machine (`DEREGISTERED` decides the same thing first), so a narrowing
- * *there* is invisible to every test in this suite, exactly like round 18's net:
- * it is a backstop, and the primary is what keeps it unreachable.
+ * reachable. [DrainController.stop]'s own gate has no scenario, and the reason is
+ * **constructive rather than a survey**: `stop` has one caller, `letGoAndStop`,
+ * reached only from the `DEREGISTERED` arm that has just evaluated `mayStop` as
+ * true. One branch of that caller hands `stop` the *same* drain with the same
+ * arguments in the same pass — and `mayStop` reads nothing but what it is given —
+ * while the other returns without stopping, so the next pass re-enters
+ * `DEREGISTERED` and the gate runs again. Not "no input anybody has thought of
+ * reaches it": nothing reaches it.
+ *
+ * The distinction is worth the sentence. "Invisible to every possible input" is
+ * what rounds 18 and 19 wrote, and both times it was an enumeration that a later
+ * reader falsified. And because the argument now rests on two facts about this
+ * source — one caller, reached from a `mayStop` branch — those two are pinned below
+ * rather than left in prose to rot, on the same rule that took the count of stop
+ * call sites out of the class KDoc: a comment counting call sites is a defect
+ * waiting.
  *
  * Precedent: `mcorch.velocity.control.TransferNeverKicksTest` scans its own
  * module's sources for the same reason — a guarantee that has to hold against code
@@ -230,7 +242,71 @@ internal class DrainWiringTest {
     }
 
     /**
-     * …and every *other* way of ending a container is decided in one file too.
+     * The backstop is a backstop, and this is what keeps it one.
+     *
+     * [DrainController.stop] re-asserts `mayStop` itself, and that re-assertion is
+     * the only gate in this controller with no scenario behind it — narrow it and
+     * every test in the suite stays green. The class note above says why that is
+     * acceptable, in the form of a claim about this source: `stop` has **one**
+     * caller, and that caller is reached from a branch that has already asked
+     * `mayStop`. Both halves are asserted here rather than asserted in prose,
+     * because a KDoc that counts call sites is what was wrong the last three times.
+     *
+     * What goes red if a future edit routes into the stop from somewhere else is
+     * this test, and what it means is not "the edit is wrong". It means the
+     * unreachability argument has expired: the backstop has become a gate, its
+     * condition is now behaviour somebody can narrow, and it needs a scenario in
+     * `DrainTest` like the other two.
+     *
+     * The second half is a *presence* check, deliberately, and the same shape as
+     * the gate assertion below: that the state which reaches `letGoAndStop` asks
+     * `mayStop` at all, not that the question is the whole of its condition. The
+     * content of that branch is the one gate a scenario can reach, so `DrainTest`
+     * is where it is held.
+     *
+     * Both counts are counts *in this file*, so both declarations have to be
+     * `private` for either to mean anything — an `internal suspend fun stop` can be
+     * called from anywhere in `:core` and this scan would never know. That is the
+     * same precondition the single-exit test above carries for `advanceOnce`, and it
+     * is asserted here for the same reason — though today the compiler gets there
+     * first: `internal suspend fun stop` is rejected outright for exposing
+     * `DrainPass`, which is private in this class, so widening step 7 means widening
+     * the pass type in the same change. The assertion is what covers the day
+     * somebody does.
+     */
+    @Test
+    fun `stop has one caller, reached from a branch that has already asked mayStop`() {
+        val declaration = rangeOf("stop").first
+        LINES[declaration].trimStart() shouldStartWith "private suspend fun stop("
+        LINES[rangeOf("letGoAndStop").first].trimStart() shouldStartWith "private suspend fun letGoAndStop("
+
+        val calls =
+            LINES.indices.filter { it != declaration && isCode(LINES[it]) && codeOf(LINES[it]).contains("stop(") }
+
+        calls shouldHaveSize 1
+        withClue("the one call to `stop` is no longer inside `letGoAndStop`") {
+            (calls.single() in rangeOf("letGoAndStop")) shouldBe true
+        }
+
+        // …and that caller is itself entered from one place. A second entry is a
+        // second way into the stop however few callers `stop` has.
+        val entries =
+            LINES.indices
+                .filter { mentions(LINES[it], "letGoAndStop") }
+                .filterNot { it in rangeOf("letGoAndStop") }
+
+        entries shouldHaveSize 1
+        val state = enclosing(entries.single())
+        // The control that `enclosing` resolved a function and not the whole file,
+        // which would contain a `mayStop` whatever the branch above the call does.
+        state.name shouldBe "step"
+        withClue("${state.name} reaches letGoAndStop without asking mayStop") {
+            codeIn(state.body).any { codeOf(it).contains("mayStop(") } shouldBe true
+        }
+    }
+
+    /**
+     * …and every *other* way of ending a container is decided at a site named here.
      *
      * The count above is scoped to one file; the claim it replaced was scoped to the
      * codebase. A stop added to `Reconciler`'s teardown, to a node-drain helper, or
@@ -246,13 +322,36 @@ internal class DrainWiringTest {
      * "kills whatever is inside with no grace and no save". The two verbs carry
      * different arguments and both are pinned here:
      *
-     * - **`stopWorkload` ends a running container**, so its safety is the gate above
-     *   and there is exactly one file allowed to decide one.
+     * - **`stopWorkload` ends a running container**, so its safety is the gate above,
+     *   and what is added here is that no other call to it is decided anywhere.
      * - **`removeWorkload` refuses a running container** ([Node.removeWorkload]'s
-     *   contract, enforced in `WorkloadView.teardown` and tested there), so what is
-     *   pinned is only that the decision to remove is taken in one file. A second
-     *   deciding file is not a data-loss defect on its own; it is the thing a drain
+     *   contract, enforced in `WorkloadView.teardown` and tested there), so a second
+     *   deciding site is not a data-loss defect on its own; it is the thing a drain
      *   audit has to look at, which is what a review trigger is for.
+     *
+     * That refusal is **enforced through the runtime's enumeration**, and the
+     * sentence above must not be read as more than that. `WorkloadView.teardown`
+     * refuses a container the enumeration reports as anything but exited or created;
+     * a container the enumeration *omits* leaves `own` null, falls through that guard
+     * with no state check at all, and is removed forcibly — no grace, no save. Only a
+     * lying runtime produces that, `containersIn` filters nothing, and the stale
+     * handle variant is caught by the occupant guard beside it — but
+     * `containers_statuses` came back unconditionally empty on containerd 2.3.3
+     * earlier in this project, so it is round 4's residual rather than a
+     * hypothetical: ruled and still open. The refusal is a strong reason this
+     * assertion may be a review trigger instead of a gate; it is not a guarantee that
+     * makes the assertion decoration.
+     *
+     * ## A file is too big a unit for the one case this exists for
+     *
+     * This pinned the deciding *files*, and the case it was widened for is not a new
+     * file. Rescheduling is reconcile-loop work, so it lands in `Reconciler.kt` —
+     * already on the list, carrying both teardowns — and a third, fourth or tenth
+     * removal decided there left the list at exactly one entry. The vacuity control
+     * beside it stayed true too. The one path the widening was performed for was the
+     * one the assertion could not notice, and the mutation harness could not have
+     * said so: its D14 adds a removal to a file that is off the list *by
+     * construction*, which is why D15 exists.
      *
      * ## Calls are classified, not files
      *
@@ -263,16 +362,17 @@ internal class DrainWiringTest {
      * passed. The unit is the call: one inside an `override` of the verb is a node
      * performing what it was asked, any other call is a decision to end a container.
      * A distributed [Node] arriving later adds an override and passes; a wrapper does
-     * not. Listing the files by name would have made this test something a new node
-     * implementation has to be edited past, which is how a maintained list becomes a
-     * maintained lie.
+     * not. That classification is what keeps the list below honest: it enumerates
+     * *decisions*, and a new node implementation contributes none, so it is not
+     * something a new node has to be edited past — which is how a maintained list of
+     * files becomes a maintained lie.
      *
      * Scoped to `:core`'s main sources, which is what a test in this module can walk
      * honestly. `:app`'s stub node and the containerd harness implement or call the
      * same methods in test code, deliberately.
      */
     @Test
-    fun `the calls that end a container are decided in one file each`() {
+    fun `the calls that end a container are decided at the sites named here`() {
         val sources =
             Path
                 .of("src/main/kotlin")
@@ -280,16 +380,26 @@ internal class DrainWiringTest {
                 .walkTopDown()
                 .filter { it.isFile && it.extension == "kt" }
                 .map(Source::of)
+                // Sorted, so the list below is the source's own order and not the
+                // order the filesystem happened to hand the walk.
+                .sortedBy { it.path }
                 .toList()
 
         // Vacuity guards. A walk that found nothing, or that ran somewhere without
         // the reconcile loop in it, satisfies the assertions below by accident.
         sources.size shouldBeGreaterThan 10
-        sources.map { it.path } shouldContain "src/main/kotlin/mcorch/core/Reconciler.kt"
+        sources.map { it.path } shouldContain RECONCILER_PATH
 
         fun naming(verb: String) = sources.filter { source -> source.lines.any { mentions(it, verb) } }.map { it.path }
 
-        fun deciding(verb: String) = sources.filter { it.decisionsAbout(verb).isNotEmpty() }.map { it.path }
+        // One entry per *call site*, because the file is the wrong unit: the path
+        // this test exists for — a rescheduling helper — is written in a file that
+        // already decides two removals, and a per-file list cannot tell a third from
+        // the two it expects.
+        fun deciding(verb: String) =
+            sources.flatMap { source -> source.decisionsAbout(verb).map { source.path to it.name } }
+
+        fun decidingFiles(verb: String) = deciding(verb).map { it.first }.distinct()
 
         // Control for the classifier: the files that *perform* each verb are really
         // being separated out, rather than everything landing on one side. The
@@ -298,14 +408,16 @@ internal class DrainWiringTest {
             naming("stopWorkload") shouldContain performer
             naming("removeWorkload") shouldContain performer
         }
-        naming("stopWorkload").size shouldBeGreaterThan deciding("stopWorkload").size
-        naming("removeWorkload").size shouldBeGreaterThan deciding("removeWorkload").size
+        naming("stopWorkload").size shouldBeGreaterThan decidingFiles("stopWorkload").size
+        naming("removeWorkload").size shouldBeGreaterThan decidingFiles("removeWorkload").size
 
-        deciding("stopWorkload") shouldBe listOf("src/main/kotlin/mcorch/core/DrainController.kt")
+        deciding("stopWorkload") shouldBe listOf(CONTROLLER_PATH to "stop", CONTROLLER_PATH to "awaitStopped")
         // Both teardowns, and nothing else. A removal decided anywhere else — a
         // rescheduling path, a node drain — is the case this test's own motivation
-        // names and the case its alphabet used to miss.
-        deciding("removeWorkload") shouldBe listOf("src/main/kotlin/mcorch/core/Reconciler.kt")
+        // names, and `Reconciler.kt` is where that case is written, which is why the
+        // file is not the unit.
+        deciding("removeWorkload") shouldBe
+            listOf(RECONCILER_PATH to "teardownProxy", RECONCILER_PATH to "teardown")
     }
 
     private data class Binding(
@@ -438,7 +550,11 @@ internal class DrainWiringTest {
                 "src/main/kotlin/mcorch/core/node/LocalNode.kt",
             )
 
-        val CONTROLLER: Source = Source.of("src/main/kotlin/mcorch/core/DrainController.kt")
+        const val CONTROLLER_PATH: String = "src/main/kotlin/mcorch/core/DrainController.kt"
+
+        const val RECONCILER_PATH: String = "src/main/kotlin/mcorch/core/Reconciler.kt"
+
+        val CONTROLLER: Source = Source.of(CONTROLLER_PATH)
 
         val LINES: List<String> get() = CONTROLLER.lines
 

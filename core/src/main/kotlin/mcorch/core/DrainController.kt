@@ -38,7 +38,10 @@ import java.time.Duration as JavaDuration
  *   main sources decides to call the stop at all. That scan covers
  *   [Node.removeWorkload] too: it is the other way a container ends, it is what a
  *   rescheduling path reaches, and the drain does not call it — `Reconciler`'s
- *   teardowns do, once this controller has reported the container down.
+ *   teardowns do, once this controller has reported the container down. The
+ *   removal's own refusal to touch a running container is enforced against the
+ *   containers the runtime *enumerates*; one it omits is round 4's residual and not
+ *   a guarantee, which is why the scan is a review trigger rather than decoration.
  * - **A drain that cannot finish leaves the server running.** Every failure path
  *   lands on [DrainState.DRAIN_FAILED], and there is no edge from there to
  *   [DrainState.STOPPING]. Reaching a retry limit means the loop stops trying,
