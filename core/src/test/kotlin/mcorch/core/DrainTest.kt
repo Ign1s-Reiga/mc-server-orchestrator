@@ -225,6 +225,53 @@ internal class DrainTest {
             harness.store.getServer(name) shouldBe null
         }
 
+    /**
+     * The sixteenth audit's first critical: a save that outruns
+     * `saveEvidenceMaxGap` used to expire its own evidence.
+     *
+     * `pass.now` is read once at the top of `advance`. Stamping `worldSavedAt`
+     * with it dates a confirmation to before the flush that earned it, so the
+     * next pass measured a gap of `save + poll`, voided evidence seconds old and
+     * went back to `SAVING`. Nothing failed, so nothing escalated — `Progressed`
+     * every pass, for ever, re-flushing a live server.
+     *
+     * Forty-five seconds against a thirty-second gap. The real threshold was
+     * about twenty-eight, and the schema's own default `saveTimeout` is 180: this
+     * is a mature survival world being deleted, not a pathological one.
+     *
+     * No test could express this before, because the harness clock only ever
+     * moved *between* passes — which models the backoff, and the backoff was
+     * never the problem. Advancing it inside the exec is the whole point.
+     */
+    @Test
+    fun `a save that outruns the evidence gap does not expire its own evidence`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.node.online = 0
+            harness.node.onExec = { command ->
+                if (command == PaperCommands.saveAll()) {
+                    harness.clock.advance(45.seconds)
+                }
+                harness.node.defaultExec(command)
+            }
+            harness.store.deleteDefinition(name)
+
+            harness.settle(name, limit = 20)
+
+            // The drain finishes: stopped once, removed, gone from the store.
+            harness.node.stops shouldHaveSize 1
+            harness.store.getServer(name) shouldBe null
+            // And invariant 5 held on the way — one flush, not one per pass.
+            // Asserted separately from the stop because a drain that stopped
+            // correctly after nine redundant saves would satisfy the lines above
+            // while still being the defect.
+            harness.node.execs.count { it == PaperCommands.saveAll() } shouldBe 1
+        }
+
     @Test
     fun `a save that times out aborts the drain and the container survives`() =
         coreTest {

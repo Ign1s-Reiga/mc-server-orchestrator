@@ -1,5 +1,7 @@
 package mcorch.core
 
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import mcorch.core.paper.PaperServerAgent
 import mcorch.core.paper.ProbeOutcome
 import mcorch.core.paper.SaveOutcome
@@ -261,17 +263,24 @@ internal class DrainController(
         // knows it, so a count taken three states ago is not evidence of anything.
         val probe = subject.probe(node, observation.handle)
 
-        // The only place occupancy is ever built, and every abort below depends
-        // on that being true: a non-null `occupancy` means an SLP answered *this
-        // pass*, so a message or a decision may say what is online, and a null
-        // one means nothing was established and nothing may be claimed. It is
-        // threaded read-only through `DrainPass` and never reconstructed.
+        // Built through [occupancyOf], which is the only constructor of a
+        // `PlayerOccupancy` in this file, and every abort below depends on that:
+        // a non-null `occupancy` means an SLP answered, so a message or a
+        // decision may say what is online, and a null one means nothing was
+        // established and nothing may be claimed.
         //
         // Stated here rather than as a list of the call sites that hold it. That
         // list was written once and was already wrong — `awaitStopped`'s abort
-        // reaches `step()` directly rather than through `requireEmpty` — while
-        // this single construction site cannot drift.
-        val occupancy = (probe as? ProbeOutcome.Joinable)?.let { PlayerOccupancy(it.online, it.max, now) }
+        // reaches `step()` directly rather than through `requireEmpty` — while a
+        // single constructor cannot drift.
+        //
+        // What this one is *not* any more is the only **call** of it. [save]
+        // re-establishes occupancy after a confirmed save, because a save is the
+        // one step long enough for a pass-entry instant to have gone stale by the
+        // time it returns. The guarantee that survives is the one the aborts
+        // actually rest on — an occupancy instant is when an SLP answered, not
+        // when the pass began.
+        val occupancy = occupancyOf(probe, now)
 
         val pass =
             DrainPass(
@@ -1290,6 +1299,21 @@ internal class DrainController(
     }
 
     /**
+     * The only constructor of a [PlayerOccupancy] in this file.
+     *
+     * [at] is when the probe answered, and callers must pass an instant read no
+     * earlier than the call that produced [probe]. Handing it a pass-entry
+     * instant for a probe taken after a three-minute save is what made the
+     * sixteenth audit's livelock: the recorded instant is what the next pass
+     * measures its evidence gap from, so a stale one voids evidence that was in
+     * fact fresh.
+     */
+    private fun occupancyOf(
+        probe: ProbeOutcome,
+        at: Instant,
+    ): PlayerOccupancy? = (probe as? ProbeOutcome.Joinable)?.let { PlayerOccupancy(it.online, it.max, at) }
+
+    /**
      * Runs [next] only if a fresh ping reports zero players; blocks the drain if
      * anybody is on, and aborts if the ping could not answer at all.
      *
@@ -1480,10 +1504,69 @@ internal class DrainController(
 
         return when (val outcome = pass.subject.requestSave(pass.node, observation, contract)) {
             SaveOutcome.Confirmed -> {
+                // Both instants below are read *after* the save returned, never
+                // from `pass.now`, and this is the whole of the sixteenth audit's
+                // first critical.
+                //
+                // `pass.now` is taken once at the top of [advance], before the
+                // probe and long before `save-all flush` comes back. A save is
+                // the only step in this protocol that can run for minutes — the
+                // schema's own default `saveTimeout` is 180 seconds — so
+                // stamping evidence with it dates the evidence to before the
+                // work that produced it. The next pass then measures its gap
+                // from that stale instant, finds it wider than
+                // `saveEvidenceMaxGap`, voids a confirmation that was seconds
+                // old, and returns to `SAVING`. Nothing fails, so nothing
+                // escalates: `Progressed` every pass, `DRAINING` on the badge,
+                // and a full flush at a live server for ever. The threshold was
+                // a save of about 28 seconds.
+                //
+                // **Which of the two instants carries that is worth knowing, and
+                // it is not the one the name suggests.** [saveIsCurrent] returns
+                // on `!confirmed.isBefore(containerStartedAt)` whenever the
+                // runtime reports a start time, which is every running
+                // container — it never consults the age. So the freshness half
+                // of `dropUnusableSaveEvidence` rests entirely on `watched`,
+                // which reads `lastProbedAt`, which is this `occupancy`'s
+                // instant. Sabotaging `worldSavedAt` alone leaves the livelock
+                // test green; sabotaging the occupancy reddens it. Both are
+                // stamped honestly here — `worldSavedAt` still decides the
+                // no-start-time branch, and an instant that lies about when it
+                // was established is a defect waiting for the next reader — but
+                // the load-bearing one is the occupancy.
+                //
+                // The re-probe is what keeps the rule honest rather than merely
+                // wider. Invariant 3 is that a stop follows a *confirmed* save
+                // with nobody on the server, and that interval still has a real
+                // zero-player reading at each end — this one closes it. A
+                // re-probe that finds players (they joined during a long save)
+                // records them, and the next pass's `requireEmpty` blocks the
+                // stop, which is the outcome that protects their progress. A
+                // re-probe that does not answer leaves occupancy null and the
+                // evidence unwatched, so a later pass saves again rather than
+                // stopping on a reading nobody took.
+                //
+                // The probe runs [NonCancellable], and that is not tidiness. It
+                // sits between a save the server has already confirmed and the
+                // record of it, so a pass cancelled here loses the confirmation
+                // — and the next pass reads `saveRequestedAt != null` with no
+                // `worldSavedAt`, which aborts `PERMANENT` and wedges the drain
+                // until a human confirms the world state by hand. Three existing
+                // tests in `SaveRecordDurabilityTest` and `ReconcileLoopTest`
+                // pin exactly that, and they caught this when the probe was
+                // added as an ordinary suspension point.
+                //
+                // The cost is bounded by the probe's own timeout — everything
+                // crossing `:cri` has one — so a shutdown waits at most that
+                // long. Losing a confirmed save costs an operator a wedged
+                // server and a manual investigation, which is the worse side of
+                // the trade by a wide margin.
+                val confirmedAt = clock.instant()
+                val settled = withContext(NonCancellable) { pass.subject.probe(pass.node, observation.handle) }
                 DrainProgress(
                     drain =
                         drain
-                            .moveTo(DrainState.DEREGISTERED, now)
+                            .moveTo(DrainState.DEREGISTERED, confirmedAt)
                             // The request is no longer outstanding — it came
                             // back, and the server said the save finished — so
                             // the wedge is released and the confirmation takes
@@ -1491,9 +1574,14 @@ internal class DrainController(
                             // confirmation left sitting beside its own request
                             // timestamp is what used to make the next `SAVING`
                             // read a completed save as one that never returned.
-                            .copy(saveRequestedAt = null, worldSavedAt = now),
-                    occupancy = occupancy,
-                    saveConfirmedAt = now,
+                            .copy(saveRequestedAt = null, worldSavedAt = confirmedAt),
+                    // No `?: occupancy` fallback, deliberately. Falling back to
+                    // the pass-entry reading would record an instant from before
+                    // the save as though it were taken after — which is the
+                    // defect this branch exists to fix, restored by the line
+                    // meant to be tidy about a null.
+                    occupancy = occupancyOf(settled, confirmedAt),
+                    saveConfirmedAt = confirmedAt,
                     sideEffectIssued = true,
                     // A `save-all flush` went out and the server said it finished.
                     // Work by any honest measure — which is why it alone does not
