@@ -964,3 +964,45 @@ Related: [[standalone-paper-drain-shape]]
     hours on a drain whose first lap cleared normally, and the message reports
     that number as "has not cleared on its own in Xs". Whenever a duration bound
     is retuned, check what resets its anchor and whether the success path does.
+
+## Round 20: the structural pin, and what a shape-based assertion cannot see
+
+84. **A "single exit" pin written as `trim().startsWith("return ")` cannot see a
+    return that is not the first token of a line.** `DrainWiringTest`'s first
+    assertion filters `advance`'s code lines for that prefix and requires the list
+    to be exactly `["return <bound name>"]`. Two ordinary Kotlin shapes escape it
+    entirely — `if (cond) return progress` and `val x = progress.occupancy ?: return
+    progress` — and each is a second exit from the one function whose whole job is
+    that every `DrainProgress` leaves through `dropSaveContradictedByPlayers`.
+    Verified by replicating the test's own regexes against mutated sources: both
+    mutations keep all four assertions green while the controls (deleting the rule,
+    deleting the adoption) go red. A structural pin's red-proof only demonstrates
+    the mutations somebody thought to try; enumerate the *language forms* of the
+    thing being forbidden, not the one the current code happens to use.
+85. **Following a bound name pins which value flows, never the condition under
+    which it was computed.** The same test binds the rule's result with
+    `val (\w+) =` and then asserts `return <name>`; the adoption test binds
+    `observed` from the `PlayerReading.Occupied` line and asserts
+    `step(pass, observed)`. Rewriting either right-hand side as
+    `if (<extra conjunct>) <the safe call> else <the unvoided value>` keeps the name,
+    keeps the flow, and deletes the guarantee. Both mutations verified green.
+    Regex-following-a-name is the right technique against renames and rewraps; it
+    is no technique at all against a narrowed predicate, so the predicate still
+    needs a behavioural test or a shape assertion of its own.
+86. **A single-file source scan pinning a claim whose scope is "this codebase".**
+    `the container stop has exactly two call sites` scans only
+    `DrainController.kt`, while the KDoc it replaces says `Node.stopWorkload` is
+    called twice *in this codebase*. True today (the only other references are the
+    `Node` declaration, the `LocalNode` override and an integration-test fixture) —
+    but a stop added to `Reconciler.teardown`, to a future rescheduling path or to a
+    node-drain helper leaves every assertion green, and those are exactly the paths
+    invariant 1 exists for. The precedent it cites, `TransferNeverKicksTest`, scans
+    its whole module. A count pinned in the file it was written in is a pin on the
+    file, not on the codebase.
+87. **A count pin is a notification, not an enforcement of the gate it is named
+    after.** `one behind each gate` asserts *where* the two stops are, and nothing
+    about `mayStop` or `readPlayers` being above them. When a third legitimate site
+    appears the repair the test invites is "bump the number and add a range", which
+    is precisely the maintained-count-of-call-sites failure it was built to retire,
+    relocated from a KDoc into a test. Cheap strengthening: assert each
+    stop-bearing function's own range also contains the gate call.
