@@ -521,3 +521,39 @@ call sites, `mayStop`, `saveIsCurrent`, `letGoAndStop`, `requireEmpty`,
   presence assertion and by one mutation that deletes it outright. See
   [[drain-audit-danger-patterns]] item 89 for the narrowing that walks through
   both.
+
+## Round 22 rulings: the classifier, and the three judgements sustained
+
+Audited at `e95f814` (`fix/save-evidence-stamping` = `feat/velocity-proxy-kind`).
+No critical. `:core` main-source change was KDoc only; both `Node.stopWorkload`
+call sites, `mayStop`, `saveIsCurrent`, `letGoAndStop`, `requireEmpty`,
+`goingRoundInCircles`, `Reconciler.teardown`/`teardownProxy` and
+`LocalNode.removeWorkload` are byte-identical to the previous audit.
+
+- **All three offered judgements sustained, and the second is provable rather than
+  argued.** `DrainController.stop` is reached only from `letGoAndStop`, whose
+  no-router / already-deregistered arm calls `stop(pass, drain)` with the *same*
+  drain the `DEREGISTERED` branch just tested `mayStop` on, with identical
+  arguments in the same pass; the `Asserted` arm returns without stopping. So a
+  narrowing of `stop`'s own gate is invisible to every input by construction, not
+  by enumeration. Stating it in the KDoc and naming the extract-and-unit-test
+  alternative is the right posture — do not manufacture a scenario for it.
+- **The `adoptSaveClause` two-argument shape is right.** Fusing receiver and
+  reading needs every `PlayerReading` to carry a drain, including `Unanswered`,
+  which is the collapse `readPlayers` exists to refuse (its three callers disagree
+  about silence). The structural receiver pin (`callee(reading.value)`) plus D8 is
+  the available substitute.
+- **`removeWorkload`'s pin being "one deciding file, not a gate" is right in kind
+  and wrong in granularity** — see [[drain-audit-danger-patterns]] item 93. The
+  posture (a red routes to a drain audit rather than to an appended list) is the
+  one to keep; the assertion as written will not fire on the rescheduling case it
+  names, because rescheduling is reconcile-loop work and `Reconciler.kt` is already
+  on the list.
+- **The round-21 gate warning is genuinely closed.** `DrainTest`'s
+  `a stop is not re-issued at a container that restarted underneath the drain`
+  reaches `awaitStopped`'s gate with the probe silent so the `Occupied` arm cannot
+  fire, asserts the `goingRoundInCircles` detail string that previously appeared
+  nowhere in the suite, and ends on an ordering assertion (`saves == 2` at the
+  second stop) rather than on a refusal — so it cannot be satisfied by a drain that
+  simply never finishes. D10 (`&& !drain.playersEvacuated`) is caught by it because
+  the scenario asserts `playersEvacuated` is true at that point.

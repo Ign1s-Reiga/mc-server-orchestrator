@@ -1075,3 +1075,42 @@ Related: [[standalone-paper-drain-shape]]
     confirmation, which is the unsafe side. When auditing an extraction, ask what a
     new case does under each form before asking whether the bodies match; the
     default branch is where the next subtype lands.
+
+## Round 22: the widened alphabet, and the granularity it was widened at
+
+93. **A file-granularity pin on a verb that already has a deciding file is blind to
+    the second decision in that file — and that is where the motivating path
+    lands.** `DrainWiringTest`'s `deciding("removeWorkload") shouldBe
+    listOf(Reconciler.kt)` maps `sources.filter { … }.map { it.path }`, one entry per
+    *file*, so `Reconciler.kt` already being on the list means a third, fourth or
+    tenth removal decided inside it keeps the assertion green. `stopWorkload` does
+    not have this hole only because a *second* test (`calls shouldHaveSize 2`, on
+    `DrainController.kt`'s lines) supplies the count; `removeWorkload` has no count
+    pin and no gate pin at all, and `naming(v).size shouldBeGreaterThan
+    deciding(v).size` is a vacuity control that stays true. The test's own stated
+    motivation is rescheduling — which is reconcile-loop work and would be written
+    in `Reconciler.kt` — so the trigger the design promises is the one case it
+    cannot fire on. The harness matches the test rather than the claim: D14 adds a
+    removal to `DrainController.kt` (a *new* file, caught); no mutation adds a
+    second removal to `Reconciler.kt`. Cheap repair: pin
+    `(path, enclosing().name)` pairs, not paths — `[teardown, teardownProxy]`.
+    General rule: when a pin's unit is coarser than the thing it claims to notice,
+    ask whether the claimed trigger is a *new* unit or another one of an existing
+    unit.
+94. **Two verbs in one scan inherit different amounts of enforcement, and the KDoc
+    reads as if they inherit the same.** Widening the alphabet from `stopWorkload`
+    to `stopWorkload` + `removeWorkload` was right (item 91 closed), and the
+    asymmetric claims are honestly written down — stop is gated, removal is only
+    located. But the *strength* also differs and is not: stop is pinned by file-set
+    **and** count **and** gate; removal by file-set alone. When an audit accepts
+    "different verbs carry different arguments", check that the difference recorded
+    is the one that exists, and not just the one about semantics.
+95. **`WorkloadView.teardown`'s first guard has no not-found arm; the second one
+    carries it.** `own = containers.firstOrNull { it.id == handle.containerId }`
+    null-falls-through to `TeardownStep.RemoveContainer(ownId)` with **no** state
+    check, and CRI's `RemoveContainer` forcibly removes a running container. The
+    stale-handle case is caught by `occupants` (a differently-ided live container is
+    in the list); the only slip is an enumeration that omits a running container
+    entirely, i.e. round 4's same-well residual, still open and still ruled. Restate
+    it whenever the removal path is re-audited: the refusal that `Node.removeWorkload`'s
+    contract promises is enforced through the enumeration, not through the handle.
