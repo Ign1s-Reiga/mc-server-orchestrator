@@ -1605,9 +1605,14 @@ internal class DrainController(
         // down rather than rediscovering. The schema guarantee it rested on
         // (`SpecInvariants.stopGraceProblem`) is `PaperServer`'s; `ProxyLifecycleSpec`
         // has no such rule, so for a proxy the arithmetic was founded on nothing and
-        // was only harmless because this branch is unreachable without world data —
-        // a reachability argument nobody had written down, which is exactly how the
-        // round-17 exemption came to be widened. And `stopGracePeriod` is an
+        // was harmless only by an unwritten reachability argument — which is exactly
+        // how the round-17 exemption came to be widened, and which was wrong anyway:
+        // a proxy whose container has lost its `world-data` label is drained as
+        // though it held a world, and one that loses it after `SAVING` reaches here
+        // with `mayStop` false at `DEREGISTERED`. What makes any allowance safe
+        // for a proxy is that its save cannot take time at all — see
+        // [ProxyDrainSubject.saveTimeout], which now carries that argument instead of
+        // leaving it to be reconstructed. And `stopGracePeriod` is an
         // operator's number, capped at two hours: someone who set a long one for an
         // unrelated reason bought a two-hour escalation latency on a defect whose
         // honest lap is about a minute, flushing a multi-gigabyte world once a minute
@@ -2961,10 +2966,28 @@ internal data class DrainProgress(
  * kept refreshing the window that keeps it alive instead.
  *
  * A read-point rule cannot catch a non-reader. This is the same move applied to
- * the *record*: [DrainProgress] is the only thing that leaves this file, it holds
- * both facts, and `Reconciler` writes them onto one observed status side by side.
- * Every producer of a progress goes through it, including the ones that never look
- * at a player count.
+ * the *record*: [DrainProgress] is the only thing that leaves this file and it
+ * holds both facts, so every producer of a progress is bound by it — including the
+ * ones that never look at a player count.
+ *
+ * ## The pair is what *this pass* established, not what lands on the status
+ *
+ * The placement argument used to be "`Reconciler` writes them onto one observed
+ * status side by side", and that is not what it does: `players` is written as
+ * `progress.occupancy ?: previous.players`. On a pass whose probe did not answer,
+ * the count on the status is carried forward from an earlier pass and sits beside
+ * *this* pass's drain — a pair this function returns early on, because a null
+ * occupancy means this pass observed nobody and has no grounds to take anything
+ * away. Which is right: a carried-forward count is not an observation of the world
+ * this drain is about to stop, and it is the same distinction [readPlayers] refuses
+ * to collapse for an unanswered probe.
+ *
+ * So the rule is over the two facts a pass **established**, which is exactly the
+ * pair [DrainProgress] carries, and that is why it belongs to the progress rather
+ * than to the drafted status. The wrong version was harmless today — a confirmation
+ * can only be minted under a fresh zero reading, so the bad pair is unreachable —
+ * and it is stated correctly here because the argument is what a future reader
+ * inherits when that stops being true.
  *
  * ## What it does not do
  *

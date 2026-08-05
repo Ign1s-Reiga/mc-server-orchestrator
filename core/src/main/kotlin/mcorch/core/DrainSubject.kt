@@ -58,8 +58,14 @@ internal interface DrainSubject {
      * `Duration.ZERO` for a workload that holds no world: there is no save in its
      * drain, so nothing that measures a lap of the protocol should be given an
      * allowance for one. That is an answer about the subject rather than a
-     * placeholder, which is what keeps a reader from having to prove the value is
-     * unreachable before trusting the arithmetic around it.
+     * placeholder — but it is not self-evidently inert, and the argument that it is
+     * belongs to the implementation that answers zero.
+     *
+     * The premise is about a *labelled* container. `holdsWorldData` defaults to
+     * `true` for every kind when the label cannot be read, deliberately, so a
+     * workload that claims no world here can still be drained as though it held one
+     * and can reach the arithmetic with a zero allowance. See
+     * [ProxyDrainSubject.saveTimeout], which carries the reason that is still safe.
      */
     val saveTimeout: Duration
 

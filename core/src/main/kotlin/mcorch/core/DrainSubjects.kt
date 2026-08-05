@@ -78,10 +78,34 @@ internal class ProxyDrainSubject(
      * measuring one should be given an allowance for it.
      *
      * `ProxyLifecycleSpec` has no save timeout to read even if this wanted one —
-     * deliberately, and its KDoc says why. Zero is the honest answer rather than
-     * a stand-in: it makes the arithmetic in `goingRoundInCircles` correct for a
-     * proxy on its own terms, instead of correct because that branch happens to be
-     * unreachable for one.
+     * deliberately, and its KDoc says why. Zero is the honest answer rather than a
+     * stand-in.
+     *
+     * ## Why zero is inert, written down rather than left to reachability
+     *
+     * The sentence above is about a proxy whose container carries its labels, and
+     * `VelocityProxyAgent.contractOf` reads `holdsWorldData = worldData ?: true` —
+     * the safe default, kept deliberately unsoftened for a proxy. So an *unlabelled*
+     * proxy container is drained as though it held a world: if the label goes
+     * missing after the drain has passed `SAVING`, `mayStop` is false at
+     * `DEREGISTERED` and the drain lands in `goingRoundInCircles` with an allowance
+     * of `saveEvidenceMaxGap + 0` — thirty seconds. The value is consulted; it is not
+     * unreachable, and the earlier version of this note claimed it did not need the
+     * argument that follows.
+     *
+     * It is still the right allowance, for a reason that does not depend on that
+     * branch being unreachable: [requestSave] answers `Unconfirmable` with no round
+     * trip, which aborts the drain `PERMANENT` at `SAVING`. **No lap of a proxy's
+     * drain can spend time inside a save**, whatever the label says — the lap is two
+     * passes and one immediate refusal — so thirty seconds is the honest length of
+     * one rather than a number that happens not to be reached. The direction the
+     * borrowed `stopGracePeriod` got wrong was the opposite one: it handed a lap
+     * *hours*.
+     *
+     * What it costs, stated plainly: a proxy whose labels stop being readable
+     * mid-drain could be told it is circling after thirty seconds. That abort is
+     * `RETRYABLE` and reports a container whose labels cannot be read, and the
+     * permanent abort from `SAVING` — the accurate diagnosis — is one pass behind it.
      */
     override val saveTimeout: Duration get() = Duration.ZERO
 
