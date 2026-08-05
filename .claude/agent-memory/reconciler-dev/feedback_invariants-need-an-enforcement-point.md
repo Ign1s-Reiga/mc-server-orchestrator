@@ -1,6 +1,6 @@
 ---
 name: invariants-need-an-enforcement-point
-description: An invariant held by every call site doing the right thing is not enforced — collapse it into one function whose return type carries it, distrust any comment counting call sites, and pin wiring that no input can exercise by asserting on the source (shapes only: unconditional application, exits, gates, classification rather than lists, and the call site rather than the file as the unit; prefer a constructive unreachability argument to a survey of inputs)
+description: An invariant held by every call site doing the right thing is not enforced — collapse it into one function whose return type carries it, distrust any comment counting call sites, and pin wiring that no input can exercise by asserting on the source (shapes only: unconditional application, exits, gates, classification rather than lists, and the call site rather than the file as the unit; prefer a constructive unreachability argument to a survey of inputs, pin every premise of it including which object reaches the callee, and cover two gates in series with an assertion about the side effect rather than the refusal)
 metadata:
   type: feedback
 ---
@@ -247,6 +247,41 @@ means at A's extremes. The fix was to put the real quantity on the interface —
 `DrainSubject.saveTimeout`, `Duration.ZERO` for a workload with no world, which
 is an answer about the subject rather than a placeholder needing a reachability
 proof.
+
+## Pin every premise, and name the one that decides dead from live
+
+Round 23. The constructive argument above ("nothing reaches it") had **three**
+premises and the test pinned two — one caller, and that caller reached from a
+branch that has already asked the same question. The unpinned one was that the
+*same object* reaches the callee: `stop(pass, drain)` and
+`stop(pass, drain.copy(…))` are both well-typed, and under the second the
+backstop answers a question nothing upstream asked. That is the premise deciding
+whether the thing is dead code (fine unpinned) or a live gate whose narrowing no
+test can see, and it was the one left in prose.
+
+- **Count the premises of a constructive argument and pin each.** Two out of
+  three reads as "asserted rather than left in prose" and is not.
+- **The arguments are premises too.** The gate read `contract`,
+  `containerStartedAt` and `now` off the *pass*, so forwarding the pass unchanged
+  carried as much as forwarding the drain. Assert the whole argument list.
+- **Follow, never restate.** Read the callee's parameter names off its own
+  declaration and require the call to forward them — a rename stays green, a
+  substitution reddens. Restating the literal `drain` catches only the second.
+
+## Two gates in series need an assertion about the side effect
+
+The same round, and it is the answer to "this presence check is coarse". When a
+dangerous side effect needs gate A **and** gate B to agree, neither weakened
+alone does harm; only the composite does. So the instrument for the pair is an
+assertion that reads **what reached the runtime** — `node.stops.shouldBeEmpty()`
+— not one that reads which refusal was recorded, because a refusal's wording
+names which gate spoke and can be satisfied by the gate that is not under test.
+
+Two consequences worth keeping: a coarse structural pin on one gate is tolerable
+when a composite assertion exists, and *that* is the argument to write down
+rather than tightening the scan; and those side-effect assertions must be marked
+as load-bearing, or somebody "strengthens" them into a check on the recorded
+failure and quietly loses the composite.
 
 See [[localnode-test-gap]] for the sibling rule about decisions, and
 [[prove-the-test-can-fail]] for why the unit test of the function was the one

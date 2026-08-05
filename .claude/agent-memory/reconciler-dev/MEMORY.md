@@ -10,10 +10,10 @@
 - [LocalNode test gap](project_localnode-test-gap.md) — collapse a decision into the module that owns it; a raw value plus a flag about it means the seam is wrong.
 - [Classify narrowly, contain broadly](feedback_classify-narrowly-and-contain-broadly.md) — keep the never-retry bucket small; let no exception escape a worker.
 - [Audit remedies are hypotheses](feedback_audit-remedies-are-hypotheses.md) — the finding is established, the remedy may be wrong or reach only half the defects; trace it per case.
-- [Prove the test can fail](feedback_prove-the-test-can-fail.md) — `--rerun` or it never ran; virtual time hides races; mutate in sets and read the XML, not the exit status.
+- [Prove the test can fail](feedback_prove-the-test-can-fail.md) — `--rerun` or it never ran; mutate in sets, read the XML, and sweep the retired claim, not the identifier.
 - [Cancellation exposure](project_cancellation-exposure.md) — what the save-record shield covers, the two windows left open on purpose, and why write-ahead was rejected on its merits.
 - [Derive from the consumer](feedback_derive-from-the-consumer.md) — a status field is judged by what reads it; two of my defects passed every `:core` test and needed a real dashboard.
 - [Unreadable state posture](project_unreadable-state-posture.md) — a bad definition row cost the fleet; a bad observation was already safe via `getServer`, and the loop's skip only buys reporting.
 - [Level-triggered seal](project_level-triggered-seal.md) — assert, never issue; anchor rules; why a resume never clears a failure; four rulings open to overruling.
 - [Record where no work happens](project_record-where-no-work-happens.md) — the third critical from "did work ⇒ recovered", and why the fix was placement rather than a narrower rule.
-- [Invariants need an enforcement point](feedback_invariants-need-an-enforcement-point.md) — a rule every call site upholds is not enforced; pin wiring by shape, and make the unit the call, not the file.
+- [Invariants need an enforcement point](feedback_invariants-need-an-enforcement-point.md) — pin wiring by shape and every premise of an unreachability argument; two gates need a side-effect assertion.

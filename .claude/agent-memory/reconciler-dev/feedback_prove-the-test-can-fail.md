@@ -1,6 +1,6 @@
 ---
 name: prove-the-test-can-fail
-description: Before trusting a green run, prove the check could have gone red — Gradle skips up-to-date tasks, virtual time hides races, a mutation set beats one sabotage, and some checks belong in the type system instead
+description: Before trusting a green run, prove the check could have gone red — Gradle skips up-to-date tasks, virtual time hides races, a mutation set beats one sabotage, a precondition the compiler refuses is written as a reason where its mutation would go, a rename must sweep the retired claim and not just the identifier, and some checks belong in the type system instead
 metadata:
   type: feedback
 ---
@@ -182,6 +182,22 @@ The mutation table was `name|file|class|literal|replacement`, and the first lite
 containing `||` split into the wrong fields, applied a replacement nobody wrote,
 and reported the resulting compile failure as UNKNOWN. It was one step from
 scoring a defect that did not exist. `@@` now, plus a field count per entry.
+
+**A precondition the compiler refuses gets no mutation, and the reason goes where
+the mutation would have gone.** That is a convention now, not an exception made
+once. Be right about *why*: under this harness a non-compiling entry leaves no
+XML (`execute` deletes the report first), `judge` reads no report as UNKNOWN, and
+the run counts it a **failure** — it does not "score as caught". Either way the
+entry proves nothing, and the written reason is what tells the next reader the
+gap is a ruling rather than an oversight, plus what to write the day the compiler
+stops refusing it.
+
+**When a rename retires a claim, grep the claim — not the identifier.** A rename
+performed on the rule that the audit trail reads these strings updated the
+harness's `$DECIDED` variable and left the prose one level up still asserting the
+retired version, in the header, which is the string read first. The identifiers
+are what the tooling sees; the sentences are what a human uses to decide whether
+a green run means anything.
 
 ## When the check cannot exist, move it to the compiler
 
