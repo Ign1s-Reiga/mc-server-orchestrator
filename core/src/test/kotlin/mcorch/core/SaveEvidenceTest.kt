@@ -2,8 +2,11 @@ package mcorch.core
 
 import io.kotest.matchers.booleans.shouldBeFalse
 import io.kotest.matchers.booleans.shouldBeTrue
+import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
+import io.kotest.matchers.types.shouldBeInstanceOf
+import mcorch.core.paper.ProbeOutcome
 import mcorch.schema.DrainState
 import mcorch.schema.DrainStatus
 import org.junit.jupiter.api.Test
@@ -184,6 +187,73 @@ internal class SaveEvidenceTest {
         val nothing = drain(null).copy(playersEvacuated = false)
         nothing.forgetSaveConfirmation() shouldBe nothing
         nothing.forgetSaveEvidence() shouldBe nothing
+    }
+
+    /**
+     * The enforcement point for the half of the rule a probe *can* supply.
+     *
+     * "A positive player count voids the save confirmation" used to be held
+     * together by each branch that read `probe.online` calling
+     * [forgetSaveEvidence] itself, and by a KDoc sentence carrying a maintained
+     * count of those branches. A change added a reader that voided nothing — the
+     * re-probe after a confirmed save — and falsified the sentence without
+     * reddening a single test, because nothing anywhere asserted the rule as a
+     * rule.
+     *
+     * This is that assertion. It is deliberately about the function rather than
+     * about a drain scenario: a scenario tests one caller, and the defect was a
+     * caller nobody had thought of.
+     */
+    @Test
+    fun `reading a positive player count hands back evidence that is already voided`() {
+        val at = start.plusSeconds(90)
+        val confirmed =
+            drain(start.plusSeconds(60)).copy(
+                saveRequestedAt = null,
+                resaveForcedAt = start,
+            )
+
+        // Nobody on. The drain comes back untouched — voiding a confirmation
+        // that a probe has just corroborated would make the drain save for ever.
+        val empty = confirmed.readPlayers(ProbeOutcome.Joinable(online = 0, max = 20), at)
+        empty.shouldBeInstanceOf<PlayerReading.Empty>().drain shouldBe confirmed
+        empty.occupancy.shouldNotBeNull().observedAt shouldBe at
+        empty.occupancy.shouldNotBeNull().online shouldBe 0
+
+        // One player is enough, and the count comes back only alongside the
+        // drain that fact implies. There is no route through this function that
+        // yields a positive count and unvoided evidence.
+        val occupied =
+            confirmed
+                .readPlayers(ProbeOutcome.Joinable(online = 1, max = 20), at)
+                .shouldBeInstanceOf<PlayerReading.Occupied>()
+        occupied.online shouldBe 1
+        occupied.max shouldBe 20
+        occupied.occupancy.observedAt shouldBe at
+        occupied.drain shouldBe confirmed.forgetSaveEvidence()
+        occupied.drain.worldSaved.shouldBeFalse()
+        occupied.drain.saveRequestedAt shouldBe null
+        occupied.drain.playersEvacuated.shouldBeFalse()
+        // The re-save anchor goes too: a player has been on the server, so the
+        // save that follows is this drain doing its job rather than circling.
+        occupied.drain.resaveForcedAt shouldBe null
+
+        // A delivered-but-unconfirmed request is dropped as well, because a
+        // player having been on since is the one thing that makes it worthless.
+        val delivered = drain(null).copy(saveRequestedAt = start.plusSeconds(30))
+        delivered
+            .readPlayers(ProbeOutcome.Joinable(online = 2, max = 20), at)
+            .shouldBeInstanceOf<PlayerReading.Occupied>()
+            .drain
+            .saveRequestedAt shouldBe null
+
+        // Silence decides nothing here. The three callers disagree about what an
+        // unanswered probe means for the evidence, and each applies its own rule
+        // at its own call site — so this hands back no drain at all.
+        confirmed
+            .readPlayers(ProbeOutcome.NotJoinable("no answer"), at)
+            .shouldBeInstanceOf<PlayerReading.Unanswered>()
+            .occupancy shouldBe null
     }
 
     @Test

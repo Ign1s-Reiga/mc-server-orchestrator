@@ -806,6 +806,182 @@ internal class DrainTest {
             harness.store.getServer(name) shouldBe null
         }
 
+    /**
+     * Somebody logs in *while the world is being flushed*, plays, and logs off
+     * before the next pass. The save that finished after they arrived must not
+     * authorise the stop.
+     *
+     * The seventeenth audit's critical, and the window is narrow enough to be
+     * worth spelling out: a standalone Paper server, a three-gigabyte world whose
+     * flush takes a minute, and nothing that seals joins — there is no proxy, so
+     * `SAVING` is a fully joinable state. A player connects fifteen seconds in,
+     * the save confirms at t+60, and the re-probe taken immediately after it sees
+     * them. Recording that reading and keeping the confirmation was worse than
+     * not probing at all: `lastProbedAt` advances on any probe that *answered*,
+     * whatever it counted, so the reading refreshed the evidence window instead of
+     * breaking it. They place blocks for a minute and disconnect; the next pass
+     * probes zero, `mayStop` passes on the pre-arrival confirmation, and the
+     * container stops. Paper writes player data on quit, so the inventory comes
+     * back and the blocks and entities do not.
+     *
+     * The load-bearing assertion is **how many saves had been sent when the stop
+     * was issued**, not the final count. A drain that stopped on the stale
+     * confirmation and saved again afterwards would satisfy a total of two.
+     */
+    @Test
+    fun `a player who joins during the save is not stopped out from under once they leave`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.store.deleteDefinition(name)
+
+            // The first flush takes a minute, and somebody joins while it runs.
+            // Only the first: the drain's second save is on an empty server, and
+            // a fixture that let them back in every time would test a different
+            // scenario — one nobody could ever drain.
+            var joinedDuringSave = false
+            harness.node.onExec = { command ->
+                if (command == PaperCommands.saveAll() && !joinedDuringSave) {
+                    joinedDuringSave = true
+                    harness.clock.advance(60.seconds)
+                    harness.node.online = 1
+                }
+                harness.node.defaultExec(command)
+            }
+
+            repeat(6) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+
+            // The flush went out and the server confirmed it — and the drain is
+            // waiting rather than deregistered, because the probe that followed
+            // the flush found somebody on.
+            harness.node.saves shouldHaveSize 1
+            joinedDuringSave.shouldBeTrue()
+            val waiting =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            waiting.state shouldBe DrainState.DRAIN_FAILED
+            waiting.blocked.shouldNotBeNull().reason shouldBe DrainBlockReason.AWAITING_ZERO_PLAYERS
+            // Waiting, not broken: a player being on the server is the protocol
+            // working.
+            waiting.failure shouldBe null
+            // The confirmation is gone. It is the one assertion that separates
+            // this from a drain that merely happened to be slow.
+            waiting.worldSaved.shouldBeFalse()
+            // The save did complete, and observed status still says so — from a
+            // field nothing gates on, next to a drain that does not claim it.
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .storage
+                .shouldNotBeNull()
+                .lastSaveConfirmedAt
+                .shouldNotBeNull()
+
+            // They build for ten seconds and disconnect. The number is chosen,
+            // not arbitrary: it is inside `saveEvidenceMaxGap`, so the
+            // observation-gap rule — which voids a confirmation the loop stopped
+            // watching — cannot be what protects the world here. A minute of
+            // building is protected by that rule whatever this branch does, and a
+            // test written that way asserts against the guard downstream of the
+            // one it is about. The exposed window is exactly this one: shorter
+            // than the gap, longer than nothing.
+            harness.clock.advance(10.seconds)
+            harness.node.online = 0
+
+            var savedWhenStopped = 0
+            harness.recordingStops { savedWhenStopped = harness.node.saves.size }
+            repeat(14) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+
+            // The drain finished, and the world on disk includes what they built:
+            // the stop waited for a second flush taken after they had gone.
+            savedWhenStopped shouldBe 2
+            harness.node.stops shouldHaveSize 1
+            harness.node.saves shouldHaveSize 2
+            harness.store.getServer(name) shouldBe null
+        }
+
+    /**
+     * The same pass run twice against the same world: one flush, one block, and a
+     * `blocked since` that does not restart.
+     *
+     * The branch above is reached by a step that has *already issued a side
+     * effect* when it decides to park, which is the shape idempotency is easiest
+     * to lose in — the obvious repair for "the confirmation is worthless" is to
+     * ask for another flush, and asking on every pass would put a `save-all flush`
+     * into a live server twice a minute for as long as somebody was playing.
+     */
+    @Test
+    fun `a drain parked by the probe after its own save does not flush again while they play`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.store.deleteDefinition(name)
+
+            var joinedDuringSave = false
+            harness.node.onExec = { command ->
+                if (command == PaperCommands.saveAll() && !joinedDuringSave) {
+                    joinedDuringSave = true
+                    harness.clock.advance(60.seconds)
+                    harness.node.online = 1
+                }
+                harness.node.defaultExec(command)
+            }
+
+            repeat(6) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+            val first =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+                    .blocked
+                    .shouldNotBeNull()
+
+            // Six more passes with the same player still connected.
+            repeat(6) {
+                harness.pass(name)
+                harness.clock.advance(45.seconds)
+            }
+
+            val later =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            // No second flush, no stop, no removal, and the container is exactly
+            // where it was.
+            harness.node.saves shouldHaveSize 1
+            harness.node.stops.shouldBeEmpty()
+            harness.node.removals.shouldBeEmpty()
+            harness.node.workload
+                .shouldBeInstanceOf<WorkloadObservation.Present>()
+                .state shouldBe WorkloadState.RUNNING
+            // The wait is one wait, counted up rather than restarted, and it is
+            // still not a failure however many times it repeats.
+            later.blocked.shouldNotBeNull().since shouldBe first.since
+            later.blocked.shouldNotBeNull().observations shouldBeGreaterThan first.observations
+            later.failure shouldBe null
+        }
+
     /** Runs [body] when the stop is issued, so a test can assert on the order of side effects. */
     private fun Harness.recordingStops(body: () -> Unit) {
         val runtime = node.onStop

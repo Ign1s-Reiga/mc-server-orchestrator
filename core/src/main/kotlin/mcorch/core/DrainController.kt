@@ -286,7 +286,7 @@ internal class DrainController(
         // knows it, so a count taken three states ago is not evidence of anything.
         val probe = subject.probe(node, observation.handle)
 
-        // Built through [occupancyOf], which is the only constructor of a
+        // Built through [readPlayers], which is the only constructor of a
         // `PlayerOccupancy` in this file, and every abort below depends on that:
         // a non-null `occupancy` means an SLP answered, so a message or a
         // decision may say what is online, and a null one means nothing was
@@ -297,13 +297,23 @@ internal class DrainController(
         // reaches `step()` directly rather than through `requireEmpty` — while a
         // single constructor cannot drift.
         //
-        // What this one is *not* any more is the only **call** of it. [save]
-        // re-establishes occupancy after a confirmed save, because a save is the
-        // one step long enough for a pass-entry instant to have gone stale by the
-        // time it returns. The guarantee that survives is the one the aborts
-        // actually rest on — an occupancy instant is when an SLP answered, not
-        // when the pass began.
-        val occupancy = occupancyOf(probe, now)
+        // [save] calls it a second time, because a save is the one step long
+        // enough for a pass-entry instant to have gone stale by the time it
+        // returns. The guarantee that survives is the one the aborts actually
+        // rest on — an occupancy instant is when an SLP answered, not when the
+        // pass began.
+        //
+        // **This is the one caller that takes the occupancy and not the drain**,
+        // and the reason is a behaviour change it must not make. A positive count
+        // voids the save evidence ([readPlayers]), and adopting the voided drain
+        // *here* would apply that to every state on the way past — including the
+        // resume ladder, which reads `playersEvacuated` and `worldSavedAt` to
+        // decide where a parked drain re-enters. A proxied drain would then
+        // resume into a transfer where it currently blocks. Nothing is lost by
+        // declining: every state that flushes a world, lets go of a backend or
+        // takes a container away reads the count itself, through the same
+        // function, and voids there.
+        val occupancy = drain.readPlayers(probe, now).occupancy
 
         val pass =
             DrainPass(
@@ -831,8 +841,7 @@ internal class DrainController(
         // Nobody to move: no search, and no destination recorded either. A
         // `destination` set here would send the resume ladder to `TARGET_RESOLVED`
         // on a drain that never needed one.
-        val probe = pass.probe
-        if (probe is ProbeOutcome.Joinable && probe.online == 0) {
+        if (drain.readPlayers(pass.probe, now) is PlayerReading.Empty) {
             return DrainProgress(
                 drain =
                     drain
@@ -997,32 +1006,37 @@ internal class DrainController(
             }
         }
 
-        return when (val probe = pass.probe) {
+        val reading = drain.readPlayers(pass.probe, now)
+        // Every answered probe is corroborated, whatever it counted, so the
+        // disagreement between the ping and the proxy is logged in both
+        // directions. A probe that did not answer establishes nothing to compare.
+        reading.occupancy?.let { corroborate(pass, router, it.online) }
+        return when (reading) {
             // A probe that did not answer is not a zero-player report, and nothing
             // about a sweep being in flight changes that.
-            is ProbeOutcome.Unanswered -> {
-                unansweredProbe(pass, drain, probe)
+            is PlayerReading.Unanswered -> {
+                unansweredProbe(pass, drain, reading.probe)
             }
 
-            is ProbeOutcome.Joinable -> {
-                corroborate(pass, router, probe.online)
-                if (probe.online == 0) {
-                    DrainProgress(
-                        drain = drain.moveTo(emptyState, now).copy(playersEvacuated = true),
-                        occupancy = occupancy,
-                        workDone = true,
-                        outcome = ReconcileOutcome.Progressed(emptyDetail),
-                    )
-                } else {
-                    issueTransfer(
-                        pass = pass,
-                        drain = drain.forgetSaveEvidence(),
-                        router = router,
-                        destination = destination,
-                        online = probe.online,
-                        into = DrainState.TRANSFERRING,
-                    )
-                }
+            is PlayerReading.Empty -> {
+                DrainProgress(
+                    drain = reading.drain.moveTo(emptyState, now).copy(playersEvacuated = true),
+                    occupancy = reading.occupancy,
+                    workDone = true,
+                    outcome = ReconcileOutcome.Progressed(emptyDetail),
+                )
+            }
+
+            is PlayerReading.Occupied -> {
+                issueTransfer(
+                    pass = pass,
+                    // Already voided: see [readPlayers].
+                    drain = reading.drain,
+                    router = router,
+                    destination = destination,
+                    online = reading.online,
+                    into = DrainState.TRANSFERRING,
+                )
             }
         }
     }
@@ -1465,21 +1479,6 @@ internal class DrainController(
     }
 
     /**
-     * The only constructor of a [PlayerOccupancy] in this file.
-     *
-     * [at] is when the probe answered, and callers must pass an instant read no
-     * earlier than the call that produced [probe]. Handing it a pass-entry
-     * instant for a probe taken after a three-minute save is what made the
-     * sixteenth audit's livelock: the recorded instant is what the next pass
-     * measures its evidence gap from, so a stale one voids evidence that was in
-     * fact fresh.
-     */
-    private fun occupancyOf(
-        probe: ProbeOutcome,
-        at: Instant,
-    ): PlayerOccupancy? = (probe as? ProbeOutcome.Joinable)?.let { PlayerOccupancy(it.online, it.max, at) }
-
-    /**
      * Runs [next] only if a fresh ping reports zero players; blocks the drain if
      * anybody is on, and aborts if the ping could not answer at all.
      *
@@ -1494,9 +1493,13 @@ internal class DrainController(
      * class note for the single-point argument that replaced "one guard for six
      * states".
      *
-     * It is still the only place a positive player count voids a save
-     * confirmation, and `awaitEvacuated` — which reads a positive count without
-     * going through here — voids it the same way, at its own call site.
+     * It is no longer where the voiding *happens*, and the sentence that used to
+     * be here is the reason. It said this was the only place a positive count
+     * voided a confirmation, named the one other reader that did it at its own
+     * call site, and carried a maintained count of them — and a later change
+     * added a reader that voided nothing without falsifying a single test. The
+     * rule is a return type now: see [readPlayers], which every branch below
+     * goes through.
      *
      * ## The message says why *this* drain is waiting, not why drains wait
      *
@@ -1514,37 +1517,37 @@ internal class DrainController(
         drain: DrainStatus,
         next: () -> DrainProgress,
     ): DrainProgress =
-        when (val probe = pass.probe) {
-            is ProbeOutcome.Joinable -> {
-                if (probe.online == 0) {
-                    next()
-                } else {
-                    val resaves = drain.worldSaved
-                    val why =
-                        if (pass.subject.router == null) {
-                            "there is no proxy to transfer them through"
-                        } else {
-                            "the transfer through the proxy is already behind this drain, so whoever is left " +
-                                "is connected straight to this server's own port and the proxy cannot move them"
-                        }
-                    blocked(
-                        subject = pass.subject,
-                        // Somebody is on the server. Anything it had saved is
-                        // now behind whatever they are doing, so the evidence
-                        // goes and a later pass has to save again before it can
-                        // reach a stop.
-                        drain = drain.forgetSaveEvidence(),
-                        occupancy = pass.occupancy,
-                        now = pass.now,
-                        reason = DrainBlockReason.AWAITING_ZERO_PLAYERS,
-                        message =
-                            "waiting for the server to empty. ${probe.online} of ${probe.max} player slots are " +
-                                "in use and $why, so the protocol waits rather than disconnecting anybody. The " +
-                                "server keeps running and stays joinable; the drain resumes on its own once it " +
-                                "is empty" +
-                                if (resaves) ", and saves the world again before it stops" else "",
-                    )
-                }
+        when (val reading = drain.readPlayers(pass.probe, pass.now)) {
+            is PlayerReading.Empty -> {
+                next()
+            }
+
+            is PlayerReading.Occupied -> {
+                val resaves = drain.worldSaved
+                val why =
+                    if (pass.subject.router == null) {
+                        "there is no proxy to transfer them through"
+                    } else {
+                        "the transfer through the proxy is already behind this drain, so whoever is left " +
+                            "is connected straight to this server's own port and the proxy cannot move them"
+                    }
+                blocked(
+                    subject = pass.subject,
+                    // Somebody is on the server, so anything this drain had
+                    // saved is now behind whatever they are doing. The voiding
+                    // is not done here — [readPlayers] has already done it, and
+                    // this is the drain it handed back.
+                    drain = reading.drain,
+                    occupancy = reading.occupancy,
+                    now = pass.now,
+                    reason = DrainBlockReason.AWAITING_ZERO_PLAYERS,
+                    message =
+                        "waiting for the server to empty. ${reading.online} of ${reading.max} player slots " +
+                            "are in use and $why, so the protocol waits rather than disconnecting anybody. The " +
+                            "server keeps running and stays joinable; the drain resumes on its own once it " +
+                            "is empty" +
+                            if (resaves) ", and saves the world again before it stops" else "",
+                )
             }
 
             // The server did not answer, and it makes no difference here whether
@@ -1574,8 +1577,8 @@ internal class DrainController(
             // and let the next healthy pass re-send the save — silently
             // replacing "a human confirms the world state" with "the exec
             // channel flickered".
-            is ProbeOutcome.Unanswered -> {
-                unansweredProbe(pass, drain, probe)
+            is PlayerReading.Unanswered -> {
+                unansweredProbe(pass, drain, reading.probe)
             }
         }
 
@@ -1705,57 +1708,141 @@ internal class DrainController(
                 // wider. Invariant 3 is that a stop follows a *confirmed* save
                 // with nobody on the server, and that interval still has a real
                 // zero-player reading at each end — this one closes it. A
-                // re-probe that finds players (they joined during a long save)
-                // records them, and the next pass's `requireEmpty` blocks the
-                // stop, which is the outcome that protects their progress. A
                 // re-probe that does not answer leaves occupancy null and the
                 // evidence unwatched, so a later pass saves again rather than
                 // stopping on a reading nobody took.
                 //
-                // The probe runs [NonCancellable], and that is not tidiness. It
-                // sits between a save the server has already confirmed and the
-                // record of it, so a pass cancelled here loses the confirmation
-                // — and the next pass reads `saveRequestedAt != null` with no
-                // `worldSavedAt`, which aborts `PERMANENT` and wedges the drain
-                // until a human confirms the world state by hand. Three existing
-                // tests in `SaveRecordDurabilityTest` and `ReconcileLoopTest`
-                // pin exactly that, and they caught this when the probe was
-                // added as an ordinary suspension point.
+                // A re-probe that finds players goes through [readPlayers] like
+                // every other reader of a count, and **the protection is the
+                // branch, not the voiding**. The confirmation is never written:
+                // only the sibling case below stamps `worldSavedAt`, so there is
+                // nothing here for [forgetSaveEvidence] to take away except
+                // `playersEvacuated` and the re-save anchor, which is why a
+                // sabotage of the voiding leaves this scenario green and a
+                // sabotage of the re-probe reddens it. Both claims are pinned
+                // separately.
                 //
-                // The cost is bounded by the probe's own timeout — everything
-                // crossing `:cri` has one — so a shutdown waits at most that
-                // long. Losing a confirmed save costs an operator a wedged
-                // server and a manual investigation, which is the worse side of
-                // the trade by a wide margin.
+                // It used to stamp the confirmation and record the players it
+                // found, on the argument that the next pass's [requireEmpty]
+                // would block the stop — which holds only while the player is
+                // still connected, and the losing case is exactly when they are
+                // not. Somebody logging in during a sixty-second save, building
+                // for ten seconds and disconnecting left a confirmation stamped
+                // after their arrival and an occupancy that *refreshed* the
+                // evidence window rather than breaking it, because `lastProbedAt`
+                // advances on any probe that answered whatever it counted. The
+                // next pass then read zero players, `mayStop` passed on that
+                // confirmation, and the container stopped. Paper writes player
+                // data on quit, so their inventory survived and their build did
+                // not. The window is bounded above by `saveEvidenceMaxGap` —
+                // longer than that and the observation-gap rule voids the
+                // confirmation anyway — and it is 1 to 30 seconds of world edits
+                // on a path where the loop held direct evidence they were there.
+                //
+                // The probe runs [NonCancellable], and that is not tidiness — but
+                // the reason is not the permanent wedge an earlier version of this
+                // comment described. This branch is reached only with
+                // `saveRequestedAt` null (the guard above aborts `PERMANENT`
+                // otherwise), so a cancellation here cannot leave an outstanding
+                // request behind. What it loses is the *record that a
+                // `save-all flush` was delivered at all*, and the next pass then
+                // sends a second one: CLAUDE.md invariant 5, and exactly what the
+                // three tests in `SaveRecordDurabilityTest` and `ReconcileLoopTest`
+                // pin when they assert `saves shouldHaveSize 1`. They caught this
+                // when the probe was added as an ordinary suspension point.
+                //
+                // Two residuals worth stating rather than implying. The cost is
+                // bounded by the probe's own timeout, but that bound is a private
+                // constant inside `PaperServerAgent` and nothing here asserts it —
+                // a probe given a minute would make a shutdown wait a minute. And
+                // the region depends on the CRI channel outliving the loop in the
+                // same way the store write does; `Main` pins the store half and
+                // nothing pins the channel half.
                 val confirmedAt = clock.instant()
                 val settled = withContext(NonCancellable) { pass.subject.probe(pass.node, observation.handle) }
-                DrainProgress(
-                    drain =
-                        drain
-                            .moveTo(DrainState.DEREGISTERED, confirmedAt)
-                            // The request is no longer outstanding — it came
-                            // back, and the server said the save finished — so
-                            // the wedge is released and the confirmation takes
-                            // its place. The two are disjoint on purpose: a
-                            // confirmation left sitting beside its own request
-                            // timestamp is what used to make the next `SAVING`
-                            // read a completed save as one that never returned.
-                            .copy(saveRequestedAt = null, worldSavedAt = confirmedAt),
-                    // No `?: occupancy` fallback, deliberately. Falling back to
-                    // the pass-entry reading would record an instant from before
-                    // the save as though it were taken after — which is the
-                    // defect this branch exists to fix, restored by the line
-                    // meant to be tidy about a null.
-                    occupancy = occupancyOf(settled, confirmedAt),
-                    saveConfirmedAt = confirmedAt,
-                    sideEffectIssued = true,
-                    // A `save-all flush` went out and the server said it finished.
-                    // Work by any honest measure — which is why it alone does not
-                    // clear a failure recorded by the step *after* it; see
-                    // [settleRecords].
-                    workDone = true,
-                    outcome = ReconcileOutcome.Progressed("world save confirmed"),
-                )
+                // Read *after* the probe, and separately from `confirmedAt`. The
+                // two answer different questions — when the save finished, and
+                // when somebody last looked at who was online — and [readPlayers]
+                // requires the second. They were one instant, read before the
+                // probe, which is the shape of the defect this branch exists to
+                // remove: off by up to the probe timeout, in the safe direction,
+                // and wrong for the same reason.
+                val observedAt = clock.instant()
+                when (val reading = drain.readPlayers(settled, observedAt)) {
+                    is PlayerReading.Occupied -> {
+                        LOG.warn(
+                            "server={} had {} player slots in use when its world save completed; the " +
+                                "confirmation is discarded and the drain waits",
+                            server,
+                            reading.online,
+                        )
+                        // `sideEffectIssued` is deliberately not threaded through
+                        // [blocked], and the flush really did go out. Nothing is
+                        // lost by that: the drain being recorded here has no
+                        // confirmation and no outstanding request — [readPlayers]
+                        // voided both — so there is no side-effect record for the
+                        // shield to protect, and a pass cancelled before the store
+                        // write is re-derived identically by the next one, which
+                        // probes, sees the same player and blocks the same way.
+                        //
+                        // The repeat that *is* accepted is the second
+                        // `save-all flush` once they log off. It is not a
+                        // duplicate: a player has been on the server since, which
+                        // is the one thing that makes an earlier flush worthless,
+                        // and it is the same trade [forgetSaveEvidence] documents
+                        // and this project has taken twice already.
+                        blocked(
+                            subject = pass.subject,
+                            drain = reading.drain,
+                            occupancy = reading.occupancy,
+                            now = observedAt,
+                            reason = DrainBlockReason.AWAITING_ZERO_PLAYERS,
+                            message =
+                                "the world save completed, and ${reading.online} of ${reading.max} player " +
+                                    "slots were in use by the time it did. The confirmation is not used: " +
+                                    "somebody joined while the save was running, so it says nothing about " +
+                                    "what they have done since. Nothing is stopped, the server keeps running, " +
+                                    "and the drain saves again once it is empty",
+                            // The save *did* complete, and observed status says so
+                            // separately from the drain's evidence. `worldSaved` is
+                            // false, so `:api` renders this as "no save is confirmed
+                            // for the world as it is now; the last confirmed save was
+                            // at ...", which is the true sentence.
+                        ).copy(saveConfirmedAt = confirmedAt)
+                    }
+
+                    is PlayerReading.Empty, is PlayerReading.Unanswered -> {
+                        DrainProgress(
+                            drain =
+                                drain
+                                    .moveTo(DrainState.DEREGISTERED, confirmedAt)
+                                    // The request is no longer outstanding — it
+                                    // came back, and the server said the save
+                                    // finished — so the wedge is released and the
+                                    // confirmation takes its place. The two are
+                                    // disjoint on purpose: a confirmation left
+                                    // sitting beside its own request timestamp is
+                                    // what used to make the next `SAVING` read a
+                                    // completed save as one that never returned.
+                                    .copy(saveRequestedAt = null, worldSavedAt = confirmedAt),
+                            // No `?: occupancy` fallback, deliberately. Falling
+                            // back to the pass-entry reading would record an
+                            // instant from before the save as though it were taken
+                            // after — which is the defect this branch exists to
+                            // fix, restored by the line meant to be tidy about a
+                            // null.
+                            occupancy = reading.occupancy,
+                            saveConfirmedAt = confirmedAt,
+                            sideEffectIssued = true,
+                            // A `save-all flush` went out and the server said it
+                            // finished. Work by any honest measure — which is why
+                            // it alone does not clear a failure recorded by the
+                            // step *after* it; see [settleRecords].
+                            workDone = true,
+                            outcome = ReconcileOutcome.Progressed("world save confirmed"),
+                        )
+                    }
+                }
             }
 
             is SaveOutcome.Unconfirmed -> {
@@ -1916,20 +2003,25 @@ internal class DrainController(
         val now = pass.now
         val server = pass.server
         if (observation.state == WorkloadState.RUNNING) {
-            if (probe is ProbeOutcome.Joinable && probe.online > 0) {
+            // Only the occupied case is acted on. An unanswered probe falls
+            // through with the drain untouched, which is the asymmetry described
+            // above and the reason [readPlayers] does not decide that half.
+            val reading = drain.readPlayers(probe, now)
+            if (reading is PlayerReading.Occupied) {
                 LOG.warn(
                     "server={} still has players after a stop was issued; not re-issuing it",
                     server,
                 )
                 return blocked(
                     subject = pass.subject,
-                    drain = drain.forgetSaveEvidence(),
-                    occupancy = occupancy,
+                    // Already voided: see [readPlayers].
+                    drain = reading.drain,
+                    occupancy = reading.occupancy,
                     now = now,
                     reason = DrainBlockReason.AWAITING_ZERO_PLAYERS,
                     message =
-                        "the container is still running after a stop was issued and ${probe.online} of " +
-                            "${probe.max} player slots are in use. The stop is not re-issued and the world is " +
+                        "the container is still running after a stop was issued and ${reading.online} of " +
+                            "${reading.max} player slots are in use. The stop is not re-issued and the world is " +
                             "saved again before it is",
                 )
             }
@@ -2751,6 +2843,122 @@ internal fun DrainStatus.dropUnusableSaveEvidence(
     }
 }
 
+/**
+ * What a probe established about who is on the server, and the drain record as
+ * that reading leaves it.
+ *
+ * ## Why the rule is a return type
+ *
+ * "A positive player count voids the save confirmation" was a distributed
+ * invariant with no enforcement point. Four branches read `probe.online`, and
+ * each was separately responsible for calling [forgetSaveEvidence] in the same
+ * expression; the argument that they all did was a sentence in [requireEmpty]'s
+ * KDoc carrying a maintained count of the call sites. A change then added a
+ * reader that voided nothing — the re-probe after a confirmed save — and neither
+ * the sentence nor a single test noticed. The drain stopped a container on a save
+ * taken before somebody logged in, built for a minute and logged off again: Paper
+ * writes player data on quit, so their inventory came back and their blocks did
+ * not.
+ *
+ * A fifth correct call site would have been a fifth thing to get right. This is
+ * one function instead, and reading a count means calling it: the [Occupied] case
+ * hands back a drain that has **already** had its evidence voided. A caller can
+ * still reach past that and use its own — nothing in the language stops it — but
+ * it has to do so in one visible expression rather than by not thinking of it.
+ *
+ * ## It enforces one clause, and the other is deliberately left to the caller
+ *
+ * [Unanswered] carries no drain, because the sites genuinely disagree about
+ * silence and a single answer would be wrong for two of them:
+ *
+ * - `requireEmpty` and `awaitEvacuated` abort, through
+ *   [forgetSaveConfirmation] — the confirmation goes and the record of a
+ *   *delivered* request stays.
+ * - `awaitStopped` tolerates it and touches nothing: a container inside its stop
+ *   grace period is expected to stop answering, and demanding an answer would
+ *   wedge the drain exactly when it is working.
+ * - `save`'s re-probe keeps the confirmation it has just earned and records no
+ *   occupancy, which leaves the evidence unwatched so a later pass saves again
+ *   rather than stopping on a reading nobody took.
+ *
+ * Folding those into one rule here would be the same mistake pointing the other
+ * way.
+ */
+internal sealed interface PlayerReading {
+    /** What this pass may record about occupancy, or null when nothing was established. */
+    val occupancy: PlayerOccupancy?
+
+    /** The probe answered and nobody is on. [drain] is returned untouched. */
+    data class Empty(
+        val drain: DrainStatus,
+        override val occupancy: PlayerOccupancy,
+    ) : PlayerReading
+
+    /**
+     * The probe answered and somebody is on.
+     *
+     * [drain] has already been through [forgetSaveEvidence]. That is the whole
+     * point of the type: it is not possible to learn that [online] is positive
+     * without also being handed the drain that fact implies.
+     */
+    data class Occupied(
+        val drain: DrainStatus,
+        override val occupancy: PlayerOccupancy,
+    ) : PlayerReading {
+        val online: Int get() = occupancy.online
+
+        val max: Int get() = occupancy.max
+    }
+
+    /**
+     * The probe could not answer, and it makes no difference whether it ran and
+     * got silence or could not be run at all. Neither is a zero-player report,
+     * and treating either as one is how a drain stops a server with people on it.
+     */
+    data class Unanswered(
+        val probe: ProbeOutcome.Unanswered,
+    ) : PlayerReading {
+        override val occupancy: PlayerOccupancy? get() = null
+    }
+}
+
+/**
+ * The only place a player count is read for a decision, and the only constructor
+ * of a [PlayerOccupancy] in this file.
+ *
+ * [at] is when the probe answered, and callers must pass an instant read no
+ * earlier than the call that produced [probe]. Handing it a pass-entry instant
+ * for a probe taken after a three-minute save is what made the sixteenth audit's
+ * livelock: the recorded instant is what the next pass measures its evidence gap
+ * from, so a stale one voids evidence that was in fact fresh.
+ *
+ * Copying a count onto observed status is not reading it — `advance` does that
+ * with the [PlayerReading.occupancy] alone, and says at its call site why it
+ * declines the drain.
+ */
+internal fun DrainStatus.readPlayers(
+    probe: ProbeOutcome,
+    at: Instant,
+): PlayerReading =
+    when (probe) {
+        is ProbeOutcome.Joinable -> {
+            val occupancy = PlayerOccupancy(online = probe.online, max = probe.max, observedAt = at)
+            if (probe.online == 0) {
+                PlayerReading.Empty(this, occupancy)
+            } else {
+                // The one statement carrying the invariant. Somebody is on the
+                // server, so anything this drain had saved is now behind whatever
+                // they are doing, and the record says so before any caller sees
+                // the count.
+                PlayerReading.Occupied(forgetSaveEvidence(), occupancy)
+            }
+        }
+
+        is ProbeOutcome.Unanswered -> {
+            PlayerReading.Unanswered(probe)
+        }
+    }
+
 /** Why the save evidence is not good enough to stop on, for an operator-facing message. */
 private fun DrainStatus.saveEvidenceProblem(containerStartedAt: Instant?): String {
     val confirmed = worldSavedAt
@@ -2767,13 +2975,14 @@ private fun DrainStatus.saveEvidenceProblem(containerStartedAt: Instant?): Strin
  * Voids everything this drain had established about getting the server empty and
  * on disk, **including the record of a save request that was delivered**.
  *
- * Called only from a pass that has just *observed* somebody on the server. There
- * are exactly two such call sites — the players-online branch of `requireEmpty`
- * and the players-online branch of `awaitStopped` — and the count is stated
- * exactly on purpose: an earlier version of this comment claimed a set of
- * callers it did not have, and a drain audit had to find that out the hard way.
- * If you add a caller, it must be one that saw a player, and this sentence must
- * change with it. That observation is what justifies the last part. Clearing `saveRequestedAt`
+ * Called only from a pass that has just *observed* somebody on the server, and
+ * there is now exactly **one** call site — [readPlayers], which is the only place
+ * a count is read for a decision and voids in the same expression it learns the
+ * count. This used to be a list of callers with a maintained count, twice: once
+ * wrong about the set it claimed, and once left correct-looking by a change that
+ * added a reader voiding nothing. A list written down is a list that goes stale;
+ * a single caller cannot. If you find yourself adding a second, add it to
+ * [readPlayers] instead. That observation is what justifies the last part. Clearing `saveRequestedAt`
  * lifts the wedge that stops a delivered-but-unconfirmed save from ever being
  * re-sent — deliberately, because a player has been on the server since, which
  * makes the old request worth nothing, and because the fresh save that follows
