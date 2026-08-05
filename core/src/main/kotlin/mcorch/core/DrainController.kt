@@ -190,6 +190,18 @@ internal class DrainController(
                 // is connected to this container; the runtime has just said there
                 // is no container, so the claim cannot survive into the teardown
                 // status and be read there as "still waiting for players".
+                //
+                // A recorded **failure** deliberately does not, and this return
+                // skipping [settleRecords] is not an oversight. This pass never ran
+                // a step: it observed that the container is gone, which says
+                // nothing about why the drain was failing. Erasing a permanent
+                // `DRAIN_SAVE_TIMEOUT` here on the strength of a container that
+                // died on its own would delete the one record telling an operator
+                // the world may not have been flushed — at the exact moment they
+                // would come looking. It rides into one or two `STOPPED` statuses
+                // and the next pass purges the whole record; the eighth audit ruled
+                // that cosmetic, and the sixteenth's harm through it (re-arming the
+                // permanent gate on the replacement path) is closed at the gate.
                 drain =
                     letGo
                         .moveTo(DrainState.STOPPING, now)
