@@ -1006,3 +1006,72 @@ Related: [[standalone-paper-drain-shape]]
     is precisely the maintained-count-of-call-sites failure it was built to retire,
     relocated from a KDoc into a test. Cheap strengthening: assert each
     stop-bearing function's own range also contains the gate call.
+
+## Round 21: the harness becomes the instrument, and presence is not content
+
+88. **A mutation harness whose verdict is per test *class* reports "caught" for
+    any red, including one it did not cause.** `scripts/dev/drain-wiring-mutations.sh`
+    closes the two obvious false-greens — a `sed` that matches nothing is an
+    exact-count-1 check in Python and exits non-zero, and a mutation that does not
+    compile leaves no JUnit XML and is scored UNKNOWN — but the caught/not-caught
+    decision is `grep -q "<failure" TEST-<class>.xml`. The `awk` that names the
+    reddened testcase is printed for a human and is not part of the verdict. So any
+    pre-existing red in `DrainWiringTest` (rename `advance` and `rangeOf`'s
+    `check(hits.size == 1)` throws; run from the wrong working directory and the
+    companion-object `check` throws) scores all seven `$WIRING` mutations *and* both
+    `$WIRING` controls as caught, and the script exits 0 having proved nothing. The
+    controls cannot detect it, because the controls fail the same way. Fix: carry
+    the expected testcase name in the mutation tuple and require it in the red set
+    the `awk` already extracts. General rule: a red-proof must name *which*
+    assertion had to bite, or its controls are testing the harness's plumbing rather
+    than the assertions.
+89. **Upgrading a rule pin from presence to content leaves the *gate* pins at
+    presence, and that is where the round-20 defect class relocates.** Round 21
+    correctly moved the rule assertions to behaviour (`SaveEvidenceTest` on
+    `adoptSaveClause` and `dropSaveContradictedByPlayers`) and left
+    `DrainWiringTest` asserting only "applied unconditionally". But the gate
+    assertion — `codeIn(gate.body).any { codeOf(it).contains("mayStop(") }` — is
+    still a *presence* test, which is exactly the shape mutations D3/D4 defeated for
+    the rules. `if (!drain.mayStop(contract, observation.startedAt, now, evidenceGap)
+    && !drain.playersEvacuated)` at `DrainController.awaitStopped` keeps the token,
+    keeps the count at two, keeps the enclosing-function set at `{stop,
+    awaitStopped}` — and deletes the guarantee. Nothing else covers it: the branch's
+    detail string, `"the stop is not re-issued until the world is saved again"`,
+    appears **nowhere in the test suite**, so no scenario reaches it. D7 (delete the
+    gate) is caught; D7-narrowed is not, and the D-set does not contain it. When a
+    pin is strengthened from shape to behaviour, enumerate the *other* assertions in
+    the same file that are still shape-only and ask which of them a narrowing would
+    walk through.
+90. **A source classifier that exempts by method *name* is bought off by a
+    same-named wrapper.** `the container stop is called from one file in this module`
+    partitions files mentioning `stopWorkload(` on whether they also mention
+    `fun stopWorkload(` — declarer/overrider versus caller. The reasoning is right
+    (a distributed `Node` adds an override and passes untouched; a maintained file
+    list would be a maintained lie) and the classification is the correct
+    generalisation, but the predicate is a string. A private wrapper —
+    `private suspend fun stopWorkload(handle, grace) = node.stopWorkload(handle, grace)`
+    added to `Reconciler.kt`, which is exactly what somebody writes when they need a
+    stop in two places — puts that file on the *performing* side and the caller
+    assertion never sees it. The harness's D6 appends a function that calls the stop
+    directly, so it does not cover the shape. Cheap repair: classify the *call*, not
+    the file — a call whose `enclosing()` function is that file's own
+    `stopWorkload` override is performing, any other call is a decision point.
+91. **The stop-scan's alphabet is one method, and the class of container-ending
+    operations is three.** The pin is keyed on `stopWorkload(`. `Node.removeWorkload`
+    ends a container too, and `LocalNode`'s own comment says `StopPodSandbox` "kills
+    whatever is inside with no grace and no save". Safe today by construction —
+    `WorkloadView.teardown` emits `TeardownStep.Refuse` for a running container and
+    `stopSandbox` has one call site, inside `removeWorkload`, after the sandbox is
+    confirmed empty — but the pin's stated property is "every container stop" and a
+    `Node` implementation that skips the refuse guard is invisible to it. Same
+    question as item 90: the scan's alphabet is a decision, so state it and check it
+    against the operations that can actually end a process.
+92. **A `when` listing every sealed subtype explicitly is a stronger extraction
+    than the `if/else` it replaces, and that is the thing to check first.**
+    `DrainStatus.adoptSaveClause` replaced
+    `if (reading is Occupied) drain.unconfirmWorldSave() else drain`. Semantically
+    identical at the one call site, but a fourth `PlayerReading` subtype now fails to
+    compile instead of falling silently to the `else` — i.e. to *keeping* the
+    confirmation, which is the unsafe side. When auditing an extraction, ask what a
+    new case does under each form before asking whether the bodies match; the
+    default branch is where the next subtype lands.

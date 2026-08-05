@@ -486,3 +486,38 @@ and `LocalNode.removeWorkload` are unchanged by the round-19 diff.
   round-18 one ("unobservable in this harness" is usually a claim about the
   default fixture) — all three are the same family: the instrument's *defaults*
   are part of what it can express.
+
+## Round 21 rulings: the two deviations, and where the pin stops
+
+Audited at `6d291d7` (`fix/save-evidence-stamping` = `feat/velocity-proxy-kind`).
+No critical. The only executable change in `:core` main sources was extracting
+`adoptSaveClause` and rewording one operator message; both `Node.stopWorkload`
+call sites, `mayStop`, `saveIsCurrent`, `letGoAndStop`, `requireEmpty`,
+`Reconciler.teardown` and `LocalNode.removeWorkload` are byte-identical.
+
+- **`\breturn\b` without a `(?!@)` lookahead is right.** Confirmed against the
+  relayed prescription, which was wrong. `return@advance` *is* an exit from
+  `advance`; excluding it would exclude a real one. The only cost is a false red
+  on a lambda-local `return@forEach`, which is a red on a refactor rather than a
+  green on a defect. `codeOf` strips string literals *before* truncating at `//`,
+  so both ways prose could fake the keyword are closed; block comments are not
+  stripped, which is the same safe direction. Do not re-propose the lookahead.
+- **Classifying the stop-scan's files beats listing them, and the price is
+  item 90.** The reasoning (a literal set becomes something a distributed `Node`
+  has to be edited past) matches CLAUDE.md's Node seam and should stand. What it
+  bought is an exemption keyed on a *name*, so a same-named private wrapper is
+  exempt for the wrong reason. Repair the predicate, not the approach.
+- **A source-scanning drain test standing in the way of a second `Node`
+  implementation: upheld.** A `RemoteNode` with an `override` passes untouched;
+  only a new *decision point* to stop a container fails, and CLAUDE.md requires
+  every container operation to go through the Node abstraction, so a red there is
+  the system working. Two caveats to carry forward: the exemption is by name
+  (above), and the rescheduling path the test's own KDoc names as its motivation
+  reaches `Node.removeWorkload`, which is outside the scan's alphabet entirely.
+- **`awaitStopped`'s `mayStop` gate has no behavioural backstop.** Its detail
+  string appears in no test. Both `goingRoundInCircles` scenarios in `DrainTest`
+  end at `harness.node.stops.shouldBeEmpty()`, i.e. they exercise the
+  `DEREGISTERED` gate and never enter `STOPPING`. So that gate is pinned by a
+  presence assertion and by one mutation that deletes it outright. See
+  [[drain-audit-danger-patterns]] item 89 for the narrowing that walks through
+  both.
