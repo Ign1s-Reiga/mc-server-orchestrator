@@ -11,6 +11,7 @@ import mcorch.schema.DrainState
 import mcorch.schema.DrainStatus
 import mcorch.schema.FailureClass
 import mcorch.schema.FailureReason
+import mcorch.schema.FailureStatus
 import mcorch.schema.PaperServerDefinition
 import mcorch.schema.PlayerOccupancy
 import mcorch.schema.ResourceName
@@ -207,7 +208,20 @@ internal class DrainController(
         // Two ways a confirmation stops describing the world, neither of which
         // any probe can report, both dropped here so that every state below
         // sees a drain whose evidence is about the container in front of it.
-        val drain = recorded.dropUnusableSaveEvidence(observation.startedAt, lastProbedAt, now, evidenceGap)
+        //
+        // Dropping one is also the event the re-save anchor measures, and this is
+        // the only place that can see it: by the time a state notices its evidence
+        // is missing, it cannot tell a confirmation that was voided from one that
+        // was never taken. Stamped set-once — see
+        // [mcorch.schema.DrainStatus.resaveForcedAt] for why nothing short of a
+        // player being seen may reset it.
+        val dropped = recorded.dropUnusableSaveEvidence(observation.startedAt, lastProbedAt, now, evidenceGap)
+        val drain =
+            if (dropped !== recorded) {
+                dropped.copy(resaveForcedAt = dropped.resaveForcedAt ?: now)
+            } else {
+                dropped
+            }
         if (drain !== recorded) {
             LOG.warn(
                 "server={} has a world save confirmed at {} that is no longer evidence: the container now " +
@@ -441,14 +455,13 @@ internal class DrainController(
                         // confirmation that has been outlived, and a drain
                         // that gives up here would leave a server nobody can
                         // retire.
-                        DrainProgress(
-                            drain = drain.moveTo(DrainState.SAVING, now),
-                            occupancy = occupancy,
-                            outcome =
-                                ReconcileOutcome.Progressed(
-                                    "the world has to be saved again before this server can stop: " +
-                                        drain.saveEvidenceProblem(observation.startedAt),
-                                ),
+                        //
+                        // Going back *for ever* is a different thing, and this is
+                        // where it is caught. See [goingRoundInCircles].
+                        goingRoundInCircles(
+                            pass = pass,
+                            drain = drain,
+                            detail = "the world has to be saved again before this server can stop",
                         )
                     }
                 }
@@ -604,6 +617,31 @@ internal class DrainController(
      * `since` and `observations` into the next genuine block, so "waiting since"
      * pointed at a wait that had already ended. It is cleared unconditionally,
      * because a re-derivation is not a block either.
+     *
+     * ### The cost of that, examined and left as it is
+     *
+     * `since` is the number an operator reads off a waiting drain, and clearing the
+     * record resets it whenever the drain leaves `DRAIN_FAILED` and comes back — a
+     * proxied drain that blocks, transfers and blocks again reports "waiting since"
+     * a few seconds ago every time. Both obvious narrowings are worse:
+     *
+     * - **Clear only on [DrainProgress.workDone].** It cannot fire. There are
+     *   exactly two callers of [blocked] and both call [forgetSaveEvidence], which
+     *   clears `playersEvacuated`, so the resume ladder lands on `SEALED` or
+     *   `TARGET_RESOLVED` — and every branch of [secureDestination] and
+     *   [transferStep] that leaves `DRAIN_FAILED` claims `workDone`, the transfer
+     *   included. The rule would change nothing, and a test for it would be one of
+     *   those that cannot fail.
+     * - **Keep the record while the drain progresses.** `DRAIN_BLOCKED` is derived
+     *   from `blocked != null && failure == null`, and `:api` documents that pair as
+     *   *waiting*. Keeping it means a live "waiting, not stuck; needs nobody" on a
+     *   drain that is transferring players — the reading this unconditional clear
+     *   exists to stop, for longer.
+     *
+     * Preserving `since` needs a carrier that is not the *current* block record, and
+     * whatever resets that carrier faces the same undecidable question the failure
+     * rule below does: from one pass, a wait that has ended and a wait that is about
+     * to resume look identical. Not added on speculation.
      *
      * ## One good pass does not clear a failure; the pass after it does
      *
@@ -1325,6 +1363,99 @@ internal class DrainController(
     }
 
     /**
+     * The edge back to `SAVING` from a state that needed a save confirmation and
+     * has not got one any more — and the one place a drain that keeps taking that
+     * edge is written down.
+     *
+     * ## Taking it once is the protocol; taking it for ever is a defect nobody could see
+     *
+     * A confirmation is voided by a container that restarted or by a gap in which
+     * the loop was not watching, and the honest response to either is to save
+     * again. But nothing failed while that happens: the pass reports `Progressed`,
+     * the save is real work, the recorded state advances, and the drain arrives
+     * back where it started. A container crash-looping under a delete produces
+     * exactly that, for ever — a full `save-all flush` at a live server every other
+     * pass, `DRAINING` on the badge, and no failure, no attempt count and no
+     * escalation anywhere. It is the sixteenth audit's first critical seen from the
+     * other end: the primary cause (evidence stamped before the work that earned
+     * it) is fixed, and this is what makes any *remaining* cause visible instead of
+     * silent.
+     *
+     * ## Why the record survives, when three rounds of records did not
+     *
+     * The clearing rule in [settleRecords] is "a pass that did work and did not
+     * begin parked has recovered", and this defect is precisely *did work and did
+     * not recover*. It is not worked around here, and it is not weakened: the
+     * failure is recorded by **the pass that does no work**. The abort parks, so
+     * [settleRecords] returns early; the pass after it is the resume, which is
+     * excluded by the hysteresis; and the pass after *that* is this abort again for
+     * as long as the cycle continues. The one pass that would clear the failure —
+     * work, not resuming — is the pass that finally reaches the stop, which is
+     * recovery and should clear it.
+     *
+     * Recording it in [save] instead was tried and is wrong. That step is reached
+     * by every drain that saves for any reason, and a drain parked on a *refused
+     * stop* re-saves on every resume by design, so it was diagnosed as a save
+     * problem and the accurate failure was overwritten by the wrong one. This
+     * branch is reached only because a confirmation went stale, which is the
+     * defect's own signature.
+     *
+     * ## `RETRYABLE`, and the container is not touched
+     *
+     * `failure-modes.md` item 7: at a limit the loop stops *trying*, it does not
+     * stop the container — and here it does not even stop trying. The class stays
+     * retryable so that a container whose runtime hiccuped cannot become
+     * undeletable, the drain re-enters through the ladder and saves again on the
+     * next pass, and what changes is only that the attempt count now rises and the
+     * anchor stops moving, so `escalates` reaches the threshold and a human is
+     * called.
+     */
+    private suspend fun goingRoundInCircles(
+        pass: DrainPass,
+        drain: DrainStatus,
+        detail: String,
+    ): DrainProgress {
+        val now = pass.now
+        val problem = drain.saveEvidenceProblem(pass.observation.startedAt)
+        // Produced where it is used and written back into the returned drain,
+        // never substituted for the length of one call. A state that reaches this
+        // without an anchor — a row written before the field existed — gets one
+        // stamped and is judged from the next cycle, which costs one cycle and
+        // cannot silently disable the bound. See `DrainStatus.transferStartedAt`
+        // for the same rule and the three wedges that taught it.
+        val anchor = drain.resaveForcedAt ?: now
+        val anchored = drain.copy(resaveForcedAt = anchor)
+        val circling = JavaDuration.between(anchor, now).toKotlinDuration()
+        // Measured against the evidence gap because that *is* the quantity: a
+        // confirmation is worth nothing once it is older than one, so a drain that
+        // has been chasing one for longer than that has failed to establish a
+        // single confirmation it could use. A second constant here would be a
+        // second thing to keep in step with the first.
+        if (circling > evidenceGap) {
+            return abort(
+                subject = pass.subject,
+                node = pass.node,
+                drain = anchored,
+                occupancy = pass.occupancy,
+                now = now,
+                reason = FailureReason.DRAIN_STALLED,
+                failureClass = FailureClass.RETRYABLE,
+                message =
+                    "this drain keeps saving the world and never reaches the stop: a confirmed save was first " +
+                        "voided ${circling.inWholeSeconds}s ago and it has happened again since — $problem. " +
+                        "Nothing has been stopped or removed and the server keeps running. It does not clear " +
+                        "on its own: check whether the container is restarting underneath the drain, and " +
+                        "whether the loop is reaching this server on every pass",
+            )
+        }
+        return DrainProgress(
+            drain = anchored.moveTo(DrainState.SAVING, now),
+            occupancy = pass.occupancy,
+            outcome = ReconcileOutcome.Progressed("$detail: $problem"),
+        )
+    }
+
+    /**
      * The only constructor of a [PlayerOccupancy] in this file.
      *
      * [at] is when the probe answered, and callers must pass an instant read no
@@ -1798,14 +1929,18 @@ internal class DrainController(
                 // `DEREGISTERED`: re-issuing a stop is only safe *because* a
                 // save that is still current is on disk, so if it is not, the
                 // drain goes back and saves rather than stopping or giving up.
-                return DrainProgress(
-                    drain = drain.moveTo(DrainState.SAVING, now),
-                    occupancy = occupancy,
-                    outcome =
-                        ReconcileOutcome.Progressed(
-                            "the stop is not re-issued until the world is saved again: " +
-                                drain.saveEvidenceProblem(observation.startedAt),
-                        ),
+                //
+                // And the same limit, through the same function. A container that
+                // will not exit *and* a backoff that has grown past the evidence
+                // gap is one cycle wearing two states — `STOPPING` → `SAVING` →
+                // `DEREGISTERED` → `STOPPING` — and it restamps `enteredStateAt`
+                // on every lap, so the elapsed-in-`STOPPING` limit below cannot
+                // see it. This anchor does not restamp, which is the whole reason
+                // it exists.
+                return goingRoundInCircles(
+                    pass = pass,
+                    drain = drain,
+                    detail = "the stop is not re-issued until the world is saved again",
                 )
             }
             LOG.warn(
@@ -1832,10 +1967,50 @@ internal class DrainController(
                     message = "the container stop could not be re-issued: ${failure.message}",
                 )
             }
+            // **`workDone` is false, and the branch is the argument.** This code is
+            // reached *because* `observation.state == RUNNING`, which is to say the
+            // previous stop did not take. A request that left the process and did
+            // not come back with what it needed is not work by the flag's own
+            // definition, and claiming it deleted the failure the drain was
+            // carrying — in the one state where the container is meant to be going
+            // away, which is where losing the record matters most.
+            //
+            // Past the grace period the runtime should have killed it in, the
+            // *report* changes and nothing else: a failure is recorded, the
+            // container is not touched again beyond the re-issue above, and the
+            // class stays retryable so the loop keeps trying. `failure-modes.md`
+            // item 7. Before that, a container that is still running is exactly
+            // what a stop in progress looks like, and there is nothing to report.
+            //
+            // `enteredStateAt` is the right anchor *here* and only here: this
+            // branch does not leave `STOPPING`, so nothing restamps it while the
+            // wait goes on. The lap that does leave — back to `SAVING` for a fresh
+            // save — is measured by [goingRoundInCircles] instead, for exactly that
+            // reason.
+            val grace = pass.subject.stopGracePeriod
+            val stuckFor = JavaDuration.between(drain.enteredStateAt, now).toKotlinDuration()
+            val overdue =
+                if (stuckFor > grace) {
+                    noteFailure(
+                        server = server,
+                        previous = drain.failure,
+                        occupancy = occupancy,
+                        now = now,
+                        reason = FailureReason.DRAIN_STALLED,
+                        failureClass = FailureClass.RETRYABLE,
+                        message =
+                            "the container is still running ${stuckFor.inWholeSeconds}s after a stop was " +
+                                "issued, past the ${grace.inWholeSeconds}s grace period the runtime should " +
+                                "have killed it in. The stop is re-issued on each pass and nothing else is " +
+                                "done to it: the world save that authorised the stop is on disk, and a " +
+                                "container that will not exit is for the runtime to explain",
+                    )
+                } else {
+                    drain.failure
+                }
             return DrainProgress(
-                drain = drain,
+                drain = drain.copy(failure = overdue),
                 occupancy = occupancy,
-                workDone = true,
                 outcome = ReconcileOutcome.Retry("the container is still running after a stop was issued"),
             )
         }
@@ -2004,12 +2179,66 @@ internal class DrainController(
         // is level-triggered and lapses on its own once this drain stops asserting
         // it; a deregistration does not, so it is undone here.
         val restored = restoreRegistration(subject, drain)
+        val failure =
+            noteFailure(
+                server = server,
+                previous = drain.failure,
+                occupancy = occupancy,
+                now = now,
+                reason = reason,
+                failureClass = failureClass,
+                message = message,
+            )
+        val aborted =
+            restored
+                .moveTo(DrainState.DRAIN_FAILED, now)
+                // Any block goes: whatever the drain was waiting for, it has now
+                // hit something that went wrong, and a record saying both would
+                // report a fault and its absence at the same time. The failure is
+                // the louder of the two and is the one that survives.
+                .copy(failure = failure, blocked = null)
+        val outcome =
+            if (failureClass == FailureClass.RETRYABLE) {
+                ReconcileOutcome.Retry(failure.message)
+            } else {
+                ReconcileOutcome.Failed(failure.message)
+            }
+        return DrainProgress(
+            drain = aborted,
+            occupancy = occupancy,
+            sideEffectIssued = sideEffectIssued,
+            outcome = outcome,
+        )
+    }
+
+    /**
+     * Builds the [mcorch.schema.FailureStatus] a drain records, decides whether it
+     * is time to call a human, and says so in the log.
+     *
+     * Split out of [abort] because a failure is not always a park. A container
+     * that will not exit is reported from `STOPPING` while the drain stays there
+     * re-issuing the stop — see [awaitStopped] — and routing that through [abort]
+     * would restore the backend to the routing table and unseal a server whose
+     * container has already been told to go away. What the two share is the part
+     * that must not be written twice: the escalation threshold, the two prose arms
+     * that go with it, and the attempt count carried forward from [previous].
+     */
+    @Suppress("LongParameterList")
+    private fun noteFailure(
+        server: ResourceName,
+        previous: FailureStatus?,
+        occupancy: PlayerOccupancy?,
+        now: Instant,
+        reason: FailureReason,
+        failureClass: FailureClass,
+        message: String,
+    ): FailureStatus {
         // The first pass that recorded *this* failure, not the first pass of the
         // drain. Asked before `recordFailure` builds the failure, because the
         // escalation decides the wording of the message that call is given — see
         // [firstOccurrenceOf] for why the rule lives in one place rather than
         // being restated here.
-        val failingSince = drain.failure.firstOccurrenceOf(reason, now)
+        val failingSince = previous.firstOccurrenceOf(reason, now)
         val failingFor = JavaDuration.between(failingSince, now).toKotlinDuration()
         val needsAttention =
             escalates(
@@ -2063,7 +2292,7 @@ internal class DrainController(
                     message
                 }
             }
-        val failure = recordFailure(reason, failureClass, reported, now, drain.failure)
+        val failure = recordFailure(reason, failureClass, reported, now, previous)
         if (needsAttention && permanent) {
             logPermanentEscalation(
                 server = server,
@@ -2079,26 +2308,7 @@ internal class DrainController(
                 detail = message,
             )
         }
-        val aborted =
-            restored
-                .moveTo(DrainState.DRAIN_FAILED, now)
-                // Any block goes: whatever the drain was waiting for, it has now
-                // hit something that went wrong, and a record saying both would
-                // report a fault and its absence at the same time. The failure is
-                // the louder of the two and is the one that survives.
-                .copy(failure = failure, blocked = null)
-        val outcome =
-            if (failureClass == FailureClass.RETRYABLE) {
-                ReconcileOutcome.Retry(reported)
-            } else {
-                ReconcileOutcome.Failed(reported)
-            }
-        return DrainProgress(
-            drain = aborted,
-            occupancy = occupancy,
-            sideEffectIssued = sideEffectIssued,
-            outcome = outcome,
-        )
+        return failure
     }
 
     /**
@@ -2565,9 +2775,17 @@ private fun DrainStatus.saveEvidenceProblem(containerStartedAt: Instant?): Strin
  * **A pass that observed nothing must not use this.** It has no player to point
  * at, so it has no grounds to lift the wedge, and doing so silently sends a
  * second `save-all flush` to a live server. Use [forgetSaveConfirmation].
+ *
+ * It is also the one thing that resets
+ * [mcorch.schema.DrainStatus.resaveForcedAt], and for the same reason it clears
+ * everything else: a player has been on the server, so the save that follows is
+ * this drain doing its job rather than this drain going round in a circle. The
+ * sibling below deliberately leaves the anchor alone — a probe that did not
+ * answer establishes nobody, and a drain that lost its evidence to a blind
+ * window is exactly the case being counted.
  */
 internal fun DrainStatus.forgetSaveEvidence(): DrainStatus =
-    copy(worldSavedAt = null, saveRequestedAt = null, playersEvacuated = false)
+    copy(worldSavedAt = null, saveRequestedAt = null, playersEvacuated = false, resaveForcedAt = null)
 
 /**
  * Voids what this drain had established, and keeps the record of a request whose

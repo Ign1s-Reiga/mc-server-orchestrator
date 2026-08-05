@@ -485,6 +485,11 @@ internal object ServerJson {
             put("saveRequestedAt", drain.saveRequestedAt)
             put("worldSavedAt", drain.worldSavedAt)
             put("worldSaved", drain.worldSaved)
+            // When this drain first had to save the world *again*. Null on a drain
+            // that has never lost a confirmation, which is every healthy one — a
+            // non-null value beside a `DRAIN_STALLED` failure is what says the drain
+            // is going round the save rather than stuck on one attempt.
+            put("resaveForcedAt", drain.resaveForcedAt)
             put("deregisteredAt", drain.deregisteredAt)
             // Rendered beside the attempt count because the two answer the
             // dashboard's question together: how many times the loop has asked, and

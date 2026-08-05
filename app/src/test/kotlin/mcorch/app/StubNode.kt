@@ -58,7 +58,27 @@ internal class StubNode(
     /** Reported by the Server List Ping. Non-zero blocks a drain, which is the point. */
     private val online: Int = 0,
     private val clock: Clock = Clock.systemUTC(),
+    /**
+     * Whether `save-all flush` reports a *completed* save.
+     *
+     * Off by default, and the default is the load-bearing one: every other server
+     * in these tests must never get past `SAVING`, and a fake that silently
+     * confirmed a save would walk a drain straight through the state being
+     * asserted on. Turned on only for the drain that has to reach the stop.
+     */
+    private val savesCleanly: Boolean = false,
+    /**
+     * Refuses the first stop, retryably, and takes every one after it.
+     *
+     * The only way to reach a drain that has *aborted and then recovered its
+     * step*, which is the state
+     * [DisplayConformanceTest.a drain that is progressing again still reads as broken, and that is the safe direction]
+     * pins.
+     */
+    private val refuseFirstStop: Boolean = false,
 ) : Node {
+    private var stopsRefused = 0
+
     private var workload: WorkloadObservation = WorkloadObservation.Absent
     private val images = mutableSetOf<String>()
 
@@ -135,11 +155,18 @@ internal class StubNode(
                 ExecOutcome(0, "version=1.21.8 online=$online max=20 motd=a server", "")
             }
 
-            // Never reached in these tests: every server here either has no RCON
-            // at all or still has players on it, so no drain gets as far as a
-            // save. Answering honestly rather than cleanly keeps it that way — a
-            // fake that silently confirmed a save would let a drain walk past the
-            // state being asserted on.
+            // The completion message, not the acknowledgement. Paper says
+            // "Saving the game" when it starts and this when the write is done,
+            // and only the second one authorises a stop.
+            savesCleanly -> {
+                ExecOutcome(0, "Saved the game", "")
+            }
+
+            // Otherwise never reached: those servers either have no RCON at all or
+            // still have players on them, so no drain gets as far as a save.
+            // Answering honestly rather than cleanly keeps it that way — a fake
+            // that silently confirmed a save would let a drain walk past the state
+            // being asserted on.
             else -> {
                 ExecOutcome(1, "", "no rcon listener")
             }
@@ -165,6 +192,10 @@ internal class StubNode(
         gracePeriod: Duration,
     ) {
         require(gracePeriod.isPositive()) { "the stub holds the real node to its contract" }
+        if (refuseFirstStop && stopsRefused == 0) {
+            stopsRefused += 1
+            throw NodeException.Unreachable(name, NodeOperation.STOP, "the runtime did not take the stop")
+        }
         stops += handle
         val present = workload as? WorkloadObservation.Present ?: return
         workload = present.copy(state = WorkloadState.EXITED, finishedAt = clock.instant(), exitCode = 0)

@@ -413,6 +413,12 @@ internal object StatusCodec {
         // both would let a document say two things. V3 rewrote the rows that
         // carried the flag — see `V3SplitWorldSavedInstant`.
         scope.put("worldSavedAt", drain.worldSavedAt)
+        // The anchor for "this drain keeps having to save again and never gets to
+        // the stop". Losing it across a restart is not cosmetic for the same
+        // reason `transferStartedAt` is not: the field is stamped once and a drain
+        // that came back without it would start its count over on every restart,
+        // which is the cycle it exists to make visible.
+        scope.put("resaveForcedAt", drain.resaveForcedAt)
         scope.put("deregisteredAt", drain.deregisteredAt)
         // The anchor drain step 4's allowance is measured from. Set once, never
         // cleared, and losing it is not cosmetic: a drain that came back without it
@@ -447,6 +453,7 @@ internal object StatusCodec {
             sealRequestedAt = reader.instant("$prefix.sealRequestedAt"),
             saveRequestedAt = reader.instant("$prefix.saveRequestedAt"),
             worldSavedAt = reader.instant("$prefix.worldSavedAt"),
+            resaveForcedAt = reader.instant("$prefix.resaveForcedAt"),
             deregisteredAt = reader.instant("$prefix.deregisteredAt"),
             transferStartedAt = reader.instant("$prefix.transferStartedAt"),
             transferAttempts = reader.requireInt("$prefix.transferAttempts"),

@@ -11,7 +11,10 @@ import mcorch.api.OperatorToken
 import mcorch.core.Reconciler
 import mcorch.core.SingleNodeScheduler
 import mcorch.core.StaticNodeRegistry
+import mcorch.schema.DrainStatus
+import mcorch.schema.PaperServerStatus
 import mcorch.schema.RconSpec
+import mcorch.schema.ResourceName
 import mcorch.schema.StorageSpec
 import mcorch.store.getOrThrow
 import mcorch.store.sqlite.EmbeddedStore
@@ -83,6 +86,18 @@ class DisplayConformanceTest {
     }
 
     private fun directory(): Path = Files.createTempDirectory("mcorch-display").also { directories.add(it) }
+
+    /** The drain the loop last wrote, read back out of the real store. */
+    private suspend fun drainOf(
+        embedded: EmbeddedStore,
+        name: ResourceName,
+    ): DrainStatus? =
+        (
+            embedded.state
+                .getServer(name)
+                ?.status
+                ?.status as? PaperServerStatus
+        )?.drain
 
     /**
      * The invariant, applied to one rendered server.
@@ -222,6 +237,73 @@ class DisplayConformanceTest {
             // surface as a 404 from the purge, which reads as broken plumbing
             // rather than as a container with an unsaved world being stopped.
             node.stops.shouldBeEmpty()
+        }
+    }
+
+    /**
+     * A drain that aborted, resumed and got its next step done still renders as
+     * broken — and that is the direction to keep.
+     *
+     * `DrainController.settleRecords` does not let the resuming pass clear the
+     * failure however much work it did, because a drain parked on a refused stop
+     * re-saves for real on every resume and clearing on that reset `attempts` and
+     * restamped `occurredAt` every cycle: a stop refused for six hours reported
+     * three attempts and never reached the escalation threshold. The price is what
+     * this test renders — `status.failure` is non-null while the drain is in
+     * `STOPPING`, so the dashboard says "the drain aborted; the server is still
+     * running" about a drain that is, right now, progressing.
+     *
+     * It over-states brokenness, which is the safe direction, and it is pinned here
+     * because the obvious tidy-up — clear the failure so the sentence reads nicely —
+     * silently deletes the hysteresis and takes the escalation with it. Anyone
+     * changing this sentence has to change [mcorch.core.DrainController] first, and
+     * this test is where that conversation happens.
+     */
+    @Test
+    fun `a drain that is progressing again still reads as broken, and that is the safe direction`() {
+        val directory = directory()
+        val node = StubNode(savesCleanly = true, refuseFirstStop = true)
+        EmbeddedStore.open(EmbeddedStoreConfig(directory = directory)).use { embedded ->
+            val registry = StaticNodeRegistry(listOf(node))
+            val reconciler = Reconciler(embedded.state, registry, SingleNodeScheduler(registry))
+
+            val definition = paperServer(name = "recovering-01")
+            val name = definition.metadata.name
+            val abortedAt =
+                runBlocking {
+                    embedded.state.putDefinition(definition).getOrThrow()
+                    repeat(4) { reconciler.reconcile(name) }
+                    embedded.state.deleteDefinition(name).getOrThrow()
+                    // Passes until the drain records something, which is the
+                    // refused stop: counted rather than guessed, so the test does
+                    // not quietly stop reaching the state it is about when a step
+                    // is added to the protocol.
+                    (1..12).firstNotNullOfOrNull {
+                        reconciler.reconcile(name)
+                        drainOf(embedded, name)?.failure?.occurredAt
+                    }
+                }
+            (abortedAt != null) shouldBe true
+
+            // One more pass: the resume issues the stop, the runtime takes it, and
+            // the drain is in `STOPPING` with the failure still on it. Exactly one,
+            // because the pass after this observes an exited container and tears
+            // the whole record down.
+            runBlocking { reconciler.reconcile(name) }
+
+            serving(embedded) { api ->
+                val display = api.display("recovering-01")
+                val drain = api.drain("recovering-01")
+
+                drain["state"] shouldBe "STOPPING"
+                // The same failure, not a new one: the record survived the pass
+                // that did the work, which is the whole of the hysteresis.
+                (drain["failure"] as Map<*, *>)["occurredAt"] shouldBe abortedAt.toString()
+                (display["detail"] as String) shouldContain "the drain aborted"
+
+                assertPermanentFailureIsFlagged(api.status("recovering-01"), display)
+                assertNothingIsSilentlyStuck(display)
+            }
         }
     }
 

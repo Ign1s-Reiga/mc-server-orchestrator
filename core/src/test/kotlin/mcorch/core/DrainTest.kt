@@ -1852,6 +1852,298 @@ internal class DrainTest {
         }
 
     /**
+     * The sixteenth audit's first critical, seen from the other end: a drain that
+     * saves, loses the confirmation, saves again and never reaches the stop.
+     *
+     * The primary cause is fixed — evidence used to be stamped from `pass.now`,
+     * before the flush that earned it — and this is about every *other* cause,
+     * because the loop's report was identical for all of them: `Progressed` on
+     * every pass, `DRAINING` on the badge, no failure, no attempt count, no
+     * escalation, and a full `save-all flush` at a live server twice a minute for
+     * ever.
+     *
+     * The scenario is a loop that is behind rather than a container that is
+     * broken, which is why it is silent: forty seconds between two passes of the
+     * *same* server is a busy orchestrator, not a fault, and it is longer than the
+     * thirty a save confirmation survives. Every pass then voids a confirmation
+     * that was fine when it was taken. Nothing in the drain, the container or the
+     * probe is wrong, and nothing was ever recorded.
+     *
+     * The fixed spacing is the mechanism here rather than a shortcut. A requeue
+     * delay is a *floor* — `ReconcileLoop` promises not to come back sooner — so a
+     * saturated loop arrives late whatever the last outcome was, and modelling the
+     * poll/backoff alternation would be modelling the case that is not the
+     * problem.
+     */
+    @Test
+    fun `a drain that keeps re-saving and never reaches the stop asks for a human`() =
+        coreTest {
+            val harness = Harness(config = ReconcilerConfig(drainAttentionAfter = 10.minutes))
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.store.deleteDefinition(name)
+
+            var firstAnchor: java.time.Instant? = null
+            val attempts = mutableListOf<Int>()
+            repeat(40) {
+                harness.pass(name)
+                harness.clock.advance(40.seconds)
+                val drain = harness.status(name)?.drain
+                if (firstAnchor == null) firstAnchor = drain?.resaveForcedAt
+                drain?.failure?.let { attempts += it.attempts }
+            }
+
+            // The instrument is not vacuous: the drain really did keep flushing a
+            // live server's world, which is the cost this makes visible.
+            harness.node.saves.size shouldBeGreaterThan 3
+
+            val drain =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            // Set once. A restamped anchor is an allowance handed back on every
+            // lap, and the escalation could then never be reached however long the
+            // cycle ran — the mistake `enteredStateAt` made for drain step 4.
+            drain.resaveForcedAt.shouldNotBeNull() shouldBe firstAnchor.shouldNotBeNull()
+
+            val failure = drain.failure.shouldNotBeNull()
+            failure.reason shouldBe FailureReason.DRAIN_STALLED
+            failure.failureClass shouldBe FailureClass.RETRYABLE
+            failure.message shouldContain "never reaches the stop"
+            // The count rises and the anchor does not move, which is what makes
+            // the threshold reachable at all.
+            attempts.distinct().size shouldBeGreaterThan 3
+            failure.attempts shouldBeGreaterThan 3
+            JavaDuration
+                .between(failure.occurredAt, harness.clock.instant())
+                .toKotlinDuration() shouldBeGreaterThan 10.minutes
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .attention()
+                .status shouldBe ConditionStatus.TRUE
+
+            // Nothing was done to the container, which is the half of
+            // `failure-modes.md` item 7 that never moves: the report changed and
+            // that is all.
+            harness.node.stops.shouldBeEmpty()
+            harness.node.removals.shouldBeEmpty()
+            harness.node.workload
+                .shouldBeInstanceOf<WorkloadObservation.Present>()
+                .state shouldBe WorkloadState.RUNNING
+            harness.store.getServer(name).shouldNotBeNull()
+        }
+
+    /**
+     * The discriminator for the test above: **one** forced re-save is the protocol
+     * working, and must record nothing.
+     *
+     * An orchestrator restart mid-drain leaves a confirmation nobody was watching
+     * behind, the drain saves again, and it finishes. If that raised a failure the
+     * mechanism would be an alarm on every deploy, and the fifteen-minute
+     * threshold would be the only thing between it and alarm fatigue — which is
+     * not a design, it is a delay.
+     */
+    @Test
+    fun `a single forced re-save is not a failure and does not ask for a human`() =
+        coreTest {
+            val harness = Harness(config = ReconcilerConfig(drainAttentionAfter = 10.minutes))
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.store.deleteDefinition(name)
+
+            repeat(6) { harness.pass(name) }
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .worldSaved
+                .shouldBeTrue()
+
+            // The loop is down for half an hour. The container never restarted, so
+            // the only witness that nobody was watching is the gap in the loop's
+            // own observations — and it costs exactly one more flush.
+            harness.clock.advance(30.minutes)
+            harness.pass(name)
+
+            val resaving =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            resaving.resaveForcedAt.shouldNotBeNull()
+            resaving.failure shouldBe null
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .attention()
+                .status shouldBe ConditionStatus.FALSE
+
+            harness.settle(name, limit = 16)
+
+            harness.node.saves shouldHaveSize 2
+            harness.node.stops shouldHaveSize 1
+            harness.store.getServer(name) shouldBe null
+        }
+
+    /**
+     * A container that will not exit, reported without anything being escalated at
+     * it.
+     *
+     * Two separate defects live in this branch. The re-issue used to claim
+     * [DrainProgress.workDone] — reached *because* the container is still running,
+     * so the previous stop did not take — and that claim deleted whatever failure
+     * the drain was carrying, in the one state where the container is meant to be
+     * going away. And a container that simply never dies looped here for ever with
+     * `Retry` and no `FailureStatus` at all: the loop was trying, nobody was told,
+     * and `crictl` was the only thing that would ever end it.
+     *
+     * What does **not** change is what happens to the container: the same stop,
+     * the same grace period, no kill, no removal. `failure-modes.md` item 7.
+     */
+    @Test
+    fun `a container that never exits is reported and is never killed harder`() =
+        coreTest {
+            val harness = Harness(config = ReconcilerConfig(drainAttentionAfter = 5.minutes))
+            val definition = paperDefinition(saveTimeout = 1.minutes)
+            val name = definition.metadata.name
+            val grace = definition.spec.lifecycle.stopGracePeriod
+            harness.declare(definition)
+            harness.settle(name)
+            // The stop is accepted and the container carries on running. The probe
+            // keeps answering, so the save confirmation stays current and this is
+            // the elapsed-time rule rather than the re-save one.
+            harness.node.onStop = { present -> present }
+            harness.store.deleteDefinition(name)
+
+            repeat(7) { harness.pass(name) }
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .state shouldBe DrainState.STOPPING
+            harness.node.stops shouldHaveSize 1
+
+            // Inside the grace period a container that is still running is what a
+            // stop in progress looks like, and there is nothing to report.
+            harness.clock.advance(25.seconds)
+            harness.pass(name)
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .failure shouldBe null
+
+            repeat(40) {
+                harness.pass(name)
+                harness.clock.advance(25.seconds)
+            }
+
+            val drain =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            drain.state shouldBe DrainState.STOPPING
+            val failure = drain.failure.shouldNotBeNull()
+            failure.reason shouldBe FailureReason.DRAIN_STALLED
+            failure.failureClass shouldBe FailureClass.RETRYABLE
+            failure.message shouldContain "grace period"
+            failure.attempts shouldBeGreaterThan 3
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .attention()
+                .status shouldBe ConditionStatus.TRUE
+
+            // The stop is re-issued and nothing else is done: the same grace
+            // period every time, no zero-grace kill, no removal — and no second
+            // world save, because the confirmation that authorised the stop is
+            // still current. That last one is the idempotency assertion: forty
+            // passes over an unchanged state added no side effect the first one
+            // had not already made.
+            harness.node.stops.size shouldBeGreaterThan 3
+            harness.node.stops
+                .map { it.second }
+                .distinct() shouldBe listOf(grace)
+            harness.node.saves shouldHaveSize 1
+            harness.node.removals.shouldBeEmpty()
+            harness.node.workload
+                .shouldBeInstanceOf<WorkloadObservation.Present>()
+                .state shouldBe WorkloadState.RUNNING
+        }
+
+    /**
+     * The re-issue does not delete the failure the drain came into `STOPPING`
+     * carrying.
+     *
+     * Item 11 of the failure modes, reopened by one flag. The drain here aborts on
+     * a refused stop, resumes, gets the stop accepted — and the container does not
+     * go away, so every later pass re-issues it. While that pass claimed
+     * `workDone`, the pass after the resume cleared the record: `attempts` back to
+     * one, `occurredAt` restamped, and the fifteen-minute threshold unreachable
+     * while the loop hammered a container that was never going to exit.
+     *
+     * The assertion is on `occurredAt` rather than on mere non-nullness, because a
+     * *new* failure recorded by the grace-period rule would satisfy the weaker
+     * one. Nothing advances the clock here, so that rule cannot fire and the only
+     * failure that can be present is the one carried in.
+     */
+    @Test
+    fun `a re-issued stop does not delete the failure the drain was carrying`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.node.onStop = { present -> present }
+            // One refused stop, then the runtime takes it — and the container
+            // keeps running anyway.
+            harness.node.failOnce(NodeOperation.STOP, harness.node.unreachable(NodeOperation.STOP))
+            harness.store.deleteDefinition(name)
+
+            repeat(7) { harness.pass(name) }
+            val aborted =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            aborted.state shouldBe DrainState.DRAIN_FAILED
+            val recorded = aborted.failure.shouldNotBeNull()
+
+            // The resume issues the stop for real, which is work; the pass after
+            // it only re-issues one the container ignored, which is not.
+            repeat(3) { harness.pass(name) }
+
+            val drain =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            drain.state shouldBe DrainState.STOPPING
+            val surviving = drain.failure.shouldNotBeNull()
+            surviving.occurredAt shouldBe recorded.occurredAt
+            surviving.attempts shouldBeGreaterThan 0
+            harness.node.workload
+                .shouldBeInstanceOf<WorkloadObservation.Present>()
+                .state shouldBe WorkloadState.RUNNING
+        }
+
+    /**
      * A container stop the runtime keeps refusing asks for a human, however many
      * times the drain has to save again while it waits.
      *

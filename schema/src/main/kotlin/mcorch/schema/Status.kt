@@ -398,6 +398,32 @@ public data class DrainStatus(
     val saveRequestedAt: Instant? = null,
     /** When the server confirmed a *completed* save. Never when one was merely asked for. */
     val worldSavedAt: Instant? = null,
+    /**
+     * When this drain first had to go back and save the world **again** because
+     * the confirmation it was holding had stopped describing the container in
+     * front of it.
+     *
+     * One forced re-save is ordinary: the container restarted, or the loop was
+     * not watching for long enough, and the drain saves again rather than
+     * stopping on evidence it cannot vouch for. A drain that keeps doing it is
+     * not: it flushes a live server's world on every other pass, reports progress
+     * on every one of them, and never reaches a stop. That state used to be
+     * invisible — nothing failed, so nothing was recorded and nothing escalated —
+     * and this is the anchor that measures it.
+     *
+     * **Set once, and cleared by exactly one event: a probe that saw somebody on
+     * the server.** A player makes the next save legitimate rather than
+     * suspicious, so the count starts again from there. It is deliberately *not*
+     * cleared by a save, by a stop attempt or by a park: each of those happens
+     * once per cycle of the very loop this measures, and clearing on any of them
+     * hands the allowance back for ever — the mistake `enteredStateAt` made for
+     * drain step 4 ([transferStartedAt]).
+     *
+     * A row written before this field existed reads null and the next voided
+     * confirmation stamps it, which costs one extra cycle before a stuck drain is
+     * reported and is the safe direction.
+     */
+    val resaveForcedAt: Instant? = null,
     val deregisteredAt: Instant? = null,
     /**
      * When this drain first entered drain step 4, and the anchor its allowance is

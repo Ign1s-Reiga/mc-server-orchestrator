@@ -1519,7 +1519,16 @@ export interface DrainStatus {
   saveRequestedAt: string | null;   // a save request that went out and was NOT confirmed
   worldSavedAt: string | null;      // a COMPLETED save. Disjoint from saveRequestedAt.
   worldSaved: boolean;
+  /**
+   * When this drain first had to save the world *again* because the confirmation
+   * it held had stopped describing the running container. Null on a drain that
+   * has never lost one. Set once, and reset only by a probe that saw somebody on
+   * the server; beside a `DRAIN_STALLED` failure it means the drain is going
+   * round the save rather than stuck on a single attempt.
+   */
+  resaveForcedAt: string | null;
   deregisteredAt: string | null;
+  transferStartedAt: string | null; // the anchor step 4's allowance is measured from
   transferAttempts: number;
   destination: string | null;       // a server name, never a player
   /** Parked and healthy. Disjoint from `failure` — see below. */
