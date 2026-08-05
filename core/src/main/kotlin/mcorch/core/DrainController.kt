@@ -1580,6 +1580,27 @@ internal class DrainController(
         // stamped and is judged from the next cycle, which costs one cycle and
         // cannot silently disable the bound. See `DrainStatus.transferStartedAt`
         // for the same rule and the three wedges that taught it.
+        //
+        // **It spans laps on purpose.** Nothing on the success path clears it —
+        // only [forgetSaveEvidence], which needs an observed player — so `circling`
+        // is the age of the *first* forced re-save and not of this one, and it keeps
+        // rising across laps that each ended with a real save and a re-issued stop.
+        //
+        // Clearing it on a lap that reached `DEREGISTERED` with a fresh confirmation
+        // was considered and is wrong, because that is what every lap of the
+        // defining cycle does: `STOPPING` → `SAVING` → a genuine save →
+        // `DEREGISTERED` → `STOPPING`, for as long as a container refuses to exit.
+        // The clear would hand the allowance back once per lap and disable the
+        // detector for exactly the defect it exists for — the sixteenth audit's
+        // first critical, arriving by a different route. A drain that has finished
+        // takes its whole record with it, so an anchor only survives while the drain
+        // has not.
+        //
+        // What the span costs is reporting, and it is why the message below states
+        // the measured fact once — how long ago a confirmation was first voided, and
+        // that it has happened again — rather than restating the same number as a
+        // claim about how long nothing has been working. Some of that interval was
+        // the drain making honest progress between laps.
         val anchor = drain.resaveForcedAt ?: now
         val anchored = drain.copy(resaveForcedAt = anchor)
         val circling = JavaDuration.between(anchor, now).toKotlinDuration()
@@ -1647,10 +1668,10 @@ internal class DrainController(
                 message =
                     "this drain keeps saving the world and never reaches the stop: a confirmed save was first " +
                         "voided ${circling.inWholeSeconds}s ago and it has happened again since — $problem. " +
-                        "Nothing has been stopped or removed and the server keeps running. It has not cleared " +
-                        "on its own in ${circling.inWholeSeconds}s and the loop will keep saving and stopping " +
-                        "nothing until the cause goes away: check whether the container is restarting " +
-                        "underneath the drain, and whether the loop is reaching this server on every pass",
+                        "Nothing has been stopped or removed and the server keeps running, and the loop will " +
+                        "keep saving and stopping nothing until the cause goes away: check whether the " +
+                        "container is restarting underneath the drain, and whether the loop is reaching this " +
+                        "server on every pass",
             )
         }
         return DrainProgress(

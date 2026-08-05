@@ -2439,7 +2439,15 @@ internal class DrainTest {
             // where the only intervention is a stop with no save. What replaces it
             // is the measured fact and the two checks that would explain it.
             failure.message shouldNotContain "It does not clear on its own"
-            failure.message shouldContain "has not cleared on its own in"
+            failure.message shouldContain "was first voided"
+            failure.message shouldContain "it has happened again since"
+            // And the fact is stated once. `resaveForcedAt` is never cleared by the
+            // success path, so it spans laps that each ended with a real save and a
+            // re-issued stop — deliberately, or the detector would hand its own
+            // allowance back once per lap. The cost of that span is that the number
+            // may include time the drain spent making progress, so it is reported as
+            // what it measures and not restated as "nothing has worked for Ns".
+            failure.message shouldNotContain "has not cleared on its own in"
 
             // Nothing was done to the container. `failure-modes.md` item 7 does not
             // move because the bound moved.
