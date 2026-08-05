@@ -200,6 +200,40 @@ from more than one call site, make it one function before writing the second
 site.** And prefer *not asserting* over asserting a guessed value: "not
 registered yet" is a state a protocol handles; "registered wrongly" often is not.
 
+## A seal is a precondition only for a subject that has a transfer
+
+Round 24's critical, and the rule generalises past the bug. `holdSeal` aborts
+because *"a drain that carried on would be transferring into a queue that refills
+behind it"* — a sentence about **step 4**. A subject with no `DrainRouter` has no
+step 4, so the justification does not apply to it, and for those subjects the
+seal is an **optimisation** while `requireEmpty` + `mayStop` is the gate.
+
+The proxy was the case nobody had traced: a `VelocityProxy` always has a seal
+object and never a router, so the `seal == null` short-circuit that carries a
+standalone `PaperServer` could not save it. With the plugin absent or unloaded it
+aborted at step 2 on **every pass of every state, at zero players, for ever** —
+and the only repair, recreating it, is itself a replacement drain through the
+endpoint that does not answer. `sealIsPrecondition(router, reading)` is the fix:
+waive only with `router == null` **and** a fresh `PlayerReading.Empty`. Silence
+still parks; players still park, because with anybody on, the seal is what lets
+the wait for zero end.
+
+Three things worth carrying:
+
+- **The proxy is the shape that has one counterparty and not the other.** When a
+  branch keys on "has a proxy", check whether it means *seal* or *router* — this
+  is the second defect from conflating them, after `sealsBackend` versus
+  `drainInitiated`.
+- **A waived step must not claim it happened.** `holdSeal` returns a `SealHold`
+  (`NothingToSeal` / `Asserted` / `Waived` / `Aborted`) rather than a nullable
+  progress, because `DRAIN_REQUESTED` stamps `sealRequestedAt` and claims
+  `workDone` on the strength of a `PUT` that landed. A boolean "did we abort"
+  would have written "sealed at" about a seal that is not in place.
+- **The residual risk was already accepted.** Somebody may connect between the
+  reading and the stop — which is exactly the standalone server's exposure, and
+  `requireEmpty` re-reading on the stopping pass is the guarantee. Saying so is
+  what makes the waiver defensible rather than a loosening.
+
 ## Rulings I made that a human may overrule
 
 1. **`DRAIN_FAILED` unseals.** A blocked-with-a-proxy drain therefore takes new

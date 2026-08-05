@@ -124,6 +124,34 @@ Velocity's own default is, why this differs, and what it would take to make the
 value a request rather than a claim ([[proxy-image-contract]]) — otherwise the
 next reader repeats the correction with the same good evidence.
 
+## A remedy hedged as "at minimum" can be weaker than the defect it is filed for
+
+Round 24 flagged that rotating the control token leaves every backend
+undrainable while `reachable` and `compatible` both read true, and prescribed:
+*"at minimum the version handshake should report whether authentication is
+required"*. Tracing it took two minutes and the remedy does not close the case.
+In a rotation **both ends agree** that authentication is required — the
+container simply holds the old value — so an `authRequired` flag reads `true`
+from a plugin that is refusing every call. It detects only the configuration
+mismatch (one end has a token, the other does not), which is the neighbouring
+defect.
+
+What detects the flagged one is an **authenticated** call, and the pass was
+already making one and discarding its variant: `assertBackends` calls
+`channel.state()` and matched only `Answered`. Branching on `UNAUTHENTICATED`
+there cost three lines, no wire change, and no new field on a status type that
+would have rippled into `:store` and `:api`.
+
+Two things to carry:
+
+- **"At minimum" is the auditor flagging their own uncertainty, not setting a
+  floor.** Treat the *finding* as established and re-derive the remedy from the
+  mechanism, exactly as for a confidently-prescribed one.
+- **Before adding a field or a wire change, look for the call the pass already
+  makes and throws away.** A discarded `when` branch is the cheapest possible
+  enforcement point and it is invisible to a grep for the thing you want to
+  detect.
+
 ## Arguing to leave something open
 
 When escalating a known hole rather than fixing it, **argue from what is at

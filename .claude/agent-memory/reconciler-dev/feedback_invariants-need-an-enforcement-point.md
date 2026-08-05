@@ -283,6 +283,51 @@ rather than tightening the scan; and those side-effect assertions must be marked
 as load-bearing, or somebody "strengthens" them into a check on the recorded
 failure and quietly loses the composite.
 
+## Where an invariant is enforced decides which failures are survivable
+
+Round 24, and it is the counterweight to everything above. A `require` in a type
+is the strongest enforcement point available — and in this codebase it is
+sometimes the *wrong* one, because of where it throws.
+
+`Reconciler` builds its `Pass` (and so the `WorkloadSpec`) **before** the
+terminating-definition exemption, and `rejectDefinition` records `PERMANENT`
+with no exemption of its own. So an `IllegalArgumentException` out of a
+`WorkloadSpec` or `StorageRequest` `init` makes that server permanently
+unreconcilable — **drain and delete included**. For a rule about a value an
+operator supplies that is a world-holding server nobody can retire, which is the
+state that ends in a manual `crictl stop`. And a `require` cannot be told the
+definition it came from is on its way out.
+
+The split that came out of it, now written in `WorkloadSpec`'s `init` and in
+`StorageRequest.Persistent.mountPath`:
+
+- **A type's `init` may only enforce what a *planner* can get wrong.** Blank
+  hash, blank hostname, two assets at one path — closed sets in this repo,
+  reachable only by a code bug, and freezing is correct because the repair is a
+  code change.
+- **Rules about operator- or store-supplied values belong at the node**, as
+  `NodeException.Rejected` from `HostPaths`. Same permanence, same message, and
+  it fails the *create* — the operation that is actually wrong — while the drain,
+  the stop and the teardown carry on, because none of them asks the type
+  anything.
+
+The tell is a second arrival route: `spec.storage.mountPath` comes from YAML
+*and* from a stored row through `DefinitionCodec`, which does not re-run the
+reader's validation. **Ask of any `require`: can this value reach here from
+outside the compiler?** If yes, it belongs where refusing costs a create.
+
+The same round produced the timing version of it. `HostPaths` correctly refuses
+a proxy whose control plugin is missing, and correctly calls it permanent — but
+the create is the *last* step of a replacement, so the question was first asked
+after the drain, the stop and the removal had all succeeded. `Node.checkWorkload`
+asks it before the teardown commits by running the create's own derivation and
+discarding the result: one enforcement point, asked earlier. **A correct refusal
+at the wrong moment is still a defect**, and the fix is not a second check, it is
+an earlier call to the same one. Note that the *classification* may legitimately
+differ between the two callers — the pre-flight records `RETRYABLE` because
+freezing a running proxy stops the routing sweep — and that is a caller's
+decision, not a second enforcement point.
+
 See [[localnode-test-gap]] for the sibling rule about decisions, and
 [[prove-the-test-can-fail]] for why the unit test of the function was the one
 that mattered.
