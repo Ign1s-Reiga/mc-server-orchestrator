@@ -644,13 +644,24 @@ internal class DrainController(
      * proxied drain that blocks, transfers and blocks again reports "waiting since"
      * a few seconds ago every time. Both obvious narrowings are worse:
      *
-     * - **Clear only on [DrainProgress.workDone].** It cannot fire. There are
-     *   exactly two callers of [blocked] and both call [forgetSaveEvidence], which
-     *   clears `playersEvacuated`, so the resume ladder lands on `SEALED` or
-     *   `TARGET_RESOLVED` — and every branch of [secureDestination] and
-     *   [transferStep] that leaves `DRAIN_FAILED` claims `workDone`, the transfer
-     *   included. The rule would change nothing, and a test for it would be one of
-     *   those that cannot fail.
+     * - **Clear only on [DrainProgress.workDone].** It fires for exactly one
+     *   pass, and that pass is the one it would be worst to misreport. Every
+     *   block voids the save evidence, which clears `playersEvacuated`, so the
+     *   resume ladder lands on `SEALED` or `TARGET_RESOLVED`; almost every branch
+     *   of [secureDestination] and [transferStep] that leaves `DRAIN_FAILED`
+     *   claims `workDone`, the transfer included. The exception is
+     *   [DestinationChoice.Chosen], which is re-derived rather than done and says
+     *   so — and it is precisely where a proxied drain resumes from a block with
+     *   no destination recorded. The narrowed rule would therefore carry the
+     *   stale block through the pass that just secured one: "waiting, not stuck"
+     *   on a drain that has made real headway. The same misreading this
+     *   unconditional clear exists to stop, one pass long instead of many.
+     *
+     *   The earlier version of this paragraph said the rule "cannot fire" and
+     *   named no exception. It is corrected rather than deleted because the
+     *   conclusion did not change and the argument for it did, and a wrong reason
+     *   left standing beside a right decision is what the next reader takes for a
+     *   general licence.
      * - **Keep the record while the drain progresses.** `DRAIN_BLOCKED` is derived
      *   from `blocked != null && failure == null`, and `:api` documents that pair as
      *   *waiting*. Keeping it means a live "waiting, not stuck; needs nobody" on a
