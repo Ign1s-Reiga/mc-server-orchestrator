@@ -5,6 +5,7 @@ import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.nulls.shouldBeNull
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.string.shouldNotContain
 import mcorch.core.StorageRequest
@@ -93,6 +94,49 @@ internal class VelocityWorkloadPlannerTest {
         // definition to vary that would move a constant, and comparing a hash with
         // itself is an assertion that cannot fail.
         VelocityWorkloadPlanner.canonicalSpec(proxyDefinition()) shouldContain "velocity.build=$fromCatalog"
+    }
+
+    /**
+     * A deployment can pin its own build, and what it pins reaches the container and
+     * the hash **as one value**.
+     *
+     * The second half is the load-bearing one. The environment variable decides which
+     * Velocity the container downloads; the `velocity.build` entry decides what hash
+     * that container is recorded under. If a future edit let them come from different
+     * expressions, a proxy would be created running one build and recorded as though
+     * it ran another — a hash that never matches, so the loop drains and recreates it
+     * on every pass, for ever. `pinnedBuild` is the one place the default is applied
+     * for exactly this reason.
+     */
+    @Test
+    fun `a pinned Velocity build reaches the container and the hash as one value`() {
+        val pinned = "9.9.9-test"
+        val spec = VelocityWorkloadPlanner.plan(proxyDefinition(), pinned)
+
+        spec.env[VelocityWorkloadPlanner.VELOCITY_VERSION] shouldBe pinned
+        VelocityWorkloadPlanner.canonicalSpec(proxyDefinition(), pinned) shouldContain "velocity.build=$pinned"
+        spec.specHash shouldBe VelocityWorkloadPlanner.specHash(proxyDefinition(), pinned)
+    }
+
+    /**
+     * Unset means this build's own pin, byte for byte.
+     *
+     * The exit an operator has when an upgrade bumps the pin is to put the old value
+     * back, and that only works because an unset pin produces the *identical*
+     * canonical form — same entry, same wording, same position. A pin that spelled
+     * its default differently would be a lever introduced by way of the fleet-wide
+     * replacement it exists to prevent.
+     */
+    @Test
+    fun `an unset pin is byte-identical to this build's own`() {
+        VelocityWorkloadPlanner.canonicalSpec(proxyDefinition()) shouldBe
+            VelocityWorkloadPlanner.canonicalSpec(proxyDefinition(), VelocityWorkloadPlanner.VELOCITY_BUILD)
+        VelocityWorkloadPlanner.specHash(proxyDefinition()) shouldBe
+            VelocityWorkloadPlanner.specHash(proxyDefinition(), VelocityWorkloadPlanner.VELOCITY_BUILD)
+        // And a different pin is a different workload, or none of the above means
+        // anything.
+        VelocityWorkloadPlanner.specHash(proxyDefinition(), "9.9.9-test") shouldNotBe
+            VelocityWorkloadPlanner.specHash(proxyDefinition())
     }
 
     /**

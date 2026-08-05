@@ -195,10 +195,14 @@ public class Reconciler(
                 is Placement.On -> {
                     val observation = placement.node.observe(pass.name)
                     val cause = placement.cause ?: drainCause(pass, observation)
-                    if (cause == null) {
-                        converge(pass, placement.node, observation)
-                    } else {
-                        drain(pass, placement.node, observation, cause, binding)
+                    // Before the drain, never after: a replacement this node cannot
+                    // build must not take a populated server away first. See
+                    // [replacementBlocker].
+                    val blocker = replacementBlocker(pass, placement.node, cause)
+                    when {
+                        blocker != null -> converge(pass, placement.node, observation, blocker)
+                        cause == null -> converge(pass, placement.node, observation)
+                        else -> drain(pass, placement.node, observation, cause, binding)
                     }
                 }
             }
@@ -336,16 +340,40 @@ public class Reconciler(
      * any distribution — only the integration suite does — so that is the default
      * state of a real install rather than an unlucky one.
      *
+     * ## The kind that holds worlds needs it more, not less
+     *
+     * The twenty-fifth audit's third warning: this existed on the proxy path only,
+     * and `storage.mountPath`, `rcon.secret` and the *proxy's* forwarding secret are
+     * all in a `PaperServer`'s spec hash. A stored row whose `mountPath` a later
+     * reader would refuse — `DefinitionCodec` does not re-run the YAML reader's
+     * validation — therefore drained a running, populated server correctly, saved
+     * it, stopped it, removed it, and only then met a create that refuses for ever.
+     * No world is lost (the volume outlives the container and the drain is correct),
+     * and the server cannot come back. One bad reference on one *proxy* definition
+     * reaches every backend behind it, because the forwarding secret's coordinates
+     * are in each of their hashes.
+     *
      * ## Why the classification here is not the create's
      *
      * `HostPaths` is still the one enforcement point and still calls a missing
      * artefact `PERMANENT`; this asks it the same question through
      * [Node.checkWorkload], which *is* the create's own derivation. But permanence
-     * means "stop trying", and stopping here would freeze the passes of a proxy
-     * that is up and serving — including `assertBackends`, which is the level
-     * trigger that restores joins to a backend whose drain has parked. The remedy
-     * is an operator staging a file, which needs no definition change, so this
-     * records a **retryable** failure and lets the proxy carry on being a proxy.
+     * means "stop trying", and that is a mechanism rather than a preference:
+     * `isBlockedByPermanentFailure` lifts **only** on `observedGeneration !=
+     * generation` or a delete, and neither documented remedy — staging a file,
+     * staging a secret, re-aligning a token — produces either. A permanent
+     * classification here would therefore be a freeze that the remedy cannot lift,
+     * so an operator who did exactly what the message asked would still need a
+     * second, meaningless definition edit. On the proxy it costs more still: a
+     * frozen proxy stops running `assertBackends`, which is the level trigger that
+     * restores joins to a backend whose own drain has parked.
+     *
+     * **What retryable costs, stated rather than glossed.** A permanent failure
+     * escalates at once; a retryable one waits out
+     * [ReconcilerConfig.drainAttentionAfter] first, and round 8 made permanent
+     * failures immediate precisely because their remedy is a human. The quiet is
+     * earned here — nothing has been stopped and the workload is up and serving —
+     * but it is a trade, not a free choice.
      *
      * ## Scope, stated rather than implied
      *
@@ -355,28 +383,35 @@ public class Reconciler(
      * refused earlier for a different reason, and pre-flighting the destination is
      * left to whoever makes a second node real.
      */
+    @Suppress("LongParameterList")
     private suspend fun replacementBlocker(
-        pass: ProxyPass,
+        name: ResourceName,
+        desired: WorkloadSpec,
         node: Node,
         cause: DrainCause?,
+        drainInFlight: Boolean,
+        previous: FailureStatus?,
+        now: Instant,
+        subject: String,
+        consequence: String,
     ): FailureStatus? {
         if (cause != DrainCause.REPLACEMENT) return null
         // A drain already in flight is past the point this question protects: the
         // container it would have saved is gone or going, and refusing now would
         // strand the drain mid-protocol.
-        if (pass.previous?.drain != null) return null
+        if (drainInFlight) return null
         return try {
-            node.checkWorkload(pass.desired)
+            node.checkWorkload(desired)
             null
         } catch (rejected: NodeException.Rejected) {
             val message =
-                "this proxy's definition has changed in a way that needs the container replaced, and node " +
+                "this $subject's definition has changed in a way that needs the container replaced, and node " +
                     "`${node.name}` cannot build the replacement: ${rejected.message}. Nothing has been drained " +
-                    "or stopped — the proxy that is running keeps running and keeps routing — and the " +
-                    "replacement happens on its own once the node can build it"
+                    "or stopped — $consequence — and the replacement happens on its own once the node can " +
+                    "build it"
             LOG.error(
                 "{} cannot be replaced, so it has not been drained: {}",
-                WorkloadRef(pass.name, node.name),
+                WorkloadRef(name, node.name),
                 message,
             )
             recordFailure(
@@ -385,11 +420,56 @@ public class Reconciler(
                 // deliberately: see the note above.
                 failureClass = FailureClass.RETRYABLE,
                 message = message,
-                now = pass.now,
-                previous = pass.previous?.failure,
+                now = now,
+                previous = previous,
             )
         }
     }
+
+    /**
+     * [replacementBlocker] for a proxy.
+     *
+     * A wrapper rather than a copy: the question, its scope and its classification
+     * are one function, and what differs between the kinds is two clauses of the
+     * sentence an operator reads. Copying it is how the proxy path came to have the
+     * guard and the world-holding path came not to.
+     */
+    private suspend fun replacementBlocker(
+        pass: ProxyPass,
+        node: Node,
+        cause: DrainCause?,
+    ): FailureStatus? =
+        replacementBlocker(
+            name = pass.name,
+            desired = pass.desired,
+            node = node,
+            cause = cause,
+            drainInFlight = pass.previous?.drain != null,
+            previous = pass.previous?.failure,
+            now = pass.now,
+            subject = "proxy",
+            consequence = "the proxy that is running keeps running and keeps routing",
+        )
+
+    /** [replacementBlocker] for a `PaperServer`. */
+    private suspend fun replacementBlocker(
+        pass: Pass,
+        node: Node,
+        cause: DrainCause?,
+    ): FailureStatus? =
+        replacementBlocker(
+            name = pass.name,
+            desired = pass.desired,
+            node = node,
+            cause = cause,
+            drainInFlight = pass.previous?.drain != null,
+            previous = pass.previous?.failure,
+            now = pass.now,
+            subject = "server",
+            consequence =
+                "the server that is running keeps running, with its players on it and its world where " +
+                    "it is",
+        )
 
     private suspend fun placeProxy(pass: ProxyPass): Placement {
         val spec = pass.definition.spec
@@ -461,6 +541,13 @@ public class Reconciler(
      * correct, just not the *current* definition — and carries the reason on
      * observed status, because a log line is not a surface an operator diagnoses
      * from.
+     *
+     * **Every branch that records a failure prefers it**, which the twenty-fifth
+     * audit's fourth warning found was true of `RUNNING` alone. On `EXITED` the
+     * pass recorded `CONTAINER_EXITED` and discarded the sentence naming the
+     * artefact that is missing — so "the proxy is down and cannot be rebuilt"
+     * reported only that it exited, and the one fact an operator could act on was
+     * in a log line.
      */
     private suspend fun convergeProxy(
         pass: ProxyPass,
@@ -470,6 +557,8 @@ public class Reconciler(
     ): ReconcileOutcome {
         val image = ensureProxyImage(pass, node, observation)
         return when (observation) {
+            // Unreachable with a [blocker], for the reason [converge] gives: a
+            // `REPLACEMENT` is named by comparing a hash read off a container.
             WorkloadObservation.Absent -> {
                 val created = node.ensureWorkload(pass.desired)
                 LOG.info(
@@ -489,7 +578,12 @@ public class Reconciler(
                         val created = node.ensureWorkload(pass.desired)
                         write(
                             pass,
-                            pass.draft(ServerPhase.CREATING, image = image, runtime = pass.identity(created)),
+                            pass.draft(
+                                ServerPhase.CREATING,
+                                image = image,
+                                runtime = pass.identity(created),
+                                failure = blocker,
+                            ),
                         ) { ReconcileOutcome.Progressed("proxy container created in the existing sandbox") }
                     }
 
@@ -497,7 +591,12 @@ public class Reconciler(
                         node.startWorkload(observation.handle)
                         write(
                             pass,
-                            pass.draft(ServerPhase.STARTING, image = image, runtime = pass.identity(observation)),
+                            pass.draft(
+                                ServerPhase.STARTING,
+                                image = image,
+                                runtime = pass.identity(observation),
+                                failure = blocker,
+                            ),
                         ) { ReconcileOutcome.Progressed("proxy container started") }
                     }
 
@@ -529,13 +628,19 @@ public class Reconciler(
                                 ServerPhase.STOPPED,
                                 image = image,
                                 runtime = pass.identity(observation),
-                                failure = failure,
+                                // "It exited" is true and unactionable; "and the
+                                // artefact it needs is not on this node" is the one
+                                // an operator can do something about.
+                                failure = blocker ?: failure,
                             ),
-                        ) { ReconcileOutcome.Failed(message) }
+                            // The outcome follows the failure that was recorded: a
+                            // `Failed` beside a retryable status is two answers to
+                            // "is the loop still trying".
+                        ) { blocker?.let { ReconcileOutcome.Retry(it.message) } ?: ReconcileOutcome.Failed(message) }
                     }
 
                     WorkloadState.UNKNOWN -> {
-                        write(pass, pass.draft(ServerPhase.UNKNOWN, image = image)) {
+                        write(pass, pass.draft(ServerPhase.UNKNOWN, image = image, failure = blocker)) {
                             ReconcileOutcome.Waiting(
                                 "the runtime did not report a usable container state",
                                 config.containerPollInterval,
@@ -627,13 +732,25 @@ public class Reconciler(
                     runtime = pass.identity(observation),
                     endpoint = endpoint,
                     control = control,
-                    failure = failure,
+                    // Same rule as every other branch: see [convergeProxy].
+                    failure = blocker ?: failure,
                 )
             return write(pass, status) {
-                if (within) {
-                    ReconcileOutcome.Waiting("the proxy is not joinable yet: $detail", config.readinessPollInterval)
-                } else {
-                    ReconcileOutcome.Retry("the proxy is not joinable: $detail")
+                when {
+                    blocker != null -> {
+                        ReconcileOutcome.Retry(blocker.message)
+                    }
+
+                    within -> {
+                        ReconcileOutcome.Waiting(
+                            "the proxy is not joinable yet: $detail",
+                            config.readinessPollInterval,
+                        )
+                    }
+
+                    else -> {
+                        ReconcileOutcome.Retry("the proxy is not joinable: $detail")
+                    }
                 }
             }
         }
@@ -795,6 +912,14 @@ public class Reconciler(
                 // here rather than letting the loop below refuse N times says what
                 // is wrong once, in the operator's terms, and skips assertions that
                 // could not have landed.
+                //
+                // It reaches `failure` and not `control`: `ControlEndpointStatus`
+                // has no field for "answering, but not to us", so a dashboard shows
+                // `reachable = true, compatible = true` beside a failure saying
+                // nothing can be sealed. **When that field lands, fill it from this
+                // branch.** The temptation is a second, authenticated probe inside
+                // `readControl`, which would be one more round trip per pass to
+                // learn what this `when` already knows.
                 is ControlOutcome.Refused if state.code == ControlErrorCode.UNAUTHENTICATED -> {
                     val message =
                         "the proxy's control endpoint is answering but rejecting this orchestrator's " +
@@ -1230,7 +1355,18 @@ public class Reconciler(
         val name: ResourceName = definition.metadata.name
         val previous: VelocityProxyStatus? = stored.status?.status as? VelocityProxyStatus
         val agent: VelocityProxyAgent = VelocityProxyAgent(definition)
-        val desired: WorkloadSpec = VelocityWorkloadPlanner.plan(definition)
+
+        /**
+         * The workload this proxy should be, including which Velocity it runs.
+         *
+         * [ReconcilerConfig.velocityBuild] is forwarded rather than read inside the
+         * planner: the planner is a pure derivation and this is the only place that
+         * holds the deployment's configuration. Forwarding it also means the
+         * environment variable the container gets and the spec-hash entry it is
+         * recorded under are one resolved value — see
+         * `VelocityWorkloadPlanner.pinnedBuild` for why they may never differ.
+         */
+        val desired: WorkloadSpec = VelocityWorkloadPlanner.plan(definition, config.velocityBuild)
 
         fun isBlockedByPermanentFailure(): Boolean {
             val failed =
@@ -1534,16 +1670,30 @@ public class Reconciler(
      * The steps are ordered the way the runtime requires — image, then
      * workload, then start, then readiness — and exactly one of them happens
      * per pass.
+     *
+     * [blocker] is set only when a replacement was wanted and [replacementBlocker]
+     * refused it. The server then converges as it always would — it is running and
+     * correct, just not the *current* definition — and carries the reason on
+     * observed status, because a log line is not a surface an operator diagnoses
+     * from. It is preferred over every failure a branch here would record for
+     * itself: "the container exited" is true and says nothing about the artefact
+     * that is missing, and the second sentence is the one that tells an operator
+     * what to do.
      */
     private suspend fun converge(
         pass: Pass,
         node: Node,
         observation: WorkloadObservation,
+        blocker: FailureStatus? = null,
     ): ReconcileOutcome {
         val storage = pass.storageStatus(observation)
         val image = ensureImage(pass, node, observation)
 
         return when (observation) {
+            // Unreachable with a [blocker] and deliberately left alone: a
+            // `REPLACEMENT` is named by comparing a spec hash *read off a
+            // container*, so a pass carrying one has observed a container. If that
+            // ever stops holding, `ensureWorkload` adopts rather than duplicates.
             WorkloadObservation.Absent -> {
                 val created = node.ensureWorkload(pass.desired)
                 LOG.info(
@@ -1573,7 +1723,11 @@ public class Reconciler(
                     runtime = pass.runtimeIdentity(observation),
                     storage = storage,
                     drain = null,
-                    failure = failure,
+                    // The blocker wins where both are set. A server that cannot be
+                    // replaced *and* has something else wrong with it has two
+                    // problems and one field; the one an operator has to act on is
+                    // the one that stops the definition being applied at all.
+                    failure = blocker ?: failure,
                 )
 
                 when (observation.state) {
@@ -1608,7 +1762,7 @@ public class Reconciler(
                     }
 
                     WorkloadState.RUNNING -> {
-                        awaitJoinable(pass, node, observation, image, storage)
+                        awaitJoinable(pass, node, observation, image, storage, blocker)
                     }
 
                     // Nothing restarts this. There is no restart policy in the
@@ -1637,7 +1791,12 @@ public class Reconciler(
                             WorkloadRef(pass.name, node.name),
                             message,
                         )
-                        write(pass, status(ServerPhase.STOPPED, failure)) { ReconcileOutcome.Failed(message) }
+                        // The outcome follows whichever failure was recorded, and it
+                        // has to: a `Failed` beside a retryable status is two answers
+                        // to "is the loop still trying".
+                        write(pass, status(ServerPhase.STOPPED, failure)) {
+                            blocker?.let { ReconcileOutcome.Retry(it.message) } ?: ReconcileOutcome.Failed(message)
+                        }
                     }
 
                     WorkloadState.UNKNOWN -> {
@@ -1667,6 +1826,7 @@ public class Reconciler(
         observation: WorkloadObservation.Present,
         image: ImageStatus?,
         storage: StorageStatus,
+        blocker: FailureStatus? = null,
     ): ReconcileOutcome {
         val probe = pass.agent.probe(node, observation.handle)
         val endpoint =
@@ -1693,14 +1853,17 @@ public class Reconciler(
             // player left, the node came back — leaves a stale record behind.
             // Reaching a joinable server means it is over.
             drain = null,
-            failure = failure,
+            // See the note in [converge]: an unbuildable replacement outranks
+            // whatever else this pass found.
+            failure = blocker ?: failure,
         )
 
         return when (probe) {
             is ProbeOutcome.Joinable -> {
                 val players = PlayerOccupancy(online = probe.online, max = probe.max, observedAt = pass.now)
                 write(pass, status(ServerPhase.RUNNING, ready = true, players = players)) {
-                    ReconcileOutcome.Settled("running and joinable")
+                    blocker?.let { ReconcileOutcome.Retry(it.message) }
+                        ?: ReconcileOutcome.Settled("running and joinable")
                 }
             }
 
@@ -1772,10 +1935,14 @@ public class Reconciler(
                     LOG.error("server={} cannot be probed for readiness: {}", pass.name, probe.detail)
                 }
                 write(pass, status(ServerPhase.UNKNOWN, ready = false, players = null, failure = failure)) {
-                    if (probe.retryable) {
-                        ReconcileOutcome.Retry(probe.detail)
-                    } else {
-                        ReconcileOutcome.Failed(probe.detail)
+                    when {
+                        // The status carries the blocker, which is retryable, so
+                        // the outcome must be too.
+                        blocker != null -> ReconcileOutcome.Retry(blocker.message)
+
+                        probe.retryable -> ReconcileOutcome.Retry(probe.detail)
+
+                        else -> ReconcileOutcome.Failed(probe.detail)
                     }
                 }
             }
@@ -2551,8 +2718,32 @@ public data class ReconcilerConfig(
      * the loop keeps retrying, which is what `failure-modes.md` item 7 requires.
      */
     val drainAttentionAfter: Duration = 15.minutes,
+    /**
+     * The Velocity build every proxy this orchestrator creates is pinned to, or
+     * null for the one it ships against
+     * ([mcorch.core.proxy.VelocityWorkloadPlanner.VELOCITY_BUILD]).
+     *
+     * The only entry here that is not a cadence, and it is here because of what it
+     * costs to get wrong. The build is a spec-hash input, so changing it drains and
+     * recreates every proxy — and a proxy's own drain seals its login path and
+     * waits for the last player to log off, because a fleet has one front door and
+     * there is nowhere to send anybody. Until this was settable, that wait had no
+     * exit an operator could reach: the value lived in a constant, so an
+     * orchestrator upgrade that bumped it closed the fleet's login path with no
+     * definition edit, no delete and no restart that reopened it.
+     *
+     * Leave it unset. Set it to the build a running fleet's containers were created
+     * with to hold them still across an upgrade, or to a newer one to lead a bump.
+     * Both are revertable and neither touches a server definition — which also
+     * means neither lifts a permanent failure, because that gate lifts on a
+     * generation bump or a delete and nothing else.
+     */
+    val velocityBuild: String? = null,
 ) {
     init {
+        require(velocityBuild == null || velocityBuild.isNotBlank()) {
+            "velocityBuild is the Velocity build proxies are pinned to; leave it null rather than blank"
+        }
         require(statusHeartbeat.isPositive()) { "statusHeartbeat must be positive" }
         require(readinessPollInterval.isPositive()) { "readinessPollInterval must be positive" }
         require(containerPollInterval.isPositive()) { "containerPollInterval must be positive" }

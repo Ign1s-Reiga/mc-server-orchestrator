@@ -266,21 +266,45 @@ public class LocalNode internal constructor(
     // ── workload lifecycle ───────────────────────────────────────────────────
 
     /**
-     * The create's own mount derivation, run and thrown away.
+     * The create's own container derivation, run and thrown away.
      *
-     * Deliberately [mountsFor] rather than a list of the things it checks. The
-     * whole value of the call is that it cannot answer "yes" to a question the
+     * Deliberately [containerSpecFor] rather than a list of the things it checks.
+     * The whole value of the call is that it cannot answer "yes" to a question the
      * create would answer "no" to, and it can only promise that by *being* the same
      * derivation — a re-implementation here would be a second enforcement point,
      * which is the thing the twenty-fourth audit asked not to add while asking for
      * the question to be asked earlier.
+     *
+     * ## It used to be [mountsFor], and that was one of two
+     *
+     * The twenty-fifth audit's second warning. `containerSpecFor` can refuse a
+     * workload in two ways — a mount it cannot build, and a secret reference that
+     * resolves to nothing — and this ran only the first. So an operator who
+     * repointed `spec.control.tokenSecret` (or `forwarding.secret`) at a secret not
+     * yet staged moved the spec hash, passed the pre-flight, and had the running
+     * proxy sealed, drained to zero, stopped and removed before the create asked
+     * the question that refuses permanently. Calling the *whole* derivation is what
+     * makes the sentence above true, and it is what makes a third refusal added to
+     * `containerSpecFor` tomorrow pre-flighted without anybody remembering to come
+     * back here.
+     *
+     * ## Presence, not material
+     *
+     * [SecretAccess.PRESENCE_ONLY] asks the secret store whether each reference
+     * resolves and never materialises a value. `SecretStore.resolve` is documented
+     * as a use-time call — "do not resolve early and carry the result around" — and
+     * a pre-flight has nothing to hand the material to, so materialising here would
+     * create copies of forwarding secrets for no purpose (CLAUDE.md invariant 4).
+     * The two arms refuse the same condition with the same message; the difference
+     * between them is a value nobody reads, and a reference that stops resolving
+     * between this call and the create is refused by the create exactly as before.
      *
      * `translating` for the same reason every other entry point uses it: a caller
      * of [Node] sees nothing but a [NodeException].
      */
     override suspend fun checkWorkload(spec: WorkloadSpec) {
         translating(NodeOperation.CREATE) {
-            mountsFor(spec)
+            containerSpecFor(spec, SecretAccess.PRESENCE_ONLY)
         }
     }
 
@@ -680,11 +704,28 @@ public class LocalNode internal constructor(
             linux = LinuxSandboxSpec(cgroupParent = cgroupParent),
         )
 
-    private suspend fun containerSpecFor(spec: WorkloadSpec): ContainerSpec =
+    /**
+     * Whether a derivation needs the secret **values** or only the answer to
+     * whether they are there.
+     *
+     * An enum rather than a boolean because the two arms differ in what they do
+     * with material, and a `true` at a call site would say nothing about which is
+     * which. The create needs [MATERIALISE]; a pre-flight that discards the result
+     * would be making copies of a forwarding secret for nothing.
+     */
+    private enum class SecretAccess {
+        MATERIALISE,
+        PRESENCE_ONLY,
+    }
+
+    private suspend fun containerSpecFor(
+        spec: WorkloadSpec,
+        secretAccess: SecretAccess = SecretAccess.MATERIALISE,
+    ): ContainerSpec =
         ContainerSpec(
             name = spec.server.value,
             image = ImageName(spec.image.canonical),
-            env = spec.env + resolveSecrets(spec.secretEnv),
+            env = spec.env + secretsFor(spec.secretEnv, secretAccess),
             command = spec.command,
             args = spec.args,
             mounts = mountsFor(spec),
@@ -740,12 +781,7 @@ public class LocalNode internal constructor(
     private suspend fun resolveSecrets(refs: Map<String, SecretRef>): Map<String, String> {
         if (refs.isEmpty()) return emptyMap()
         return refs.mapValues { (variable, ref) ->
-            val secret =
-                secrets.resolve(ref) ?: throw NodeException.Rejected(
-                    name,
-                    NodeOperation.CREATE,
-                    "the secret `${ref.name}/${ref.key}` needed for `$variable` is not in the secret store",
-                )
+            val secret = secrets.resolve(ref) ?: throw missingSecret(variable, ref)
             try {
                 secret.use { material -> String(material) }
             } finally {
@@ -753,6 +789,49 @@ public class LocalNode internal constructor(
             }
         }
     }
+
+    /**
+     * The environment contribution of [refs], with or without their values.
+     *
+     * Both arms refuse the same condition through [missingSecret], so the
+     * pre-flight and the create cannot come to different conclusions about a
+     * reference or word the refusal differently. What they differ in is whether
+     * material exists in this process at all.
+     */
+    private suspend fun secretsFor(
+        refs: Map<String, SecretRef>,
+        access: SecretAccess,
+    ): Map<String, String> =
+        when (access) {
+            SecretAccess.MATERIALISE -> {
+                resolveSecrets(refs)
+            }
+
+            SecretAccess.PRESENCE_ONLY -> {
+                for ((variable, ref) in refs) {
+                    if (!secrets.contains(ref)) throw missingSecret(variable, ref)
+                }
+                emptyMap()
+            }
+        }
+
+    /**
+     * One definition of "this workload names a secret that is not there", so the
+     * create's refusal and the pre-flight's are the same refusal.
+     *
+     * [NodeOperation.CREATE] in both cases, because that is the operation being
+     * refused: the pre-flight is the create's question asked earlier and reports
+     * nothing else. Names the coordinates and the variable, never the material.
+     */
+    private fun missingSecret(
+        variable: String,
+        ref: SecretRef,
+    ): NodeException.Rejected =
+        NodeException.Rejected(
+            name,
+            NodeOperation.CREATE,
+            "the secret `${ref.name}/${ref.key}` needed for `$variable` is not in the secret store",
+        )
 
     /**
      * Creates the host directories the runtime needs.

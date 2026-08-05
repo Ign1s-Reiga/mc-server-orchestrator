@@ -44,6 +44,24 @@ internal object ProxyFleet {
          * differing-secret one: two proxies routing to one backend means only one of
          * them would be told to stop during a drain, which is a live registration
          * pointing at a container on its way out.
+         *
+         * ## The exit, and the one that looks like it but is not
+         *
+         * The message tells an operator to make a selector stop matching, and that
+         * is deliberate rather than the shortest sentence available. Two
+         * qualifications the twenty-fifth audit verified:
+         *
+         * - **Deleting one of the proxies is not sufficient on its own.** A
+         *   tombstoned definition is still a row in `store.listAll()`, so it still
+         *   claims this backend, and it is only purged by `teardownProxy` once its
+         *   container is gone — which needs its own drain to reach zero players. On
+         *   a fleet that does not empty, deleting the proxy does not free the
+         *   backend, and an operator who did it and waited would see nothing change.
+         * - **Narrowing `spec.backends.selector` is the better exit, and it is
+         *   immediate.** The selector is deliberately *not* in
+         *   `VelocityWorkloadPlanner.canonicalSpec`, so editing it un-claims the
+         *   backend on the next pass with no container operation, no proxy
+         *   replacement and nobody disconnected.
          */
         data class Conflicted(
             val message: String,

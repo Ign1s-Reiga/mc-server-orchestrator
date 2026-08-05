@@ -2555,6 +2555,86 @@ internal class DrainController(
     }
 
     /**
+     * The compensating edge for **step 2**, taken when a drain parks with a seal
+     * in place that nothing else will ever lift.
+     *
+     * ## Why the level trigger is not enough for this subject
+     *
+     * The seal is asserted rather than issued precisely so that an abort needs no
+     * edge: a backend stops being sealed because the *proxy's* own pass re-asserts
+     * its admission from `DrainState.sealsBackend()`, which is false in
+     * `DRAIN_FAILED`, on every pass — including for a backend whose permanent abort
+     * has stopped its own passes. That argument has a counterparty in it, and it
+     * names a *third party*. For a subject that is asserting its own admission
+     * there is nobody else: the proxy's re-assertion lives in `assertBackends`,
+     * which a pass only reaches when it is *not* draining, and a drain whose cause
+     * persists takes the draining branch for ever. A permanent abort then freezes
+     * the passes altogether, and the front door is left running, ready, joinable to
+     * nobody, with the loop no longer looking at it.
+     *
+     * So the test is **"is there anything else that asserts this workload's
+     * admission"**, and the answer is no exactly when the subject has a seal and no
+     * [DrainRouter] — the same shape [sealIsPrecondition] keys on, for the
+     * neighbouring reason. Do not read it as "the proxy": a future subject that
+     * seals itself gets this for free, which is the point of asking the question in
+     * the type rather than about the kind.
+     *
+     * ## Why [blocked] deliberately does not do this
+     *
+     * A block is the protocol working: the drain has sealed the login path and is
+     * waiting for the last player to log off, and **the seal is the mechanism of
+     * that wait**. Releasing it there would refill the population the drain is
+     * waiting to drain, and a delete on a busy fleet could never complete — the
+     * state that ends in a manual `crictl stop`. A block also keeps requeueing, so
+     * nothing is abandoned. An abort is the opposite: this drain has stopped
+     * advancing, so the seal buys nothing and costs a fleet its logins.
+     *
+     * Best effort, and it says so. A seal that could not be asserted usually cannot
+     * be released either — the endpoint is not answering — and there is nothing
+     * useful to do about that but say which state the proxy has been left in. The
+     * residual window is the accepted one: a player may connect between this and a
+     * resumed drain re-sealing, and `requireEmpty` re-reads on the pass that stops.
+     */
+    private suspend fun releaseSeal(subject: DrainSubject) {
+        val seal = subject.seal ?: return
+        if (subject.router != null) return
+        when (val outcome = seal.assertAdmission(admits = true)) {
+            is SealOutcome.Asserted -> {
+                if (outcome.admits) {
+                    LOG.info(
+                        "released the login seal on server={}: its drain has parked, so it admits players again",
+                        subject.server,
+                    )
+                } else {
+                    LOG.warn(
+                        "server={} accepted the release of its login seal and still reports new players refused. " +
+                            "It is running and nobody can join it",
+                        subject.server,
+                    )
+                }
+            }
+
+            is SealOutcome.Refused -> {
+                LOG.warn(
+                    "server={} refused the release of its login seal after its drain parked: {}. It is running " +
+                        "and nobody can join it until this succeeds",
+                    subject.server,
+                    outcome.detail,
+                )
+            }
+
+            is SealOutcome.Unavailable -> {
+                LOG.warn(
+                    "server={} could not be reached to release its login seal after its drain parked: {}. It is " +
+                        "running and nobody can join it until this succeeds",
+                    subject.server,
+                    outcome.detail,
+                )
+            }
+        }
+    }
+
+    /**
      * Records a failure, leaves the container alone, and says how long this has
      * been going on.
      *
@@ -2585,6 +2665,11 @@ internal class DrainController(
         // is level-triggered and lapses on its own once this drain stops asserting
         // it; a deregistration does not, so it is undone here.
         val restored = restoreRegistration(subject, drain)
+        // …and "lapses on its own" is a sentence about a *third party* asserting it.
+        // For a subject that seals itself there is none, so the seal needs the same
+        // treatment as a deregistration. See [releaseSeal], which also says why the
+        // block path must not do this.
+        releaseSeal(subject)
         val failure =
             noteFailure(
                 server = server,
@@ -3364,6 +3449,26 @@ internal fun DrainStatus.readPlayers(
  * close that window — `requireEmpty` re-reads on the pass that stops, and that is
  * the guarantee — so the waiver takes on no risk that the accepted shape does not
  * already carry.
+ *
+ * ## How narrow the waiver is, by construction rather than by survey
+ *
+ * The paragraphs above argue that waiving is *safe* for a subject with no router.
+ * They do not say which subjects those are, and "a `PaperServer` behind a proxy
+ * always has both" is the kind of sentence a later edit falsifies quietly. The
+ * constructive version, which the twenty-fifth audit verified and asked to have
+ * written down:
+ *
+ * `Reconciler.drain` builds one `ProxyFleet.linkFor` result and passes that **same
+ * object** as `seal` and as `router`, so for every `PaperDrainSubject`
+ * `seal != null` if and only if `router != null`. A Paper subject therefore either
+ * has both counterparties, in which case the waiver's guard is false, or neither,
+ * in which case `holdSeal` returned `NothingToSeal` and this was never asked.
+ * `ProxyDrainSubject` overrides `router` with a `null` that is a `get()` — not a
+ * constructor parameter anything could fill — so it is the only subject this
+ * waiver can reach, and it is the subject the waiver was written for.
+ *
+ * The premise is one expression at one call site, so it is pinned there:
+ * `DrainWiringTest` asserts that the two arguments are the same name.
  */
 internal fun sealIsPrecondition(
     router: DrainRouter?,

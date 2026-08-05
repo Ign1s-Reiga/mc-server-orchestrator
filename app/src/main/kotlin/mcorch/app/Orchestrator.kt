@@ -153,7 +153,20 @@ public class Orchestrator private constructor(
                 // asks the scheduler, and neither of them counts.
                 val registry = StaticNodeRegistry(listOf(node))
                 val scheduler = SingleNodeScheduler(registry)
-                val reconciler = Reconciler(embedded.state, registry, scheduler, reconcilerConfig)
+                // The environment's Velocity pin overrides whatever a caller passed,
+                // and only when it is set. `MCORCH_VELOCITY_BUILD` is the operator's
+                // lever on a spec-hash input that would otherwise live in
+                // orchestrator source, and a lever the composition root drops is not
+                // one — see [ReconcilerConfig.velocityBuild].
+                val reconciler =
+                    Reconciler(
+                        embedded.state,
+                        registry,
+                        scheduler,
+                        reconcilerConfig.copy(
+                            velocityBuild = config.velocityBuild ?: reconcilerConfig.velocityBuild,
+                        ),
+                    )
                 LOG.info(
                     "orchestrator wired: node={} data={} volumes={}",
                     config.nodeName,

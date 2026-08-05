@@ -46,6 +46,16 @@ public data class OrchestratorConfig(
     val sandboxNamespace: String = DEFAULT_SANDBOX_NAMESPACE,
     /** See [LocalNodeConfig.cgroupParent]: its shape depends on the runtime's cgroup driver. */
     val cgroupParent: String? = LocalNodeConfig.DEFAULT_CGROUP_PARENT,
+    /**
+     * The Velocity build every proxy is pinned to, or null for the one this
+     * orchestrator ships against.
+     *
+     * The operator's lever on a spec-hash input that otherwise lives in orchestrator
+     * source. See [mcorch.core.ReconcilerConfig.velocityBuild] for what setting it
+     * is for and what leaving it unset means; it is here because a value nobody can
+     * set is not a lever, and this is the layer an operator configures.
+     */
+    val velocityBuild: String? = null,
 ) {
     public companion object {
         public const val ENDPOINT_VARIABLE: String = "MCORCH_CRI_ENDPOINT"
@@ -53,6 +63,7 @@ public data class OrchestratorConfig(
         public const val NODE_VARIABLE: String = "MCORCH_NODE_NAME"
         public const val CGROUP_VARIABLE: String = "MCORCH_CGROUP_PARENT"
         public const val ASSET_VARIABLE: String = "MCORCH_ASSET_DIR"
+        public const val VELOCITY_BUILD_VARIABLE: String = "MCORCH_VELOCITY_BUILD"
 
         public const val DEFAULT_SANDBOX_NAMESPACE: String = "mcorch"
         public const val DEFAULT_NODE_NAME: String = "local"
@@ -93,6 +104,10 @@ public data class OrchestratorConfig(
                 cgroupParent =
                     environment[CGROUP_VARIABLE]?.takeIf { it.isNotBlank() }
                         ?: LocalNodeConfig.DEFAULT_CGROUP_PARENT,
+                // Blank reads as unset, like every other optional variable here. A
+                // blank pin would otherwise be a spec-hash input of "", which is a
+                // fleet-wide recreate spelled as a typo.
+                velocityBuild = environment[VELOCITY_BUILD_VARIABLE]?.takeIf { it.isNotBlank() },
             )
         }
     }

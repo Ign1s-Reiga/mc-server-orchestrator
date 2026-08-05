@@ -356,6 +356,56 @@ internal class ProxyReconcileTest {
         }
 
     /**
+     * The blocker outranks "it exited", because only one of them can be acted on.
+     *
+     * The twenty-fifth audit's fourth warning. `convergeProxy` preferred the blocker
+     * over the routing failure in the `RUNNING` branch and dropped it everywhere
+     * else — so a proxy that is *down* and cannot be rebuilt reported
+     * `CONTAINER_EXITED`, permanently, and the sentence naming the artefact that is
+     * missing went to a log line. An operator reading the dashboard is told the
+     * container exited and nothing about why nothing replaces it.
+     *
+     * The class matters as much as the message: `CONTAINER_EXITED` is `PERMANENT`,
+     * which freezes the passes. Staging the artefact would then change nothing until
+     * somebody also edited the definition.
+     */
+    @Test
+    fun `a proxy that exited and cannot be rebuilt reports the artefact, not the exit`() =
+        coreTest {
+            val harness = ProxyHarness()
+            val name = harness.proxyDefinition.metadata.name
+            harness.bringUp()
+
+            harness.proxyNode.failAlways(
+                NodeOperation.CREATE,
+                NodeException.Rejected(
+                    harness.proxyNode.name,
+                    NodeOperation.CREATE,
+                    "`front-01` needs the VELOCITY_CONTROL_PLUGIN artefact and node `proxy-node` does not have it",
+                ),
+            )
+            // The container is gone and the definition has moved on: both problems
+            // at once, which is the state that has one status field between them.
+            val running = harness.proxyNode.workload.shouldBeInstanceOf<WorkloadObservation.Present>()
+            harness.proxyNode.workload =
+                running.copy(state = WorkloadState.EXITED, exitCode = 1, reason = "Error")
+            harness.declare(proxyDefinition(maxPlayers = 300))
+
+            harness.pass(name)
+
+            val status = harness.proxyStatus().shouldNotBeNull()
+            status.phase shouldBe ServerPhase.STOPPED
+            val failure = status.failure.shouldNotBeNull()
+            failure.reason shouldBe FailureReason.CONTAINER_CREATE_FAILED
+            failure.failureClass shouldBe FailureClass.RETRYABLE
+            failure.message shouldContain "cannot build the replacement"
+
+            // And the loop is still trying, which the recorded class promises: a
+            // frozen pass would make staging the artefact do nothing.
+            harness.pass(name).shouldBeInstanceOf<ReconcileOutcome.Retry>()
+        }
+
+    /**
      * A proxy that is answering, but not to us.
      *
      * The spec hash carries the control token's **coordinates** and never its

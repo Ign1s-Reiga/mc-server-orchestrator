@@ -57,6 +57,29 @@
 #            The argument's remaining precondition — step 7 being private, so
 #            callers in this file are all the callers — has no mutation, and the
 #            reason is written beside where one would go.
+#   D18..D19 the replacement pre-flight on the kind that holds worlds, in its two
+#            halves: the call removed (structural), and the call kept while its
+#            answer is dropped (behavioural). Only the second is a plausible edit,
+#            and no structural assertion can see it — which is the division of
+#            labour D10 established for gates, arriving one layer out.
+#   D20      the pre-flight narrowed back to the mounts alone: the subset that let
+#            a missing secret through the question and into a create that had
+#            already been drained for.
+#   D21      the premise the step-2 waiver's narrowness rests on — a Paper subject
+#            given a seal and no router, which is well-typed and would waive the
+#            seal for a *backend* whose proxy stopped answering.
+#   D22..D23 the seal's compensating edge, both directions: removed from `abort`,
+#            and added to `blocked` — the plausible edit, since both park in
+#            `DRAIN_FAILED`, and the one that would refill the population a delete
+#            is waiting to drain.
+#   D24..D25 the Velocity pin: dropped between the configuration and the planner,
+#            and split so that the container's environment and the spec hash come
+#            from different expressions. The second is the quiet one — a proxy
+#            created running one build and recorded as running another is drained
+#            and recreated on every pass, for ever.
+#   D26      an unbuildable replacement's failure discarded on the branch where the
+#            container has also exited, which is the branch where an operator most
+#            needs to be told which of the two to fix.
 #   C1..C3   controls: the rule deleted outright, once per assertion arm. If these
 #            do not redden, the harness is not reaching the assertions at all.
 #   S1       the self-test. See below.
@@ -102,10 +125,16 @@ BACKUP_DIR="$(mktemp -d -t drain-wiring-XXXXXX)"
 
 CONTROLLER=core/src/main/kotlin/mcorch/core/DrainController.kt
 RECONCILER=core/src/main/kotlin/mcorch/core/Reconciler.kt
+LOCAL_NODE=core/src/main/kotlin/mcorch/core/node/LocalNode.kt
+PLANNER=core/src/main/kotlin/mcorch/core/proxy/VelocityWorkloadPlanner.kt
 
 WIRING=mcorch.core.DrainWiringTest
 RULES=mcorch.core.SaveEvidenceTest
 DRAIN=mcorch.core.DrainTest
+PROXY_DRAIN=mcorch.core.ProxyDrainTest
+PROXY_RECONCILE=mcorch.core.ProxyReconcileTest
+REPLACEMENT=mcorch.core.ReplacementTest
+PLANNING=mcorch.core.proxy.VelocityWorkloadPlannerTest
 
 # The test cases, by name. A mutation names the ones it must redden and no others.
 EXIT='nothing leaves advance that has not been through the record-level rule'
@@ -116,6 +145,16 @@ BACKSTOP='stop has one caller, reached from a branch that has already asked mayS
 ADOPTS='a pass entry adopts the confirmation clause of its reading and no more'
 RECORDS='a recorded pass cannot carry a confirmed save beside a player count'
 RESTARTED='a stop is not re-issued at a container that restarted underneath the drain'
+ASKS_FIRST='every pass that decides to drain asks first whether the replacement can be built'
+PREFLIGHT="the replacement pre-flight runs the create's own container derivation"
+SAME_LINK='a Paper subject is given the same object as its seal and its router'
+KEPT_RUNNING='a server whose replacement the node cannot build is not drained, and keeps running'
+KEPT_PLAYING='players are not drained for a replacement the node cannot build'
+RELEASES='a proxy drain that aborts permanently releases its own login seal'
+KEEPS_SEAL='a proxy drain waiting for players to leave keeps its login seal on'
+PIN_EXIT='an operator can pin a proxy fleet back onto the build its containers were created with'
+ONE_VALUE='a pinned Velocity build reaches the container and the hash as one value'
+ARTEFACT='a proxy that exited and cannot be rebuilt reports the artefact, not the exit'
 
 # Single-quoted throughout: these are literals, and one of them contains the
 # quoting characters of two languages.
@@ -224,6 +263,44 @@ STOP_CALL='        if (router == null || drain.deregisteredAt != null) return st
 # one somebody can narrow with every test in the suite green.
 DRAIN_SUBSTITUTED='        if (router == null || drain.deregisteredAt != null) return stop(pass, drain.copy(deregisteredAt = now))'
 
+# The Paper pass's pre-flight, with the comment above it: the proxy path's call is
+# written identically one screen down, so the literal has to carry its context.
+PAPER_PREFLIGHT='                    // [replacementBlocker].
+                    val blocker = replacementBlocker(pass, placement.node, cause)'
+# The branch that uses the answer. Keeping the call and dropping its result is the
+# edit a structural assertion cannot see, and the only one of the two that somebody
+# would really write.
+PAPER_BRANCH='                    when {
+                        blocker != null -> converge(pass, placement.node, observation, blocker)
+                        cause == null -> converge(pass, placement.node, observation)
+                        else -> drain(pass, placement.node, observation, cause, binding)
+                    }'
+PAPER_BRANCH_DROPPED='                    if (cause == null) {
+                        converge(pass, placement.node, observation)
+                    } else {
+                        drain(pass, placement.node, observation, cause, binding)
+                    }'
+# The pre-flight'"'"'s own derivation, and the subset it used to be.
+PREFLIGHT_DERIVATION='            containerSpecFor(spec, SecretAccess.PRESENCE_ONLY)'
+PREFLIGHT_SUBSET='            mountsFor(spec)'
+# The waiver'"'"'s premise, at the one call site that establishes it.
+SUBJECT_ROUTER='                router = link,'
+# The seal'"'"'s compensating edge, in `abort`.
+SEAL_RELEASE='        releaseSeal(subject)'
+# `blocked`'"'"'s first two lines, to put the same edge in front of. Both park in
+# `DRAIN_FAILED`, so "make them consistent" is the obvious edit — and it releases the
+# seal that is the mechanism of the wait a block is waiting out.
+BLOCK_ENTRY='        val restored = restoreRegistration(subject, drain)
+        val block = recordBlock(reason, message, now, drain.blocked)'
+# The deployment'"'"'s Velocity pin, between the configuration and the planner.
+PIN_FORWARDED='VelocityWorkloadPlanner.plan(definition, config.velocityBuild)'
+# The resolved pin reaching the container'"'"'s environment. The hash entry is taken
+# from the same value two lines up; this is what splitting them looks like.
+PIN_IN_ENVIRONMENT='                    put(VELOCITY_VERSION, velocity)'
+# The blocker preferred over the exit failure, on the branch where both are true.
+EXIT_PREFERENCE='                                // an operator can do something about.
+                                failure = blocker ?: failure,'
+
 # name @@ file @@ class @@ testcases that must redden (";"-separated) @@ literal @@ replacement
 #
 # `@@` because a field holds Kotlin: `|` was the separator until a literal
@@ -301,6 +378,40 @@ MUTATIONS=(
     # 'private-in-class' parameter type 'DrainPass'", so widening it means widening
     # `DrainPass` in the same change, which is not a quiet edit. The assertion stays
     # because that day may come; the compiler is what refuses it today.
+    # The pre-flight the world-holding kind went without. The call, first: a
+    # `REPLACEMENT` decided with no question asked of the node.
+    "D18@@$RECONCILER@@$WIRING@@$ASKS_FIRST@@$PAPER_PREFLIGHT@@                    val blocker: FailureStatus? = null"
+    # And the half no shape can carry: the question asked, the answer thrown away.
+    "D19@@$RECONCILER@@$REPLACEMENT@@$KEPT_RUNNING;$KEPT_PLAYING@@$PAPER_BRANCH@@$PAPER_BRANCH_DROPPED"
+    # The pre-flight narrowed to one of the create's two refusals, which is what it
+    # was when a repointed secret drained a proxy to zero before anybody asked.
+    "D20@@$LOCAL_NODE@@$WIRING@@$PREFLIGHT@@$PREFLIGHT_DERIVATION@@$PREFLIGHT_SUBSET"
+    # The waiver's premise. Well-typed, quiet, and it hands the seal waiver to a
+    # backend whose proxy has stopped answering.
+    "D21@@$RECONCILER@@$WIRING@@$SAME_LINK@@$SUBJECT_ROUTER@@                router = null,"
+    # The compensating edge removed: a proxy left running, ready and joinable to
+    # nobody, with the loop no longer passing over it.
+    "D22@@$CONTROLLER@@$PROXY_DRAIN@@$RELEASES@@$SEAL_RELEASE@@        Unit"
+    # And added where it must not be. A block is the protocol working, and the seal
+    # is what lets the wait end.
+    #
+    # It claims two names, and the second is a fact about the defect rather than
+    # noise: the pin's exit test demonstrates the blackout by asserting the login
+    # path is shut while the replacement drain waits, so a seal released on a block
+    # means there was never a blackout to have an exit from. Both reddened for the
+    # one reason, and D22 is the entry that isolates the edge on its own.
+    "D23@@$CONTROLLER@@$PROXY_DRAIN@@$KEEPS_SEAL;$PIN_EXIT@@$BLOCK_ENTRY@@$BLOCK_ENTRY
+        releaseSeal(subject)"
+    # The operator's lever dropped between the configuration and the planner: the
+    # knob still exists, and nothing reads it.
+    "D24@@$RECONCILER@@$PROXY_DRAIN@@$PIN_EXIT@@$PIN_FORWARDED@@VelocityWorkloadPlanner.plan(definition)"
+    # The environment and the hash taken from different expressions. Nothing fails
+    # at create time; the container simply never matches the hash it was recorded
+    # under, so the loop drains and recreates it on every pass.
+    "D25@@$PLANNER@@$PLANNING@@$ONE_VALUE@@$PIN_IN_ENVIRONMENT@@                    put(VELOCITY_VERSION, VELOCITY_BUILD)"
+    # The artefact's message discarded on the branch that reports a container which
+    # has also exited — where the operator is told the unactionable half.
+    "D26@@$RECONCILER@@$PROXY_RECONCILE@@$ARTEFACT@@$EXIT_PREFERENCE@@                                failure = failure,"
     "C1@@$CONTROLLER@@$WIRING@@$EXIT@@$RULE@@val recorded = progress"
     "C2@@$CONTROLLER@@$WIRING@@$STEPPED@@$ADOPTION@@val observed = drain"
     "C3@@$CONTROLLER@@$RULES@@$ADOPTS@@$CLAUSE@@is PlayerReading.Occupied -> this"
@@ -312,6 +423,8 @@ restore() {
         case "$(basename -- "$backup")" in
             DrainController.kt) cp -- "$backup" "$REPO_ROOT/$CONTROLLER" ;;
             Reconciler.kt) cp -- "$backup" "$REPO_ROOT/$RECONCILER" ;;
+            LocalNode.kt) cp -- "$backup" "$REPO_ROOT/$LOCAL_NODE" ;;
+            VelocityWorkloadPlanner.kt) cp -- "$backup" "$REPO_ROOT/$PLANNER" ;;
         esac
     done
 }
@@ -322,7 +435,7 @@ restore() {
 # the same trap that restores the source: this script's own printed verdict is the
 # record of the run, and it names the tests it reddened.
 discard_reports() {
-    for class in "$WIRING" "$RULES" "$DRAIN"; do
+    for class in "$WIRING" "$RULES" "$DRAIN" "$PROXY_DRAIN" "$PROXY_RECONCILE" "$REPLACEMENT" "$PLANNING"; do
         rm -f -- "$RESULTS/TEST-$class.xml"
     done
 }
@@ -336,6 +449,8 @@ trap cleanup EXIT INT TERM
 
 cp -- "$REPO_ROOT/$CONTROLLER" "$BACKUP_DIR/DrainController.kt"
 cp -- "$REPO_ROOT/$RECONCILER" "$BACKUP_DIR/Reconciler.kt"
+cp -- "$REPO_ROOT/$LOCAL_NODE" "$BACKUP_DIR/LocalNode.kt"
+cp -- "$REPO_ROOT/$PLANNER" "$BACKUP_DIR/VelocityWorkloadPlanner.kt"
 
 apply() {
     LITERAL="$2" REPLACEMENT="$3" python3 - "$1" <<'PY'

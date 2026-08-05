@@ -1,15 +1,23 @@
 package mcorch.core
 
+import io.kotest.matchers.booleans.shouldBeFalse
+import io.kotest.matchers.booleans.shouldBeTrue
+import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.collections.shouldHaveSize
+import io.kotest.matchers.nulls.shouldBeNull
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.types.shouldBeInstanceOf
 import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
 import mcorch.schema.DrainState
+import mcorch.schema.FailureClass
 import mcorch.schema.MemoryQuantity
+import mcorch.schema.ServerPhase
 import org.junit.jupiter.api.Test
 import kotlin.time.Duration.Companion.minutes
+import kotlin.time.Duration.Companion.seconds
 
 /**
  * A definition change that needs the container recreated.
@@ -173,6 +181,116 @@ internal class ReplacementTest {
             status.conditions
                 .single { it.type == ConditionType.WORLD_SAVED }
                 .status shouldBe ConditionStatus.FALSE
+        }
+
+    /**
+     * The twenty-fifth audit's third warning: the pre-flight existed on the proxy
+     * path only, and the kind that holds worlds went without it.
+     *
+     * `storage.mountPath`, `rcon.secret` and the *proxy's* forwarding secret are all
+     * in a `PaperServer`'s spec hash, and every one of them can be edited into a
+     * value the create refuses permanently — a relative mount path, a secret
+     * reference that is not staged yet. A stored row reaches the same place without
+     * an edit at all, because `DefinitionCodec` does not re-run the YAML reader's
+     * validation. So: hash mismatch, drain, world saved, container stopped, container
+     * removed, and only then a create that refuses for ever. No world is lost, and a
+     * running server is taken down and cannot come back.
+     *
+     * ## Why the scenario has nobody on the server
+     *
+     * Zero players is the number that makes this test about *this* guard. With
+     * players on, the drain's own zero-player gate blocks it at step 2 and nothing is
+     * stopped whatever this code does — the assertions below would pass against the
+     * build that has the defect. The destructive path needs an empty server, and an
+     * empty server is the ordinary state of one being replaced out of hours.
+     *
+     * `stops` and `removals` are the load-bearing assertions. `drain` being null is
+     * the discriminator for the *shape*: the question is asked before the protocol
+     * begins, rather than by a drain that starts and then thinks better of it.
+     */
+    @Test
+    fun `a server whose replacement the node cannot build is not drained, and keeps running`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.node.creates shouldHaveSize 1
+
+            // The shape round 24 moved out of `StorageRequest.Persistent.init` and
+            // into the node: a value only the create refuses, and permanently.
+            harness.node.failAlways(
+                NodeOperation.CREATE,
+                NodeException.Rejected(
+                    harness.node.name,
+                    NodeOperation.CREATE,
+                    "`storage.mountPath` must be an absolute path inside the container",
+                ),
+            )
+            harness.declare(paperDefinition(image = "docker.io/itzg/minecraft-server:2026.7.0"))
+
+            repeat(8) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+
+            // Nothing was taken away on the strength of being able to build a
+            // replacement that cannot be built.
+            harness.node.stops.shouldBeEmpty()
+            harness.node.removals.shouldBeEmpty()
+            harness.node.creates shouldHaveSize 1
+            harness.node.saves.shouldBeEmpty()
+
+            val status = harness.status(name).shouldNotBeNull()
+            status.phase shouldBe ServerPhase.RUNNING
+            status.ready.shouldBeTrue()
+            status.drain.shouldBeNull()
+            val failure = status.failure.shouldNotBeNull()
+            // Retryable, and the class is a mechanism rather than a preference: the
+            // remedy is an operator staging something, which bumps no generation, and
+            // `isBlockedByPermanentFailure` lifts on nothing else.
+            failure.failureClass shouldBe FailureClass.RETRYABLE
+            failure.message shouldContain "cannot build the replacement"
+            failure.message shouldContain "its world where it is"
+        }
+
+    /**
+     * The same guard, with players on: they are never sealed, moved or waited for.
+     *
+     * The test above is the one that reddens against the defect; this is the one
+     * that says what an operator sees. A drain that starts and blocks on players is
+     * a `DRAIN_INITIATED` condition, a server excluded from being anybody's transfer
+     * destination and a proxy-side seal — all of it in aid of a replacement that
+     * cannot happen.
+     */
+    @Test
+    fun `players are not drained for a replacement the node cannot build`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.node.online = 4
+
+            harness.node.failAlways(
+                NodeOperation.CREATE,
+                NodeException.Rejected(harness.node.name, NodeOperation.CREATE, "the artefact is not on this node"),
+            )
+            harness.declare(paperDefinition(image = "docker.io/itzg/minecraft-server:2026.7.0"))
+
+            repeat(6) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+
+            val status = harness.status(name).shouldNotBeNull()
+            status.drain.shouldBeNull()
+            status.drainInitiated.shouldBeFalse()
+            status.ready.shouldBeTrue()
+            status.players.shouldNotBeNull().online shouldBe 4
+            harness.node.stops.shouldBeEmpty()
         }
 
     @Test

@@ -13,6 +13,7 @@ import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.string.shouldNotContain
+import mcorch.core.proxy.VelocityWorkloadPlanner
 import mcorch.schema.ConditionStatus
 import mcorch.schema.DrainBlockReason
 import mcorch.schema.DrainState
@@ -1442,6 +1443,280 @@ internal class ProxyDrainTest {
             node.stops shouldHaveSize 1
             harness.plugin.deregistrations shouldContain "survival-01"
             harness.store.getServer(name) shouldBe null
+        }
+
+    /**
+     * The twenty-fifth audit's first warning: an orchestrator upgrade must not
+     * close the fleet's login path with no way back.
+     *
+     * `velocity.build` is a spec-hash input, so bumping it is a replacement — and a
+     * proxy's replacement drain seals its own login path and then waits for the last
+     * player to log off, because a fleet has one front door and there is nowhere to
+     * send anybody. On a fleet that does not empty, that wait never ends. Every
+     * other hash input is a field an operator can put back; this one lived in
+     * orchestrator source, so the seal had **no exit** short of editing that source
+     * or `crictl stop`-ing a running, joinable front door.
+     *
+     * ## What the scenario has to contain to mean anything
+     *
+     * **Players, and they never leave.** At zero the drain simply completes, the
+     * proxy is recreated on the new build and there is no outage to see; the whole
+     * defect is about the fleet that does not empty. One backend, so the fleet's own
+     * `assertBackends` has something to admit — with nothing registered the proxy
+     * seals itself for an unrelated, ruled-on reason and `proxyAdmits` would read
+     * false whatever this test did.
+     *
+     * ## The assertions
+     *
+     * The seal at the wire is the load-bearing one, in both directions: false while
+     * the pinned build disagrees with the running container, and true again once the
+     * operator pins the build their containers were created with. A status field
+     * would not do — the harm is that *players cannot log in*, and that is a fact
+     * about the plugin, not about a record.
+     */
+    @Test
+    fun `an operator can pin a proxy fleet back onto the build its containers were created with`() =
+        coreTest {
+            val backend = backendDefinition("survival-01")
+            val harness = ProxyHarness(backends = listOf(backend))
+            val name = harness.proxyDefinition.metadata.name
+            harness.bringUp()
+            harness.plugin.proxyAdmits.shouldBeTrue()
+            val created = harness.proxyNode.creates.size
+
+            // Sixty players, and none of them log off for the rest of this test.
+            harness.proxyNode.online = 60
+
+            // The orchestrator is upgraded, and its bundled plugin now targets a
+            // newer Velocity. Same store, same node, same containers.
+            val upgraded =
+                Reconciler(
+                    harness.store,
+                    harness.registry,
+                    harness.scheduler,
+                    ReconcilerConfig(velocityBuild = "4.1.0"),
+                    harness.clock,
+                )
+            repeat(6) {
+                upgraded.reconcile(name)
+                harness.clock.advance(2.seconds)
+            }
+
+            // The replacement is wanted, correctly, and it cannot proceed: the front
+            // door is sealed and the players it is waiting for are still playing.
+            harness
+                .proxyStatus()
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .state shouldBe DrainState.DRAIN_FAILED
+            harness.plugin.proxyAdmits.shouldBeFalse()
+            harness.proxyNode.stops.shouldBeEmpty()
+
+            // The exit: pin the build the running containers were created with. No
+            // definition edit, no restart of anybody's server.
+            val pinned =
+                Reconciler(
+                    harness.store,
+                    harness.registry,
+                    harness.scheduler,
+                    ReconcilerConfig(velocityBuild = VelocityWorkloadPlanner.VELOCITY_BUILD),
+                    harness.clock,
+                )
+            repeat(4) {
+                pinned.reconcile(name)
+                harness.clock.advance(2.seconds)
+            }
+
+            // Logins are open again, at the wire, with the sixty players still on.
+            harness.plugin.proxyAdmits.shouldBeTrue()
+            val settled = harness.proxyStatus().shouldNotBeNull()
+            settled.drain shouldBe null
+            settled.ready.shouldBeTrue()
+            // And nothing was taken away to get here.
+            harness.proxyNode.stops.shouldBeEmpty()
+            harness.proxyNode.removals.shouldBeEmpty()
+            harness.proxyNode.creates shouldHaveSize created
+        }
+
+    /**
+     * The waiver, under the cause that actually fires on every proxy in existence.
+     *
+     * Both of the cases this waiver was written for drive `DELETION`, and the
+     * twenty-fifth audit pointed out that `REPLACEMENT` is the cause a proxy meets
+     * without anybody asking for anything. The two take different routes into the
+     * same drain — a tombstoned definition against a hash that no longer matches —
+     * and only one of them was exercised.
+     *
+     * Zero players, so the seal is not a precondition and the drain carries on
+     * without it, exactly as for a delete: the replacement completes, on a proxy
+     * whose control endpoint never answered once.
+     */
+    @Test
+    fun `a proxy at zero players whose endpoint is dead can still be replaced`() =
+        coreTest {
+            val harness = ProxyHarness()
+            val name = harness.proxyDefinition.metadata.name
+            harness.bringUp()
+            val created = harness.proxyNode.creates.size
+
+            harness.plugin.unreachable = true
+            val assertsBefore = harness.plugin.proxyAsserts.size
+            // A hash-bearing edit. `maxPlayers` is in the proxy's spec hash.
+            harness.declare(proxyDefinition(maxPlayers = 300))
+
+            repeat(12) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+
+            // Stopped, taken away and rebuilt — the exit exists for a replacement,
+            // not only for a delete.
+            harness.proxyNode.stops shouldHaveSize 1
+            harness.proxyNode.removals.shouldNotBeEmpty()
+            harness.proxyNode.creates shouldHaveSize created + 1
+            harness.proxyNode.creates
+                .last()
+                .specHash shouldBe VelocityWorkloadPlanner.plan(proxyDefinition(maxPlayers = 300)).specHash
+            // Nothing was claimed that did not happen: no seal landed at the wire.
+            harness.plugin.proxyAsserts shouldHaveSize assertsBefore
+        }
+
+    /**
+     * …and the park, under the same cause.
+     *
+     * With players on, the seal is doing real work — it is what lets the wait for
+     * zero end — so a proxy that cannot seal still parks, and the container it was
+     * asked to replace keeps running. The discriminator against a build that waived
+     * the seal unconditionally is the **recorded failure**: a waiver reports
+     * `Progressed` and records nothing, and both builds otherwise end parked.
+     */
+    @Test
+    fun `a proxy with players online still parks when a replacement finds its endpoint dead`() =
+        coreTest {
+            val harness = ProxyHarness()
+            val name = harness.proxyDefinition.metadata.name
+            harness.bringUp()
+
+            harness.proxyNode.online = 1
+            harness.plugin.unreachable = true
+            harness.declare(proxyDefinition(maxPlayers = 300))
+
+            harness.pass(name)
+            harness.clock.advance(2.seconds)
+            harness.pass(name)
+
+            val aborted =
+                harness
+                    .proxyStatus()
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            aborted.state shouldBe DrainState.DRAIN_FAILED
+            aborted.sealRequestedAt shouldBe null
+            val failure = aborted.failure.shouldNotBeNull()
+            failure.reason shouldBe FailureReason.PROXY_CONTROL_UNREACHABLE
+            failure.failureClass shouldBe FailureClass.RETRYABLE
+
+            harness.proxyNode.stops.shouldBeEmpty()
+            harness.proxyNode.removals.shouldBeEmpty()
+        }
+
+    /**
+     * A drain that parks permanently gives the login path back.
+     *
+     * The seal is asserted rather than issued so that an abort needs no compensating
+     * edge — but that argument names a *third party*: a backend is un-sealed by the
+     * proxy's own pass re-asserting its admission every pass. A proxy sealing
+     * **itself** has nobody to do that for it. Its own re-assertion lives in
+     * `assertBackends`, which only a non-draining pass reaches, and a permanent abort
+     * stops its passes altogether — so before this compensation the proxy was left
+     * running, ready, and joinable to nobody, with the loop no longer looking at it.
+     *
+     * ## Reaching a permanent abort without inventing a failure
+     *
+     * The route is the one the audit traced: a container whose `WORLD_DATA` label is
+     * missing — an image or a build older than the label — reads as *holding* world
+     * data, because that is the safe default. The drain then asks a Velocity proxy to
+     * confirm a world save, which it can never do, and that is `PERMANENT` at
+     * `SAVING`. The label is stripped from the observation rather than mocked at the
+     * planner, because what the drain reads is the container.
+     */
+    @Test
+    fun `a proxy drain that aborts permanently releases its own login seal`() =
+        coreTest {
+            val harness = ProxyHarness()
+            val name = harness.proxyDefinition.metadata.name
+            harness.bringUp()
+
+            // The container predates the label. A drain has to assume it holds a
+            // world, and no proxy can confirm a save.
+            val observed = harness.proxyNode.workload as WorkloadObservation.Present
+            harness.proxyNode.workload = observed.copy(labels = observed.labels - Labels.WORLD_DATA)
+            harness.store.deleteDefinition(name)
+
+            repeat(6) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+
+            val parked =
+                harness
+                    .proxyStatus()
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            parked.state shouldBe DrainState.DRAIN_FAILED
+            val failure = parked.failure.shouldNotBeNull()
+            failure.failureClass shouldBe FailureClass.PERMANENT
+            // Nothing is going to move those players, and nothing is going to run
+            // another pass over this proxy either…
+            harness.proxyNode.stops.shouldBeEmpty()
+            // …so the seal it put on had to come off on the way past. This is the
+            // assertion: at the wire, the front door admits players.
+            harness.plugin.proxyAdmits.shouldBeTrue()
+            harness.plugin.proxyAsserts
+                .last()
+                .shouldBeTrue()
+        }
+
+    /**
+     * …and a drain that is merely *waiting* keeps the seal on.
+     *
+     * The counterpart to the test above, and the reason the compensation is on
+     * `DrainController.abort` alone. A block is the protocol working: the proxy has
+     * sealed its login path and is waiting for the last player to log off, and the
+     * seal is the mechanism of that wait. Releasing it there would refill the
+     * population the drain is waiting to drain, and a delete on a busy fleet could
+     * never complete — which is the state that ends in a manual `crictl stop`.
+     */
+    @Test
+    fun `a proxy drain waiting for players to leave keeps its login seal on`() =
+        coreTest {
+            val harness = ProxyHarness()
+            val name = harness.proxyDefinition.metadata.name
+            harness.bringUp()
+
+            harness.proxyNode.online = 3
+            harness.store.deleteDefinition(name)
+
+            repeat(8) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+
+            val waiting =
+                harness
+                    .proxyStatus()
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            waiting.blocked.shouldNotBeNull().reason shouldBe DrainBlockReason.AWAITING_ZERO_PLAYERS
+            // No failure: waiting for players is not a fault…
+            waiting.failure shouldBe null
+            // …and the login path stays shut, which is what lets the wait end.
+            harness.plugin.proxyAdmits.shouldBeFalse()
+            harness.proxyNode.stops.shouldBeEmpty()
         }
 
     /** Runs [body] when the stop is issued, so a test can assert on the order of side effects. */

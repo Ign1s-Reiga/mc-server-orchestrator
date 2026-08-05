@@ -145,10 +145,48 @@ internal object VelocityWorkloadPlanner {
      * the catalog's value out of a system property the build supplies and fails if
      * they differ, so a bump to one that forgets the other does not compile a green
      * suite.
+     *
+     * ## A hash input no operator can edit is a replacement with no exit
+     *
+     * The twenty-fifth audit's first warning, and it is a property of the *shape*
+     * rather than of this value. A proxy whose spec hash moves is drained: its own
+     * drain seals the login path and waits for the last player to log off, because
+     * a fleet has one front door and there is nowhere to send anybody. That wait is
+     * unbounded by design. So for every hash input the operator can edit — the
+     * image, the memory, `maxPlayers` — the seal has an exit, which is to put the
+     * value back; and for an input that lives in this file it had none. Bumping
+     * this constant sealed every proxy in the fleet on its first pass after the
+     * deploy, existing players kept playing, nobody could join, and the only ways
+     * out were editing orchestrator source or `crictl stop`.
+     *
+     * That is why the value reaching [plan] and [canonicalSpec] is a *parameter*
+     * with this constant as its default, supplied from
+     * `ReconcilerConfig.velocityBuild` and from `MCORCH_VELOCITY_BUILD` at the top
+     * of `:app`. The pin keeps every property it was added for — a running proxy's
+     * Velocity cannot change underneath it, and a bump still drains the fleet onto
+     * the new build by the ordinary replacement path — and gains the one it was
+     * missing: an operator can hold their fleet on the build its containers were
+     * created with, or lead a bump, without editing this file. Setting it to a
+     * build the mounted plugin cannot load is a proxy with no control endpoint,
+     * reported as `PROXY_CONTROL_UNREACHABLE`; that is a visible, revertable
+     * mistake, which is the trade being made against a fleet-wide login blackout.
+     *
+     * **`plugin.protocol` is the same shape and deliberately has no such lever.**
+     * It names what the mounted JAR *speaks*, so an operator pinning it would be
+     * asserting something about an artefact rather than choosing a version, and the
+     * honest repair for a protocol bump is the recreate. The exposure it leaves is
+     * real and is named in the report rather than papered over here.
      */
     const val VELOCITY_VERSION: String = "VELOCITY_VERSION"
 
-    /** See [VELOCITY_VERSION]. Pinned to the `velocity-api` `:velocity-plugin` compiles against. */
+    /**
+     * The default [VELOCITY_VERSION], pinned to the `velocity-api`
+     * `:velocity-plugin` compiles against.
+     *
+     * The default rather than the value: see [VELOCITY_VERSION] for why a
+     * deployment can pin its own, and [pinnedBuild] for the single place the two
+     * become one answer.
+     */
     const val VELOCITY_BUILD: String = "4.0.0"
 
     const val FORWARDING_SECRET: String = "VELOCITY_FORWARDING_SECRET"
@@ -173,14 +211,33 @@ internal object VelocityWorkloadPlanner {
     const val INIT_MEMORY: String = "INIT_MEMORY"
     const val MAX_MEMORY: String = "MAX_MEMORY"
 
-    fun plan(definition: VelocityProxyDefinition): WorkloadSpec {
+    /**
+     * The Velocity build this deployment pins, resolved.
+     *
+     * **The one place the default is applied**, so the environment variable the
+     * container is given and the `velocity.build` entry the hash is taken over
+     * cannot come from different answers. They must not: a container created with
+     * one and recorded under the other is a workload whose hash never matches, so
+     * the loop drains and recreates it on every pass for ever.
+     */
+    private fun pinnedBuild(build: String?): String = build ?: VELOCITY_BUILD
+
+    /**
+     * @param build the Velocity build this deployment pins, or null for the one
+     *   this orchestrator ships against ([VELOCITY_BUILD]).
+     */
+    fun plan(
+        definition: VelocityProxyDefinition,
+        build: String? = null,
+    ): WorkloadSpec {
         val spec = definition.spec
         val name = definition.metadata.name
+        val velocity = pinnedBuild(build)
         return WorkloadSpec(
             server = name,
             kind = definition.kind,
             image = spec.image,
-            specHash = specHash(definition),
+            specHash = specHash(definition, velocity),
             // A proxy holds no world. This is the branch CLAUDE.md invariant 2
             // exempts by name — "only disposable lobbies and minigame instances
             // may be treated as ephemeral" — and a proxy qualifies for the
@@ -208,7 +265,10 @@ internal object VelocityWorkloadPlanner {
                     // Second, and for a related reason: `TYPE` decides that this is
                     // Velocity at all, and this decides *which* Velocity. Unset, the
                     // image takes the newest published build at container start.
-                    put(VELOCITY_VERSION, VELOCITY_BUILD)
+                    //
+                    // The same resolved value the hash was taken over, by
+                    // construction — see [pinnedBuild].
+                    put(VELOCITY_VERSION, velocity)
                     put(FORWARDING_MODE, spec.forwarding.mode.wireValue)
                     put(CONTROL_PORT, spec.control.port.toString())
                     put(INIT_MEMORY, jvmMemory(spec.resources.heap.min.bytes))
@@ -294,8 +354,12 @@ internal object VelocityWorkloadPlanner {
      * Velocity, which is precisely the state that made a proxy undrainable. See
      * [VELOCITY_VERSION].
      */
-    fun specHash(definition: VelocityProxyDefinition): String {
-        val digest = MessageDigest.getInstance("SHA-256").digest(canonicalSpec(definition).toByteArray(Charsets.UTF_8))
+    fun specHash(
+        definition: VelocityProxyDefinition,
+        build: String? = null,
+    ): String {
+        val canonical = canonicalSpec(definition, build)
+        val digest = MessageDigest.getInstance("SHA-256").digest(canonical.toByteArray(Charsets.UTF_8))
         return digest.take(HASH_BYTES).joinToString("") { "%02x".format(it) }
     }
 
@@ -304,15 +368,23 @@ internal object VelocityWorkloadPlanner {
      *
      * Separate so a test can assert *membership* rather than only that two hashes
      * differ. Most entries here are checked by varying the definition, which a
-     * constant like the Velocity build has no way to express — and "the hash is
+     * constant like the control protocol has no way to express — and "the hash is
      * equal to itself" is an assertion that cannot fail.
+     *
+     * The `velocity.build` entry keeps its wording and its position when [build] is
+     * unset, and that is load-bearing rather than incidental: a proxy created by a
+     * build that had no lever here must not be replaced by one that has, or the
+     * lever would be introduced by way of the outage it exists to prevent.
      */
-    fun canonicalSpec(definition: VelocityProxyDefinition): String {
+    fun canonicalSpec(
+        definition: VelocityProxyDefinition,
+        build: String? = null,
+    ): String {
         val spec = definition.spec
         return buildList {
             add("kind=${definition.kind.wireValue}")
             add("image=${spec.image.canonical}")
-            add("velocity.build=$VELOCITY_BUILD")
+            add("velocity.build=${pinnedBuild(build)}")
             add("memory=${spec.resources.memory.bytes}")
             add("cpu=${spec.resources.cpu?.millicores ?: "unset"}")
             add("heap.max=${spec.resources.heap.max.bytes}")

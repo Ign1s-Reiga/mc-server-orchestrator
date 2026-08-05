@@ -466,6 +466,135 @@ internal class DrainWiringTest {
             listOf(RECONCILER_PATH to "teardownProxy", RECONCILER_PATH to "teardown")
     }
 
+    /**
+     * The premise the step-2 waiver's narrowness rests on.
+     *
+     * [sealIsPrecondition] waives a failed step 2 for a subject with a
+     * [DrainSeal] and no [DrainRouter], and the argument that this is narrow is
+     * *constructive*: `Reconciler.drain` builds one link and passes the **same
+     * object** as both, so a `PaperDrainSubject` has either both counterparties or
+     * neither, and `ProxyDrainSubject` — whose `router` is a `get() = null` nothing
+     * can fill — is the only subject the waiver can reach.
+     *
+     * `PaperDrainSubject(seal = link, router = null)` is well-typed, both parameters
+     * default to null, and under it a *backend* whose proxy stopped answering would
+     * carry on draining on the strength of one Server List Ping and stop a container
+     * a proxy is still routing players to. Nothing in the type system refuses it, and
+     * no scenario would show it as long as the reconciler keeps passing both — so
+     * the premise is asserted here rather than left in the KDoc that argues from it.
+     *
+     * Follows the name rather than restating `link`: a rename stays green, a
+     * substitution reddens.
+     */
+    @Test
+    fun `a Paper subject is given the same object as its seal and its router`() {
+        val reconciler = Source.of(RECONCILER_PATH)
+        val built = reconciler.lines.indices.filter { mentions(reconciler.lines[it], "PaperDrainSubject") }
+
+        built shouldHaveSize 1
+        val arguments =
+            reconciler.lines
+                .drop(built.single() + 1)
+                .takeWhile { !codeOf(it).trimStart().startsWith(")") }
+                .map { codeOf(it).trim() }
+
+        fun argument(name: String): String =
+            arguments
+                .single { it.startsWith("$name = ") }
+                .removePrefix("$name = ")
+                .removeSuffix(",")
+
+        // Control: both counterparties are supplied here, by name, from something
+        // that is a name rather than a literal.
+        argument("seal") shouldMatch Regex("""\w+""")
+        argument("seal") shouldBe argument("router")
+    }
+
+    /**
+     * No kind drains for a replacement its node was never asked about.
+     *
+     * A drain destroys the container it is replacing. Asking the node whether it can
+     * build the replacement *after* that is a correct refusal at the wrong moment —
+     * the twenty-fourth audit's finding on the proxy path, and the twenty-fifth's on
+     * the path that holds worlds, where the pre-flight had simply never been added.
+     *
+     * ## Classified rather than enumerated
+     *
+     * The unit is "a function that computes a drain cause", not a list of the two
+     * kinds that exist today. A third kind must compute a cause before it can drain,
+     * so it lands in this scan by construction rather than by somebody remembering
+     * to extend a list — which is the failure mode this test is about in the first
+     * place.
+     */
+    @Test
+    fun `every pass that decides to drain asks first whether the replacement can be built`() {
+        val reconciler = Source.of(RECONCILER_PATH)
+        val causes =
+            reconciler.lines.indices
+                .filter { DRAIN_CAUSE.containsMatchIn(codeOf(reconciler.lines[it])) && isCode(reconciler.lines[it]) }
+                .filterNot { DECLARATION.containsMatchIn(reconciler.lines[it]) }
+                .map { reconciler.enclosing(it) }
+
+        // Control: the scan found the pass entries rather than nothing, and one per
+        // kind. A third kind makes this two and is meant to.
+        causes.map { it.name }.toSet() shouldBe setOf("reconcilePaper", "reconcileProxy")
+
+        causes.forEach { pass ->
+            val body = reconciler.codeIn(pass.body)
+            withClue("${pass.name} computes a drain cause without a replacement pre-flight") {
+                body.count { codeOf(it).contains("replacementBlocker(") } shouldBe 1
+            }
+            // …and asks before it drains, which is the whole point. `drain(` and
+            // `drainProxy(` are the two ways into `DrainController` from here.
+            val asked = body.indexOfFirst { codeOf(it).contains("replacementBlocker(") }
+            val drains = body.indexOfFirst { ENTERS_DRAIN.containsMatchIn(codeOf(it)) }
+            withClue("${pass.name} drains before it asks") {
+                (drains > asked) shouldBe true
+            }
+        }
+    }
+
+    /**
+     * The pre-flight is the create's own derivation, not a subset of it.
+     *
+     * `LocalNode` is the one file `:core`'s tests may not call into, so this is a
+     * claim about its source. It ran [mountsFor] alone, which is one of the two ways
+     * `containerSpecFor` can refuse a workload — so a secret reference that resolves
+     * to nothing passed the pre-flight, the proxy was drained to zero, stopped and
+     * removed, and the create then refused permanently.
+     *
+     * What is asserted is that there is nothing left to be a subset *of*: the
+     * pre-flight calls the whole derivation, and each refusable half is reached from
+     * exactly one place. A third refusal added to `containerSpecFor` is then
+     * pre-flighted without anybody coming back here.
+     */
+    @Test
+    fun `the replacement pre-flight runs the create's own container derivation`() {
+        val local = Source.of(LOCAL_NODE_PATH)
+        val preflight = local.codeIn(local.rangeOf("checkWorkload"))
+
+        preflight.count { codeOf(it).contains("containerSpecFor(") } shouldBe 1
+        // Nothing else: a derivation written here is the subset that let a secret
+        // through, whatever it is a derivation of.
+        withClue("the pre-flight re-derives part of the create instead of running it") {
+            preflight.none { codeOf(it).contains("mountsFor(") || codeOf(it).contains("secrets.") } shouldBe true
+        }
+
+        fun calls(name: String) =
+            local.lines.indices
+                .filter { mentions(local.lines[it], name) }
+                .filterNot { DECLARATION.containsMatchIn(local.lines[it]) }
+
+        // One create and one pre-flight…
+        calls("containerSpecFor") shouldHaveSize 2
+        // …and each half that can refuse is reached only through it.
+        calls("mountsFor") shouldHaveSize 1
+        calls("secretsFor") shouldHaveSize 1
+        // The refusal itself is one value, so the pre-flight cannot word or classify
+        // it differently from the create that follows.
+        calls("missingSecret") shouldHaveSize 2
+    }
+
     private data class Binding(
         val name: String,
         val value: String,
@@ -607,11 +736,19 @@ internal class DrainWiringTest {
         /** A string literal, so a keyword scan cannot be fooled by prose. */
         val STRING = Regex(""""([^"\\]|\\.)*"""")
 
+        /** `drainCause(` or `proxyDrainCause(` — a call, never the `DrainCause` type. */
+        val DRAIN_CAUSE = Regex("""\w*[Dd]rainCause\(""")
+
+        /** The two calls in `Reconciler` that hand a pass to `DrainController`. */
+        val ENTERS_DRAIN = Regex("""\bdrain(Proxy)?\(""")
+
+        const val LOCAL_NODE_PATH: String = "src/main/kotlin/mcorch/core/node/LocalNode.kt"
+
         /** The interface and the implementations of it — the files that perform, never decide. */
         val NODE_FILES =
             listOf(
                 "src/main/kotlin/mcorch/core/Node.kt",
-                "src/main/kotlin/mcorch/core/node/LocalNode.kt",
+                LOCAL_NODE_PATH,
             )
 
         const val CONTROLLER_PATH: String = "src/main/kotlin/mcorch/core/DrainController.kt"
