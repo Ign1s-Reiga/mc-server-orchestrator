@@ -55,8 +55,9 @@ internal class DrainTest {
             harness.node.saves shouldHaveSize 1
             harness.node.stops shouldHaveSize 1
             harness.node.removals shouldHaveSize 1
-            // The grace period comes from the definition, which the schema
-            // guarantees exceeds the save timeout.
+            // The grace period comes from the definition. This is a `PaperServer`,
+            // so the schema guarantees it exceeds *that server's* save timeout —
+            // a relation `ProxyLifecycleSpec` deliberately does not have.
             harness.node.stops
                 .single()
                 .second shouldBe definition.spec.lifecycle.stopGracePeriod
@@ -1254,6 +1255,78 @@ internal class DrainTest {
             // connected and the save no longer describes what they are doing.
             drain.failure shouldBe null
             drain.blocked.shouldNotBeNull().reason shouldBe DrainBlockReason.AWAITING_ZERO_PLAYERS
+        }
+
+    /**
+     * The other arm of `STOPPING`'s asymmetry: a probe that stops *answering* does
+     * not block the re-issue.
+     *
+     * `STOPPING` is the one stop-bearing state the zero-player gate does not wrap,
+     * and this is the reason. A container inside its stop grace period is expected
+     * to go quiet — that is what a server shutting down looks like — so routing this
+     * state through `requireEmpty`, which aborts on a probe that could not answer at
+     * all, would park the drain precisely when it is working correctly: backend
+     * already deregistered, kill already counting down, and nothing left that would
+     * re-register it.
+     *
+     * The sibling above pins the arm that *does* block, a positive count. Both are
+     * asserted now because the class KDoc states these two gates as the whole of the
+     * stop safety argument, and only one arm of the second one was covered.
+     *
+     * Nine seconds of silence, and the number is a choice rather than a round
+     * figure. Past `saveEvidenceMaxGap` (30s) the confirmation is voided for want of
+     * a witness and the drain goes back to `SAVING` — correct, and a different rule
+     * from the one under test. Inside it, the only thing that could stop the
+     * re-issue is the gate.
+     */
+    @Test
+    fun `a container that has gone quiet inside its grace period is still stopped`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.store.deleteDefinition(name)
+
+            // The stop is issued and does not take: the container is still running
+            // on the next pass, which is what brings the re-issue into play.
+            harness.node.onStop = { present -> present }
+            repeat(7) { harness.pass(name) }
+            harness.node.stops shouldHaveSize 1
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .state shouldBe DrainState.STOPPING
+
+            // And now it stops answering its Server List Ping.
+            harness.node.joinable = false
+            repeat(3) {
+                harness.pass(name)
+                harness.clock.advance(3.seconds)
+            }
+
+            val drain =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            drain.state shouldBe DrainState.STOPPING
+            // Neither an abort nor a block. Nothing was observed that says anything
+            // is wrong, and the drain is not waiting on anybody.
+            drain.failure shouldBe null
+            drain.blocked shouldBe null
+            // The instrument is not vacuous: the silence reached the re-issue, and
+            // the re-issue happened anyway.
+            harness.node.stops.size shouldBeGreaterThan 1
+            // The other half of the gate is untouched by the silence: the stop is
+            // re-issued *because* the confirmation is still current, and no second
+            // flush is sent at a container that is already going away.
+            drain.worldSaved.shouldBeTrue()
+            harness.node.saves shouldHaveSize 1
         }
 
     @Test

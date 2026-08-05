@@ -524,7 +524,8 @@ public class LocalNode internal constructor(
                 name,
                 NodeOperation.STOP,
                 "the stop grace period must be positive; it comes from spec.lifecycle.stopGracePeriod, which " +
-                    "the schema already guarantees exceeds the save timeout",
+                    "the schema validates at parse time — for a Paper server, to exceed that server's save " +
+                    "timeout; a Velocity proxy holds no world and has no such rule",
             )
         }
         val containerId =

@@ -84,17 +84,33 @@ import java.time.Duration as JavaDuration
  * destination search that never runs, and a transfer that refuses to move anybody
  * unless nobody is there is not a transfer.
  *
- * What replaces the old argument is narrower, not looser, and it is the claim that
- * actually matters:
+ * What replaces the old argument is narrower, not looser. There are **two** gates
+ * on [Node.stopWorkload], not one, and the second exists because the first cannot
+ * be applied where it stands:
  *
- * **No path reaches [Node.stopWorkload] except through [requireEmpty] followed by
- * `mayStop`.** The gate guards `SAVING`, `DEREGISTERED`, `STOPPING` and the
- * `DRAIN_FAILED` resume — the states that flush the world, let go of the backend
- * and take the container away — and those are the only states whose mistake loses
- * data. Steps 2, 3 and 4 have no [Node.stopWorkload] call and no edge to
- * `STOPPING` that does not pass through `SAVING`, so they cannot stop anything
- * however wrong they are; and [stop] re-asserts `mayStop` itself as a backstop for
- * a future edit that routes around the state machine.
+ * 1. **Step 7 itself** ([stop], reached from `DEREGISTERED`) is behind
+ *    [requireEmpty] followed by `mayStop`. [requireEmpty] guards `SAVING`,
+ *    `DEREGISTERED` and the `DRAIN_FAILED` resume — the states that flush the
+ *    world, let go of the backend and take the container away — and it aborts on a
+ *    probe that could not answer at all.
+ * 2. **The re-issue of that same stop** ([awaitStopped], in `STOPPING`) is behind an
+ *    inline [readPlayers] followed by `mayStop`. `STOPPING` is deliberately *not*
+ *    wrapped in [requireEmpty], and the difference is what an unanswered probe
+ *    means: a container inside its stop grace period is expected to stop answering,
+ *    so aborting on silence would leave a drain unable to finish exactly when it is
+ *    working correctly. A *positive* count blocks the re-issue in both.
+ *
+ * Both gates end in `mayStop`, so neither can issue a stop against a world that is
+ * not on disk, and [stop] re-asserts `mayStop` itself as a backstop for a future
+ * edit that routes around the state machine. Steps 2, 3 and 4 have no
+ * [Node.stopWorkload] call and no edge to `STOPPING` that does not pass through
+ * `SAVING`, so they cannot stop anything however wrong they are.
+ *
+ * The sentence above used to read "no path reaches [Node.stopWorkload] except
+ * through [requireEmpty] followed by `mayStop`", and it had been false since the
+ * re-issue was written. That the count is now two is held by `DrainWiringTest`
+ * rather than by this paragraph, because a KDoc carrying a maintained count of call
+ * sites is how the last three of these came to be wrong.
  *
  * Steps 3 and 4 get their own preconditions instead, which are the preconditions
  * of the thing they do: step 3 needs *a destination with capacity*, step 4 needs
@@ -142,13 +158,20 @@ internal class DrainController(
      * ## The one exit, and the one rule asserted on it
      *
      * Every [DrainProgress] this controller produces leaves through here, which
-     * makes this the point where the pass is *recorded*: the caller writes
-     * [DrainProgress.drain] and [DrainProgress.occupancy] onto one observed status,
-     * side by side. [dropSaveContradictedByPlayers] states the rule those two
-     * fields have to satisfy together, and it is asserted here rather than at the
-     * steps that build a progress because the defect it exists for is a step that
-     * does not think to ask — round 17's was a reader, round 18's was a step that
-     * read no count at all and aborted with what it was handed.
+     * makes this the point where the pass is *recorded*: [DrainProgress.drain] and
+     * [DrainProgress.occupancy] are the two facts it establishes, and they leave
+     * together. [dropSaveContradictedByPlayers] states the rule they have to satisfy
+     * together, and it is asserted here rather than at the steps that build a
+     * progress because the defect it exists for is a step that does not think to
+     * ask — round 17's was a reader, round 18's was a step that read no count at all
+     * and aborted with what it was handed.
+     *
+     * That this is the *only* exit is not a claim maintained here: `DrainWiringTest`
+     * asserts that `advanceOnce` is private with one caller, that this function
+     * returns nothing but the rule's result, and that the pass is stepped with the
+     * adopted reading. Both lines were jointly pinned and individually unpinned by
+     * the behavioural suite, for a reason that is not going to change — see that
+     * test's own note.
      *
      * It should never fire. `advanceOnce` establishes the pass's drain through
      * [readPlayers] and hands the same value to every state, so a positive count
@@ -2060,13 +2083,22 @@ internal class DrainController(
     }
 
     /**
-     * Step 7. The only container stop in this codebase.
+     * Step 7. The stop that ends a drain, and one of the two calls to
+     * [Node.stopWorkload] in this codebase — the other is [awaitStopped]'s re-issue
+     * of *this* stop, behind its own gate. See the class note for both.
      *
      * Everything it depends on has been established by the states above: zero
-     * players confirmed by a probe taken this pass, and — for a server with
-     * world data — a save the server itself reported as completed. The grace
-     * period comes from the definition, where the schema has already guaranteed
-     * it exceeds the save timeout.
+     * players confirmed by a probe taken this pass, and — for a workload with
+     * world data — a save the server itself reported as completed.
+     *
+     * The grace period is `spec.lifecycle.stopGracePeriod`, read through
+     * [DrainSubject.stopGracePeriod] and used as nothing but what the container stop
+     * is given. For a `PaperServer` the schema guarantees it exceeds that server's
+     * save timeout (`SpecInvariants.stopGraceProblem`); `ProxyLifecycleSpec` has no
+     * such rule and needs none, because a proxy holds no world to flush. Nothing
+     * here may read the value *as* a save timeout on the strength of the first half
+     * — [DrainSubject.saveTimeout] is the quantity for that, and the one place that
+     * made the substitution is written up in [goingRoundInCircles].
      */
     private suspend fun stop(
         pass: DrainPass,
