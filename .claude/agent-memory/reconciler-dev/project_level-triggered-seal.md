@@ -117,6 +117,20 @@ to any anchored bound:
    `pass.occupancy?.online ?: 0` in `exhausted`.
 3. Treat it like `saveRequestedAt`: one load-bearing field, covered by a test
    that drives the path where the ordinary stamp does not happen.
+4. **An anchor on a cycle detector must not be cleared by the success path.**
+   `resaveForcedAt` is cleared only by `forgetSaveEvidence` — an observed player
+   — so it spans laps. Round 19 asked whether a lap that reached `DEREGISTERED`
+   with a fresh confirmation should clear it; the answer is no, and the reason
+   generalises: **that is exactly what every lap of the cycle being detected
+   does**, so the clear would hand the allowance back once per lap and disable
+   the detector for the defect it was built for. The general test — would this
+   clear fire on a healthy lap *of the pathological cycle*? A drain that
+   genuinely finishes takes its whole record with it, so an anchor only ever
+   outlives laps, never a drain. The price is reporting: the figure may include
+   time the drain spent making honest progress, so state it as what it measures
+   ("a confirmation was first voided Ns ago and it has happened again") and never
+   restate the same number as "nothing has worked for Ns" — that second wording
+   is what sends an operator to `crictl stop`.
 
 ### A flag that names the exception is wrong the moment a second exception exists
 

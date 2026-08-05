@@ -70,6 +70,22 @@ Two things worth keeping from it:
   emptied after a play session waiting out a five-minute backoff; the loose rule
   on the failure record is the defect.
 
+## A re-scoping reaches the files you edited, not the claim you were fixing
+
+Round 18 narrowed "the schema guarantees the grace period exceeds the save
+timeout" to `PaperServer`, because `ProxyLifecycleSpec` has no such rule. It was
+applied to `DrainSubject` and `Node` — the two files the change touched — and
+left standing on `stop()`, the one function that issues the call, and in
+`LocalNode`'s non-positive-grace refusal, which is the wording an operator reads.
+Round 19 found both.
+
+**Grep the claim's words across the repo, not the files in the diff.** A claim
+that has to be re-scoped is a sentence, and sentences get copied to exactly the
+places that matter most: the call site and the error message. The same grep is
+what tells you which copies are already correctly scoped by their subject
+(`PaperWorkloadPlanner`'s is, because its parameter is a `PaperServerDefinition`)
+so you do not churn them.
+
 ## Arguing to leave something open
 
 When escalating a known hole rather than fixing it, **argue from what is at

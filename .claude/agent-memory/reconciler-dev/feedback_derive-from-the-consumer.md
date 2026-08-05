@@ -38,6 +38,22 @@ orchestrator and a real Paper server to surface.
   joinable" on the one abort reached *because* nothing could be confirmed about
   who was on the server.
 
+## A KDoc that argues from what a consumer does is a claim to check against it
+
+Round 19: the record-level save rule justified living on `DrainProgress` with
+"`Reconciler` writes them onto one observed status side by side". It writes
+`players = progress.occupancy ?: previous.players`, so on a pass whose probe did
+not answer the pair on the status is a *carried-forward* count beside *this*
+pass's drain. Harmless today and wrong as an argument, which is what the next
+reader inherits.
+
+The rule is genuinely over the pair a pass **established**, which is what
+`DrainProgress` carries — so the placement was right and the justification was
+about the wrong object. **When a doc comment reaches into another module to
+explain why something sits where it does, open that module.** The same habit that
+catches a wrong predicate catches a wrong rationale, and a wrong rationale is
+what a later change is judged against.
+
 ## Where such a test can live, and where it cannot
 
 `:api` has no `:core` dependency, not even for tests — so an `:api` test can only

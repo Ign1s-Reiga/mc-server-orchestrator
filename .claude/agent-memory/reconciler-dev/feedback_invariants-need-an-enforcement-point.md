@@ -1,6 +1,6 @@
 ---
 name: invariants-need-an-enforcement-point
-description: An invariant held by every call site doing the right thing is not enforced — collapse it into one function whose return type carries it, and distrust any comment that maintains a count of call sites
+description: An invariant held by every call site doing the right thing is not enforced — collapse it into one function whose return type carries it, distrust any comment counting call sites, and pin wiring that no input can exercise by asserting on the source
 metadata:
   type: feedback
 ---
@@ -74,6 +74,42 @@ the gate, so they agree — but no repair of a record can un-stop a container, a
 the net's value as a defect signal (it logs at error) depends on the primary
 keeping it unreachable. Say which is which in the test docstring, or the next
 reader deletes the one that "does nothing".
+
+## When the enforcement point cannot be behavioural, pin the wiring by shape
+
+The net-and-fix pair above has a property that took another round to name: **the
+primary makes the secondary unreachable, so no input can make the secondary
+fire, so no scenario test can pin it.** Delete either line and all 216 `:core`
+tests stay green. That is not a gap in those tests; it is what "unreachable by
+construction" means. The only thing left standing between the surviving half and
+a container stopped on an outlived save is a docstring — the same protection
+that failed in rounds 17 and 18.
+
+The answer is a test that reads the module's own sources.
+`velocity-plugin`'s `TransferNeverKicksTest` was already doing this for a
+different reason; `core/src/test/kotlin/mcorch/core/DrainWiringTest.kt` does it
+for wiring. Four assertions worth copying the shape of:
+
+- `advance` **binds** the rule's result and its only `return` returns that bound
+  name — follow a name the regex captured, never a literal line, so a rename or a
+  rewrap stays green and a deletion does not.
+- `advanceOnce` is `private` and has exactly **one** call site, which lies inside
+  `advance`'s line range. That is what makes "single exit" a fact rather than a
+  sentence.
+- The pass is stepped with the *adopted* reading, not the drain it was built from.
+- `stopWorkload` has exactly **two** call sites, one in each gate's function.
+
+That last one is the direct answer to this file's own rule: if you are about to
+write "there are exactly N such places" and you cannot collapse them, make the
+count a test. Two is the honest number and the class KDoc had been claiming one
+since `awaitStopped` learned to re-issue a stop.
+
+**A structural test needs a different red-proof.** Behavioural sabotage cannot
+work on it, so sabotage the *wiring*: remove the call at the record point,
+replace the adoption with the unvoided drain, add a third `stopWorkload` site as
+a dead private function. Each reddened exactly one test and nothing else — which
+is simultaneously the red-proof and the evidence for the finding that motivated
+the test. Report both halves; "only this test failed" is the load-bearing half.
 
 ## A borrowed constant carries the guarantees of the type it came from
 

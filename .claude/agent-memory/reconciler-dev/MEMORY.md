@@ -16,4 +16,4 @@
 - [Unreadable state posture](project_unreadable-state-posture.md) — a bad definition row cost the fleet; a bad observation was already safe via `getServer`, and the loop's skip only buys reporting.
 - [Level-triggered seal](project_level-triggered-seal.md) — assert, never issue; anchor rules; why a resume never clears a failure; four rulings open to overruling.
 - [Record where no work happens](project_record-where-no-work-happens.md) — the third critical from "did work ⇒ recovered", and why the fix was placement rather than a narrower rule.
-- [Invariants need an enforcement point](feedback_invariants-need-an-enforcement-point.md) — a rule every call site upholds is not enforced; a comment counting call sites is the signal to collapse them.
+- [Invariants need an enforcement point](feedback_invariants-need-an-enforcement-point.md) — a rule every call site upholds is not enforced; when no input can exercise the wiring, assert on the source.
