@@ -166,6 +166,17 @@ refuse the result — but it must also assert the class went red at all, because
 self-test whose own mutation fails to compile refuses for the wrong reason and
 reads exactly like a working one.
 
+**A mutation set proves what it ran, and the claim usually reaches further.** Twice
+now the set has mutated the shape that is caught *by construction* and left the
+real one unwritten: round 21's D6 put a stop in a file that was off the list
+anyway (the wrapper shape needed D13), and round 22's D14 put a removal in a file
+off the *removal* list, while the path the test exists for — rescheduling — lands
+in the one file already on it. Both times the run was honest about what it ran and
+was read as evidence for the general claim. **For every "X anywhere else is caught"
+assertion, ask which mutation lands in the location that is already listed**, and
+write it *before* the fix, so a not-caught entry states the finding in the
+instrument's voice rather than the auditor's.
+
 **A delimiter that can occur in the payload is a harness lying about its subject.**
 The mutation table was `name|file|class|literal|replacement`, and the first literal
 containing `||` split into the wrong fields, applied a replacement nobody wrote,

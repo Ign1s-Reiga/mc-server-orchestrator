@@ -1,6 +1,6 @@
 ---
 name: invariants-need-an-enforcement-point
-description: An invariant held by every call site doing the right thing is not enforced — collapse it into one function whose return type carries it, distrust any comment counting call sites, and pin wiring that no input can exercise by asserting on the source (shapes only: unconditional application, exits, gates, and classification rather than lists)
+description: An invariant held by every call site doing the right thing is not enforced — collapse it into one function whose return type carries it, distrust any comment counting call sites, and pin wiring that no input can exercise by asserting on the source (shapes only: unconditional application, exits, gates, classification rather than lists, and the call site rather than the file as the unit; prefer a constructive unreachability argument to a survey of inputs)
 metadata:
   type: feedback
 ---
@@ -184,6 +184,47 @@ in two places, and which moves the whole file onto the *performing* side. The un
 is the call, and performing means a call inside an **`override`** of the verb: a
 wrapper cannot write `override`, a distributed `Node` implementation can. The same
 correction applies to any "which files may do X" test.
+
+## The unit of a scan has to be smaller than where the danger would be written
+
+Round 22, and it is round 20's "classify the call, not the file" arriving one
+level lower. The removal pin listed the deciding **files** and read
+`["…/Reconciler.kt"]`. Rescheduling — the case the whole widening was performed
+for — is reconcile-loop work, so it lands in `Reconciler.kt`, which was already
+on the list carrying `teardown` and `teardownProxy`. A third, fourth or tenth
+removal decided there left the list unchanged, and the vacuity control beside it
+(`naming(v).size > deciding(v).size`) stayed true as well. Right verb, right
+alphabet, wrong unit.
+
+**Ask where the thing you are protecting against would actually be written, and
+make the assertion's unit smaller than that.** `path to enclosingFunctionName`
+per call site, not a set of paths. It stays a review trigger and it still fails
+open on a new `Node` implementation, because what is enumerated is *decisions*
+and an `override` is not one.
+
+## A constructive argument, not a survey of inputs
+
+The same round: I defended leaving one gate's condition unpinned with "invisible
+to every possible input". The auditor accepted the conclusion and flagged the
+argument, because the stronger form was available — `stop` has one caller, whose
+one branch hands it the *same* object the caller's own gate just tested with the
+same arguments in the same pass, and whose other branch returns without stopping.
+Nothing reaches it, rather than nothing anybody thought of. "Invisible to every
+input" is the round-18 and round-19 sentence, and both were enumerations that a
+later reader falsified.
+
+Two follow-ons:
+
+- **The facts a constructive argument rests on are call-site counts, so they go in
+  a test.** Otherwise the argument is the KDoc counting call sites that this file
+  opens by banning. Assert the count *and* the visibility that makes the count
+  complete: "one caller in this file" means nothing if the callee could be called
+  from another one.
+- **A mutation that will not compile can be an enforcement point you did not
+  know you had.** Widening `stop` to `internal` is rejected outright — it would
+  expose a `private`-in-class parameter type — so the visibility half has no
+  mutation. Write *why* where the mutation would have gone, and keep the
+  assertion for the day somebody widens both.
 
 ## A borrowed constant carries the guarantees of the type it came from
 
