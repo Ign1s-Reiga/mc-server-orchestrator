@@ -982,6 +982,54 @@ internal class DrainTest {
             later.failure shouldBe null
         }
 
+    /**
+     * The save-confirming pass writes down **two** instants, and they are not the
+     * same instant.
+     *
+     * `worldSavedAt` is when `save-all flush` came back; the occupancy's
+     * `observedAt` is when the probe *after* it answered. They were one value read
+     * once before the probe, which is the shape of the sixteenth audit's first
+     * critical — an instant that dates a reading to before the work that produced
+     * it — and the seventeenth round accepted that this fixture could not tell the
+     * two apart. It can: [FakeNode.exec] routes every command through `onExec`,
+     * `mc-monitor` included, so a ping that costs five seconds makes the gap
+     * something a test can read off the recorded status.
+     *
+     * Fused back into one instant read before the probe, the two are equal and this
+     * fails. That is the whole assertion; the drain reaching `DEREGISTERED` on one
+     * flush is here so it cannot pass by never getting to the branch.
+     */
+    @Test
+    fun `the occupancy recorded with a confirmed save is read after the probe that took it`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.store.deleteDefinition(name)
+
+            harness.node.onExec = { command ->
+                if (command.firstOrNull() == "mc-monitor") harness.clock.advance(5.seconds)
+                harness.node.defaultExec(command)
+            }
+
+            repeat(6) { harness.pass(name) }
+
+            val status = harness.status(name).shouldNotBeNull()
+            status.drain.shouldNotBeNull().state shouldBe DrainState.DEREGISTERED
+            harness.node.saves shouldHaveSize 1
+
+            val confirmedAt =
+                status.storage
+                    .shouldNotBeNull()
+                    .lastSaveConfirmedAt
+                    .shouldNotBeNull()
+            status.players
+                .shouldNotBeNull()
+                .observedAt shouldBe confirmedAt.plusSeconds(5)
+        }
+
     /** Runs [body] when the stop is issued, so a test can assert on the order of side effects. */
     private fun Harness.recordingStops(body: () -> Unit) {
         val runtime = node.onStop
@@ -2260,6 +2308,71 @@ internal class DrainTest {
             harness.node.saves shouldHaveSize 3
             harness.node.stops shouldHaveSize 1
             harness.store.getServer(name) shouldBe null
+        }
+
+    /**
+     * The allowance for a lap is the **save timeout**, and an unrelated grace
+     * period does not buy the defect more time to run.
+     *
+     * The bound was `saveEvidenceMaxGap + stopGracePeriod`, using the grace period
+     * as a stand-in for the save timeout on the strength of a schema guarantee that
+     * one exceeds the other. Sound in direction, and it hands an operator a lever
+     * they did not know they were pulling: `stopGracePeriod` is their number, capped
+     * at two hours, and setting a long one for a reason of their own — a world that
+     * takes for ever to unload, a runtime that is slow to reap — bought a two-hour
+     * escalation latency on a defect whose honest lap is about a minute. Meanwhile
+     * the drain flushes a multi-gigabyte world roughly once a minute, records no
+     * failure, and reads `NEEDS_ATTENTION = false` throughout.
+     *
+     * The scenario is the same silent livelock as the test above — a loop arriving
+     * every forty seconds, which is longer than a confirmation survives — with the
+     * two durations pulled apart. Thirteen minutes is far past
+     * `30s + saveTimeout` and nowhere near `30s + 2h`.
+     */
+    @Test
+    fun `a long stop grace period does not delay the report of a drain that keeps re-saving`() =
+        coreTest {
+            val harness = Harness(config = ReconcilerConfig(drainAttentionAfter = 10.minutes))
+            val definition = paperDefinition(saveTimeout = 3.minutes, stopGracePeriod = 2.hours)
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.store.deleteDefinition(name)
+
+            repeat(20) {
+                harness.pass(name)
+                harness.clock.advance(40.seconds)
+            }
+
+            // The instrument is not vacuous: this really is a drain flushing a live
+            // server's world over and over.
+            harness.node.saves.size shouldBeGreaterThan 3
+
+            val drain =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            val failure = drain.failure.shouldNotBeNull()
+            failure.reason shouldBe FailureReason.DRAIN_STALLED
+            failure.failureClass shouldBe FailureClass.RETRYABLE
+            failure.message shouldContain "never reaches the stop"
+
+            // The prognosis is gone from the wording, and this is the assertion for
+            // it. "It does not clear on its own" is the opposite of what a retryable
+            // abort means — `resumeInto` re-enters on the next pass — and an
+            // operator told a drain will not clear intervenes on the container,
+            // where the only intervention is a stop with no save. What replaces it
+            // is the measured fact and the two checks that would explain it.
+            failure.message shouldNotContain "It does not clear on its own"
+            failure.message shouldContain "has not cleared on its own in"
+
+            // Nothing was done to the container. `failure-modes.md` item 7 does not
+            // move because the bound moved.
+            harness.node.stops.shouldBeEmpty()
+            harness.node.removals.shouldBeEmpty()
+            harness.store.getServer(name).shouldNotBeNull()
         }
 
     /**

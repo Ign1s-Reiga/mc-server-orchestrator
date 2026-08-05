@@ -1,5 +1,6 @@
 package mcorch.core
 
+import io.kotest.matchers.booleans.shouldBeFalse
 import io.kotest.matchers.booleans.shouldBeTrue
 import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.collections.shouldContain
@@ -1151,4 +1152,156 @@ internal class ProxyDrainTest {
             harness.plugin.backend("survival-01").shouldNotBeNull()
             harness.store.getServer(name).shouldNotBeNull()
         }
+
+    /**
+     * The eighteenth audit's critical: a step that reads **no** player count parks
+     * a drain still holding a confirmation the same pass has just contradicted.
+     *
+     * Round 17 made a positive count void the confirmation *where the count is
+     * read*. `holdSeal` reads none — it asserts the seal and nothing else — and at
+     * `DEREGISTERED` it runs **before** the zero-player gate. So:
+     *
+     * 1. the save confirms on an empty server and the drain moves to
+     *    `DEREGISTERED`, still registered;
+     * 2. somebody connects straight to the backend's own port, which the proxy
+     *    cannot see and a Server List Ping can — the exact case the gate at
+     *    `DEREGISTERED` exists for;
+     * 3. the proxy's control endpoint stops answering (a restart, a plugin reload,
+     *    a node blip), so `holdSeal` aborts *first*, with the drain it was handed;
+     * 4. the abort touches neither the confirmation nor `playersEvacuated`, and the
+     *    pass records the player it saw — which advances `lastProbedAt` and so
+     *    **refreshes** the window keeping the confirmation alive rather than
+     *    breaking it;
+     * 5. they log off, the proxy comes back, and the resume ladder jumps straight
+     *    to the stop on a confirmation taken before they arrived.
+     *
+     * ## The numbers are chosen
+     *
+     * The outage runs for forty seconds of two-second passes, which is deliberately
+     * **longer** than `saveEvidenceMaxGap`. That is the point: the loop keeps
+     * probing throughout, so the observation-gap rule never fires and cannot be
+     * what protects the world here. Unlike round 17's window this one has no
+     * upper bound of its own — it lasts as long as the control channel is down.
+     *
+     * ## What each assertion separates
+     *
+     * `savedWhenStopped` is the load-bearing one, as in `DrainTest`: a drain that
+     * stopped on the stale confirmation and saved afterwards would satisfy a total
+     * of two. `playersEvacuated` staying true is the discriminator for the *shape*
+     * of the fix — the pass adopts the confirmation clause alone, not
+     * `forgetSaveEvidence`, so a parked proxied drain still re-enters at `SAVING`
+     * and blocks there instead of resuming into a destination search that this
+     * one-backend fleet could never satisfy.
+     *
+     * ## Which fix this reddens against, which is not what it looks like
+     *
+     * The change has two halves and **either one alone keeps this test green**.
+     * Sabotaging the pass-entry adoption in `advance` leaves it passing, because
+     * `dropSaveContradictedByPlayers` repairs the same record on the way out; both
+     * had to be disabled for it to fail, and then it fails twice — on
+     * `worldSaved` first and, with that assertion relaxed, on `savedWhenStopped`
+     * being 1.
+     *
+     * They are not redundant, and the difference is what a net cannot do. The net
+     * repairs what is *written*; the pass-entry adoption is what makes every
+     * *decision* in the pass see a drain that does not claim a save. Nothing today
+     * decides to stop before the zero-player gate, so today the two produce the same
+     * record — but a step that acted on `saveIsCurrent` before that gate would have
+     * stopped the container already, and no repair of the record afterwards can
+     * un-stop it. The net's own value is as a defect signal (it logs at error and
+     * says so), and that value depends on the adoption keeping it unreachable.
+     */
+    @Test
+    fun `a seal that cannot be asserted does not park a drain on a save a player has outlived`() =
+        coreTest {
+            val leaving = backendDefinition("survival-01")
+            val harness = ProxyHarness(backends = listOf(leaving))
+            val name = leaving.metadata.name
+            val node = harness.nodeOf(leaving)
+            harness.bringUp()
+            harness.store.deleteDefinition(name)
+
+            // requested, sealed, destination, transfer, save, deregistered.
+            repeat(6) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+            val confirmed =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            // The pass under test is the one *before* the deregistration, which is
+            // the only state where `holdSeal` still runs and a stop is one gate
+            // away.
+            confirmed.state shouldBe DrainState.DEREGISTERED
+            confirmed.worldSaved.shouldBeTrue()
+            confirmed.deregisteredAt shouldBe null
+            node.saves shouldHaveSize 1
+            node.stops.shouldBeEmpty()
+
+            // They connect to the backend's own port, and the proxy's control
+            // endpoint goes away in the same moment.
+            node.online = 1
+            harness.plugin.unreachable = true
+
+            repeat(20) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+
+            val parked =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            parked.state shouldBe DrainState.DRAIN_FAILED
+            parked.failure.shouldNotBeNull().reason shouldBe FailureReason.PROXY_CONTROL_UNREACHABLE
+            // The confirmation is gone, though nothing on this path ever read a
+            // player count.
+            parked.worldSaved.shouldBeFalse()
+            // And only the confirmation is gone.
+            parked.playersEvacuated.shouldBeTrue()
+            // The pass recorded the player it saw, which is what used to keep the
+            // evidence window fresh.
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .players
+                .shouldNotBeNull()
+                .online shouldBe 1
+            node.stops.shouldBeEmpty()
+            node.saves shouldHaveSize 1
+            harness.plugin.deregistrations.shouldBeEmpty()
+
+            // They log off and the proxy comes back.
+            node.online = 0
+            harness.plugin.unreachable = false
+
+            var savedWhenStopped = 0
+            node.recordingStops { savedWhenStopped = node.saves.size }
+            repeat(16) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+
+            // The world on disk includes whatever they built: the stop waited for a
+            // second flush taken after they had gone.
+            savedWhenStopped shouldBe 2
+            node.saves shouldHaveSize 2
+            node.stops shouldHaveSize 1
+            harness.plugin.deregistrations shouldContain "survival-01"
+            harness.store.getServer(name) shouldBe null
+        }
+
+    /** Runs [body] when the stop is issued, so a test can assert on the order of side effects. */
+    private fun FakeNode.recordingStops(body: () -> Unit) {
+        val runtime = onStop
+        onStop = { present ->
+            body()
+            runtime(present)
+        }
+    }
 }

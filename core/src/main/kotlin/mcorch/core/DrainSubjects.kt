@@ -28,6 +28,8 @@ internal class PaperDrainSubject(
 
     override val stopGracePeriod: Duration get() = definition.spec.lifecycle.stopGracePeriod
 
+    override val saveTimeout: Duration get() = definition.spec.lifecycle.drain.saveTimeout
+
     override val playerTransferTimeout: Duration get() = definition.spec.lifecycle.drain.playerTransferTimeout
 
     override val maxPlayers: Int get() = definition.spec.maxPlayers
@@ -70,6 +72,18 @@ internal class ProxyDrainSubject(
     override val server: ResourceName get() = definition.metadata.name
 
     override val stopGracePeriod: Duration get() = definition.spec.lifecycle.stopGracePeriod
+
+    /**
+     * A proxy holds no world, so a lap of its drain contains no save and nothing
+     * measuring one should be given an allowance for it.
+     *
+     * `ProxyLifecycleSpec` has no save timeout to read even if this wanted one —
+     * deliberately, and its KDoc says why. Zero is the honest answer rather than
+     * a stand-in: it makes the arithmetic in `goingRoundInCircles` correct for a
+     * proxy on its own terms, instead of correct because that branch happens to be
+     * unreachable for one.
+     */
+    override val saveTimeout: Duration get() = Duration.ZERO
 
     /**
      * There is no transfer, so nothing measures against this. It is the proxy's

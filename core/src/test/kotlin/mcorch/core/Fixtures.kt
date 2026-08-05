@@ -122,6 +122,18 @@ internal fun paperDefinition(
     hostPort: Int? = 30001,
     placement: PlacementSpec = PlacementSpec(),
     saveTimeout: Duration = 3.minutes,
+    /**
+     * Independent of [saveTimeout] on purpose, though the default is the schema's
+     * own derivation of it.
+     *
+     * They are two quantities and the schema only relates them one way — a
+     * `PaperServer`'s grace period must *exceed* the save timeout, not track it —
+     * so an operator may set a long one for a reason of their own. A fixture that
+     * could not express that made every `:core` test one where the two moved
+     * together, which is how a bound on a save came to be written in terms of the
+     * grace period.
+     */
+    stopGracePeriod: Duration = saveTimeout + 60.seconds,
     startupTimeout: Duration = 5.minutes,
     memoryBytes: Long = 4L * MemoryQuantity.GIB,
     heapBytes: Long = 3L * MemoryQuantity.GIB,
@@ -145,7 +157,7 @@ internal fun paperDefinition(
                 lifecycle =
                     LifecycleSpec(
                         drain = DrainSpec(saveTimeout = saveTimeout),
-                        stopGracePeriod = saveTimeout + 60.seconds,
+                        stopGracePeriod = stopGracePeriod,
                         startupTimeout = startupTimeout,
                     ),
                 placement = placement,

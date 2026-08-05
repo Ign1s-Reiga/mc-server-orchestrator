@@ -6,9 +6,11 @@ import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.types.shouldBeInstanceOf
+import io.kotest.matchers.types.shouldBeSameInstanceAs
 import mcorch.core.paper.ProbeOutcome
 import mcorch.schema.DrainState
 import mcorch.schema.DrainStatus
+import mcorch.schema.PlayerOccupancy
 import org.junit.jupiter.api.Test
 import java.time.Instant
 import kotlin.time.Duration.Companion.minutes
@@ -254,6 +256,97 @@ internal class SaveEvidenceTest {
             .readPlayers(ProbeOutcome.NotJoinable("no answer"), at)
             .shouldBeInstanceOf<PlayerReading.Unanswered>()
             .occupancy shouldBe null
+    }
+
+    /**
+     * The enforcement point for the same rule at the point a pass is **recorded**,
+     * which is where round 18 lost it.
+     *
+     * [readPlayers] can only bind a step that reads a count. `holdSeal` reads none —
+     * it asserts the seal, and at `DEREGISTERED` it runs before the zero-player
+     * gate — so when the proxy's control endpoint stopped answering it parked a
+     * drain still claiming a save taken before somebody joined on the backend's own
+     * port. The rule that actually holds is about the pair of facts a pass writes
+     * down together: `DrainController.advance` puts every progress through this on
+     * the way out, so a producer that never looks at a player count is bound by it
+     * anyway.
+     *
+     * Tested as a function for the reason the sibling above is: a scenario tests the
+     * producer somebody thought of, and both defects were producers nobody had.
+     */
+    @Test
+    fun `a recorded pass cannot carry a confirmed save beside a player count`() {
+        val confirmed = drain(start.plusSeconds(60))
+        val at = start.plusSeconds(90)
+        val outcome = ReconcileOutcome.Retry("parked")
+
+        fun progress(
+            record: DrainStatus,
+            online: Int?,
+        ) = DrainProgress(
+            drain = record,
+            occupancy = online?.let { PlayerOccupancy(online = it, max = 20, observedAt = at) },
+            outcome = outcome,
+        )
+
+        // The case the defect produced: an abort that recorded the player it saw
+        // and the confirmation it was handed. The confirmation does not survive
+        // the record.
+        val contradicted = progress(confirmed, online = 1).dropSaveContradictedByPlayers()
+        contradicted.drain.worldSaved.shouldBeFalse()
+        // And only the confirmation goes. Taking `playersEvacuated` with it would
+        // move a parked proxied drain down the resume ladder into a transfer.
+        contradicted.drain.playersEvacuated.shouldBeTrue()
+        contradicted.occupancy shouldBe progress(confirmed, online = 1).occupancy
+
+        // A zero reading corroborates the confirmation rather than contradicting
+        // it, and voiding here would make every healthy drain save for ever.
+        progress(confirmed, online = 0) shouldBe progress(confirmed, online = 0).dropSaveContradictedByPlayers()
+
+        // Nothing established: a pass that recorded no occupancy has observed
+        // nobody and has no grounds to take anything away. That is the same
+        // distinction [readPlayers] refuses to collapse.
+        progress(confirmed, online = null) shouldBe progress(confirmed, online = null).dropSaveContradictedByPlayers()
+
+        // Nothing to take. Identity matters as well as equality: an unchanged
+        // progress is how the caller decides whether to log a defect.
+        val nothing = progress(drain(null), online = 3)
+        nothing.dropSaveContradictedByPlayers() shouldBeSameInstanceAs nothing
+    }
+
+    /**
+     * The three voiders are a ladder, and the rungs differ by exactly one field
+     * each.
+     *
+     * Round 18's site needed the narrowest rung — the confirmation alone — and it
+     * did not exist, so the site took *none* of them and the drain kept a save a
+     * player had outlived. Naming the rung is what stops the next site making the
+     * same choice, and `worldSavedAt = null` is now written in one place with the
+     * other two composed from it.
+     */
+    @Test
+    fun `voiding the confirmation alone leaves where a parked drain re-enters unchanged`() {
+        val confirmed = drain(start.plusSeconds(60)).copy(saveRequestedAt = null, resaveForcedAt = start)
+
+        val unconfirmed = confirmed.unconfirmWorldSave()
+        unconfirmed.worldSaved.shouldBeFalse()
+        // The two facts the resume ladder reads below `saveIsCurrent`, both intact:
+        // a proxied drain parked here re-enters at `SAVING` and blocks on the
+        // player, rather than resuming into a transfer.
+        unconfirmed.playersEvacuated.shouldBeTrue()
+        unconfirmed.resaveForcedAt shouldBe start
+        unconfirmed.saveRequestedAt shouldBe null
+
+        // Each rung is the one below it plus one field, which is the property that
+        // keeps them from drifting apart.
+        confirmed.forgetSaveConfirmation() shouldBe unconfirmed.copy(playersEvacuated = false)
+        confirmed.forgetSaveEvidence() shouldBe
+            confirmed.forgetSaveConfirmation().copy(saveRequestedAt = null, resaveForcedAt = null)
+
+        // Nothing to void still compares equal, so an unchanged status does not
+        // become a store write.
+        val nothing = drain(null)
+        nothing.unconfirmWorldSave() shouldBe nothing
     }
 
     @Test

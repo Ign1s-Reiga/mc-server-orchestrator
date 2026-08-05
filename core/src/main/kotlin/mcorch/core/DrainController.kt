@@ -139,6 +139,24 @@ internal class DrainController(
      * Advances the drain by at most one step, performing at most one side
      * effect.
      *
+     * ## The one exit, and the one rule asserted on it
+     *
+     * Every [DrainProgress] this controller produces leaves through here, which
+     * makes this the point where the pass is *recorded*: the caller writes
+     * [DrainProgress.drain] and [DrainProgress.occupancy] onto one observed status,
+     * side by side. [dropSaveContradictedByPlayers] states the rule those two
+     * fields have to satisfy together, and it is asserted here rather than at the
+     * steps that build a progress because the defect it exists for is a step that
+     * does not think to ask — round 17's was a reader, round 18's was a step that
+     * read no count at all and aborted with what it was handed.
+     *
+     * It should never fire. `advanceOnce` establishes the pass's drain through
+     * [readPlayers] and hands the same value to every state, so a positive count
+     * and a live confirmation cannot coexist by the time a step runs. That is an
+     * argument about today's code; this is the thing that holds if it stops being
+     * true, and it fails safe — the confirmation goes, the drain saves again, and
+     * nothing is stopped on it.
+     *
      * @param current the drain recorded last pass, or null to start one.
      * @param lastProbedAt when a probe last answered for this server, or null if
      *   none ever has. The evidence chain is measured against it.
@@ -148,6 +166,43 @@ internal class DrainController(
      */
     @Suppress("LongParameterList")
     suspend fun advance(
+        subject: DrainSubject,
+        node: Node,
+        observation: WorkloadObservation,
+        current: DrainStatus?,
+        cause: DrainCause,
+        lastProbedAt: Instant?,
+        hadContainer: Boolean,
+    ): DrainProgress {
+        val progress =
+            advanceOnce(
+                subject = subject,
+                node = node,
+                observation = observation,
+                current = current,
+                cause = cause,
+                lastProbedAt = lastProbedAt,
+                hadContainer = hadContainer,
+            )
+        val recorded = progress.dropSaveContradictedByPlayers()
+        if (recorded !== progress) {
+            LOG.error(
+                "server={} was about to record a drain claiming a world save confirmed at {} in the same pass " +
+                    "that observed {} of {} player slots in use. The confirmation has been discarded, so the " +
+                    "drain saves again and nothing is stopped on it — but a step reached the record without " +
+                    "voiding it, which is a defect in the drain controller",
+                subject.server,
+                progress.drain.worldSavedAt,
+                progress.occupancy?.online,
+                progress.occupancy?.max,
+            )
+        }
+        return recorded
+    }
+
+    /** One pass, before the rule [advance] asserts on the way out. */
+    @Suppress("LongParameterList")
+    private suspend fun advanceOnce(
         subject: DrainSubject,
         node: Node,
         observation: WorkloadObservation,
@@ -303,17 +358,47 @@ internal class DrainController(
         // rest on — an occupancy instant is when an SLP answered, not when the
         // pass began.
         //
-        // **This is the one caller that takes the occupancy and not the drain**,
-        // and the reason is a behaviour change it must not make. A positive count
-        // voids the save evidence ([readPlayers]), and adopting the voided drain
-        // *here* would apply that to every state on the way past — including the
-        // resume ladder, which reads `playersEvacuated` and `worldSavedAt` to
-        // decide where a parked drain re-enters. A proxied drain would then
-        // resume into a transfer where it currently blocks. Nothing is lost by
-        // declining: every state that flushes a world, lets go of a backend or
-        // takes a container away reads the count itself, through the same
-        // function, and voids there.
-        val occupancy = drain.readPlayers(probe, now).occupancy
+        // **This caller adopts one clause of the reading and declines the rest**,
+        // and which clause is the whole of round 18's critical.
+        //
+        // *Adopted:* the confirmation. A positive count means anything this drain
+        // had saved is behind whatever that player is doing, and from here on every
+        // state in this pass sees a drain that does not claim a save. It used to
+        // take neither clause, on the argument that each state which flushes a
+        // world, lets go of a backend or takes a container away reads the count
+        // itself. They do — but only *after* the steps that run before them. At
+        // `DEREGISTERED`, [holdSeal] runs before [requireEmpty], reads no count, and
+        // aborts with whatever drain it was handed when the proxy's control endpoint
+        // does not answer. That abort parked a drain still claiming a save taken
+        // before the player arrived, the loop kept probing and so kept the evidence
+        // window fresh, and the pass after they logged off stopped the container on
+        // it. Blocks placed after the flush were lost. The rule that holds is about
+        // *recording*, not reading, so it is applied where the pass's drain is
+        // established rather than at the readers.
+        //
+        // *Declined:* `playersEvacuated`, `saveRequestedAt` and the re-save anchor —
+        // everything else [forgetSaveEvidence] takes. Clearing `playersEvacuated`
+        // here would drop a proxied parked drain from rung 2 of the resume ladder to
+        // rung 3, so it would resume into a *transfer* where it now resumes into
+        // `SAVING` and blocks in [requireEmpty]. Rung 1 is `saveIsCurrent`, which the
+        // adopted clause correctly stops satisfying; rung 2 sends it somewhere that
+        // blocks on the same player. So the ladder still refuses to jump to the stop
+        // and still refuses to start a sweep, which is what the two rungs are for.
+        //
+        // What this retires is a proof that was never written down: the exemption
+        // used to be harmless in `SEALED`, `TARGET_RESOLVED`, `TRANSFERRING` and
+        // `SAVING` only because [dropUnusableSaveEvidence] and the resume ladder
+        // between them make `worldSavedAt` provably null in all four, and it was
+        // *not* harmless in `DEREGISTERED`. Nobody had to check which four, because
+        // there are no longer any states where the confirmation survives a positive
+        // count — which is the argument this line makes on its own.
+        //
+        // The general form is enforced where this pass is *recorded* rather than
+        // trusted to this line — see [dropSaveContradictedByPlayers], called on the
+        // way out of [advance].
+        val reading = drain.readPlayers(probe, now)
+        val occupancy = reading.occupancy
+        val observed = if (reading is PlayerReading.Occupied) drain.unconfirmWorldSave() else drain
 
         val pass =
             DrainPass(
@@ -331,7 +416,7 @@ internal class DrainController(
         // recorded state, and it is one of the two inputs [settleRecords] needs. A
         // step cannot be asked about it afterwards: the resume has already moved the
         // drain out of `DRAIN_FAILED` by the time its progress comes back.
-        return step(pass, drain).settleRecords(resuming = drain.state == DrainState.DRAIN_FAILED)
+        return step(pass, observed).settleRecords(resuming = observed.state == DrainState.DRAIN_FAILED)
     }
 
     /**
@@ -1488,14 +1573,29 @@ internal class DrainController(
         // given time to satisfy, about a cycle that then cleared on its own two
         // passes later.
         //
-        // [DrainSubject.stopGracePeriod] is the ceiling on a save — the schema
-        // guarantees it exceeds `saveTimeout`, which is why nothing here
-        // re-derives it — so it is read instead of adding a second field that
-        // would have to be kept in step with the first. Note what is *not*
-        // bought: two thirty-minute loop stalls in a row still trip this, and
-        // should, because a drain that has been chasing a usable confirmation for
-        // an hour is the thing being detected.
-        if (circling > evidenceGap + pass.subject.stopGracePeriod) {
+        // So the allowance is the quantity the lap is actually made of:
+        // [DrainSubject.saveTimeout], the schema's own ceiling on the flush in the
+        // middle of it, plus one [evidenceGap] for the passes at either end.
+        //
+        // It was `stopGracePeriod`, as a stand-in for the save timeout, and the
+        // substitution was sound in direction and wrong in two ways worth writing
+        // down rather than rediscovering. The schema guarantee it rested on
+        // (`SpecInvariants.stopGraceProblem`) is `PaperServer`'s; `ProxyLifecycleSpec`
+        // has no such rule, so for a proxy the arithmetic was founded on nothing and
+        // was only harmless because this branch is unreachable without world data —
+        // a reachability argument nobody had written down, which is exactly how the
+        // round-17 exemption came to be widened. And `stopGracePeriod` is an
+        // operator's number, capped at two hours: someone who set a long one for an
+        // unrelated reason bought a two-hour escalation latency on a defect whose
+        // honest lap is about a minute, flushing a multi-gigabyte world once a minute
+        // meanwhile with nothing recorded. Reading the save timeout makes both
+        // subjects answer for themselves — a proxy's is zero, because its lap
+        // contains no save.
+        //
+        // Note what is *not* bought: two thirty-minute loop stalls in a row still
+        // trip this, and should, because a drain that has been chasing a usable
+        // confirmation for an hour is the thing being detected.
+        if (circling > evidenceGap + pass.subject.saveTimeout) {
             return abort(
                 subject = pass.subject,
                 node = pass.node,
@@ -1504,12 +1604,25 @@ internal class DrainController(
                 now = now,
                 reason = FailureReason.DRAIN_STALLED,
                 failureClass = FailureClass.RETRYABLE,
+                // The measured fact, never the prognosis. This said "it does not
+                // clear on its own", which is the opposite of what the class means:
+                // the abort is `RETRYABLE` by deliberate choice and `resumeInto`
+                // re-enters on the next pass, so the cycle *does* clear once its
+                // cause stops — a container that settles, a loop that catches up.
+                // What an operator does when told a drain will not clear is
+                // intervene on the container, and the only intervention available
+                // there is `crictl stop`, which is a container stopped with no save.
+                // A false diagnostic here is a data-loss vector one human step
+                // removed, so it reports how long this has been going on and what
+                // the loop will keep doing, and asks for the two observations that
+                // would explain it.
                 message =
                     "this drain keeps saving the world and never reaches the stop: a confirmed save was first " +
                         "voided ${circling.inWholeSeconds}s ago and it has happened again since — $problem. " +
-                        "Nothing has been stopped or removed and the server keeps running. It does not clear " +
-                        "on its own: check whether the container is restarting underneath the drain, and " +
-                        "whether the loop is reaching this server on every pass",
+                        "Nothing has been stopped or removed and the server keeps running. It has not cleared " +
+                        "on its own in ${circling.inWholeSeconds}s and the loop will keep saving and stopping " +
+                        "nothing until the cause goes away: check whether the container is restarting " +
+                        "underneath the drain, and whether the loop is reaching this server on every pass",
             )
         }
         return DrainProgress(
@@ -1739,7 +1852,18 @@ internal class DrainController(
                 // of `dropUnusableSaveEvidence` rests entirely on `watched`,
                 // which reads `lastProbedAt`, which is this `occupancy`'s
                 // instant. Sabotaging `worldSavedAt` alone leaves the livelock
-                // test green; sabotaging the occupancy reddens it. Both are
+                // test green; sabotaging the occupancy reddens it.
+                //
+                // That claim is about **two functions agreeing**, and it goes with
+                // them if either moves: [dropUnusableSaveEvidence] and the
+                // `saveIsCurrent` early return above are computed from the same
+                // `observation.startedAt`, the same `now` and the same
+                // `evidenceGap`, which is why "the confirmation half never fires
+                // for a running container" is true of both. Give one of them a
+                // different argument and the sentence above stops holding without
+                // anything else changing.
+                //
+                // Both instants are
                 // stamped honestly here — `worldSavedAt` still decides the
                 // no-start-time branch, and an instant that lies about when it
                 // was established is a defect waiting for the next reader — but
@@ -2790,6 +2914,44 @@ internal data class DrainProgress(
 )
 
 /**
+ * The rule a recorded pass has to satisfy: **a pass that records players online
+ * may not also record a confirmed world save.**
+ *
+ * ## Why this exists next to [readPlayers] rather than instead of it
+ *
+ * [readPlayers] enforces the rule where a count is *read*, which is where round 17
+ * lost it. Round 18 lost it one step earlier: `holdSeal` reads no count at all, so
+ * the type never gets the chance to hand it a voided drain, and at `DEREGISTERED`
+ * it runs *before* the zero-player gate. A proxy control endpoint that stopped
+ * answering therefore parked a drain still claiming a save taken before somebody
+ * connected straight to the backend's own port — and because the loop kept probing
+ * that player every pass, the observation that should have destroyed the evidence
+ * kept refreshing the window that keeps it alive instead.
+ *
+ * A read-point rule cannot catch a non-reader. This is the same move applied to
+ * the *record*: [DrainProgress] is the only thing that leaves this file, it holds
+ * both facts, and `Reconciler` writes them onto one observed status side by side.
+ * Every producer of a progress goes through it, including the ones that never look
+ * at a player count.
+ *
+ * ## What it does not do
+ *
+ * Only the confirmation goes — the narrowest rung of the ladder, for the reason
+ * `advance` gives at its pass-entry reading: taking `playersEvacuated` with it
+ * would move a parked proxied drain down the resume ladder and send it into a
+ * transfer where it currently blocks. Voiding is always safe on its own; changing
+ * where a drain re-enters is not.
+ *
+ * Pure, and the log line lives at the call site, so the rule can be asserted
+ * directly in a unit test. A scenario tests the producer somebody thought of.
+ */
+internal fun DrainProgress.dropSaveContradictedByPlayers(): DrainProgress {
+    val online = occupancy?.online ?: return this
+    if (online == 0 || drain.worldSavedAt == null) return this
+    return copy(drain = drain.unconfirmWorldSave())
+}
+
+/**
  * Whether this drain's save confirmation still describes what is on disk.
  *
  * Two ways it stops describing it, and both have to be checked because they fail
@@ -2880,7 +3042,7 @@ internal fun DrainStatus.dropUnusableSaveEvidence(
     return if (saveIsCurrent(containerStartedAt, now, maxGap) && watched) {
         this
     } else {
-        copy(worldSavedAt = null)
+        unconfirmWorldSave()
     }
 }
 
@@ -3044,7 +3206,32 @@ private fun DrainStatus.saveEvidenceProblem(containerStartedAt: Instant?): Strin
  * window is exactly the case being counted.
  */
 internal fun DrainStatus.forgetSaveEvidence(): DrainStatus =
-    copy(worldSavedAt = null, saveRequestedAt = null, playersEvacuated = false, resaveForcedAt = null)
+    forgetSaveConfirmation().copy(saveRequestedAt = null, resaveForcedAt = null)
+
+/**
+ * The narrowest of the three voiders: this drain no longer claims a **confirmed
+ * world save**, and nothing else about it changes.
+ *
+ * The three are a ladder, and each rung is a strictly wider claim about what the
+ * pass established:
+ *
+ * 1. this — *the confirmation does not describe the world any more*. Used where a
+ *    pass has to stop a drain jumping to the stop without changing where a parked
+ *    one re-enters: `advance`'s pass-entry reading, and
+ *    [dropUnusableSaveEvidence].
+ * 2. [forgetSaveConfirmation] — that, **and** this drain can no longer claim it saw
+ *    the server empty. For a pass that could not vouch for anything it had.
+ * 3. [forgetSaveEvidence] — that, **and** the record of a delivered save request and
+ *    the re-save anchor. Only for a pass that *observed a player*, because only
+ *    that makes an outstanding request worthless.
+ *
+ * `worldSavedAt = null` is written here and nowhere else, on purpose. It was
+ * written in four places, each of which was separately right about which of the
+ * other fields to take with it, and the round-18 defect is what a fifth reader
+ * needing a *fourth* combination looks like when the combinations are open-coded:
+ * the one it needed did not exist, so the site took none of them.
+ */
+internal fun DrainStatus.unconfirmWorldSave(): DrainStatus = copy(worldSavedAt = null)
 
 /**
  * Voids what this drain had established, and keeps the record of a request whose
@@ -3066,7 +3253,7 @@ internal fun DrainStatus.forgetSaveEvidence(): DrainStatus =
  * keeping a confirmation's timestamp, and the other lifted the wedge on a
  * delivered save. Neither can ask any more, because there is nothing to ask.
  */
-internal fun DrainStatus.forgetSaveConfirmation(): DrainStatus = copy(worldSavedAt = null, playersEvacuated = false)
+internal fun DrainStatus.forgetSaveConfirmation(): DrainStatus = unconfirmWorldSave().copy(playersEvacuated = false)
 
 /** Moves to a new state, stamping the transition. Re-entering the same state does not restamp. */
 private fun DrainStatus.moveTo(

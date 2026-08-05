@@ -156,8 +156,11 @@ public interface Node {
      *
      * [gracePeriod] must be strictly positive — a zero-grace kill is not
      * expressible through this interface, on purpose. Implementations derive it
-     * from `spec.lifecycle.stopGracePeriod`, which the schema already
-     * guarantees exceeds the save timeout.
+     * from `spec.lifecycle.stopGracePeriod`. For a `PaperServer` the schema
+     * guarantees that exceeds the save timeout (`SpecInvariants.stopGraceProblem`);
+     * a `VelocityProxy` has no such rule and needs none, because it holds no world.
+     * Nothing may read this value *as* a save timeout on the strength of the first
+     * half — `DrainSubject.saveTimeout` is the quantity for that.
      *
      * Idempotent: stopping an already-stopped workload succeeds.
      */

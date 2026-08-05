@@ -36,10 +36,32 @@ internal interface DrainSubject {
     val server: ResourceName
 
     /**
-     * From `spec.lifecycle.stopGracePeriod`. The schema has already guaranteed it
-     * exceeds the save timeout, so nothing here re-derives it.
+     * From `spec.lifecycle.stopGracePeriod`: what the container stop is given, and
+     * nothing else.
+     *
+     * **It is not a bound on a save, and nothing here may read it as one.** The
+     * guarantee that it exceeds the save timeout belongs to `PaperServer` alone
+     * (`SpecInvariants.stopGraceProblem`); `ProxyLifecycleSpec` deliberately has
+     * no such rule, and says so in its own KDoc, because a proxy holds no world.
+     * A reader that wants "how long a save may take" wants [saveTimeout], which
+     * every subject answers for itself — the substitution was made once, in
+     * `goingRoundInCircles`, and it was correct for a `PaperServer`, silently
+     * unfounded for a proxy, and capped at `MAX_STOP_GRACE_PERIOD` (two hours) for
+     * an operator who had set a long grace period for an unrelated reason.
      */
     val stopGracePeriod: Duration
+
+    /**
+     * The longest a world flush may take on this workload, from
+     * `spec.lifecycle.drain.saveTimeout`.
+     *
+     * `Duration.ZERO` for a workload that holds no world: there is no save in its
+     * drain, so nothing that measures a lap of the protocol should be given an
+     * allowance for one. That is an answer about the subject rather than a
+     * placeholder, which is what keeps a reader from having to prove the value is
+     * unreachable before trusting the arithmetic around it.
+     */
+    val saveTimeout: Duration
 
     /**
      * How long step 4 gets before the loop stops issuing transfers, before the
