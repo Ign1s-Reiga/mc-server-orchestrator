@@ -214,10 +214,48 @@ internal class VelocityProxyReader(
         )
     }
 
+    /**
+     * The player port, which has exactly one correct value, refused here rather
+     * than accepted and regretted later.
+     *
+     * ## It is a claim about the image, and only one claim is true
+     *
+     * Nothing configures Velocity's `bind`: there is no `VELOCITY_PORT` in
+     * `itzg/mc-proxy` and Velocity reads no port from the environment. The image
+     * installs a stock `velocity.toml` binding 25577 before the proxy starts, so
+     * [VelocityProxyDefaults.PLAYER_PORT] is what the proxy *will* listen on
+     * whatever a definition says. See that constant for the evidence and for what
+     * owning `velocity.toml` would change.
+     *
+     * ## What accepting another value cost
+     *
+     * It was not merely "the proxy never becomes ready", which the KDoc used to
+     * promise and which is only true of a *fresh* proxy. On a running one the field
+     * is both hash-bearing and probe-bearing, so an edit meant: hash drift →
+     * `REPLACEMENT` → a drain whose occupancy probe aims at a port the old
+     * container never bound → `NotJoinable` → `Unanswered` → `DRAIN_STALLED`,
+     * "cannot confirm zero players", for ever. Reverting the edit recovers a proxy
+     * that is merely running; a proxy edited and *then* deleted is stuck with no
+     * revert available.
+     *
+     * A value that can only be one thing belongs in validation, not in a free field
+     * that two subsystems read as though it meant something.
+     */
     private fun readNetwork(reader: MappingReader): ProxyNetworkSpec {
         val port = reader.port("port", default = VelocityProxyDefaults.PLAYER_PORT) ?: VelocityProxyDefaults.PLAYER_PORT
         val hostPort = reader.port("hostPort")
         reader.done()
+        if (port != VelocityProxyDefaults.PLAYER_PORT) {
+            reader.violation(
+                "port",
+                "must be ${VelocityProxyDefaults.PLAYER_PORT}, found $port: nothing configures the port Velocity " +
+                    "binds — the proxy image installs its own `velocity.toml` before the proxy starts — so this " +
+                    "field states what the image does rather than requesting anything. A proxy declared on any " +
+                    "other port never becomes joinable, and editing it on a running proxy wedges the drain that " +
+                    "would replace it. Use `hostPort` to choose the port players connect to",
+            )
+            return ProxyNetworkSpec(hostPort = hostPort)
+        }
         return ProxyNetworkSpec(port = port, hostPort = hostPort)
     }
 

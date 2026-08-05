@@ -63,6 +63,56 @@ class VelocityProxyValidationTest {
             listOf("spec.image", "spec.resources", "spec.forwarding", "spec.backends")
     }
 
+    /**
+     * `spec.network.port` has exactly one correct value, and is refused rather than
+     * accepted and regretted.
+     *
+     * The field configures nothing — the proxy image installs its own
+     * `velocity.toml` before Velocity starts — but it is read by two subsystems
+     * that treat it as though it did: it is in the proxy's spec hash, and it is the
+     * port the drain's occupancy probe pings. So an edit on a *running* proxy is a
+     * `REPLACEMENT` whose drain then probes a port the old container never bound
+     * and stalls on "cannot confirm zero players" for ever, with no revert
+     * available once the definition is also deleted.
+     *
+     * Asserted through the parser rather than through the constant so that a change
+     * to what the image binds moves this test with it, and asserted on the *advice*
+     * because "use hostPort" is what an operator who wanted to move the port
+     * actually needs.
+     */
+    @Test
+    fun `a player port that is not the one the image binds is refused with the alternative`() {
+        val yaml =
+            """
+            apiVersion: mcorch.dev/v1alpha1
+            kind: VelocityProxy
+            metadata:
+              name: proxy-01
+            spec:
+              image: docker.io/itzg/mc-proxy:2026.7.1-java25
+              resources:
+                memory: 2Gi
+                heap:
+                  max: 1Gi
+              forwarding:
+                secret:
+                  name: proxy-01-forwarding
+                  key: secret
+              backends:
+                selector:
+                  matchLabels:
+                    mcorch.example/pool: survival
+              network:
+                port: 25565
+                hostPort: 25577
+            """.trimIndent()
+
+        val violation = ServerDefinitionParser.parse(yaml, "moved-port.yaml").violations().single()
+        violation.field shouldBe "spec.network.port"
+        violation.problem.contains("nothing configures the port Velocity binds") shouldBe true
+        violation.problem.contains("Use `hostPort`") shouldBe true
+    }
+
     @Test
     fun `a bad fallback entry is reported on its own index and does not stop the others`() {
         val violation = violationsOf("proxy-fallback-bad-name.yaml").single()
