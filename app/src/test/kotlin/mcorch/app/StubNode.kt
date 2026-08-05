@@ -123,6 +123,9 @@ internal class StubNode(
         return ImageAvailability(image, id = "sha256:${reference.hashCode().toUInt()}", pulled = pulled)
     }
 
+    /** This node has everything. The pre-flight is a question, and here the answer is yes. */
+    override suspend fun checkWorkload(spec: WorkloadSpec) = Unit
+
     override suspend fun ensureWorkload(spec: WorkloadSpec): WorkloadObservation.Present {
         val existing = workload
         if (existing is WorkloadObservation.Present && existing.state != WorkloadState.SANDBOX_ONLY) return existing

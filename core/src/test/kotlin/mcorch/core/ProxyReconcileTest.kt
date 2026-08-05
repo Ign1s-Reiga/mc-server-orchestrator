@@ -6,6 +6,7 @@ import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.collections.shouldContain
 import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.collections.shouldNotBeEmpty
+import io.kotest.matchers.nulls.shouldBeNull
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
@@ -22,6 +23,7 @@ import mcorch.schema.ServerPhase
 import mcorch.store.getOrThrow
 import org.junit.jupiter.api.Test
 import kotlin.time.Duration.Companion.minutes
+import kotlin.time.Duration.Companion.seconds
 
 /**
  * Bringing a `VelocityProxy` up, and what it does to the servers behind it.
@@ -280,6 +282,140 @@ internal class ProxyReconcileTest {
             harness.pass(name)
             harness.pass(name)
             harness.proxyNode.calls.count { it == NodeOperation.CREATE } shouldBe attempts
+        }
+
+    /**
+     * The same refusal, asked **before** the drain that would destroy the thing
+     * being replaced.
+     *
+     * The twenty-fourth audit's warning, and the classification and the enforcement
+     * point are not what was wrong with it — *when it was first asked* was. A proxy
+     * running perfectly, a hash-bearing edit, then: drain to zero, stop, remove,
+     * all correct — and only at `ensureWorkload` does the node discover it has no
+     * plugin to mount. The front door is gone and the loop has just established
+     * permanently that it cannot build another. Nothing stages that artefact for
+     * `:app:run` or for any distribution, so it is the *default* state of a real
+     * install rather than bad luck.
+     *
+     * ## The assertions, and which of them is not enough on its own
+     *
+     * "The replacement was not created" would pass against the broken build too —
+     * it never got created there either. The discriminators are that the **old
+     * container is still running and was never stopped**, and that the failure is
+     * `RETRYABLE`: permanence here would freeze the proxy's passes, and with them
+     * `assertBackends`, which is the level trigger that restores joins to a backend
+     * whose own drain has parked.
+     */
+    @Test
+    fun `a proxy that cannot be rebuilt is not drained, and keeps running`() =
+        coreTest {
+            val harness = ProxyHarness()
+            val name = harness.proxyDefinition.metadata.name
+            harness.bringUp()
+            harness
+                .proxyStatus()
+                .shouldNotBeNull()
+                .ready
+                .shouldBeTrue()
+            val handle = harness.proxyNode.stops.size
+
+            // The artefact goes: staged for the first create, gone by the second.
+            harness.proxyNode.failAlways(
+                NodeOperation.CREATE,
+                NodeException.Rejected(
+                    harness.proxyNode.name,
+                    NodeOperation.CREATE,
+                    "`front-01` needs the VELOCITY_CONTROL_PLUGIN artefact and node `proxy-node` does not have it",
+                ),
+            )
+            // A hash-bearing edit. `maxPlayers` is in the proxy's spec hash, so this
+            // is a replacement rather than an in-place update.
+            harness.declare(proxyDefinition(maxPlayers = 300))
+
+            repeat(6) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+
+            // Nothing was taken away on the strength of being able to build a
+            // replacement that cannot be built.
+            harness.proxyNode.stops shouldHaveSize handle
+            harness.proxyNode.removals.shouldBeEmpty()
+
+            val status = harness.proxyStatus().shouldNotBeNull()
+            status.phase shouldBe ServerPhase.RUNNING
+            status.ready.shouldBeTrue()
+            // No drain was started at all — not started and parked, not started and
+            // blocked. The question is asked before the protocol begins.
+            status.drain.shouldBeNull()
+
+            val failure = status.failure.shouldNotBeNull()
+            failure.failureClass shouldBe FailureClass.RETRYABLE
+            failure.message shouldContain "cannot build the replacement"
+            failure.message shouldContain "keeps running and keeps routing"
+        }
+
+    /**
+     * A proxy that is answering, but not to us.
+     *
+     * The spec hash carries the control token's **coordinates** and never its
+     * value — deliberately, and correctly, because that is what stops a secret
+     * rotation restarting the whole fleet at once. For the *forwarding* secret the
+     * mismatch that follows is loud: nobody can log in. For the *control* token it
+     * was silent. The container keeps the token it was created with, `:core` starts
+     * sending the new one, and `GET /v1/version` needs no token at all — so the
+     * handshake kept reporting `reachable = true, compatible = true` while every
+     * seal, transfer and deregistration in the fleet was refused.
+     *
+     * The state became reachable in the change that first delivered the token to
+     * the container. Before it, the plugin required no credential and accepted
+     * anything.
+     *
+     * ## Where the answer has to show up
+     *
+     * On `status.failure`, which is what `NEEDS_ATTENTION` and every "is anything
+     * wrong here" surface reads. Retryable, because re-aligning the token is an
+     * operator action needing no definition change — and because a permanent
+     * failure on a proxy freezes its passes and with them the routing sweep, which
+     * is the one thing that restores joins to a backend whose drain has parked.
+     *
+     * The proxy is not stopped and not recreated: it is serving players perfectly
+     * well, and this build cannot know whether the operator would rather fix the
+     * secret than restart their front door.
+     */
+    @Test
+    fun `a proxy that refuses this orchestrator's control token says so rather than looking healthy`() =
+        coreTest {
+            val backend = backendDefinition("survival-01")
+            val harness = ProxyHarness(backends = listOf(backend))
+            harness.bringUp()
+            harness
+                .proxyStatus()
+                .shouldNotBeNull()
+                .failure
+                .shouldBeNull()
+
+            // The secret behind the reference is rotated. Nothing in the definition
+            // changed, so nothing recreates the container, and the token it holds is
+            // no longer the one being sent.
+            harness.plugin.rejectsCredential = true
+            harness.sweep()
+
+            val status = harness.proxyStatus().shouldNotBeNull()
+            val failure = status.failure.shouldNotBeNull()
+            failure.reason shouldBe FailureReason.PROXY_CONTROL_UNREACHABLE
+            failure.failureClass shouldBe FailureClass.RETRYABLE
+            failure.message shouldContain "rejecting this orchestrator's credential"
+
+            // The handshake still says the endpoint is there and speaks our
+            // protocol, and both are true. That is precisely why the failure above
+            // has to exist: a reader of `control` alone learns nothing is wrong.
+            val control = status.control.shouldNotBeNull()
+            control.reachable.shouldBeTrue()
+            control.compatible.shouldBeTrue()
+
+            harness.proxyNode.stops.shouldBeEmpty()
+            harness.proxyNode.removals.shouldBeEmpty()
         }
 
     /**

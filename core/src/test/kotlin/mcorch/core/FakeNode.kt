@@ -198,6 +198,24 @@ internal class FakeNode(
         return ImageAvailability(image, id = "sha256:${reference.hashCode().toUInt()}", pulled = false)
     }
 
+    /**
+     * The pre-flight, and deliberately **not** `check(NodeOperation.CREATE)`.
+     *
+     * `LocalNode` answers this out of its own mount derivation and never touches
+     * the runtime, so a one-shot CRI flake armed against the create is not
+     * something this call could see — and consuming one here would silently spend a
+     * budget a test set for the create itself, which is the fake being *more*
+     * permissive than the thing it stands in for in one direction and less in the
+     * other.
+     *
+     * A standing [NodeException.Rejected] is exactly the shape it does see: an
+     * artefact that is not on this host is not there for the pre-flight either.
+     */
+    override suspend fun checkWorkload(spec: WorkloadSpec) {
+        currentCoroutineContext().ensureActive()
+        (alwaysFailures[NodeOperation.CREATE] as? NodeException.Rejected)?.let { throw it }
+    }
+
     override suspend fun ensureWorkload(spec: WorkloadSpec): WorkloadObservation.Present {
         check(NodeOperation.CREATE)
         val existing = workload

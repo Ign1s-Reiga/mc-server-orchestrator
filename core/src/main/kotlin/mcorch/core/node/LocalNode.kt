@@ -265,6 +265,25 @@ public class LocalNode internal constructor(
 
     // ── workload lifecycle ───────────────────────────────────────────────────
 
+    /**
+     * The create's own mount derivation, run and thrown away.
+     *
+     * Deliberately [mountsFor] rather than a list of the things it checks. The
+     * whole value of the call is that it cannot answer "yes" to a question the
+     * create would answer "no" to, and it can only promise that by *being* the same
+     * derivation — a re-implementation here would be a second enforcement point,
+     * which is the thing the twenty-fourth audit asked not to add while asking for
+     * the question to be asked earlier.
+     *
+     * `translating` for the same reason every other entry point uses it: a caller
+     * of [Node] sees nothing but a [NodeException].
+     */
+    override suspend fun checkWorkload(spec: WorkloadSpec) {
+        translating(NodeOperation.CREATE) {
+            mountsFor(spec)
+        }
+    }
+
     override suspend fun ensureWorkload(spec: WorkloadSpec): WorkloadObservation.Present =
         translating(NodeOperation.CREATE) {
             val sandboxSpec = sandboxSpecFor(spec)

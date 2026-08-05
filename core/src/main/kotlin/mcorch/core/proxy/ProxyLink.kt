@@ -103,11 +103,29 @@ internal class BackendLink(
                         TransferReport.DestinationLost("${outcome.code}: ${outcome.problem}")
                     }
 
-                    // Step 2 has not taken effect at the proxy this request reached.
-                    // Retryable: the next pass re-asserts the seal before it gets
-                    // here, which is the whole reason the seal is asserted on every
-                    // pass rather than once.
-                    ControlErrorCode.SOURCE_NOT_SEALED -> {
+                    // Step 2 has not taken effect at the proxy this request reached,
+                    // or this caller is not who the proxy thinks it is. Retryable:
+                    // the next pass re-asserts the seal before it gets here, which
+                    // is the whole reason the seal is asserted on every pass rather
+                    // than once.
+                    //
+                    // `UNAUTHENTICATED` is named rather than left to the `else`, and
+                    // the reason is the same one [asSealOutcome] gives for making
+                    // *every* seal refusal retryable: "stop trying" on a drain step
+                    // is how a container becomes undeletable on a fault the next
+                    // pass could have cleared. A control token rotated behind a
+                    // running container 401s every call until the proxy is
+                    // recreated, which is a repair an operator makes — so a
+                    // permanent classification here freezes the backend's status and
+                    // stops its passes for a condition that fixes itself.
+                    //
+                    // It is unreachable today only because `holdSeal` meets the same
+                    // 401 one step earlier and parks first. That is an ordering
+                    // accident, not a guarantee, and the ordering is exactly what a
+                    // future change to step 2 would move.
+                    ControlErrorCode.SOURCE_NOT_SEALED,
+                    ControlErrorCode.UNAUTHENTICATED,
+                    -> {
                         TransferReport.Refused("${outcome.code}: ${outcome.problem}", retryable = true)
                     }
 

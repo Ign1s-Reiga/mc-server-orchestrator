@@ -38,6 +38,7 @@ import mcorch.store.Store
 import mcorch.store.StoreException
 import mcorch.store.StoredServer
 import mcorch.store.WriteOutcome
+import mcorch.velocity.control.ControlErrorCode
 import org.slf4j.LoggerFactory
 import java.time.Clock
 import java.time.Instant
@@ -305,10 +306,11 @@ public class Reconciler(
                 is Placement.On -> {
                     val observation = placement.node.observe(pass.name)
                     val cause = placement.cause ?: proxyDrainCause(pass, observation)
-                    if (cause == null) {
-                        convergeProxy(pass, placement.node, observation)
-                    } else {
-                        drainProxy(pass, placement.node, observation, cause)
+                    val blocker = replacementBlocker(pass, placement.node, cause)
+                    when {
+                        blocker != null -> convergeProxy(pass, placement.node, observation, blocker)
+                        cause == null -> convergeProxy(pass, placement.node, observation)
+                        else -> drainProxy(pass, placement.node, observation, cause)
                     }
                 }
             }
@@ -316,6 +318,76 @@ public class Reconciler(
             proxyNodeFailure(pass, failure)
         } catch (failure: StoreException) {
             storeOutcome(pass.name, failure)
+        }
+    }
+
+    /**
+     * Asks whether the replacement could be built **before** the drain that
+     * destroys the thing being replaced.
+     *
+     * ## What went wrong without it
+     *
+     * A proxy running perfectly, a hash-bearing edit, and then: drain to zero,
+     * stop, remove — all correct — and only at `ensureWorkload` does the node
+     * discover it has no control plugin to mount. The refusal is right and its
+     * permanence is right; what was wrong is *when it was first asked*. The front
+     * door was already gone, and the loop had just established permanently that it
+     * could not build another. Nothing stages that artefact for `:app:run` or for
+     * any distribution — only the integration suite does — so that is the default
+     * state of a real install rather than an unlucky one.
+     *
+     * ## Why the classification here is not the create's
+     *
+     * `HostPaths` is still the one enforcement point and still calls a missing
+     * artefact `PERMANENT`; this asks it the same question through
+     * [Node.checkWorkload], which *is* the create's own derivation. But permanence
+     * means "stop trying", and stopping here would freeze the passes of a proxy
+     * that is up and serving — including `assertBackends`, which is the level
+     * trigger that restores joins to a backend whose drain has parked. The remedy
+     * is an operator staging a file, which needs no definition change, so this
+     * records a **retryable** failure and lets the proxy carry on being a proxy.
+     *
+     * ## Scope, stated rather than implied
+     *
+     * `REPLACEMENT` only. A `DELETION` needs no create and must never be blocked by
+     * one — that is how a workload becomes undeletable. A `RELOCATION` would create
+     * on a *different* node, which this call site does not hold a handle to; it is
+     * refused earlier for a different reason, and pre-flighting the destination is
+     * left to whoever makes a second node real.
+     */
+    private suspend fun replacementBlocker(
+        pass: ProxyPass,
+        node: Node,
+        cause: DrainCause?,
+    ): FailureStatus? {
+        if (cause != DrainCause.REPLACEMENT) return null
+        // A drain already in flight is past the point this question protects: the
+        // container it would have saved is gone or going, and refusing now would
+        // strand the drain mid-protocol.
+        if (pass.previous?.drain != null) return null
+        return try {
+            node.checkWorkload(pass.desired)
+            null
+        } catch (rejected: NodeException.Rejected) {
+            val message =
+                "this proxy's definition has changed in a way that needs the container replaced, and node " +
+                    "`${node.name}` cannot build the replacement: ${rejected.message}. Nothing has been drained " +
+                    "or stopped — the proxy that is running keeps running and keeps routing — and the " +
+                    "replacement happens on its own once the node can build it"
+            LOG.error(
+                "{} cannot be replaced, so it has not been drained: {}",
+                WorkloadRef(pass.name, node.name),
+                message,
+            )
+            recordFailure(
+                reason = FailureReason.CONTAINER_CREATE_FAILED,
+                // Retryable although the create's own answer is permanent, and
+                // deliberately: see the note above.
+                failureClass = FailureClass.RETRYABLE,
+                message = message,
+                now = pass.now,
+                previous = pass.previous?.failure,
+            )
         }
     }
 
@@ -381,11 +453,20 @@ public class Reconciler(
         return if (actual == pass.desired.specHash) null else DrainCause.REPLACEMENT
     }
 
-    /** Moves an undrained proxy one step toward running, joinable and routing. */
+    /**
+     * Moves an undrained proxy one step toward running, joinable and routing.
+     *
+     * [blocker] is set only when a replacement was wanted and [replacementBlocker]
+     * refused it. The proxy then converges as it always would — it is running and
+     * correct, just not the *current* definition — and carries the reason on
+     * observed status, because a log line is not a surface an operator diagnoses
+     * from.
+     */
     private suspend fun convergeProxy(
         pass: ProxyPass,
         node: Node,
         observation: WorkloadObservation,
+        blocker: FailureStatus? = null,
     ): ReconcileOutcome {
         val image = ensureProxyImage(pass, node, observation)
         return when (observation) {
@@ -421,7 +502,7 @@ public class Reconciler(
                     }
 
                     WorkloadState.RUNNING -> {
-                        awaitProxyReady(pass, node, observation, image)
+                        awaitProxyReady(pass, node, observation, image, blocker)
                     }
 
                     WorkloadState.EXITED -> {
@@ -510,6 +591,7 @@ public class Reconciler(
         node: Node,
         observation: WorkloadObservation.Present,
         image: ImageStatus?,
+        blocker: FailureStatus? = null,
     ): ReconcileOutcome {
         val channel = pass.channel(node, observation.handle)
         val control = readControl(pass, channel)
@@ -569,10 +651,16 @@ public class Reconciler(
                 backends = routing.status,
                 control = control,
                 drain = null,
-                failure = routing.failure,
+                // The blocker wins where both are set. A proxy that cannot be
+                // replaced *and* cannot assert its routing table has two problems
+                // and one field; the one an operator has to act on is the artefact,
+                // because the other may well be a consequence of running the wrong
+                // container.
+                failure = blocker ?: routing.failure,
             )
         return write(pass, status) {
             when {
+                blocker != null -> ReconcileOutcome.Retry(blocker.message)
                 routing.failure != null -> ReconcileOutcome.Retry(routing.failure.message)
                 else -> ReconcileOutcome.Settled("running, joinable and routing")
             }
@@ -686,8 +774,59 @@ public class Reconciler(
         val matched = pass.backends(listing)
         val registered =
             when (val state = channel.state()) {
-                is ControlOutcome.Answered -> state.value
-                else -> null
+                is ControlOutcome.Answered -> {
+                    state.value
+                }
+
+                // **"Answering" is not "answering to us".**
+                //
+                // `GET /v1/version` needs no token by design — it is what lets a
+                // misconfigured credential be told apart from a wrong port — so the
+                // handshake above reports `reachable = true, compatible = true`
+                // while every call that matters 401s. The spec hash carries the
+                // token's *coordinates* and not its value, deliberately, so
+                // rotating the secret behind the reference does not recreate the
+                // container: it keeps the token it was created with, `:core` starts
+                // sending the new one, and every seal, transfer and deregistration
+                // is refused. Silently, until somebody tried to drain something.
+                //
+                // This is the first authenticated call of the pass and it is one
+                // that was already being made — the variant was discarded. Refusing
+                // here rather than letting the loop below refuse N times says what
+                // is wrong once, in the operator's terms, and skips assertions that
+                // could not have landed.
+                is ControlOutcome.Refused if state.code == ControlErrorCode.UNAUTHENTICATED -> {
+                    val message =
+                        "the proxy's control endpoint is answering but rejecting this orchestrator's " +
+                            "credential (${state.code}). Its container holds the control token it was created " +
+                            "with, and rotating the secret behind `spec.control.tokenSecret` does not recreate " +
+                            "it — so no backend behind this proxy can be sealed, transferred or deregistered " +
+                            "until the token they share is the same one again"
+                    LOG.error("proxy={} is refusing this orchestrator's control token: {}", pass.name, message)
+                    return ProxyRouting(
+                        status = pass.previous?.backends,
+                        failure =
+                            recordFailure(
+                                reason = FailureReason.PROXY_CONTROL_UNREACHABLE,
+                                // The same reasoning the unreachable and
+                                // incompatible branches above give: "stop trying"
+                                // on a proxy freezes its status and stops this
+                                // sweep, which is the one thing that restores joins
+                                // to a backend whose drain has parked. And the
+                                // remedy — re-align the token, or recreate the
+                                // proxy — is one an operator performs without
+                                // touching this definition.
+                                failureClass = FailureClass.RETRYABLE,
+                                message = message,
+                                now = pass.now,
+                                previous = pass.previous?.failure,
+                            ),
+                    )
+                }
+
+                else -> {
+                    null
+                }
             }
         val statuses = mutableListOf<BackendStatus>()
         var problem: String? = null

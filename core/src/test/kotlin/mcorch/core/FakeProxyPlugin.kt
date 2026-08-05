@@ -68,6 +68,19 @@ internal class FakeProxyPlugin(
     /** Requests that never got a reply, simulating an endpoint that is not listening. */
     var unreachable: Boolean = false
 
+    /**
+     * The container holds a control token that is not the one `:core` is sending.
+     *
+     * Modelled as a flag rather than as a pair of token strings, and that is the
+     * faithful shape rather than a shortcut. `EndpointRequest.bearerToken` carries
+     * *coordinates* — the node resolves them — so a rotation behind an unchanged
+     * `SecretRef` looks identical on the wire here; and putting token material in a
+     * fixture is the thing CLAUDE.md invariant 4 exists to stop. What the real
+     * plugin does in that state is exactly this: `GET /v1/version` still answers,
+     * because it is deliberately unauthenticated, and every other route is 401.
+     */
+    var rejectsCredential: Boolean = false
+
     class Backend(
         val name: String,
         var address: String,
@@ -129,6 +142,13 @@ internal class FakeProxyPlugin(
                     """"pluginApiVersion":"${ControlProtocol.VERSION}",""" +
                     """"supported":[${supported.joinToString(",") { "\"$it\"" }}],"ready":$ready}""",
             )
+        }
+        // Authentication is checked after the handshake and before readiness, in the
+        // order the real transport does it: `ControlEndpoint.serve` exempts
+        // `/v1/version` by path and authorises everything else before `ControlService`
+        // sees the request at all.
+        if (rejectsCredential) {
+            return error(ControlErrorCode.UNAUTHENTICATED, "the bearer token is not the control token")
         }
         if (!ready) return error(ControlErrorCode.NOT_READY, "the proxy has not finished starting")
         return when {
