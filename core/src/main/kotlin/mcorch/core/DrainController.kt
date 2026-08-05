@@ -30,9 +30,12 @@ import java.time.Duration as JavaDuration
  * Read `.claude/skills/drain-protocol/` before changing anything here. The
  * short version:
  *
- * - **There is no unconditional stop in this class.** The only call to
+ * - **There is no unconditional stop in this class.** Every call to
  *   [Node.stopWorkload] is guarded by a freshly observed zero-player count and,
- *   for a server with world data, a *confirmed* save.
+ *   for a server with world data, a *confirmed* save. How many there are is not
+ *   stated here — see the two gates below, and `DrainWiringTest`, which asserts
+ *   that each one sits behind `mayStop` and that no other file in this module's
+ *   main sources calls the stop at all.
  * - **A drain that cannot finish leaves the server running.** Every failure path
  *   lands on [DrainState.DRAIN_FAILED], and there is no edge from there to
  *   [DrainState.STOPPING]. Reaching a retry limit means the loop stops trying,
@@ -382,7 +385,11 @@ internal class DrainController(
         // pass began.
         //
         // **This caller adopts one clause of the reading and declines the rest**,
-        // and which clause is the whole of round 18's critical.
+        // and which clause is the whole of round 18's critical. The clause is
+        // [DrainStatus.adoptSaveClause] rather than a conditional written here, so
+        // that the predicate has somewhere a unit test can reach it — no scenario
+        // can, for the reason given under *Declined* below. The argument for
+        // choosing this clause stays here, with the caller it is about.
         //
         // *Adopted:* the confirmation. A positive count means anything this drain
         // had saved is behind whatever that player is doing, and from here on every
@@ -421,7 +428,7 @@ internal class DrainController(
         // way out of [advance].
         val reading = drain.readPlayers(probe, now)
         val occupancy = reading.occupancy
-        val observed = if (reading is PlayerReading.Occupied) drain.unconfirmWorldSave() else drain
+        val observed = drain.adoptSaveClause(reading)
 
         val pass =
             DrainPass(
@@ -2110,8 +2117,10 @@ internal class DrainController(
 
     /**
      * Step 7. The stop that ends a drain, and one of the two calls to
-     * [Node.stopWorkload] in this codebase — the other is [awaitStopped]'s re-issue
-     * of *this* stop, behind its own gate. See the class note for both.
+     * [Node.stopWorkload] in `:core`'s main sources — the other is [awaitStopped]'s
+     * re-issue of *this* stop, behind its own gate. See the class note for both.
+     * `DrainWiringTest` holds both halves of that claim: the count and the gate
+     * here, and that no other file in the module reaches the stop.
      *
      * Everything it depends on has been established by the states above: zero
      * players confirmed by a probe taken this pass, and — for a workload with
@@ -3236,6 +3245,34 @@ internal fun DrainStatus.readPlayers(
         is ProbeOutcome.Unanswered -> {
             PlayerReading.Unanswered(probe)
         }
+    }
+
+/**
+ * The drain a pass is stepped and recorded against, given what its probe read.
+ *
+ * The one clause of a [PlayerReading] that a pass entry adopts, and deliberately
+ * not the whole reading: [PlayerReading.Occupied] carries a drain that has been
+ * through [forgetSaveEvidence], rung 3 of the ladder in [unconfirmWorldSave]'s
+ * note, and this takes rung 1. Taking more would move a parked proxied drain down
+ * the resume ladder and send it into a transfer where it currently blocks. The
+ * argument for the choice is written out at the only call site,
+ * `DrainController.advanceOnce`.
+ *
+ * ## Why the predicate is a function and not a conditional at that call site
+ *
+ * It is the one clause of round 18's fix that nothing can exercise. The adoption
+ * makes the confirmation unreachable to every step in the pass, so narrowing it —
+ * `is Occupied && !playersEvacuated`, say, which is a plausible reading of the
+ * *Declined* paragraph at the call site — changes no scenario's outcome: the
+ * record-level rule in `advance` still repairs what is written down. The
+ * twentieth audit demonstrated exactly that by mutation. A rule no input can
+ * exercise has to be asserted on the rule itself, which needs the rule to be
+ * something a test can call. `SaveEvidenceTest` calls this one.
+ */
+internal fun DrainStatus.adoptSaveClause(reading: PlayerReading): DrainStatus =
+    when (reading) {
+        is PlayerReading.Occupied -> unconfirmWorldSave()
+        is PlayerReading.Empty, is PlayerReading.Unanswered -> this
     }
 
 /** Why the save evidence is not good enough to stop on, for an operator-facing message. */

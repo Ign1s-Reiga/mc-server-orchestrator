@@ -259,6 +259,77 @@ internal class SaveEvidenceTest {
     }
 
     /**
+     * The clause a pass *entry* adopts from its reading — the primary half of round
+     * 18's fix, and the half that had nowhere to be tested until it was a function.
+     *
+     * `advanceOnce` used to write the predicate inline. That made it untestable in
+     * both directions at once: no scenario can distinguish this rule from a narrowed
+     * version of it, because the adoption is what makes the confirmation unreachable
+     * to every step in the pass and the record-level rule repairs whatever is written
+     * down regardless. The twentieth audit proved it by mutating the predicate to
+     * `is Occupied && !playersEvacuated` — a plausible misreading of the *Declined*
+     * paragraph at the call site, restoring the critical, with the whole suite green.
+     *
+     * A rule no input can exercise has to be asserted on the rule. Which is this
+     * test, and the reason [DrainStatus.adoptSaveClause] exists as a function:
+     * `DrainWiringTest` can then pin that the call site applies it unconditionally,
+     * which is a shape, and leave what it *does* to be checked here, which is
+     * behaviour.
+     */
+    @Test
+    fun `a pass entry adopts the confirmation clause of its reading and no more`() {
+        val at = start.plusSeconds(90)
+        val confirmed = drain(start.plusSeconds(60)).copy(saveRequestedAt = null, resaveForcedAt = start)
+
+        // Somebody is on: the confirmation cannot describe the world any more, and
+        // every state in this pass is run against a drain that does not claim one.
+        val occupied = confirmed.readPlayers(ProbeOutcome.Joinable(online = 1, max = 20), at)
+        val adopted = confirmed.adoptSaveClause(occupied)
+        adopted.worldSaved.shouldBeFalse()
+
+        // No narrowing. The count is the whole of the condition — not the count and
+        // some property of the drain — because every field the drain is carrying is
+        // one a step in this pass may be about to act on.
+        confirmed
+            .copy(playersEvacuated = false)
+            .adoptSaveClause(occupied)
+            .worldSaved
+            .shouldBeFalse()
+        confirmed
+            .copy(saveRequestedAt = at)
+            .adoptSaveClause(occupied)
+            .worldSaved
+            .shouldBeFalse()
+        confirmed
+            .copy(resaveForcedAt = null)
+            .adoptSaveClause(occupied)
+            .worldSaved
+            .shouldBeFalse()
+        confirmed
+            .copy(state = DrainState.STOPPING)
+            .adoptSaveClause(occupied)
+            .worldSaved
+            .shouldBeFalse()
+
+        // And no widening: rung 1 of the ladder, never the rung the reading itself
+        // carries. `Occupied.drain` has been through `forgetSaveEvidence`, and
+        // adopting *that* would drop a parked proxied drain from `saveIsCurrent` past
+        // `playersEvacuated` and resume it into a transfer instead of into `SAVING`.
+        adopted shouldBe confirmed.unconfirmWorldSave()
+        adopted.playersEvacuated.shouldBeTrue()
+        adopted.resaveForcedAt shouldBe start
+
+        // Nobody on, and silence. Neither is grounds to take anything away — voiding
+        // on a corroborating zero reading would make every healthy drain save for
+        // ever, and an unanswered probe establishes nothing at all. Identity, so an
+        // unchanged drain does not become a store write.
+        val empty = confirmed.readPlayers(ProbeOutcome.Joinable(online = 0, max = 20), at)
+        confirmed.adoptSaveClause(empty) shouldBeSameInstanceAs confirmed
+        val silent = confirmed.readPlayers(ProbeOutcome.NotJoinable("no answer"), at)
+        confirmed.adoptSaveClause(silent) shouldBeSameInstanceAs confirmed
+    }
+
+    /**
      * The enforcement point for the same rule at the point a pass is **recorded**,
      * which is where round 18 lost it.
      *
