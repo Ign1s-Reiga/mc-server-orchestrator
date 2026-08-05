@@ -143,6 +143,48 @@ scan of one file is false in the direction that matters, because a stop added to
 a teardown or a rescheduling path is outside the scanned file *by construction*
 and is precisely what a drain audit goes looking for.
 
+## Presence catches a deletion; a narrowing needs a scenario
+
+Round 21. "Every stop's enclosing function also calls `mayStop`" is a **presence**
+pin: it catches the token being deleted and is green against
+`!mayStop(…) && !playersEvacuated`, which keeps the token, the count and the
+enclosing set. `playersEvacuated` is true of every drain that reaches `STOPPING`,
+so the narrowed gate is an unconditional re-issue — at a container an operator may
+have restarted underneath the drain, which is invariant 2 with a live session in
+it. Round 20's rule was "assert the gate, not the location"; the rule now is that a
+gate's *content* is behaviour like any other rule, and its branch needs a scenario.
+Two cheap ways to find the branches that have none:
+
+- **Grep the branch's own message.** A detail string that appears nowhere in the
+  test sources means nothing has ever reached that branch.
+- **Ask what the narrowing reads.** A field that is constant by the time the branch
+  runs makes the narrowing an unconditional bypass rather than a special case.
+
+Some branches cannot be reached at all: `DrainController.stop`'s own `mayStop` is a
+backstop that `DEREGISTERED` decides first, so a narrowing *there* is invisible to
+every test. Same category as round 18's net, same answer — say so in the docstring
+rather than invent a scenario that cannot exist.
+
+## A scan has an alphabet, and the motivation names what is outside it
+
+The stop scan was keyed on `stopWorkload(` while its own KDoc gave **rescheduling**
+as the reason it existed — and rescheduling reaches `Node.removeWorkload`, outside
+the alphabet by construction. Before trusting a source scan, list the verbs that do
+the dangerous thing and check each is covered; they may need *different* claims,
+because they carry different arguments. A stop ends a running container and needs a
+gate; a removal refuses one at the interface, so all it needs is to be decided in
+one file.
+
+## Classify the call, not the file
+
+A file-level partition — "a file naming `stopWorkload(` either declares it or calls
+it" — is bought off by `private suspend fun stopWorkload(node, grace) =
+node.stopWorkload(…)`, which is exactly what somebody writes when they need a stop
+in two places, and which moves the whole file onto the *performing* side. The unit
+is the call, and performing means a call inside an **`override`** of the verb: a
+wrapper cannot write `override`, a distributed `Node` implementation can. The same
+correction applies to any "which files may do X" test.
+
 ## A borrowed constant carries the guarantees of the type it came from
 
 `goingRoundInCircles` bounded a re-save lap with `stopGracePeriod` as a stand-in

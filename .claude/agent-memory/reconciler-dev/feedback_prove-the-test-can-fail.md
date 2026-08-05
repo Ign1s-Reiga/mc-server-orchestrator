@@ -147,6 +147,31 @@ mutation that fails to compile also exits non-zero, and counting that as "caught
 is the non-compiling-sabotage trap above pointing the other way. No report is an
 unknown; a report with no `<failure>` is a green.
 
+**And read it per test case, not per class.** `grep -q "<failure"` on the class
+report scores *any* red as "caught", so one broken shared helper — a renamed
+function that an exactly-one-declaration `check` throws on, a class-init failure, a
+count assertion a legitimate third call site reddens — makes every mutation *and
+both controls* pass at once, and the run prints "all caught" having proved nothing.
+The controls cannot detect it, because the controls fail the same way. An auditor
+and I both signed off on a 10/10 run that was equally consistent with the real
+thing and with total vacuity. Carry the expected test-case names in the tuple and
+require the red set to equal them exactly: a name missing means the assertion did
+not bite, a name extra means something else broke and the run says nothing about
+either.
+
+**The harness needs its own red-proof, and that proof needs its own vacuity
+check.** `S1` in `drain-wiring-mutations.sh` breaks the whole class the way a
+rename does *and* applies a real mutation on top, then requires the verdict to
+refuse the result — but it must also assert the class went red at all, because a
+self-test whose own mutation fails to compile refuses for the wrong reason and
+reads exactly like a working one.
+
+**A delimiter that can occur in the payload is a harness lying about its subject.**
+The mutation table was `name|file|class|literal|replacement`, and the first literal
+containing `||` split into the wrong fields, applied a replacement nobody wrote,
+and reported the resulting compile failure as UNKNOWN. It was one step from
+scoring a defect that did not exist. `@@` now, plus a field count per entry.
+
 ## When the check cannot exist, move it to the compiler
 
 Structured-logging argument order is untyped and untested anywhere in this repo —
