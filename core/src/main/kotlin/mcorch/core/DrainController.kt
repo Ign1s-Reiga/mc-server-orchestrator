@@ -1432,6 +1432,21 @@ internal class DrainController(
      * next pass, and what changes is only that the attempt count now rises and the
      * anchor stops moving, so `escalates` reaches the threshold and a human is
      * called.
+     *
+     * ## What the abort widens, written down rather than left to be rediscovered
+     *
+     * [abort] calls [restoreRegistration], and [awaitStopped] can reach here from
+     * `STOPPING` — so this can put a backend back into the proxy's routing table
+     * while a container stop with a **live grace period** is counting down to a
+     * SIGKILL, and stop asserting the seal in the same act. The two pre-existing
+     * paths that re-register from `STOPPING` do it after a stop the runtime
+     * *refused*, so no kill was pending; this one has one genuinely in flight.
+     *
+     * It is the accepted posture widened rather than a new one. A parked drain
+     * takes players again because a running server nobody can reach is the worse
+     * failure, and the exposure is bounded: once the grace period elapses the
+     * container is down, and the container-is-down branch releases the
+     * registration properly.
      */
     private suspend fun goingRoundInCircles(
         pass: DrainPass,
@@ -1449,12 +1464,27 @@ internal class DrainController(
         val anchor = drain.resaveForcedAt ?: now
         val anchored = drain.copy(resaveForcedAt = anchor)
         val circling = JavaDuration.between(anchor, now).toKotlinDuration()
-        // Measured against the evidence gap because that *is* the quantity: a
-        // confirmation is worth nothing once it is older than one, so a drain that
-        // has been chasing one for longer than that has failed to establish a
-        // single confirmation it could use. A second constant here would be a
-        // second thing to keep in step with the first.
-        if (circling > evidenceGap) {
+        // The bound is **one lap**, and a lap is not one evidence gap.
+        //
+        // It was `evidenceGap` alone, on the argument that a confirmation is
+        // worth nothing once it is older than one. That is true of the
+        // confirmation and false of the cycle: a lap is void, save, try to stop,
+        // and the save in the middle is the one step in this protocol that runs
+        // for minutes. The schema sizes it at `saveTimeout`, 180 seconds by
+        // default, while `evidenceGap` is 30 and lives in a different module — so
+        // any server whose world takes longer than half a minute to flush could
+        // be told it "does not clear on its own" by a bound it had never been
+        // given time to satisfy, about a cycle that then cleared on its own two
+        // passes later.
+        //
+        // [DrainSubject.stopGracePeriod] is the ceiling on a save — the schema
+        // guarantees it exceeds `saveTimeout`, which is why nothing here
+        // re-derives it — so it is read instead of adding a second field that
+        // would have to be kept in step with the first. Note what is *not*
+        // bought: two thirty-minute loop stalls in a row still trip this, and
+        // should, because a drain that has been chasing a usable confirmation for
+        // an hour is the thing being detected.
+        if (circling > evidenceGap + pass.subject.stopGracePeriod) {
             return abort(
                 subject = pass.subject,
                 node = pass.node,

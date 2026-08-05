@@ -2171,6 +2171,98 @@ internal class DrainTest {
         }
 
     /**
+     * The second discriminator: the bound on a re-saving drain is **one lap**, and
+     * a lap contains a save.
+     *
+     * It was one `saveEvidenceMaxGap` — thirty seconds, from a different module —
+     * on the argument that a confirmation older than one is worthless. True of the
+     * confirmation, false of the cycle: the schema sizes a save at `saveTimeout`,
+     * three minutes by default, so a world that takes longer than half a minute to
+     * flush could not complete a single forced re-save inside the allowance it was
+     * being judged against. Two ordinary loop stalls then produced a failure
+     * telling an operator it "does not clear on its own" about a drain that
+     * cleared on its own two passes later — round sixteen's first critical
+     * relocated.
+     *
+     * The scenario is deliberately the innocent one. Nothing here is broken: a
+     * three-gigabyte world, an orchestrator that fell behind twice, and a drain
+     * that saves again each time and finishes. The detection it must not weaken is
+     * the test above, which keeps stalling for ever.
+     */
+    @Test
+    fun `a forced re-save is given time for the save itself before the drain is called stalled`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.store.deleteDefinition(name)
+
+            // Every flush takes a minute, which is twice the evidence gap on its
+            // own and is the whole difficulty.
+            harness.node.onExec = { command ->
+                if (command == PaperCommands.saveAll()) {
+                    harness.clock.advance(60.seconds)
+                }
+                harness.node.defaultExec(command)
+            }
+
+            repeat(6) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+            harness.node.saves shouldHaveSize 1
+
+            // Stall one: the loop is away for half an hour. Nobody was watching,
+            // so the confirmation goes and the drain saves again.
+            harness.clock.advance(30.minutes)
+            harness.pass(name)
+            val anchor =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+                    .resaveForcedAt
+                    .shouldNotBeNull()
+            harness.clock.advance(2.seconds)
+            harness.pass(name)
+            harness.clock.advance(2.seconds)
+            harness.node.saves shouldHaveSize 2
+
+            // Stall two, and this one only has to be wider than the evidence gap
+            // to void the confirmation again — thirty-five seconds between two
+            // passes of the same server is a busy orchestrator, not a fault.
+            harness.clock.advance(35.seconds)
+            harness.pass(name)
+
+            val circling =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            // The instrument is not vacuous: this really is a *second* forced
+            // re-save measured against the first one's anchor, which is the only
+            // situation the bound governs.
+            circling.resaveForcedAt shouldBe anchor
+            circling.state shouldBe DrainState.SAVING
+            // And it is not a failure. Nothing is wrong with this server.
+            circling.failure shouldBe null
+
+            harness.clock.advance(2.seconds)
+            repeat(6) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+
+            harness.node.saves shouldHaveSize 3
+            harness.node.stops shouldHaveSize 1
+            harness.store.getServer(name) shouldBe null
+        }
+
+    /**
      * A container that will not exit, reported without anything being escalated at
      * it.
      *
