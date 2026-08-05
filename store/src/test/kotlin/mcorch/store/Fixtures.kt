@@ -288,6 +288,12 @@ internal object Fixtures {
             playersEvacuated = true,
             sealRequestedAt = at.minusSeconds(115),
             saveRequestedAt = at.minusSeconds(20),
+            // The two set-once anchors, both of which decide a bound the drain
+            // cannot reach if a round trip drops them: one hands step 4 its
+            // allowance back on every restart, the other restarts the count of a
+            // drain that keeps re-saving and never stops.
+            resaveForcedAt = at.minusSeconds(95),
+            transferStartedAt = at.minusSeconds(100),
             deregisteredAt = null,
             transferAttempts = 4,
             destination = resourceName("lobby-01"),
