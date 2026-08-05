@@ -1607,7 +1607,9 @@ internal class DrainController(
         // the measured fact once — how long ago a confirmation was first voided, and
         // that it has happened again — rather than restating the same number as a
         // claim about how long nothing has been working. Some of that interval was
-        // the drain making honest progress between laps.
+        // the drain making honest progress between laps, and the message says so in
+        // as many words: an anchor hours old and a cause that started a minute ago
+        // produce the same number, and the first pass of the second one aborts on it.
         val anchor = drain.resaveForcedAt ?: now
         val anchored = drain.copy(resaveForcedAt = anchor)
         val circling = JavaDuration.between(anchor, now).toKotlinDuration()
@@ -1669,16 +1671,22 @@ internal class DrainController(
                 // intervene on the container, and the only intervention available
                 // there is `crictl stop`, which is a container stopped with no save.
                 // A false diagnostic here is a data-loss vector one human step
-                // removed, so it reports how long this has been going on and what
-                // the loop will keep doing, and asks for the two observations that
-                // would explain it.
+                // removed.
+                //
+                // So it says what was measured, what the number is *not*, and what
+                // the next pass does. The disclaimer is not padding: the anchor
+                // spans laps, so a drain that circled this morning and hit an
+                // unrelated cause a minute ago aborts on that cause's first lap
+                // reporting hours — every word of it true, and read as hours of
+                // downtime by anyone who is not holding this paragraph.
                 message =
                     "this drain keeps saving the world and never reaches the stop: a confirmed save was first " +
                         "voided ${circling.inWholeSeconds}s ago and it has happened again since — $problem. " +
-                        "Nothing has been stopped or removed and the server keeps running, and the loop will " +
-                        "keep saving and stopping nothing until the cause goes away: check whether the " +
-                        "container is restarting underneath the drain, and whether the loop is reaching this " +
-                        "server on every pass",
+                        "That is the age of the first voiding and not a duration of downtime; laps in between " +
+                        "may each have saved. Nothing has been stopped or removed and the server is still " +
+                        "running, and the next pass saves again and re-tries the stop, so this clears on its " +
+                        "own once the cause does: check whether the container is restarting underneath the " +
+                        "drain, and whether the loop is reaching this server on every pass",
             )
         }
         return DrainProgress(

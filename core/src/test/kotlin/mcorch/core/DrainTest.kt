@@ -2448,6 +2448,12 @@ internal class DrainTest {
             // may include time the drain spent making progress, so it is reported as
             // what it measures and not restated as "nothing has worked for Ns".
             failure.message shouldNotContain "has not cleared on its own in"
+            // The span is not only left unclaimed, it is disclaimed. An anchor hours
+            // old and a cause a minute old produce the same number — the first pass
+            // of an unrelated later defect aborts on an interval that was mostly a
+            // working drain — and the operator this message is for cannot tell those
+            // apart from the number.
+            failure.message shouldContain "not a duration of downtime"
 
             // Nothing was done to the container. `failure-modes.md` item 7 does not
             // move because the bound moved.
