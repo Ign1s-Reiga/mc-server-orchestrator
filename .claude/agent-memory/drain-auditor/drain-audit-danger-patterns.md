@@ -1162,3 +1162,87 @@ Related: [[standalone-paper-drain-shape]]
     the exact claim D15 was added to refute. Same family as the maintained-lie rule
     the rename was performed under: grep the retired *claim*, not just the retired
     identifier.
+100. **A seal whose failure aborts unconditionally makes an unsealable workload
+    unstoppable, and for the proxy's own drain the justification does not apply.**
+    `DrainController.holdSeal` aborts on any `SealOutcome` that is not `Asserted`,
+    before any occupancy is consulted. Its KDoc argues the abort from a *backend*
+    with a router ("transferring into a queue that refills behind it"). A
+    `ProxyDrainSubject` has `router = null` and never transfers — it waits for zero
+    like a standalone server — so a proxy whose control endpoint does not answer is
+    parked in `DRAIN_FAILED` for ever *even with zero players confirmed by ping*,
+    and is therefore unstoppable, unreplaceable and undeletable. The standalone
+    Paper path is fine because `seal == null` short-circuits; the asymmetry is that
+    "there is no seal" is safe and "the seal did not answer" is not. Whenever a
+    step's abort is justified by a step that comes *after* it, check every subject
+    type for which that later step is absent.
+101. **The remediation for "the plugin is missing" needs the plugin.** Round 24's
+    closed loop: a Velocity proxy with no working control endpoint can only be
+    repaired by recreating it; recreating it is a `REPLACEMENT` drain; that drain
+    seals through the endpoint it does not have. Nothing in the spec hash
+    (`VelocityWorkloadPlanner.specHash`) mentions the asset, the environment or the
+    token *value*, so the loop cannot even notice. Exit is a manual `crictl stop`.
+    Live causes that survive: unpinned `VELOCITY_VERSION` (the image pulls latest
+    Velocity, the plugin is compiled against velocity-api 4.0.0, and a breaking
+    upstream release makes a previously-working proxy come up ready and permanently
+    undrainable, with no hash input moved), the asset going missing between create
+    and a later recreate, and a control-token rotation. Generalisation of memory
+    item 4: whenever a capability is *delivered* by the create path and *required*
+    by the drain path, ask what repairs a container that has the second but not the
+    first.
+102. **A value that configures nothing but participates in the spec hash and in the
+    drain probe is a wedging edit.** `VelocityProxy.spec.network.port` is a *claim
+    about the image* (nothing configures Velocity's `bind`), it is in
+    `VelocityWorkloadPlanner.specHash`, and `VelocityProxyAgent.probe` pings it from
+    the **desired** definition against the **running** container. Editing it
+    therefore triggers a replacement drain and simultaneously breaks the ping that
+    gates that drain's stop, so the proxy wedges on `DRAIN_STALLED` / "cannot
+    confirm zero players" rather than the `READINESS_TIMEOUT` the KDoc promises.
+    The KDoc's promise holds only for a *fresh* proxy. When a constant is
+    reclassified from request to claim, check whether it is still hash-bearing and
+    still probe-bearing; a claim that can only have one correct value belongs in the
+    reader's validation, not in the hash.
+103. **`Refused` is always retryable in one mapper and permanent-by-default in the
+    other, and enforcement newly opened the door.** `ProxyLink.asSealOutcome` makes
+    every `ControlOutcome.Refused` retryable on the stated grounds that "stop
+    trying" on a drain step is how a container becomes undeletable —
+    while `BackendLink.transfer`'s `else` bucket maps a refusal to
+    `TransferReport.Refused(retryable = false)`, i.e. a PERMANENT drain abort. That
+    bucket now contains `UNAUTHENTICATED`, which was unreachable while the plugin
+    ran with `auth.required = false` and became reachable the moment
+    `MCORCH_CONTROL_TOKEN` was delivered. It stays unreachable only because
+    `holdSeal` issues the same 401 first and aborts retryably — an ordering
+    accident, not a guarantee. Whenever an auth mechanism is switched from
+    unenforced to enforced, re-walk every `else` branch over the protocol's error
+    codes.
+104. **A new `require` in a workload type is a new way to make a populated server
+    undeletable.** `Reconciler.rejectDefinition` records `PERMANENT` and does *not*
+    exempt `terminating`, and `Pass` construction happens before the delete
+    exemption, so any `IllegalArgumentException` thrown while planning a workload
+    makes that server permanently unreconcilable — drain included. Round 24 added
+    `StorageRequest.Persistent.init { require(mountPath.startsWith("/")) }`, which
+    the YAML reader already enforces more strictly but the store's
+    `DefinitionCodec.readStorage` does not re-check. Prefer refusing at the node
+    (`NodeException.Rejected` from `HostPaths`), which fails the create without
+    freezing the delete. Before adding an `init` check to anything on the
+    `WorkloadSpec` path, ask what it does to a server the operator is trying to
+    remove.
+105. **`WorkloadSpec.init` checks assets against assets, not against the world
+    mount.** The duplicate-destination guard is `assets.distinctBy { it.destination }`
+    only; nothing forbids an `AssetMount` whose destination sits at or under
+    `StorageRequest.Persistent.mountPath`, and `HostPaths.mounts` appends asset
+    mounts *after* the storage mount with `readOnly = true`. Unreachable today (one
+    asset, proxies only, ephemeral storage), which is exactly why it will be
+    reachable later. The whole premise of the round-24 change is "a path in this
+    type is now a path that is honoured" — so the honoured paths have to be checked
+    against each other across both fields, not within one.
+106. **A create-time refusal is discovered after the old container is already
+    gone.** `HostPaths.mounts` throws for a missing asset from `containerSpecFor`,
+    which `LocalNode.ensureWorkload` calls *after* `runSandbox` — and, on the
+    replacement path, after the previous proxy has been drained, stopped and
+    removed by an earlier pass. The orphan sandbox is the small half; the large half
+    is that the fleet's only front door is gone and the loop has just discovered,
+    permanently, that it cannot build a new one. Nothing stages the artefact for
+    `:app:run` (only `:app:integrationTest` does), so the gap is the default state.
+    Whenever a create gains a new permanent refusal, ask what the *replacement*
+    sequence has already destroyed by the time it fires, and whether the same
+    question could have been asked before the teardown committed.
