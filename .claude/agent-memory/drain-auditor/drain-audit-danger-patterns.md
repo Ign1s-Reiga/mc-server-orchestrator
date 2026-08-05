@@ -859,3 +859,44 @@ Related: [[standalone-paper-drain-shape]]
     Whenever a new abort is placed on a cycle whose *resume* does real work, state
     separately what it does to the report and what it does to the rate — they are
     now decided by different fields.
+
+## Round 18: the enforcement point catches readers, and the hole is in a non-reader
+
+75. **A "reading the count means voiding" enforcement point cannot see the branch
+    that reads no count but acts on the drain in the same pass.** `readPlayers`
+    makes `PlayerReading.Occupied` carry an already-voided drain, which closes
+    every branch that *reads* `probe.online`. `advance` still takes
+    `readPlayers(...).occupancy` and throws the drain away, so `step` runs against
+    an unvoided record — and at `DEREGISTERED` the first thing `step` does is
+    `holdSeal`, **before** `requireEmpty`. A proxy control blip therefore aborts
+    with `worldSavedAt` intact and `pass.occupancy` positive, and
+    `Reconciler` writes that occupancy into `status.players`, so the very
+    observation that should have destroyed the confirmation *refreshes* the
+    evidence window instead (item 70). When auditing an enforcement point, do not
+    stop at "who reads the trigger" — enumerate everything that runs against the
+    unenforced value *before* the enforcing call, per state.
+76. **A per-state exemption is safe only as long as the state's own invariants
+    hold, and those are what change.** The `advance` exemption is defensible for
+    `SEALED`/`TARGET_RESOLVED`/`TRANSFERRING`/`SAVING` because
+    `dropUnusableSaveEvidence` plus the resume ladder make `worldSavedAt`
+    provably null in all four. Nothing states that, nothing tests it, and the
+    call-site comment argues something else entirely (resume-ladder behaviour).
+    An exemption whose written reason is not its actual safety argument will be
+    widened by the next reader on the written one.
+77. **"Unobservable in this harness" is usually a claim about the default
+    fixture.** `confirmedAt` vs `observedAt` was left unpinned because
+    "`FakeNode`'s probe consumes no clock time" — but `FakeNode.exec` routes
+    `mc-monitor` through the same `onExec` hook that tests already use to make
+    `saveAll()` take sixty seconds, so `harness.clock.advance()` inside the probe
+    pins it directly. Same class as the round-17 finding that a 60 s player
+    session was being protected by `dropUnusableSaveEvidence` rather than by the
+    branch under test: a statement about what the fixture does today, mistaken for
+    a statement about what the harness can express.
+78. **A grace period is not a save budget, and only one kind has an invariant.**
+    `SpecInvariants.stopGraceProblem` ties `stopGracePeriod` to `saveTimeout` for
+    `PaperServer` only; `ProxyLifecycleSpec` documents in prose that it has no
+    such rule. So `DrainSubject.stopGracePeriod` satisfies "exceeds `saveTimeout`"
+    for one implementation and not the other, and any bound derived from it
+    inherits that split. It is also operator-settable up to
+    `MAX_STOP_GRACE_PERIOD` (2 h), so a bound sized from it can silently become
+    thirty times the quantity it was meant to cover.
