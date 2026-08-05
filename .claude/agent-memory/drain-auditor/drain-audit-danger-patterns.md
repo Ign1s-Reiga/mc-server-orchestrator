@@ -1114,3 +1114,51 @@ Related: [[standalone-paper-drain-shape]]
     entirely, i.e. round 4's same-well residual, still open and still ruled. Restate
     it whenever the removal path is re-audited: the refusal that `Node.removeWorkload`'s
     contract promises is enforced through the enumeration, not through the handle.
+
+## Round 23: what a constructive unreachability argument can be pinned at
+
+96. **A constructive "nothing reaches it" argument has three premises, and a
+    caller-count pin carries two.** `DrainWiringTest`'s
+    `stop has one caller, reached from a branch that has already asked mayStop`
+    pins (a) `stop`/`letGoAndStop` are `private` with one call site each, and (b)
+    the one entry's enclosing function is `step` and `step` names `mayStop`. The
+    third premise — that the *value* handed down is the one `mayStop` was asked
+    about — is prose only: nothing asserts `letGoAndStop`'s call reads
+    `stop(pass, drain)` with its own parameter, nor that `step` applies `mayStop`
+    and `letGoAndStop` to the same `drain`. Low consequence in isolation (a
+    divergence either makes the backstop fire or leaves it dead), but it is the
+    premise the whole "this gate needs no scenario" ruling rests on, and it is one
+    line with the technique the sibling adoption test already uses
+    (`callee(reading.value)` — follow the name, do not restate it). When accepting
+    a constructive argument, list its premises and check each is pinned or
+    disclosed; a premise about a *value* is the one that gets left in prose.
+97. **The thing that actually catches the composite is an outcome assertion, not a
+    gate assertion.** A narrowed primary (`step`'s `mayStop(...) || playersEvacuated`)
+    is invisible to a presence check; a narrowed backstop (`stop`'s
+    `!mayStop(...) && !playersEvacuated`) is invisible to everything. Both together
+    issue a stop with no current save — and that is caught, by `DrainTest`'s
+    `harness.node.stops.shouldBeEmpty()` assertions, precisely *because* they assert
+    that no stop happened rather than which gate refused. A scenario that asserts a
+    refusal by its detail string can be satisfied by the other gate refusing; one
+    that asserts the runtime was never asked cannot. Prefer the outcome assertion
+    for a gate that has a peer, and say in the KDoc that it is the peer's cover.
+98. **`performs(verb) = name == verb && declaration.contains("override ")` closes
+    the wrapper (item 90) and leaves the decorator.** A call to `stopWorkload`
+    inside an `override fun stopWorkload` is exempt unconditionally, so a `Node`
+    decorator that shortens the grace period on the way through
+    (`delegate.stopWorkload(handle, ZERO)`) contributes no entry to the deciding
+    list. `Node.stopWorkload`'s strictly-positive-grace promise is KDoc at the
+    interface (`Node.kt:157`) and enforced only in `LocalNode.stopWorkload`. The
+    exemption is right — it is what lets a distributed `Node` land without editing
+    the test — but it means the seam CLAUDE.md protects is the one place the scan
+    is blind. When the second `Node` arrives, the check to add is that every
+    implementation of `stopWorkload` passes its own `gracePeriod` parameter through
+    unmodified.
+99. **A test-case rename has to be chased into every string that quotes it, and the
+    prose one level up is a string.** The round-23 rename (…"decided in one file
+    each" → …"decided at the sites named here") updated the harness's `$DECIDED`
+    variable and left `scripts/dev/drain-wiring-mutations.sh:7` still describing the
+    suite as asserting "every call which ends a container is decided in one file" —
+    the exact claim D15 was added to refute. Same family as the maintained-lie rule
+    the rename was performed under: grep the retired *claim*, not just the retired
+    identifier.

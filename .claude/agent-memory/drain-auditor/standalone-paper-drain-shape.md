@@ -557,3 +557,35 @@ call sites, `mayStop`, `saveIsCurrent`, `letGoAndStop`, `requireEmpty`,
   second stop) rather than on a refusal — so it cannot be satisfied by a drain that
   simply never finishes. D10 (`&& !drain.playersEvacuated`) is caught by it because
   the scenario asserts `playersEvacuated` is true at that point.
+
+## Round 23 rulings: the backstop's argument, and the two judgements sustained
+
+Audited at `3dfc643` (`feat/paper-server-kind` = the branch under review). No
+critical — the fifth clean round in six. `:core` main sources carry **zero**
+executable change this round (`git diff` of the round is three KDoc lines in
+`DrainController`); `Reconciler.kt`, `LocalNode.kt`, `WorkloadView.kt` and
+`Node.kt` are byte-identical.
+
+- **The new test carries the constructive argument, not its shadow — with one
+  premise left in prose.** `stop has one caller, reached from a branch that has
+  already asked mayStop` really does pin what makes the backstop unreachable, and
+  the `private`-on-both-declarations precondition is asserted rather than assumed.
+  What it does not pin is "the same drain with the same arguments", which is the
+  premise that decides whether the backstop is dead or live. See
+  [[drain-audit-danger-patterns]] items 96 and 97 — 97 is the reason this is a
+  warning and not a critical.
+- **Both offered judgements sustained.** D17's absence is right: `internal suspend
+  fun stop` is an `EXPOSED_PARAMETER_TYPE` error against the `private class
+  DrainPass` (`DrainController.kt:864`), and the harness scores a non-compiling
+  mutation UNKNOWN → failure, so adding it would have produced a red run that
+  proved nothing. Writing the reason where the mutation would have gone, rather
+  than skipping the number, is the right posture. The rename is right for the
+  reason given — the audit trail reads those strings — and the follow-through is
+  incomplete, see item 99.
+- **Round 22's three warnings are all genuinely closed.** Item 93: `deciding` is
+  now one entry per call, `(path, enclosing.name)`, and D15 demonstrates the file
+  unit was blind. Item 94: the asymmetry of *strength* between the two verbs is
+  now stated. Item 95: the omitted-container residual is named at
+  `DrainController.kt:41` and in the `DrainWiringTest` bullet, with the containerd
+  2.3.3 precedent, and my re-read of `WorkloadView.kt:171-196` and
+  `LocalNode.kt:558-563` confirms the description is exact.
