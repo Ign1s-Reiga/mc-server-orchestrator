@@ -101,6 +101,29 @@ question to ask of any extraction is "where can this be written now that it
 could not be written before", and the answer belongs in the red-proof rather than
 in the commit message.
 
+## A fact about upstream is not a fact about what we run
+
+A hand-off arrived with a defect stated as verified: "Velocity 4.0.0's generated
+`velocity.toml` binds players on 25565, not 25577 — observed against the real
+STABLE release, sha256 verified. Check `VelocityProxyDefaults.PLAYER_PORT`." The
+observation was correct. The conclusion was not, and acting on it broke every
+proxy: the image installs a stock `velocity.toml` binding 25577 *before* Velocity
+ever generates one, so the release's own default never happens here. A real proxy
+then came up healthy, loaded its plugin, answered its control endpoint — and
+never became ready, because the readiness ping went to a port nothing was
+listening on.
+
+**Before changing a constant on evidence about an upstream project, find the
+layer that actually decides it in our deployment.** Usually that is the image's
+entrypoint, and it is usually one readable file. The same question applies to
+every "the docs say" fact about a container: the docs describe the software, and
+we run an image that configures the software.
+
+Keep the evidence *both* ways in the code. The constant's KDoc now says what
+Velocity's own default is, why this differs, and what it would take to make the
+value a request rather than a claim ([[proxy-image-contract]]) — otherwise the
+next reader repeats the correction with the same good evidence.
+
 ## Arguing to leave something open
 
 When escalating a known hole rather than fixing it, **argue from what is at

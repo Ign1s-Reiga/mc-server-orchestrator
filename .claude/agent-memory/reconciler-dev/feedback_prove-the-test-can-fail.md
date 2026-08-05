@@ -177,6 +177,15 @@ assertion, ask which mutation lands in the location that is already listed**, an
 write it *before* the fix, so a not-caught entry states the finding in the
 instrument's voice rather than the auditor's.
 
+**The name in the report is not the name in the source.** A test taking an
+injected parameter is reported as `the plugin is mounted …(Path)` — every
+`@TempDir` test is — so a stripper that only knows the empty `()` pair produces a
+name no claim can ever match, and *every* entry reads MISCAUGHT. That is
+indistinguishable at a glance from twelve real findings, and it fails in the
+opposite direction from the vacuity trap: total noise rather than total green.
+Strip a trailing parenthesised list, and read one MISCAUGHT's two lists side by
+side before believing a run that reddened everything.
+
 **A delimiter that can occur in the payload is a harness lying about its subject.**
 The mutation table was `name|file|class|literal|replacement`, and the first literal
 containing `||` split into the wrong fields, applied a replacement nobody wrote,

@@ -2,6 +2,7 @@
 
 - [Standalone drain decision](project_standalone-drain-decision.md) — the human's ruling on no-proxy drains, plus my follow-on calls that are still open to overruling.
 - [Paper image contract](project_unverified-paper-image-contract.md) — the in-container commands, now verified, and the 60–95s startup window that makes probes time out normally.
+- [Proxy image contract](project_proxy-image-contract.md) — verified: TYPE defaults to BungeeCord, /plugins is staging, and a third-party velocity.toml decides the player port.
 - [Assert on side effects](feedback_assert-on-side-effects.md) — how tests here go green while proving nothing, and the habits that prevent it.
 - [Drain against the container](feedback_drain-against-the-container.md) — save evidence expires, and a drain reads the workload's labels rather than the edited definition.
 - [Escalation ruling](project_escalation-ruling.md) — item 7's reach, and why NEEDS_ATTENTION stopped being a drain flag; the anchor that decides alarm fatigue.
