@@ -411,6 +411,11 @@ public data class DrainStatus(
      * invisible — nothing failed, so nothing was recorded and nothing escalated —
      * and this is the anchor that measures it.
      *
+     * **Stamped on the edge back to `SAVING`** — the drain going back for another
+     * confirmation, which is the thing being counted — rather than where a
+     * confirmation is voided. Losing one while parked is not this defect and has a
+     * failure recorded already.
+     *
      * **Set once, and cleared by exactly one event: a probe that saw somebody on
      * the server.** A player makes the next save legitimate rather than
      * suspicious, so the count starts again from there. It is deliberately *not*

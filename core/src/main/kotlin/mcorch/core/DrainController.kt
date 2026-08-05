@@ -209,19 +209,16 @@ internal class DrainController(
         // any probe can report, both dropped here so that every state below
         // sees a drain whose evidence is about the container in front of it.
         //
-        // Dropping one is also the event the re-save anchor measures, and this is
-        // the only place that can see it: by the time a state notices its evidence
-        // is missing, it cannot tell a confirmation that was voided from one that
-        // was never taken. Stamped set-once — see
-        // [mcorch.schema.DrainStatus.resaveForcedAt] for why nothing short of a
-        // player being seen may reset it.
-        val dropped = recorded.dropUnusableSaveEvidence(observation.startedAt, lastProbedAt, now, evidenceGap)
-        val drain =
-            if (dropped !== recorded) {
-                dropped.copy(resaveForcedAt = dropped.resaveForcedAt ?: now)
-            } else {
-                dropped
-            }
+        // Deliberately **not** where the re-save anchor is stamped, although this is
+        // the one place that can see a confirmation being voided. Losing one is not
+        // the signal — the drain having to go *back* for another is, and a drain
+        // that loses its evidence while parked has a failure recorded already. A
+        // stamp here also made the anchor older than the cycle it measures, so a
+        // drain that had been parked for an hour aborted on its first honest lap
+        // with the wrong diagnosis. [goingRoundInCircles] stamps it at the edge it
+        // bounds, and no test could tell the two apart, which is the other half of
+        // the reason this line is not here.
+        val drain = recorded.dropUnusableSaveEvidence(observation.startedAt, lastProbedAt, now, evidenceGap)
         if (drain !== recorded) {
             LOG.warn(
                 "server={} has a world save confirmed at {} that is no longer evidence: the container now " +
