@@ -477,6 +477,113 @@ internal class DrainTest {
                 .failureClass shouldBe FailureClass.PERMANENT
         }
 
+    /**
+     * A permanent diagnosis is not resolved by somebody logging back on.
+     *
+     * The twenty-eighth audit's third finding, and the state it names is the most
+     * ordinary one there is: a standalone server under a **delete**, a save request
+     * delivered and never confirmed, and then a player. `permanentFailureStopsPasses`
+     * is false under a delete — a failure must never make a workload undeletable — so
+     * the passes carry on, the resume finds the server occupied, and the block used
+     * to write `failure = null`.
+     *
+     * What a dashboard then said was *"waiting, not stuck … the drain resumes on its
+     * own once it is empty"* about a server whose world may not be on disk and whose
+     * delete cannot complete: when it empties, `save` takes the `saveRequestedAt`
+     * branch and aborts permanently again. Nothing is stopped either way — the wedge
+     * survives, which is why this is a reporting defect — but it is the report that
+     * decides whether somebody reaches for `crictl stop`.
+     *
+     * ## Three assertions, three different consumers
+     *
+     * The record is the first: a permanent failure survives the block. The
+     * **escalation anchor** is the second, and it is the half that made a
+     * come-and-go population outlast any threshold — every clear restamped
+     * `occurredAt`, so a fault present for hours reported as first seen a moment ago.
+     * The third is the condition a dashboard reads: `DRAIN_BLOCKED` is derived from
+     * `blocked != null && failure == null`, so the *needs nobody* sentence disappears
+     * exactly here, and `NEEDS_ATTENTION` is free to fire on the anchor that survived.
+     *
+     * A retryable failure is still cleared by a block, and that is deliberate — a
+     * healthy wait must not carry a fault the pass in front of it has already got
+     * past. `a block does not survive the resume that re-derives past it` is the
+     * other side of it.
+     */
+    @Test
+    fun `a permanent save wedge survives a player logging back on`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+
+            // The save goes out and never reports completion: the request is
+            // recorded as delivered and only a human can say what is on disk.
+            harness.node.onExec = { command ->
+                if (command == PaperCommands.saveAll()) {
+                    throw harness.node.unanswered(NodeOperation.EXEC)
+                } else {
+                    harness.node.defaultExec(command)
+                }
+            }
+            harness.store.deleteDefinition(name)
+            repeat(6) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+
+            val wedged =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            wedged.saveRequestedAt.shouldNotBeNull()
+            val diagnosis = wedged.failure.shouldNotBeNull()
+            diagnosis.reason shouldBe FailureReason.DRAIN_SAVE_TIMEOUT
+            diagnosis.failureClass shouldBe FailureClass.PERMANENT
+
+            // Somebody logs back on, and keeps playing. The drain waits for them,
+            // which is correct — and says nothing about the wedge that is still
+            // there, which was not.
+            harness.node.online = 2
+            harness.clock.advance(20.minutes)
+            repeat(4) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+
+            val waiting =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+            val drain = waiting.drain.shouldNotBeNull()
+            drain.blocked.shouldNotBeNull().reason shouldBe DrainBlockReason.AWAITING_ZERO_PLAYERS
+            val standing = drain.failure.shouldNotBeNull()
+            standing.reason shouldBe FailureReason.DRAIN_SAVE_TIMEOUT
+            standing.failureClass shouldBe FailureClass.PERMANENT
+            // The anchor, unmoved by the block. A population that comes and goes
+            // must not reset how long this has been outstanding.
+            standing.occurredAt shouldBe diagnosis.occurredAt
+            // The block says so too: it is the drain's own message, and "resumes on
+            // its own once it is empty" is false while this stands.
+            drain.blocked.shouldNotBeNull().message shouldContain "DRAIN_SAVE_TIMEOUT"
+            drain.blocked.shouldNotBeNull().message shouldContain "waiting alone does not finish this"
+
+            // What the dashboard reads. Not *waiting, needs nobody* — somebody has
+            // to confirm the world state before this delete can complete.
+            waiting.condition(ConditionType.DRAIN_BLOCKED).status shouldBe ConditionStatus.FALSE
+            waiting.attention().status shouldBe ConditionStatus.TRUE
+
+            // And nothing was stopped, saved again, or removed while all that was
+            // being reported wrongly.
+            harness.node.saves shouldHaveSize 1
+            harness.node.stops.shouldBeEmpty()
+            harness.node.removals.shouldBeEmpty()
+            harness.store.getServer(name).shouldNotBeNull()
+        }
+
     @Test
     fun `a server with world data and no RCON cannot be drained and is not stopped`() =
         coreTest {

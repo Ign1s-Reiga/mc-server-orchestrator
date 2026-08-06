@@ -507,11 +507,15 @@ internal object ServerJson {
      * A drain that is waiting and not broken.
      *
      * Rendered beside `failure` and never instead of it: a client reads
-     * `blocked !== null && failure === null` as *waiting*, and the two are
-     * disjoint in everything this API serves. `observations` is deliberately a
-     * count of passes rather than a duration — `since` is the instant, and the
-     * client does the arithmetic against its own clock rather than against a
-     * number that was stale the moment it was written.
+     * `blocked !== null && failure === null` as *waiting*, and both keys are served
+     * whenever both are set. That pair is reachable — a drain waiting for players
+     * keeps a *permanent* failure standing, since somebody logging in does not
+     * resolve a save that was never confirmed — so a client that reads `blocked`
+     * alone as "waiting, needs nobody" is wrong, and the `DRAIN_BLOCKED` condition
+     * this module renders elsewhere already asks both halves. `observations` is
+     * deliberately a count of passes rather than a duration — `since` is the
+     * instant, and the client does the arithmetic against its own clock rather than
+     * against a number that was stale the moment it was written.
      */
     private fun blocked(block: DrainBlock): Json.Obj =
         jsonObject {
@@ -915,11 +919,13 @@ internal object ServerJson {
      *
      * The two used to be derived separately, and they disagreed. The condition
      * asks `blocked != null && failure == null`; this module asked
-     * `blocked != null`. So a document carrying both — which the design
-     * deliberately permits, because the alternative was a decode-time `require`
-     * paid by the widest fleet read, where one bad row aborts `listServers` and
-     * halts every in-flight drain — rendered `drainBlocked: false` beside
-     * `detail: "waiting, not stuck"`. Declining the `require` makes this
+     * `blocked != null`. So a document carrying both rendered `drainBlocked: false`
+     * beside `detail: "waiting, not stuck"` — and the loop **produces** that pair:
+     * a drain waiting on players keeps a *permanent* failure standing, because
+     * somebody logging in does not resolve a save that was never confirmed. It is
+     * not enforced apart either, because the alternative was a decode-time
+     * `require` paid by the widest fleet read, where one bad row aborts
+     * `listServers` and halts every in-flight drain. Both together make this
      * precedence the entire specification, so it has to hold at every site that
      * reads it, and one function is how that is guaranteed rather than reviewed.
      *

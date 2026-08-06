@@ -781,6 +781,206 @@ internal class ProxyDrainTest {
         }
 
     /**
+     * …and once its resume has shut the door, the park says so instead of saying the
+     * opposite.
+     *
+     * The twenty-eighth audit's first critical, and it is the discriminator the two
+     * tests above cannot draw between them. Both of them end with `sealRequestedAt`
+     * null — one because the seal never landed, the other because the *record* of it
+     * landing was written only by the `DRAIN_REQUESTED` arm, which this drain never
+     * runs again. The state in between is the one this drives: seal refused with
+     * players on, park, endpoint returns, the **resume** shuts the door, players stay
+     * on, endpoint drops again. The old build then told an operator *"The server
+     * keeps running and keeps taking players"* about a fleet whose login path this
+     * controller had shut one pass earlier — the same sentence the twenty-seventh
+     * round removed from the KDoc, reintroduced through a call site.
+     *
+     * ## What each assertion is for
+     *
+     * The wire flag is read *with* the record, deliberately. `sealRequestedAt` alone
+     * would pass against a build that stamped it without sealing anything, and the
+     * flag alone says nothing about what the operator is told. The message
+     * assertions are then a claim about the pair: the door is shut at the simulator,
+     * the record says since when, and the sentence describes that state rather than
+     * its opposite.
+     *
+     * The last one is the fourth finding of the same round: a `DELETION` cannot be
+     * withdrawn — `deletedAt` is one-way and there is no un-delete — so the remedy
+     * *"until whatever asked for this drain is withdrawn"* was an impossible action
+     * offered in the case where the blackout lasts longest.
+     */
+    @Test
+    fun `a proxy sealed by its resume reports the blackout when its endpoint drops again`() =
+        coreTest {
+            val harness = ProxyHarness(backends = listOf(backendDefinition("survival-01")))
+            val name = harness.proxyDefinition.metadata.name
+            harness.bringUp()
+            harness.plugin.proxyAdmits.shouldBeTrue()
+
+            // Players on, endpoint down, delete asked for: step 2 never lands, so the
+            // drain parks with the front door open and says so.
+            harness.proxyNode.online = 2
+            harness.plugin.unreachable = true
+            harness.store.deleteDefinition(name)
+            repeat(4) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+            val open =
+                harness
+                    .proxyStatus()
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            open.sealRequestedAt shouldBe null
+            open.failure.shouldNotBeNull().message shouldContain "keeps taking players"
+
+            // The endpoint comes back. The resume asserts step 2 ahead of the
+            // zero-player gate, so *this* pass is what shuts the fleet's front door —
+            // and it is the only pass that ever will, because nothing re-enters
+            // `DRAIN_REQUESTED`.
+            harness.plugin.unreachable = false
+            harness.pass(name)
+            harness.clock.advance(2.seconds)
+            harness.plugin.proxyAdmits.shouldBeFalse()
+            val shut =
+                harness
+                    .proxyStatus()
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            val sealedAt = shut.sealRequestedAt.shouldNotBeNull()
+
+            // …and now it drops again, with the same players still connected.
+            harness.plugin.unreachable = true
+            harness.pass(name)
+            harness.clock.advance(2.seconds)
+
+            val parked =
+                harness
+                    .proxyStatus()
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            // The record survives the park: it is what the sentence below is read
+            // from, and a seal nobody wrote down is a blackout nobody can report.
+            parked.sealRequestedAt shouldBe sealedAt
+            val failure = parked.failure.shouldNotBeNull()
+            failure.reason shouldBe FailureReason.PROXY_CONTROL_UNREACHABLE
+            // The door really is shut at the proxy…
+            harness.plugin.proxyAdmits.shouldBeFalse()
+            // …so the sentence about it must be the blackout one, not its opposite.
+            failure.message shouldNotContain "keeps taking players"
+            failure.message shouldContain "login seal this drain put on still in place"
+            failure.message shouldContain "nobody can join it"
+            // The remedy offered is one this cause has. A delete has no un-delete.
+            failure.message shouldContain "a delete cannot be withdrawn"
+
+            harness.proxyNode.stops.shouldBeEmpty()
+            harness.store.getServer(name).shouldNotBeNull()
+        }
+
+    /**
+     * A permanent park whose seal release does not land is recorded **retryable**, so
+     * the loop comes back and tries the release again.
+     *
+     * The twenty-eighth audit's second finding. The release was best-effort inside
+     * the one gate that guarantees nobody retries it: a single refused control call
+     * left the fleet's front door shut, the permanent class then froze
+     * `reconcileProxy`, and no pass ever tried again. A definition edit does not
+     * repair it either — the generation bump resumes the passes straight into
+     * `holdSeal`, which shuts the door again — and a frozen proxy stops running
+     * `assertBackends`, so a backend whose own drain has parked stays out of routing
+     * with nothing left to re-register it.
+     *
+     * `restoreRegistration` is best-effort too and is safe for a reason this edge
+     * does not have: `assertBackends` re-registers a parked backend on every proxy
+     * pass. The seal has no such third party, which is the whole argument for the
+     * edge existing.
+     *
+     * ## The two halves, and which build passes which
+     *
+     * The old build records `PERMANENT` and freezes with the door shut, so it fails
+     * the class assertion and the one that follows it — a pass that still reaches the
+     * runtime. The new build keeps coming back until the release lands, and then
+     * settles exactly where the compensation was always meant to leave it: door open,
+     * failure permanent, loop no longer looking. Both ends are asserted, because a
+     * build that only ever retried would be a permanent failure nobody can ever act
+     * on, which is the other way to get this wrong.
+     *
+     * The route to a permanent abort is the twenty-sixth audit's: a container whose
+     * `WORLD_DATA` label is missing reads as *holding* world data, and no Velocity
+     * proxy can confirm a world save. One backend, so `assertBackends` leaves the
+     * proxy's own door open at bring-up rather than sealing it for an unrelated
+     * reason and making every reading below vacuous.
+     */
+    @Test
+    fun `a permanent park whose seal release fails keeps being retried until it lands`() =
+        coreTest {
+            val harness = ProxyHarness(backends = listOf(backendDefinition("survival-01")))
+            val name = harness.proxyDefinition.metadata.name
+            harness.bringUp()
+            harness.plugin.proxyAdmits.shouldBeTrue()
+
+            val observed = harness.proxyNode.workload as WorkloadObservation.Present
+            harness.proxyNode.workload = observed.copy(labels = observed.labels - Labels.WORLD_DATA)
+            // The endpoint answers and the proxy stays shut whatever it is asked:
+            // the seal lands, the release does not. An edit rather than a delete, so
+            // a permanent record really would stop the passes.
+            harness.plugin.stuckSealed = true
+            harness.declare(proxyDefinition(maxPlayers = 300))
+
+            repeat(6) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+
+            val stuck =
+                harness
+                    .proxyStatus()
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            stuck.state shouldBe DrainState.DRAIN_FAILED
+            val held = stuck.failure.shouldNotBeNull()
+            // The step's own verdict was permanent. What is recorded is what the
+            // compensation achieved, and it achieved nothing.
+            held.failureClass shouldBe FailureClass.RETRYABLE
+            held.message shouldContain "could not be released either"
+            harness.plugin.proxyAdmits.shouldBeFalse()
+
+            // The consequence that matters: the loop is still looking at this proxy.
+            val calls = harness.proxyNode.calls.size
+            harness.pass(name)
+            harness.clock.advance(2.seconds)
+            (harness.proxyNode.calls.size > calls) shouldBe true
+
+            // The proxy's login handler comes back. The next release lands, and the
+            // abort settles where it was always meant to: door open, nothing else to
+            // be done, and no more passes.
+            harness.plugin.stuckSealed = false
+            repeat(4) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+            val settled =
+                harness
+                    .proxyStatus()
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            settled.failure.shouldNotBeNull().failureClass shouldBe FailureClass.PERMANENT
+            harness.plugin.proxyAdmits.shouldBeTrue()
+
+            val frozen = harness.proxyNode.calls.size
+            harness.pass(name).shouldBeInstanceOf<ReconcileOutcome.Failed>()
+            harness.proxyNode.calls shouldHaveSize frozen
+            // Nothing was stopped on the way through any of that.
+            harness.proxyNode.stops.shouldBeEmpty()
+            harness.proxyNode.removals.shouldBeEmpty()
+        }
+
+    /**
      * Two servers draining at once must not select each other.
      *
      * `PaperServerStatus.draining` is deliberately **false** in `DRAIN_FAILED`, so
@@ -912,18 +1112,29 @@ internal class ProxyDrainTest {
     /**
      * A drain that could not seal on its one step-2 pass still stops asking.
      *
-     * `sealRequestedAt` is written at exactly one place and `holdSeal` runs above
-     * it, so a single `Unavailable` on the drain's one bodied `DRAIN_REQUESTED`
-     * pass — the control endpoint blinking, which this design treats as expected —
-     * meant the stamp never happened. Nothing re-enters `DRAIN_REQUESTED`: the
-     * resume ladder tops out at `SEALED`, and `started()` needs no drain record at
-     * all. So the anchor was absent for the life of that drain, `exhausted` fell
-     * back to `enteredStateAt`, and the bound could never trip: ~2 minutes of
-     * asking, one pass parked, the allowance handed back in full, for ever, with
-     * `failure` cleared each cycle so nothing escalated. Sealed, unjoinable,
-     * transfer requests firing at live players, and a delete that never completes.
+     * `sealRequestedAt` used to be written at exactly one place, with `holdSeal`
+     * above it, so a single `Unavailable` on the drain's one bodied
+     * `DRAIN_REQUESTED` pass — the control endpoint blinking, which this design
+     * treats as expected — meant the stamp never happened. Nothing re-enters
+     * `DRAIN_REQUESTED`: the resume ladder tops out at `SEALED`, and `started()`
+     * needs no drain record at all. So the anchor was absent for the life of that
+     * drain, `exhausted` fell back to `enteredStateAt`, and the bound could never
+     * trip: ~2 minutes of asking, one pass parked, the allowance handed back in
+     * full, for ever, with `failure` cleared each cycle so nothing escalated.
+     * Sealed, unjoinable, transfer requests firing at live players, and a delete
+     * that never completes.
      *
      * The anchor is stamped on entry to step 4 instead, which every path takes.
+     *
+     * ## What changed under it, and why this still tests the same thing
+     *
+     * Since the twenty-eighth audit the seal record is maintained by *every* state
+     * that asserts step 2 (`SealHold.recordedOn`), so this drain does get one — from
+     * the pass that re-seals after the endpoint comes back, long after the
+     * `DRAIN_REQUESTED` pass that missed it. That is a strictly better field and it
+     * is still the wrong anchor: it moves with the seal, not with step 4, so a bound
+     * measured from it would restart the allowance at every re-seal. The assertion is
+     * therefore the *ordering* of the two records rather than the absence of one.
      */
     @Test
     fun `a drain whose first seal was refused still reaches the transfer bound`() =
@@ -968,9 +1179,16 @@ internal class ProxyDrainTest {
                     .shouldNotBeNull()
                     .drain
                     .shouldNotBeNull()
-            // Step 4 stamped its own anchor, and it is still null at step 2.
-            drain.sealRequestedAt shouldBe null
-            drain.transferStartedAt.shouldNotBeNull()
+            // Both records exist, and on this path one pass wrote both: the drain
+            // resumed into step 3, `holdSeal` re-asserted the seal the endpoint had
+            // refused, and the destination search below it stamped step 4's anchor.
+            // Equal, and not interchangeable — the seal's record is *since when the
+            // door has been shut* and is maintained by every state that asserts one,
+            // while the anchor is *when step 4 began* and nothing may move it. The
+            // bound that trips below is measured from the second.
+            val sealedAt = drain.sealRequestedAt.shouldNotBeNull()
+            val anchor = drain.transferStartedAt.shouldNotBeNull()
+            sealedAt shouldBe anchor
             // And the bound trips, which is the whole point.
             drain.state shouldBe DrainState.DRAIN_FAILED
             drain.failure.shouldNotBeNull().reason shouldBe FailureReason.DRAIN_TRANSFER_FAILED

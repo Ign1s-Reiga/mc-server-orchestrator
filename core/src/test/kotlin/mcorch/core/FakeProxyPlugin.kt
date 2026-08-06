@@ -81,6 +81,20 @@ internal class FakeProxyPlugin(
      */
     var rejectsCredential: Boolean = false
 
+    /**
+     * The proxy accepts `PUT /v1/proxy` and goes on refusing logins whatever it was
+     * asked for.
+     *
+     * The one failure the protocol reports *separately from a refusal*: the call
+     * succeeds and the read-back disagrees with the request, which is why
+     * `DrainSeal.assertAdmission` returns the admission it observed rather than a
+     * boolean. `:core` treats it as the seal being left in place — see
+     * `DrainController.releaseSeal` — and it is the only knob here that can fail a
+     * *release* without also failing the seal one line above it, which is what makes
+     * it the right one for a compensation that could not land.
+     */
+    var stuckSealed: Boolean = false
+
     class Backend(
         val name: String,
         var address: String,
@@ -173,7 +187,10 @@ internal class FakeProxyPlugin(
 
     private fun assertProxy(request: EndpointRequest): EndpointResponse {
         val admits = field(request.body, "admitsNewPlayers").toBoolean()
-        proxyAdmits = admits
+        // Recorded as asked, applied as the proxy manages. The record is what a
+        // test reads to see what `:core` requested; the level is what a player
+        // would meet.
+        proxyAdmits = admits && !stuckSealed
         proxyAsserts += admits
         return ok(proxyJson())
     }

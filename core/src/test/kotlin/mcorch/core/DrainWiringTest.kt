@@ -640,6 +640,77 @@ internal class DrainWiringTest {
     }
 
     /**
+     * Every pass that gets the login seal in place writes down that it did.
+     *
+     * The twenty-eighth audit's first critical. `sealRequestedAt` was stamped by the
+     * `DRAIN_REQUESTED` arm alone, while `holdSeal` runs on six other states and on
+     * the gated `DRAIN_FAILED` resume — which, since the twenty-seventh audit, is
+     * where a self-sealing workload's door is *first* shut whenever its opening
+     * attempt failed with players on. The record stayed null, and the next pass to
+     * lose the endpoint read that null and told an operator the server "keeps taking
+     * players" about a fleet this controller had blacked out one pass earlier.
+     *
+     * ## Why this is structural
+     *
+     * The behavioural half is in `ProxyDrainTest` — a proxy sealed by its resume and
+     * then parked reports the blackout — and it can only ever cover the one call site
+     * a scenario happens to drive. Six more sites do the same work, and a build that
+     * dropped the record at any of them would still be green: nothing *decides* on
+     * this field, so the only way to see it is a status read taken in exactly the
+     * right state. So the shape is asserted instead: a `holdSeal` result is bound,
+     * consulted for its abort, and recorded on the drain the pass carries on with,
+     * everywhere.
+     *
+     * What it cannot see is a site that records the stamp on a drain other than the
+     * one the hold was taken with. The stamped name is followed for that, in the same
+     * way the pass-entry test follows its receiver — as a set, because six of the
+     * seven sites are arms of one `when` and share their names by construction.
+     */
+    @Test
+    fun `every step-2 assertion is recorded on the drain the pass carries on with`() {
+        val calls =
+            LINES.indices
+                .filter { mentions(LINES[it], "holdSeal") }
+                .filterNot { DECLARATION.containsMatchIn(LINES[it]) }
+
+        // Vacuity control, and a deliberately loose one: this is a count of the
+        // states that assert step 2, which a new state may raise.
+        calls.size shouldBeGreaterThan 5
+
+        // Bound, never called for its abort alone. An unbound call is the shape that
+        // cannot record anything, whatever it does with the result.
+        val held = calls.map { binding(LINES[it]) }
+        held.forEach { hold ->
+            withClue("a step-2 assertion is not bound to a name: ${hold.value}") {
+                hold.value shouldMatch Regex("""holdSeal\(\w+, (\w+)\)""")
+            }
+        }
+        val names = held.map { it.name }.toSet()
+        val stamped = held.map { requireNotNull(Regex("""holdSeal\(\w+, (\w+)\)""").find(it.value)).groupValues[1] }
+
+        fun using(token: String) = LINES.filter { isCode(it) && codeOf(it).contains(token) }.map { codeOf(it).trim() }
+
+        // One of each per call: the abort is taken, and the hold is recorded. A site
+        // that consults the abort and drops the record is the defect; a site that
+        // records without consulting would carry on past a park.
+        using(".abortOrNull") shouldHaveSize calls.size
+        val records = using(".recordedOn(")
+        records shouldHaveSize calls.size
+        records.forEach { line ->
+            val receiver =
+                requireNotNull(Regex("""(\w+)\.recordedOn\((\w+),""").find(line)) {
+                    "expected `<hold>.recordedOn(<drain>, …)`, found: $line"
+                }
+            withClue("a step-2 record is taken from something other than the hold this pass held") {
+                names shouldContain receiver.groupValues[1]
+            }
+            withClue("a step-2 record is stamped on a drain the hold was not taken with") {
+                stamped shouldContain receiver.groupValues[2]
+            }
+        }
+    }
+
+    /**
      * No kind drains for a replacement its node was never asked about.
      *
      * A drain destroys the container it is replacing. Asking the node whether it can

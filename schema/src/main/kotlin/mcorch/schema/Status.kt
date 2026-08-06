@@ -381,18 +381,41 @@ public data class StorageStatus(
  * the escalation is already false whenever [failure] is null, so the correct
  * behaviour falls out of the rule that was always there.
  *
- * The two are disjoint by construction — every site that records one clears the
- * other — and that is deliberately **not** enforced by a `require` here. This
- * type is rebuilt on every status decode, so a check costs the widest read in the
+ * The two were disjoint by construction and are not any more. A park clears any
+ * block, and a block clears a **retryable** failure — the pass that reached it
+ * re-established whatever that fault was about — but a *permanent* one stands: a
+ * world save that was never confirmed is not resolved by somebody logging back in,
+ * and the drain hits it again the moment the server empties. So *blocked, and
+ * healthy* above means [blocked] set and [failure] null, which is what
+ * [ConditionType.DRAIN_BLOCKED] is derived from.
+ *
+ * Neither the clearing nor the pairing is enforced by a `require` here. This type
+ * is rebuilt on every status decode, so a check costs the widest read in the
  * system and is one more way for a single hand-edited row to abort a fleet read.
- * A document carrying both is read, and wherever the two are consulted together
- * the failure wins: reporting the louder of the two is the safe direction.
+ * Wherever the two are consulted together the failure wins: reporting the louder
+ * of the two is the safe direction.
  */
 public data class DrainStatus(
     val state: DrainState,
     val startedAt: Instant,
     val enteredStateAt: Instant,
     val playersEvacuated: Boolean = false,
+    /**
+     * Since when this drain has had the workload's login path shut at the proxy.
+     *
+     * Stamped by whichever state got a `PUT` the proxy confirmed — drain step 2 runs
+     * on every pass of every state that depends on it, and the *first* of them to
+     * land writes this. Never restamped, so it stays "since when" rather than "most
+     * recently"; never cleared, because there is no unseal operation for a drain to
+     * record.
+     *
+     * **Not a live level.** A drain that has parked hands a backend's admission back
+     * without touching this field, since it is the *proxy's* pass that states a
+     * backend's admission. Whether players can join right now is what the proxy
+     * answers, and for a backend `PaperServerStatus.draining` is the closer question.
+     * Nothing in the loop gates on this — a bound that did is the event-shaped seal
+     * wearing a timestamp, and [transferStartedAt] is the anchor that replaced it.
+     */
     val sealRequestedAt: Instant? = null,
     /** A save request that went out and was never confirmed. See the note above. */
     val saveRequestedAt: Instant? = null,
@@ -502,11 +525,9 @@ public enum class ConditionType {
      * so.** [NEEDS_ATTENTION] is derived from the failure recorded on the *pass*
      * as well as from the drain's own, and the two answer different questions: a
      * drain can be quietly waiting for players while the node it is on has become
-     * unreachable, and both facts are then true and worth reporting. The
-     * disjointness that does still hold is the narrow one this condition is
-     * defined by — a drain is never simultaneously *blocked* and *failed* — and a
-     * dashboard that rendered the pair as one tri-state must show the attention
-     * flag separately.
+     * unreachable, and both facts are then true and worth reporting. A dashboard
+     * that rendered the pair as one tri-state must show the attention flag
+     * separately.
      *
      * `False` rather than `Unknown` on a server with no drain at all, for the same
      * reason [NEEDS_ATTENTION] is: "nothing is blocked" is something the loop
@@ -514,9 +535,14 @@ public enum class ConditionType {
      * genuinely unreadable status as quiet too. [StatusCondition.lastTransitionAt]
      * is *blocked since when*, which is the number a dashboard puts beside it.
      *
-     * True only while [DrainStatus.failure] is null. The two are disjoint by
-     * construction, and a stored document that says otherwise is reported as
-     * failed — the louder of the two.
+     * True only while [DrainStatus.failure] is null, and a record carrying both is
+     * reported as failed — the louder of the two. That pair is **produced on
+     * purpose** rather than being a repaired document: a drain whose *permanent*
+     * diagnosis is outstanding keeps it while it waits for players, because
+     * somebody logging in does not resolve a world save that was never confirmed.
+     * Waiting is then true and so is the fault, and the sentence this condition
+     * carries — *waiting, not stuck, needs nobody* — is the one that must not be
+     * shown.
      */
     DRAIN_BLOCKED,
 

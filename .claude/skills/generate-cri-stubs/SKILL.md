@@ -68,8 +68,6 @@ io.grpc:protoc-gen-grpc-kotlin:<version>:jdk8@jar
 
 Generated output lands at `build/generated/sources/proto/$sourceSet/$plugin` — for this module, `build/generated/sources/proto/main/{java,kotlin,grpc,grpckt}`. Note `sources`, plural; the pre-0.9 plugin layout was `build/generated/source/proto/...`, and stale docs still show it.
 
-**The plugin creates a generate task per source set, including ones you add for other reasons.** `:cri` has an `integrationTest` source set for tests against a real containerd, so the build also carries `generateIntegrationTestProto` and `processIntegrationTestProtoResources`. There is no `src/integrationTest/proto`, so both are no-ops — but they exist, they run on a clean build, and they are not evidence that something generates stubs twice. The stubs come from `main` and only from `main`; a source set that needs them gets them from `sourceSets["main"].output`, never from its own generation.
-
 Reference the pinned versions through the version catalog rather than inlining version strings. The protobuf plugin wants coordinate *strings*, not `Dependency` objects, so rendering a catalog `Provider` into `group:name:version` with a small local helper is preferable to hardcoding.
 
 ### 4. Generate and verify

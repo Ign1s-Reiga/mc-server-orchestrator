@@ -198,16 +198,6 @@ public interface Node {
      * Nothing may read this value *as* a save timeout on the strength of the first
      * half — `DrainSubject.saveTimeout` is the quantity for that.
      *
-     * **It is also bounded above, and not for tidiness.** A container runtime
-     * carries the grace period as a fixed-width count, and past some magnitude
-     * its own arithmetic wraps: the value stops meaning "wait longer" and starts
-     * meaning "kill now", while the call still reports success. So an
-     * implementation may refuse a grace period for being *too large*, and a
-     * caller must not read a bigger number as a safer one. Where the bound
-     * actually is belongs to the runtime, so it is the runtime-facing layer that
-     * knows it — `mcorch.cri.StopGracePeriod` for the containerd implementation,
-     * which carries the measurements it was derived from.
-     *
      * Idempotent: stopping an already-stopped workload succeeds.
      */
     public suspend fun stopWorkload(

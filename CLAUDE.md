@@ -52,7 +52,6 @@ If a change makes one of these assume single-host in a way that a later distribu
 scripts/dev/containerd-up.sh       # start a local containerd for integration work
 scripts/dev/containerd-down.sh
 ./gradlew :app:integrationTest     # integration tests against a real containerd (requires containerd-up.sh)
-./gradlew :cri:integrationTest     # CRI-boundary tests against a real containerd (same prerequisite)
 ```
 
 ## Non-negotiable invariants

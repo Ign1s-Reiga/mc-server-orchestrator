@@ -99,6 +99,17 @@
 #   D33      step 2 taken off the gated resume, which is the mirror: a drain whose
 #            *first* seal failed with players on could then never reach `holdSeal`
 #            again, so the door stayed open and the wait for zero could not end.
+#   D34..D35 the same site with step 2 kept and its *record* dropped — the
+#            twenty-eighth audit's first critical, scored once as a scenario and
+#            once as a shape. The stamp lived at the `DRAIN_REQUESTED` arm alone
+#            while seven sites shut the door, so a fleet blacked out by its own
+#            resume was reported as one that "keeps taking players".
+#   D36      the seal release's outcome discarded. Best effort inside the one gate
+#            that stops anybody retrying it: the door stays shut, the permanent
+#            class freezes the passes, and a definition edit resumes straight back
+#            into the seal.
+#   D37      a block clearing a *permanent* failure. Nothing is stopped by it, and
+#            the report is what decides whether somebody reaches for `crictl stop`.
 #   C1..C3   controls: the rule deleted outright, once per assertion arm. If these
 #            do not redden, the harness is not reaching the assertions at all.
 #   S1       the self-test. See below.
@@ -179,6 +190,15 @@ DELETE_SEALED='a permanent abort under a delete keeps the proxy login seal on'
 # with players on can still reach one.
 FIRST_SEAL='a proxy whose first seal failed still converges once the endpoint comes back'
 PARKED_ENDPOINT='a proxy with players online still parks when its control endpoint is dead'
+# The twenty-eighth audit's first critical, in its two halves: the state the pair
+# above cannot tell apart — sealed by the resume, then parked — and the shape that
+# covers the six sites no scenario drives.
+BLACKOUT_REPORTED='a proxy sealed by its resume reports the blackout when its endpoint drops again'
+RECORDS_THE_SEAL='every step-2 assertion is recorded on the drain the pass carries on with'
+# Its second: a permanence whose compensation did not land is retried rather than
+# frozen, and its third, where a block finds a permanent diagnosis and keeps it.
+RELEASE_RETRIED='a permanent park whose seal release fails keeps being retried until it lands'
+WEDGE_SURVIVES='a permanent save wedge survives a player logging back on'
 HANDED="the drain is handed the loop's permanence gate rather than deriving one"
 GATED_RELEASE='the seal release is gated on the answer the abort was handed'
 MID_DRAIN='a replacement that becomes unbuildable mid-drain parks before the stop'
@@ -317,18 +337,29 @@ PREFLIGHT_SUBSET='            mountsFor(spec)'
 # The waiver'"'"'s premise, at the one call site that establishes it.
 SUBJECT_ROUTER='                router = link,'
 # The seal'"'"'s compensating edge, in `abort`, with the condition that decides which
-# aborts it belongs to.
-SEAL_RELEASE='        if (failureClass == FailureClass.PERMANENT && permanentFailureStopsPasses) releaseSeal(subject)'
+# aborts it belongs to. Since the twenty-eighth audit the call'"'"'s *answer* is bound
+# too — whether the login path was left shut — so removing the edge means removing
+# the release from the binding rather than removing a statement.
+SEAL_RELEASE='        val heldShut = failureClass == FailureClass.PERMANENT && permanentFailureStopsPasses && releaseSeal(subject)'
+SEAL_RELEASE_NONE='        val heldShut = false'
 # …and the edge with its condition dropped, which is how it was written when the
 # twenty-sixth audit found it. A retryable park then gives the login path back, and
 # nothing takes it again until the next pass's resume — a whole backoff of open
 # door, once per cycle, on the fleet the drain is waiting to empty.
-SEAL_RELEASE_UNGATED='        releaseSeal(subject)'
+SEAL_RELEASE_UNGATED='        val heldShut = releaseSeal(subject)'
 # …and with half the condition: the class alone, which is how the twenty-sixth
 # audit's fix was written and what the twenty-seventh found. It is true of a
 # permanent abort under a delete, and a delete is exempt from the gate the sentence
 # rests on, so the door is reopened on a fleet the loop keeps reconciling.
-SEAL_RELEASE_CLASS_ONLY='        if (failureClass == FailureClass.PERMANENT) releaseSeal(subject)'
+SEAL_RELEASE_CLASS_ONLY='        val heldShut = failureClass == FailureClass.PERMANENT && releaseSeal(subject)'
+# What the park records once the release has spoken. The twenty-eighth audit'"'"'s
+# second finding is the version that discards it: the declared class is written down
+# however the compensation went, so a fleet whose front door this abort could not
+# reopen is frozen with nobody left to try again.
+RELEASE_DECIDES_CLASS='                failureClass = recorded,
+                message = if (heldShut) "$message. $SEAL_STUCK_SHUT" else message,'
+RELEASE_DISCARDED='                failureClass = failureClass,
+                message = message,'
 # The stop'"'"'s abort, handed a gate it worked out for itself. `RELOCATION` never
 # occurs in any scenario in this suite, so the value is the pass'"'"'s on every path a
 # test can drive and only the wiring assertion can see the difference — which is
@@ -356,9 +387,18 @@ PROXY_GATE_COPIED='                    previous.drain.let { it == null || it.sta
 # seventh audit'"'"'s second finding is about, where `holdSeal` sits behind
 # `requireEmpty` and is unreachable while anybody is connected.
 RESUME_SEAL='        if (!gated) return resumeInto(pass, drain)
-        holdSeal(pass, drain).abortOrNull?.let { return it }
-        return requireEmpty(pass, drain) { resumeInto(pass, drain) }'
+        val hold = holdSeal(pass, drain)
+        hold.abortOrNull?.let { return it }
+        val sealed = hold.recordedOn(drain, pass.now)
+        return requireEmpty(pass, sealed) { resumeInto(pass, sealed) }'
 RESUME_WITHOUT_SEAL='        if (!gated) return resumeInto(pass, drain)
+        return requireEmpty(pass, drain) { resumeInto(pass, drain) }'
+# …and step 2 kept while its *record* is dropped, which is the twenty-eighth audit'"'"'s
+# first critical. The door is shut and nothing says since when, so the park that
+# follows describes a fleet that "keeps taking players".
+RESUME_WITHOUT_RECORD='        if (!gated) return resumeInto(pass, drain)
+        val hold = holdSeal(pass, drain)
+        hold.abortOrNull?.let { return it }
         return requireEmpty(pass, drain) { resumeInto(pass, drain) }'
 # The last asking before the irreversible half of the protocol, at the entry to
 # steps 6 and 7. Carries the line below it so the literal cannot match anything else.
@@ -372,7 +412,13 @@ PREFLIGHT_SCOPE='        if (pass.cause != DrainCause.REPLACEMENT) return null'
 # `DRAIN_FAILED`, so "make them consistent" is the obvious edit — and it releases the
 # seal that is the mechanism of the wait a block is waiting out.
 BLOCK_ENTRY='        val restored = restoreRegistration(subject, drain)
-        val block = recordBlock(reason, message, now, drain.blocked)'
+        val standing = drain.failure?.takeIf { it.failureClass == FailureClass.PERMANENT }'
+# What a block does to a failure it finds standing. Clearing it unconditionally is
+# the twenty-eighth audit'"'"'s third finding: a permanent diagnosis is not resolved by
+# somebody logging in, and the status settled on "waiting, not stuck" about a server
+# whose delete cannot complete and whose world may not be on disk.
+BLOCK_KEEPS_PERMANENT='                    .copy(blocked = block, failure = standing),'
+BLOCK_CLEARS_EVERYTHING='                    .copy(blocked = block, failure = null),'
 # The deployment'"'"'s Velocity pin, between the configuration and the planner.
 PIN_FORWARDED='VelocityWorkloadPlanner.plan(definition, config.velocityBuild)'
 # The resolved pin reaching the container'"'"'s environment. The hash entry is taken
@@ -473,7 +519,11 @@ MUTATIONS=(
     "D21@@$RECONCILER@@$WIRING@@$SAME_LINK@@$SUBJECT_ROUTER@@                router = null,"
     # The compensating edge removed: a proxy left running, ready and joinable to
     # nobody, with the loop no longer passing over it.
-    "D22@@$CONTROLLER@@$PROXY_DRAIN@@$RELEASES@@$SEAL_RELEASE@@        Unit"
+    #
+    # It claims the retry test as well, and that is a fact about the defect: with no
+    # release attempted there is no outcome to record, so the park that was supposed
+    # to be retried until the door reopens settles as permanent on the first pass.
+    "D22@@$CONTROLLER@@$PROXY_DRAIN@@$RELEASES;$RELEASE_RETRIED@@$SEAL_RELEASE@@$SEAL_RELEASE_NONE"
     # And added where it must not be. A block is the protocol working, and the seal
     # is what lets the wait end.
     #
@@ -486,9 +536,10 @@ MUTATIONS=(
     # for players blocks, so a release lands inside the window in which no `PUT
     # /v1/proxy` may assert `true`; and the first-seal test's recovery pass seals and
     # then blocks, so the door it just shut is handed straight back and the fleet
-    # never empties. All five redden for the one reason, and D22 is the entry that
-    # isolates the edge on its own.
-    "D23@@$CONTROLLER@@$PROXY_DRAIN@@$KEEPS_SEAL;$PIN_EXIT;$RETRYABLE_SEAL;$DELETE_SEALED;$FIRST_SEAL@@$BLOCK_ENTRY@@$BLOCK_ENTRY
+    # never empties. The sixth is the twenty-eighth audit's blackout report, whose
+    # park follows a block that would have handed the door back. All six redden for
+    # the one reason, and D22 is the entry that isolates the edge on its own.
+    "D23@@$CONTROLLER@@$PROXY_DRAIN@@$KEEPS_SEAL;$PIN_EXIT;$RETRYABLE_SEAL;$DELETE_SEALED;$FIRST_SEAL;$BLACKOUT_REPORTED@@$BLOCK_ENTRY@@$BLOCK_ENTRY
         releaseSeal(subject)"
     # The operator's lever dropped between the configuration and the planner: the
     # knob still exists, and nothing reads it.
@@ -536,8 +587,25 @@ MUTATIONS=(
     # seal failed with players on can then never reach `holdSeal` again: the door
     # stays open, the population never falls, and recovery of the endpoint does not
     # help. It reddens the report half too, and that is a true dependency: with the
-    # seal unreachable the park settles into a healthy-looking block.
-    "D33@@$CONTROLLER@@$PROXY_DRAIN@@$FIRST_SEAL;$PARKED_ENDPOINT@@$RESUME_SEAL@@$RESUME_WITHOUT_SEAL"
+    # seal unreachable the park settles into a healthy-looking block. The blackout
+    # report is red for the plainest reason of all: this is the site that shuts the
+    # door it describes.
+    "D33@@$CONTROLLER@@$PROXY_DRAIN@@$FIRST_SEAL;$PARKED_ENDPOINT;$BLACKOUT_REPORTED@@$RESUME_SEAL@@$RESUME_WITHOUT_SEAL"
+    # …and the same site with step 2 kept and its *record* dropped, which is the
+    # twenty-eighth audit's first critical. One mutation, scored twice, because a
+    # class is the unit here and the pairing is the point: the scenario covers the
+    # one site it drives, and the shape covers the six it cannot.
+    "D34@@$CONTROLLER@@$PROXY_DRAIN@@$BLACKOUT_REPORTED@@$RESUME_SEAL@@$RESUME_WITHOUT_RECORD"
+    "D35@@$CONTROLLER@@$WIRING@@$RECORDS_THE_SEAL@@$RESUME_SEAL@@$RESUME_WITHOUT_RECORD"
+    # The seal release's outcome discarded — best effort inside the one gate that
+    # guarantees nobody retries it. The class is what carries the difference: a
+    # permanence whose own compensation could not be delivered freezes the loop on a
+    # fleet with no front door.
+    "D36@@$CONTROLLER@@$PROXY_DRAIN@@$RELEASE_RETRIED@@$RELEASE_DECIDES_CLASS@@$RELEASE_DISCARDED"
+    # A block clearing every failure it finds, including a permanent one. Nothing is
+    # stopped by it — the wedge survives — so only the report moves, and the report
+    # is what decides whether somebody reaches for `crictl stop`.
+    "D37@@$CONTROLLER@@$DRAIN@@$WEDGE_SURVIVES@@$BLOCK_KEEPS_PERMANENT@@$BLOCK_CLEARS_EVERYTHING"
     "C1@@$CONTROLLER@@$WIRING@@$EXIT@@$RULE@@val recorded = progress"
     "C2@@$CONTROLLER@@$WIRING@@$STEPPED@@$ADOPTION@@val observed = drain"
     "C3@@$CONTROLLER@@$RULES@@$ADOPTS@@$CLAUSE@@is PlayerReading.Occupied -> this"

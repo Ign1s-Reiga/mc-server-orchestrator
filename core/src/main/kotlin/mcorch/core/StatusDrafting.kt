@@ -229,12 +229,14 @@ private fun deriveConditions(
     val passAttention =
         passFailure?.let { escalates(it.occurredAt, it.failureClass, now, attentionAfter) } == true
     val needsAttention = drainAttention || passAttention
-    // Blocked *and* not failed. The two are disjoint by construction, so the
-    // second half only decides for a stored document that has been repaired by
-    // hand — and there the failure wins, because reporting the louder of the two
-    // is the direction that does not leave somebody uncalled. It also makes the
-    // three states a consumer has to tell apart mutually exclusive at the
-    // condition level, which is what the dashboard reads.
+    // Blocked *and* not failed, and the second half decides a state the loop
+    // produces rather than only a hand-repaired document: a drain waiting for
+    // players keeps a **permanent** failure standing, because somebody logging in
+    // does not resolve a save that was never confirmed. The failure wins, which is
+    // the direction that does not leave somebody uncalled — this condition's
+    // message is *waiting, not stuck, needs nobody*, and that is the sentence which
+    // must not be rendered over an outstanding fault. It also keeps the three
+    // states a consumer tells apart mutually exclusive at the condition level.
     val drainBlocked = drain?.blocked != null && drain.failure == null
     val entries =
         listOf(
