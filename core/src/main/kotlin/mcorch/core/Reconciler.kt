@@ -396,9 +396,18 @@ public class Reconciler(
         consequence: String,
     ): FailureStatus? {
         if (cause != DrainCause.REPLACEMENT) return null
-        // A drain already in flight is past the point this question protects: the
-        // container it would have saved is gone or going, and refusing now would
-        // strand the drain mid-protocol.
+        // A drain already in flight is past the point *this* asking protects: it is
+        // asked before anything is drained, and refusing here once the protocol has
+        // begun would strand a drain mid-flight without undoing any of it.
+        //
+        // The exemption is not a claim that the question stops mattering. It stops
+        // mattering only from the stop onwards, and the passes before that — sealing,
+        // waiting, transferring, saving — are hours on a populated server, in which
+        // an asset directory can be restaged or a secret rotated. So the question is
+        // asked again by `DrainController.letGoAndStop`, at the entry to steps 6 and
+        // 7, where a refusal still costs nothing. Two askings, one for each end of
+        // the window; this one is the cheap one and it is not the last line of
+        // defence it used to read as.
         if (drainInFlight) return null
         return try {
             node.checkWorkload(desired)
@@ -1124,7 +1133,13 @@ public class Reconciler(
             }
         val progress =
             drainController.advance(
-                subject = ProxyDrainSubject(pass.definition, pass.agent, seal),
+                subject =
+                    ProxyDrainSubject(
+                        definition = pass.definition,
+                        agent = pass.agent,
+                        replacementSpec = pass.desired,
+                        seal = seal,
+                    ),
                 node = node,
                 observation = observation,
                 current = pass.previous?.drain,
@@ -2024,6 +2039,10 @@ public class Reconciler(
             PaperDrainSubject(
                 definition = pass.definition,
                 agent = pass.agent,
+                // What the drain would be replacing this container with, so steps 6
+                // and 7 can ask the node about it once more before they commit. Given
+                // for every cause; read only for a `REPLACEMENT`.
+                replacementSpec = pass.desired,
                 seal = link,
                 router = link,
             )

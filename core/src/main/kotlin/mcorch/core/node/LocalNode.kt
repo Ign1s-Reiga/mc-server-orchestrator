@@ -268,12 +268,37 @@ public class LocalNode internal constructor(
     /**
      * The create's own container derivation, run and thrown away.
      *
-     * Deliberately [containerSpecFor] rather than a list of the things it checks.
-     * The whole value of the call is that it cannot answer "yes" to a question the
-     * create would answer "no" to, and it can only promise that by *being* the same
-     * derivation — a re-implementation here would be a second enforcement point,
-     * which is the thing the twenty-fourth audit asked not to add while asking for
-     * the question to be asked earlier.
+     * Deliberately [containerSpecFor] rather than a list of the things it checks:
+     * a re-implementation here would be a second enforcement point, which is the
+     * thing the twenty-fourth audit asked not to add while asking for the question
+     * to be asked earlier. So the promise is exact and it is also **bounded**, and
+     * the bound is written here rather than left to be discovered:
+     *
+     * > Every refusal [containerSpecFor] can produce, this call produces too. The
+     * > steps of [ensureWorkload] that are *not* that derivation are outside it.
+     *
+     * ## What is outside, named
+     *
+     * [prepareHostPaths] — `HostPaths.prepare`, which creates the log directory and,
+     * for persistent storage, the volume directory. It throws
+     * [NodeException.Rejected] (permanent) on an `IOException` or a
+     * `SecurityException`: a volume or log root that has been unmounted, remounted
+     * read-only, or had its ownership changed. A replacement can therefore still
+     * pass this call, drain, save, stop, remove, and meet a create that refuses.
+     *
+     * The twenty-sixth audit's third warning, and the reason it is a narrowed
+     * sentence rather than a new check: whether `createDirectories` will succeed
+     * cannot be established without attempting it, and an approximation — "are the
+     * two roots writable" — is a *different* derivation that can refuse a create the
+     * real one would accept, which would freeze every replacement on a host whose
+     * roots are read-only but whose per-workload directories already exist. That is
+     * the second enforcement point this call exists not to be. Closing it properly
+     * means letting a pre-flight create the directories it is checking, which
+     * [Node.checkWorkload] forbids on purpose; the day that trade looks right, it is
+     * an interface change and not a quiet one here.
+     *
+     * `sandboxSpecFor` is also outside and needs no argument: it is field copying
+     * and cannot refuse anything.
      *
      * ## It used to be [mountsFor], and that was one of two
      *
@@ -298,6 +323,16 @@ public class LocalNode internal constructor(
      * The two arms refuse the same condition with the same message; the difference
      * between them is a value nobody reads, and a reference that stops resolving
      * between this call and the create is refused by the create exactly as before.
+     *
+     * One consequence, since "the same derivation" is doing work above: the arms
+     * differ in the *shape* of what they build, not only in the value. `PRESENCE_ONLY`
+     * contributes no entries, so the [ContainerSpec] built here has no secret
+     * environment variables in it and `ContainerSpec`'s own `require` on blank
+     * environment keys is blind to a blank `secretEnv` key. Unreachable today — every
+     * such key is a compile-time constant in a planner — and if it ever were not, the
+     * `IllegalArgumentException` would reach the create as a permanent `Rejected`
+     * *after* a teardown. It is a second entry on the bounded list above rather than
+     * a defect to fix now.
      *
      * `translating` for the same reason every other entry point uses it: a caller
      * of [Node] sees nothing but a [NodeException].

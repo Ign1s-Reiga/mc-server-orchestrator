@@ -293,6 +293,155 @@ internal class ReplacementTest {
             harness.node.stops.shouldBeEmpty()
         }
 
+    /**
+     * The twenty-sixth audit's fourth warning: the pre-flight's exemption for a
+     * drain already in flight is justified by the *end* of the drain and applied
+     * from its beginning.
+     *
+     * `replacementBlocker` returns null as soon as a drain record exists, because
+     * "the container it would have saved is gone or going". True from the stop
+     * onwards; false for every pass before it — sealing, waiting, transferring,
+     * saving — which on a populated server is hours. An orchestrator upgrade that
+     * replaces the asset directory, or a secret rotated out from under a reference,
+     * lands inside that window, and the teardown then commits into a create that
+     * refuses for ever.
+     *
+     * ## What the scenario has to contain
+     *
+     * The fault is armed **after the world is saved**, which is the last pass before
+     * the deregistration and the stop. Arming it earlier would be the case the
+     * pass-level pre-flight already refuses, and this test would pass against the
+     * build that has the defect. The world save is also what makes the checkpoint
+     * unambiguous: the drain is one gate from `stopWorkload`.
+     *
+     * ## The assertions
+     *
+     * `stops` and `removals`, in that order of importance: the running container is
+     * still there, so the replacement can happen the moment the node can build it.
+     * The second half is the repair, because a guard that parks for ever is the same
+     * outage with a different message.
+     */
+    @Test
+    fun `a replacement that becomes unbuildable mid-drain parks before the stop`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.node.creates shouldHaveSize 1
+
+            harness.declare(paperDefinition(image = "docker.io/itzg/minecraft-server:2026.7.0"))
+            // Up to the point where the world is on disk and the next gate is the
+            // stop. Driven by the drain's own record rather than by a pass count, so
+            // a change to the ladder cannot quietly move the checkpoint.
+            var passes = 0
+            while (harness.status(name)?.drain?.worldSaved != true && passes++ < 8) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .worldSaved
+                .shouldBeTrue()
+            harness.node.saves shouldHaveSize 1
+            harness.node.stops.shouldBeEmpty()
+
+            // The artefact goes away while the drain is mid-protocol: an upgrade
+            // restaging the asset directory, a secret rotated behind its reference.
+            harness.node.failAlways(
+                NodeOperation.CREATE,
+                NodeException.Rejected(harness.node.name, NodeOperation.CREATE, "the artefact is not on this node"),
+            )
+
+            repeat(4) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+
+            harness.node.stops.shouldBeEmpty()
+            harness.node.removals.shouldBeEmpty()
+            harness.node.creates shouldHaveSize 1
+            val parked =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            parked.state shouldBe DrainState.DRAIN_FAILED
+            val failure = parked.failure.shouldNotBeNull()
+            failure.failureClass shouldBe FailureClass.RETRYABLE
+            failure.message shouldContain "cannot build the replacement"
+            harness.node.workload
+                .shouldBeInstanceOf<WorkloadObservation.Present>()
+                .state shouldBe WorkloadState.RUNNING
+
+            // Idempotent while it is parked: more passes over the same state issue
+            // no stop, no removal and no create. The save count is in there too, and
+            // the pass spacing is what lets it be — eight passes at two seconds is
+            // inside `saveEvidenceMaxGap` (30s), so the confirmation this drain is
+            // holding has not aged out and the ladder does not go back to `SAVING`.
+            // Past that gap a second flush at an empty server is the designed
+            // behaviour and not a repeated side effect, which is why the number of
+            // passes here is a choice rather than a round figure.
+            repeat(4) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+            harness.node.saves shouldHaveSize 1
+            harness.node.stops.shouldBeEmpty()
+            harness.node.removals.shouldBeEmpty()
+            harness.node.creates shouldHaveSize 1
+
+            // The operator stages the artefact again. No definition edit: the class
+            // is retryable precisely so that this is enough.
+            harness.node.clearFailures(NodeOperation.CREATE)
+            harness.settle(name, limit = 16)
+
+            harness.node.stops shouldHaveSize 1
+            harness.node.removals shouldHaveSize 1
+            harness.node.creates shouldHaveSize 2
+            harness.node.creates[1]
+                .image.canonical shouldBe "docker.io/itzg/minecraft-server:2026.7.0"
+        }
+
+    /**
+     * …and the same fault never blocks a **delete**.
+     *
+     * The scope half of the guard above, and the one that has to be pinned by a
+     * scenario rather than by reading the condition: a delete needs no create, and a
+     * delete a create can block is how a workload becomes undeletable — the failure
+     * mode the pre-flight exists to avoid, arriving from the other direction.
+     */
+    @Test
+    fun `a delete still completes while the node refuses every create`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+
+            harness.node.failAlways(
+                NodeOperation.CREATE,
+                NodeException.Rejected(harness.node.name, NodeOperation.CREATE, "the artefact is not on this node"),
+            )
+            harness.store.deleteDefinition(name)
+
+            repeat(10) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+
+            harness.node.saves shouldHaveSize 1
+            harness.node.stops shouldHaveSize 1
+            harness.node.removals shouldHaveSize 1
+            harness.store.getServer(name).shouldBeNull()
+        }
+
     @Test
     fun `a memory change is a replacement`() =
         coreTest {

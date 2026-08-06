@@ -103,6 +103,14 @@ public interface Node {
      * Cheap and side-effect free: it creates nothing, and it must not — the caller
      * is a pass that has decided to do nothing yet.
      *
+     * Those two paragraphs pull against each other, and the seam between them is
+     * where an implementation has to be explicit. A create that *prepares* something
+     * before it builds — host directories, in `LocalNode` — cannot have that half
+     * checked without doing it, so the half is outside the promise and the
+     * implementation says which half. A caller therefore gets "the derivation says
+     * yes", never "the create will succeed": a create that refuses after a
+     * successful pre-flight is narrower than it was, not impossible.
+     *
      * A node that cannot answer without contacting a runtime may throw
      * [NodeException.Unreachable], which the caller requeues; "I could not check"
      * is never "yes".

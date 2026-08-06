@@ -85,6 +85,26 @@ internal interface DrainSubject {
      */
     val maxPlayers: Int
 
+    /**
+     * What a `REPLACEMENT` of this workload would create, so the drain can ask the
+     * node whether it can build it *before* taking the running one away.
+     *
+     * `Reconciler` asks the same question once per pass, before it decides to drain
+     * at all — and exempts a drain that is already in flight, on the grounds that
+     * the container it would have saved is gone or going. That is true from the stop
+     * onwards and false for every pass before it, which on a populated server is
+     * hours: an orchestrator upgrade that replaces the asset directory, or a secret
+     * rotated out from under a reference, lands inside that window and the teardown
+     * still commits. So the question is asked again at the entry to steps 6 and 7 —
+     * see `DrainController.letGoAndStop` — where a refusal still costs nothing.
+     *
+     * It is a spec rather than a `checkWorkload()` closure because the subject is
+     * where facts about the workload live, and because a closure would let the two
+     * askers disagree about what is being asked. `DELETION` never reads it: a delete
+     * needs no create and must never be blocked by one.
+     */
+    val replacementSpec: WorkloadSpec
+
     /** Step 2's counterparty, or null when nothing can stop new joins. */
     val seal: DrainSeal?
 

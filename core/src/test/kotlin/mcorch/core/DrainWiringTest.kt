@@ -483,6 +483,19 @@ internal class DrainWiringTest {
      * no scenario would show it as long as the reconciler keeps passing both — so
      * the premise is asserted here rather than left in the KDoc that argues from it.
      *
+     * ## A second claim now rests on it, and it is smaller than it looks
+     *
+     * `DrainController.releaseSeal` has no `deregisteredAt` guard where `holdSeal`
+     * has one, and what keeps the two consistent is the `router != null` early return
+     * — which is total only because of the line asserted here. The twenty-sixth audit
+     * read that as a stop ordering; it is not. `releaseSeal` runs on an abort, which
+     * is a *park*, and putting a backend back in the routing table is exactly what
+     * `restoreRegistration` does there, so the register half of the `PUT` would be
+     * the same compensation rather than a hazard. What the premise buys is the
+     * *record*: a `PUT` from `releaseSeal` would re-register without clearing
+     * `deregisteredAt`, leaving the drain record saying "deregistered" about a
+     * backend that is registered. Worth pinning, not worth alarm.
+     *
      * Follows the name rather than restating `link`: a rename stays green, a
      * substitution reddens.
      */

@@ -6,6 +6,7 @@ import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.collections.shouldContain
 import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.collections.shouldNotBeEmpty
+import io.kotest.matchers.collections.shouldNotContain
 import io.kotest.matchers.comparables.shouldBeGreaterThan
 import io.kotest.matchers.ints.shouldBeGreaterThan
 import io.kotest.matchers.ints.shouldBeLessThanOrEqual
@@ -1473,6 +1474,18 @@ internal class ProxyDrainTest {
      * operator pins the build their containers were created with. A status field
      * would not do — the harm is that *players cannot log in*, and that is a fact
      * about the plugin, not about a record.
+     *
+     * ## What holds the first half up, re-examined
+     *
+     * The twenty-sixth audit asked the question and the answer is worth writing down:
+     * the blackout this asserts is reached through [DrainController.blocked], because
+     * the proxy's control endpoint is healthy here and nothing aborts. So this test
+     * says nothing about the *abort* path, and for a while that path handed the
+     * login seal back on any retryable failure and could never take it again — a
+     * defect with the same shape as the one this test exists for, one door along. It
+     * is pinned by `a proxy drain that parks on a retryable abort keeps its login
+     * seal on`, and the two are kept separate on purpose: this one demonstrates the
+     * lever, that one the rule.
      */
     @Test
     fun `an operator can pin a proxy fleet back onto the build its containers were created with`() =
@@ -1717,6 +1730,115 @@ internal class ProxyDrainTest {
             // …and the login path stays shut, which is what lets the wait end.
             harness.plugin.proxyAdmits.shouldBeFalse()
             harness.proxyNode.stops.shouldBeEmpty()
+        }
+
+    /**
+     * …and a drain that parks *retryably* keeps it on too, which is the case
+     * between the two above and the one nothing asserted.
+     *
+     * The twenty-sixth audit's critical. The compensation was written for the state
+     * where nothing will ever re-assert the seal — a permanent abort stops the
+     * server's passes altogether — and it was applied to every abort. A retryable
+     * one is the opposite: the loop keeps coming back, so the drain is still trying
+     * to reach zero, and the seal is what lets it get there.
+     *
+     * ## Why releasing it there does not lapse, and does not come back
+     *
+     * `DRAIN_FAILED` resumes through `requireEmpty` for a subject with no router,
+     * and with anybody online that lands in `blocked` — which does not seal, and
+     * never reaches the six forward states that do. So the release is permanent in
+     * the only sense that matters: the front door is open, the population it was
+     * waiting to drain refills, and no later pass can shut it again. A delete or a
+     * replacement parked there never completes, which is the state that ends in a
+     * manual `crictl stop`.
+     *
+     * ## The scenario needs no exotic fault
+     *
+     * A busy proxy that misses one Server List Ping inside its 10s timeout is a
+     * `PlayerReading.Unanswered` at `SEALED`, and the routerless branch of
+     * [DrainController.secureDestination] runs that through `requireEmpty` →
+     * `unansweredProbe` → a `RETRYABLE` abort. The control endpoint is healthy
+     * throughout, which is exactly what makes the release land at the wire.
+     *
+     * ## The assertions
+     *
+     * At the wire, in both halves: the front door stays shut across the park and
+     * every pass after it, and no `PUT /v1/proxy` in that window ever asserted
+     * `true` — a build that released and re-sealed once a backoff would pass the
+     * first assertion and fail the second. Then the drain converges once the last
+     * player logs off, because a seal that could never be released would be a
+     * different defect with the same first half.
+     *
+     * One backend, for the reason the pin-exit test needs one: with nothing
+     * registered, `assertBackends` finds nothing admitting and seals the proxy on
+     * bring-up for an unrelated, ruled-on reason, and every assertion here would
+     * read the same whatever the drain did.
+     */
+    @Test
+    fun `a proxy drain that parks on a retryable abort keeps its login seal on`() =
+        coreTest {
+            val harness = ProxyHarness(backends = listOf(backendDefinition("survival-01")))
+            val name = harness.proxyDefinition.metadata.name
+            harness.bringUp()
+            harness.plugin.proxyAdmits.shouldBeTrue()
+
+            // Four players on the front door, and a delete asked for.
+            harness.proxyNode.online = 4
+            harness.store.deleteDefinition(name)
+
+            // Step 1 and step 2: the drain is recorded, then the seal lands.
+            harness.pass(name)
+            harness.clock.advance(2.seconds)
+            harness.pass(name)
+            harness.clock.advance(2.seconds)
+            harness.plugin.proxyAdmits.shouldBeFalse()
+            val sealed = harness.plugin.proxyAsserts.size
+
+            // One missed ping. Nothing else is wrong with the proxy.
+            harness.proxyNode.joinable = false
+            harness.pass(name)
+            harness.clock.advance(2.seconds)
+            harness.proxyNode.joinable = true
+
+            val parked =
+                harness
+                    .proxyStatus()
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            parked.state shouldBe DrainState.DRAIN_FAILED
+            // The discriminator against the permanent case, which *does* release:
+            // this drain is still being attempted.
+            parked.failure.shouldNotBeNull().failureClass shouldBe FailureClass.RETRYABLE
+
+            // The park itself, and then the passes after it — where the resume is
+            // gated on zero players and lands in `blocked`, which cannot re-seal.
+            harness.plugin.proxyAdmits.shouldBeFalse()
+            repeat(6) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+            harness
+                .proxyStatus()
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .blocked
+                .shouldNotBeNull()
+                .reason shouldBe DrainBlockReason.AWAITING_ZERO_PLAYERS
+            harness.plugin.proxyAdmits.shouldBeFalse()
+            // …and it was never handed back in between, not even for one backoff.
+            harness.plugin.proxyAsserts.drop(sealed) shouldNotContain true
+            harness.proxyNode.stops.shouldBeEmpty()
+
+            // The last player logs off and the drain finishes on its own.
+            harness.proxyNode.online = 0
+            repeat(6) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+            harness.proxyNode.stops shouldHaveSize 1
+            harness.proxyNode.removals.shouldNotBeEmpty()
         }
 
     /** Runs [body] when the stop is issued, so a test can assert on the order of side effects. */

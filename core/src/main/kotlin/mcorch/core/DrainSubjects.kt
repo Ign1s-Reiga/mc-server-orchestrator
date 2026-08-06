@@ -21,6 +21,7 @@ import kotlin.time.Duration
 internal class PaperDrainSubject(
     private val definition: PaperServerDefinition,
     private val agent: PaperServerAgent,
+    override val replacementSpec: WorkloadSpec,
     override val seal: DrainSeal? = null,
     override val router: DrainRouter? = null,
 ) : DrainSubject {
@@ -67,6 +68,7 @@ internal class PaperDrainSubject(
 internal class ProxyDrainSubject(
     private val definition: VelocityProxyDefinition,
     private val agent: VelocityProxyAgent,
+    override val replacementSpec: WorkloadSpec,
     override val seal: DrainSeal? = null,
 ) : DrainSubject {
     override val server: ResourceName get() = definition.metadata.name

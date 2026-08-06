@@ -80,6 +80,14 @@
 #   D26      an unbuildable replacement's failure discarded on the branch where the
 #            container has also exited, which is the branch where an operator most
 #            needs to be told which of the two to fix.
+#   D27      the seal's compensating edge stripped of its condition, which is how it
+#            was written when the twenty-sixth audit found it: a *retryable* park
+#            gives the login path back, and no later pass can take it again while
+#            anybody is on, because the gated resume lands in `blocked`. D22 removes
+#            the edge, this one over-applies it, and the two tests are different.
+#   D28..D29 the last asking before steps 6 and 7 — the window the pass-level
+#            pre-flight exempts — removed, and then widened past `REPLACEMENT` so
+#            that a create can wedge a delete.
 #   C1..C3   controls: the rule deleted outright, once per assertion arm. If these
 #            do not redden, the harness is not reaching the assertions at all.
 #   S1       the self-test. See below.
@@ -152,6 +160,9 @@ KEPT_RUNNING='a server whose replacement the node cannot build is not drained, a
 KEPT_PLAYING='players are not drained for a replacement the node cannot build'
 RELEASES='a proxy drain that aborts permanently releases its own login seal'
 KEEPS_SEAL='a proxy drain waiting for players to leave keeps its login seal on'
+RETRYABLE_SEAL='a proxy drain that parks on a retryable abort keeps its login seal on'
+MID_DRAIN='a replacement that becomes unbuildable mid-drain parks before the stop'
+DELETE_COMPLETES='a delete still completes while the node refuses every create'
 PIN_EXIT='an operator can pin a proxy fleet back onto the build its containers were created with'
 ONE_VALUE='a pinned Velocity build reaches the container and the hash as one value'
 ARTEFACT='a proxy that exited and cannot be rebuilt reports the artefact, not the exit'
@@ -285,8 +296,22 @@ PREFLIGHT_DERIVATION='            containerSpecFor(spec, SecretAccess.PRESENCE_O
 PREFLIGHT_SUBSET='            mountsFor(spec)'
 # The waiver'"'"'s premise, at the one call site that establishes it.
 SUBJECT_ROUTER='                router = link,'
-# The seal'"'"'s compensating edge, in `abort`.
-SEAL_RELEASE='        releaseSeal(subject)'
+# The seal'"'"'s compensating edge, in `abort`, with the condition that decides which
+# aborts it belongs to.
+SEAL_RELEASE='        if (failureClass == FailureClass.PERMANENT) releaseSeal(subject)'
+# …and the edge with its condition dropped, which is how it was written when the
+# twenty-sixth audit found it. A retryable park then gives the login path back, and
+# the gated resume lands in `blocked` — which does not seal — so nothing can ever
+# take it again while anybody is on.
+SEAL_RELEASE_UNGATED='        releaseSeal(subject)'
+# The last asking before the irreversible half of the protocol, at the entry to
+# steps 6 and 7. Carries the line below it so the literal cannot match anything else.
+MID_DRAIN_PREFLIGHT='        replacementIsBuildable(pass, drain)?.let { return it }
+        val router = pass.subject.router'
+# Its scope. Widening it is the plausible edit — "why only a replacement" — and it
+# makes an unbuildable create able to block a *delete*, which is the failure mode
+# the whole pre-flight exists to avoid, arriving from the other direction.
+PREFLIGHT_SCOPE='        if (pass.cause != DrainCause.REPLACEMENT) return null'
 # `blocked`'"'"'s first two lines, to put the same edge in front of. Both park in
 # `DRAIN_FAILED`, so "make them consistent" is the obvious edit — and it releases the
 # seal that is the mechanism of the wait a block is waiting out.
@@ -395,12 +420,14 @@ MUTATIONS=(
     # And added where it must not be. A block is the protocol working, and the seal
     # is what lets the wait end.
     #
-    # It claims two names, and the second is a fact about the defect rather than
-    # noise: the pin's exit test demonstrates the blackout by asserting the login
-    # path is shut while the replacement drain waits, so a seal released on a block
-    # means there was never a blackout to have an exit from. Both reddened for the
-    # one reason, and D22 is the entry that isolates the edge on its own.
-    "D23@@$CONTROLLER@@$PROXY_DRAIN@@$KEEPS_SEAL;$PIN_EXIT@@$BLOCK_ENTRY@@$BLOCK_ENTRY
+    # It claims three names, and the two beyond the obvious one are facts about the
+    # defect rather than noise. The pin's exit test demonstrates the blackout by
+    # asserting the login path is shut while the replacement drain waits, so a seal
+    # released on a block means there was never a blackout to have an exit from; and
+    # the retryable-abort test spends six passes in `blocked` proving the seal is
+    # never handed back, which this hands back on the first of them. All three redden
+    # for the one reason, and D22 is the entry that isolates the edge on its own.
+    "D23@@$CONTROLLER@@$PROXY_DRAIN@@$KEEPS_SEAL;$PIN_EXIT;$RETRYABLE_SEAL@@$BLOCK_ENTRY@@$BLOCK_ENTRY
         releaseSeal(subject)"
     # The operator's lever dropped between the configuration and the planner: the
     # knob still exists, and nothing reads it.
@@ -412,6 +439,20 @@ MUTATIONS=(
     # The artefact's message discarded on the branch that reports a container which
     # has also exited — where the operator is told the unactionable half.
     "D26@@$RECONCILER@@$PROXY_RECONCILE@@$ARTEFACT@@$EXIT_PREFERENCE@@                                failure = failure,"
+    # The same edge with its condition dropped — the twenty-sixth audit's critical.
+    # It is the *retryable* park that must keep the seal: the loop is still coming
+    # back, and for a subject with no router the resume is gated on zero players, so
+    # a release there is one nothing can undo while anybody is connected. D22 and
+    # this are the two directions of one line, and each reddens its own test.
+    "D27@@$CONTROLLER@@$PROXY_DRAIN@@$RETRYABLE_SEAL@@$SEAL_RELEASE@@$SEAL_RELEASE_UNGATED"
+    # The last asking before the irreversible half, removed. The pass-level
+    # pre-flight exempts a drain in flight, so with this gone an artefact that
+    # disappears mid-drain is discovered by the create — after the stop and the
+    # removal.
+    "D28@@$CONTROLLER@@$REPLACEMENT@@$MID_DRAIN@@$MID_DRAIN_PREFLIGHT@@        val router = pass.subject.router"
+    # …and the same guard widened past a replacement, which makes a create nobody
+    # needs able to wedge a delete.
+    "D29@@$CONTROLLER@@$REPLACEMENT@@$DELETE_COMPLETES@@$PREFLIGHT_SCOPE@@        if (pass.cause == DrainCause.RELOCATION) return null"
     "C1@@$CONTROLLER@@$WIRING@@$EXIT@@$RULE@@val recorded = progress"
     "C2@@$CONTROLLER@@$WIRING@@$STEPPED@@$ADOPTION@@val observed = drain"
     "C3@@$CONTROLLER@@$RULES@@$ADOPTS@@$CLAUSE@@is PlayerReading.Occupied -> this"
