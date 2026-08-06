@@ -1,6 +1,6 @@
 ---
 name: level-triggered-seal
-description: Why the proxy seal is asserted rather than issued, the two rules that look alike and are not (sealsBackend vs drainInitiated), the anchor rules a bounded drain step needs, and why a resume never clears a failure
+description: Why the proxy seal is asserted rather than issued, the two rules that look alike and are not (sealsBackend vs drainInitiated), the anchor rules a bounded drain step needs, why a resume never clears a failure, and the two rounds that narrowed the seal release to the gate's answer while making the gated resume assert step 2
 metadata:
   type: project
 ---
@@ -274,7 +274,60 @@ Three things to carry:
   `requireEmpty` on the gated resume — was rejected on its merits: it hands the
   door back for a whole backoff per cycle (enough to refill a busy fleet), and it
   turns a healthy block into an abort exactly when the control endpoint is what is
-  down.
+  down. **Half of it was taken in round 27** — see below — once the release was
+  narrow enough that there was nothing left to pair it with.
+
+### …and "permanent" was still one of the gate's *inputs*
+
+Round 27's critical, and it is the same defect one clause along. The fix above
+read `failureClass == PERMANENT`, and the sentence it rests on — *no pass will
+look at this workload again* — is `isBlockedByPermanentFailure`, which is
+`PERMANENT` **and not terminating**. A delete is exempt from that gate on purpose
+(a failure must never make a workload undeletable), so a permanent abort during a
+delete — a refused `stopWorkload`, or a proxy whose missing `WORLD_DATA` label
+makes a save unconfirmable — reopened the door of a fleet the loop kept
+reconciling. Then the population refilled, the gated resume blocked for ever, and
+the first `blocked` wrote `failure = null`, so the status settled on *"waiting for
+the server to empty"* about a blackout the orchestrator had itself undone.
+
+- **Key an edge on the gate's answer, never on one of its inputs.** The remedy is
+  `Reconciler.permanentFailureStopsPasses()`: one expression, asked by both kinds'
+  gates, handed to `advance` per pass and carried to every `abort` on `DrainPass`.
+  A second derivation is what produced this, and `cause == DELETION` would have
+  been a third — placement decides a cause first, so a terminating definition can
+  drain as a `RELOCATION`.
+- **A level a later pass restores cannot be asserted from a flag.** My first
+  version of the delete test read `plugin.proxyAdmits` after the passes and went
+  **green against the defect**: the resume's own `holdSeal` had re-sealed the door
+  by the time it looked. The assertion has to be the wire record — *no `PUT
+  /v1/proxy` asserted `true` after the seal landed* — which is the form the round-26
+  test had already used and I did not copy. Ask, of any door/level assertion: what
+  re-asserts this between the event and the read?
+
+### The mirror: a first failed seal was final
+
+The same round's second finding, and the re-take of the rejected alternative. The
+six states that seal all sit behind `requireEmpty` on the gated path, so a proxy
+whose **first** `holdSeal` failed with players on parked with the door open and
+could never reach step 2 again — the fleet never emptied, and it did not converge
+after the endpoint recovered either. `resume` now asserts `holdSeal` before
+`requireEmpty` for the gated path.
+
+- Under the old *unconditional* release the pairing handed the door back once a
+  backoff; under the permanent-and-not-terminating release **there is no release to
+  pair with**, so all that is left is a reporting change: a pass that cannot reach
+  the endpoint with somebody on records a `RETRYABLE` failure where it recorded a
+  healthy block. That is the honest report — a wait whose seal cannot be maintained
+  is not a wait that can end — and it is the change to argue about, not the seal.
+- **Re-take a rejected alternative when the rule it was argued under changes.** The
+  rejection was right at the time and wrong six weeks later, and nothing in the
+  code says so.
+- It repairs the neighbouring case for free: a proxy restarted under a long healthy
+  block loses its admission state, and `assertBackends` — the only other re-assertion
+  — is reached by non-draining passes only.
+- The price is one extra control call per parked pass (two, on a waived path: the
+  resume's and the resumed state's). Bounded by `sealTimeout`; visible in the
+  integration log for `it-mute-proxy`.
 
 **`blocked` deliberately does not**, and that asymmetry is the interesting part:
 a block is the protocol working, the drain is waiting for the last player to log
@@ -294,11 +347,22 @@ removes the reason the wait can end.
    is kept struck through rather than deleted because the *reasoning* is the
    instructive part: the resume it relied on is gated on zero players, so with
    anybody on there was no flap and no re-assertion at all. The release is
-   `PERMANENT`-only now. What the old ruling feared — a retryable park staying
-   sealed while the fault lasts — is real and is the accepted cost: the loop keeps
-   retrying, the escalation fires after `drainAttentionAfter`, and reverting the
-   definition (or the build pin) makes the cause vanish so a *converging* pass
-   re-asserts admission through `assertBackends`.
+   permanent-**and-not-terminating** only, since round 27. What the old ruling
+   feared — a retryable park staying sealed while the fault lasts — is real and is
+   the accepted cost: the loop keeps retrying, the escalation fires after
+   `drainAttentionAfter`, and reverting the definition (or the build pin) makes the
+   cause vanish so a *converging* pass re-asserts admission through
+   `assertBackends`. Round 27 made the resume assert the seal, so the flap the
+   ruling described is now exactly what an over-wide release would produce — which
+   is why the two changes have to be read together and why the delete test asserts
+   at the wire.
+6. **A parked routerless drain whose endpoint is down reports a failure, not a
+   block.** The reporting half of the resume's `holdSeal`; it makes
+   `NEEDS_ATTENTION` fire after `drainAttentionAfter` on a proxy drain that a
+   dashboard used to render as *waiting, do not act*. Defensible because the wait
+   genuinely cannot end while the seal cannot be asserted — but it is the one part
+   of round 27 a human may want the other way, and `blocked-is-not-failed` is the
+   ruling it sits closest to.
 2. **More than one proxy claiming a backend is a retryable failure on the
    *backend's* status**, and the container is not created while it holds. The
    refusal is **exempt for a terminating definition** — it returns before

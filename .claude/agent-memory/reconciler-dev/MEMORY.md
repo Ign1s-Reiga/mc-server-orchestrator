@@ -15,7 +15,7 @@
 - [Cancellation exposure](project_cancellation-exposure.md) — what the save-record shield covers, the two windows left open on purpose, and why write-ahead was rejected on its merits.
 - [Derive from the consumer](feedback_derive-from-the-consumer.md) — a status field is judged by what reads it; two of my defects passed every `:core` test and needed a real dashboard.
 - [Unreadable state posture](project_unreadable-state-posture.md) — a bad definition row cost the fleet; a bad observation was already safe via `getServer`, and the loop's skip only buys reporting.
-- [Level-triggered seal](project_level-triggered-seal.md) — assert, never issue; anchor rules; why the release is permanent-only, and the ruling that got overruled.
+- [Level-triggered seal](project_level-triggered-seal.md) — assert, never issue; anchor rules; why the release is keyed on the gate's answer, and why the gated resume now seals.
 - [Record where no work happens](project_record-where-no-work-happens.md) — the third critical from "did work ⇒ recovered", and why the fix was placement rather than a narrower rule.
 - [Invariants need an enforcement point](feedback_invariants-need-an-enforcement-point.md) — pin wiring by shape and every premise of an unreachability argument; two gates need a side-effect assertion.
 - [Replacement needs an exit](project_replacement-exit.md) — a hash input no operator can edit closes the fleet's login path; the lever, the pre-flight asked at both ends, the wait still unbounded.

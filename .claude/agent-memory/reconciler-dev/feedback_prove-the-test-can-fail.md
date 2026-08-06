@@ -1,6 +1,6 @@
 ---
 name: prove-the-test-can-fail
-description: Before trusting a green run, prove the check could have gone red — Gradle skips up-to-date tasks, virtual time hides races, a mutation set beats one sabotage, a precondition the compiler refuses is written as a reason where its mutation would go, a rename must sweep the retired claim and not just the identifier, and some checks belong in the type system instead
+description: Before trusting a green run, prove the check could have gone red — Gradle skips up-to-date tasks, virtual time hides races, a level something else re-asserts must be pinned at the wire, a mutation set beats one sabotage, a precondition the compiler refuses is written as a reason where its mutation would go, a rename must sweep the retired claim and not just the identifier, and some checks belong in the type system instead
 metadata:
   type: feedback
 ---
@@ -37,6 +37,17 @@ sabotage. Two rules from it: sabotage by *changing a value* (`since = now`), nev
 by adding dead code, and treat "no failures **and** no test-count line" as a
 build failure to investigate rather than a pass. Check the exit status or the
 `BUILD` line, not just the failure list.
+
+**A level that something else re-asserts cannot be pinned by reading the level.**
+Round 27's delete test asserted `plugin.proxyAdmits` was `false` after a run of
+passes, and passed against the very defect it was written for: the release opened
+the door and the resume's own `holdSeal` shut it again before the assertion looked.
+The instrument is the **record of the calls** — no `PUT /v1/proxy` asserted `true`
+after the seal landed — which the neighbouring round-26 test already used. Ask of
+any assertion on a door, a flag or a registration: *what re-asserts this between
+the event and the read?* If anything does, assert on the wire, and take the
+baseline at the moment the property starts holding rather than at the end. See
+[[level-triggered-seal]].
 
 **A negative assertion satisfied by a *downstream* guard proves nothing about the
 one you changed.** A test for "the proxy's player count does not move the gate"
