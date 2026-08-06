@@ -7,6 +7,7 @@ import io.kotest.matchers.booleans.shouldBeTrue
 import io.kotest.matchers.collections.shouldContainExactly
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.string.shouldContain
 import org.junit.jupiter.api.Test
 import runtime.v1.Api
 import runtime.v1.createContainerResponse
@@ -14,6 +15,8 @@ import runtime.v1.execResponse
 import runtime.v1.execSyncResponse
 import runtime.v1.pullImageResponse
 import runtime.v1.runPodSandboxResponse
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.days
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
@@ -27,7 +30,7 @@ class RequestConstructionTest {
         runCriTest {
             val runtime = FakeCriServer.RuntimeBehaviour()
             FakeCriServer(runtime = runtime).use { fake ->
-                fake.client.stopContainer(ContainerId("c1"), StopGracePeriod.ofSeconds(120))
+                fake.client.stopContainer(ContainerId("c1"), StopGracePeriod.ofSeconds(120).getOrThrow())
 
                 val sent = runtime.lastStopContainer.shouldNotBeNull()
                 sent.containerId shouldBe "c1"
@@ -38,20 +41,57 @@ class RequestConstructionTest {
     @Test
     fun `a fractional grace period rounds up, never down`() {
         // Rounding down would shorten the safety net below the configured value.
-        StopGracePeriod.of(90.5.seconds).seconds shouldBe 91L
-        StopGracePeriod.of(1.milliseconds).seconds shouldBe 1L
-        StopGracePeriod.of(90.seconds).seconds shouldBe 90L
+        StopGracePeriod.of(90.5.seconds).getOrThrow().seconds shouldBe 91L
+        StopGracePeriod.of(1.milliseconds).getOrThrow().seconds shouldBe 1L
+        StopGracePeriod.of(90.seconds).getOrThrow().seconds shouldBe 90L
     }
 
     @Test
     fun `a zero or negative grace period cannot be constructed by accident`() {
-        shouldThrow<IllegalArgumentException> { StopGracePeriod.of(0.seconds) }
-        shouldThrow<IllegalArgumentException> { StopGracePeriod.of((-5).seconds) }
-        shouldThrow<IllegalArgumentException> { StopGracePeriod.ofSeconds(0) }
+        StopGracePeriod.of(0.seconds).isFailure.shouldBeTrue()
+        StopGracePeriod.of((-5).seconds).isFailure.shouldBeTrue()
+        StopGracePeriod.ofSeconds(0).isFailure.shouldBeTrue()
 
         // The zero case exists, but only under a name that shows up in a drain audit.
         StopGracePeriod.IMMEDIATE_KILL.seconds shouldBe 0L
         StopGracePeriod.IMMEDIATE_KILL.toString() shouldBe "IMMEDIATE_KILL"
+    }
+
+    @Test
+    fun `a grace period containerd would invert into a kill cannot be constructed`() {
+        // The defect this closes is not "the stop fails". It is that containerd
+        // multiplies these seconds by a billion into an int64 nanosecond count,
+        // and above MAX_SECONDS that product wraps: the runtime then kills the
+        // container with little or no grace and answers `{}` — the same empty
+        // message a stop that waited the full period returns. Nothing downstream
+        // can tell the two apart, so the value has to be refused before it is
+        // sent. The numbers are measured; see StopGracePeriod.MAX_SECONDS.
+        StopGracePeriod.ofSeconds(StopGracePeriod.MAX_SECONDS).getOrThrow().seconds shouldBe
+            StopGracePeriod.MAX_SECONDS
+
+        // One second further is where containerd stopped waiting and started
+        // killing on the pinned runtime.
+        StopGracePeriod.ofSeconds(StopGracePeriod.MAX_SECONDS + 1).isFailure.shouldBeTrue()
+        StopGracePeriod.ofSeconds(Long.MAX_VALUE).isFailure.shouldBeTrue()
+
+        // 18446744083s is the row that matters most: it wraps to a *positive*
+        // 9.29s, so containerd signals, waits and kills exactly as a healthy stop
+        // looks. 584 years asked for, nine seconds served.
+        StopGracePeriod.ofSeconds(18_446_744_083L).isFailure.shouldBeTrue()
+
+        // Reached through a Duration as well, since that is the form the node
+        // hands in. Rounding up must not be a way over the line either.
+        StopGracePeriod.of(StopGracePeriod.MAX_SECONDS.seconds).getOrThrow().seconds shouldBe
+            StopGracePeriod.MAX_SECONDS
+        StopGracePeriod.of((StopGracePeriod.MAX_SECONDS.seconds) + 1.milliseconds).isFailure.shouldBeTrue()
+        StopGracePeriod.of((400 * 365).days).isFailure.shouldBeTrue()
+
+        // Infinity is refused before the rounding runs, not by the range check:
+        // rounding an infinite duration up would add one to Long.MAX_VALUE and
+        // hand the range check a negative number, which reads as "not positive".
+        val infinite = StopGracePeriod.of(Duration.INFINITE)
+        infinite.isFailure.shouldBeTrue()
+        infinite.exceptionOrNull()?.message.shouldNotBeNull() shouldContain "finite"
     }
 
     @Test

@@ -603,28 +603,53 @@ public class LocalNode internal constructor(
         handle: WorkloadHandle,
         gracePeriod: Duration,
     ) {
-        if (!gracePeriod.isPositive()) {
-            // Refused rather than asserted: [Node] promises callers see nothing
-            // but a [NodeException], and an `IllegalArgumentException` from here
-            // would be the one thing a caller cannot classify. The refusal is
-            // just as absolute — no stop is issued either way.
-            throw NodeException.Rejected(
-                name,
-                NodeOperation.STOP,
-                "the stop grace period must be positive; it comes from spec.lifecycle.stopGracePeriod, which " +
-                    "the schema validates at parse time — for a Paper server, to exceed that server's save " +
-                    "timeout; a Velocity proxy holds no world and has no such rule",
-            )
-        }
+        // One rule, asked once, of the type that owns it. This used to be a
+        // local `isPositive()` check standing in front of a `StopGracePeriod.of`
+        // that enforced strictly more — so `Duration.INFINITE` cleared the guard
+        // here and failed inside [translating] instead, where the catch-all for
+        // unclassified `RuntimeException`s turns it into a *non-retryable*
+        // rejection: a permanent drain abort produced by an argument, with no
+        // container runtime involved. Two guards that disagree about the same
+        // value is the defect; a second, better-informed local guard would be
+        // the same defect again.
+        //
+        // `of` rounds up to whole seconds, so a grace period is never silently
+        // shortened, and it refuses anything containerd's own arithmetic would
+        // wrap — see [StopGracePeriod.MAX_SECONDS], where a very long grace
+        // period becomes a very short one.
+        val grace =
+            StopGracePeriod.of(gracePeriod).getOrElse { rejection ->
+                // Refused rather than thrown on: [Node] promises callers see
+                // nothing but a [NodeException], and an
+                // `IllegalArgumentException` from here would be the one thing a
+                // caller cannot classify. The refusal is just as absolute — no
+                // stop is issued either way.
+                throw NodeException.Rejected(
+                    name,
+                    NodeOperation.STOP,
+                    "${rejection.message}. It comes from spec.lifecycle.stopGracePeriod, which the schema " +
+                        "validates at parse time — for a Paper server, to exceed that server's save timeout; " +
+                        "a Velocity proxy holds no world and has no such rule",
+                )
+            }
         val containerId =
-            handle.containerId?.let(::ContainerId) ?: run {
+            handle.containerId ?: run {
                 LOG.debug("nothing to stop for sandbox {}: no container was ever created", handle.sandboxId)
                 return
             }
         translating(NodeOperation.STOP) {
-            // `StopGracePeriod.of` rounds up to whole seconds, so a grace
-            // period is never silently shortened.
-            client.stopContainer(containerId, StopGracePeriod.of(gracePeriod))
+            // `ContainerId` is constructed *inside* [translating] because it can
+            // reject. A blank id built outside would leave here as a raw
+            // `IllegalArgumentException` — not a [NodeException], so it would
+            // slip past the `catch (failure: NodeException)` in
+            // `DrainController.stop` that exists to compensate the routing table.
+            //
+            // Nothing can currently reach that: [WorkloadHandle] already requires
+            // a set `containerId` to be non-blank, so the value here is either
+            // null (handled above) or valid. This is not a fix for an observed
+            // failure — it is so that the argument for safety is "the failure is
+            // classified" rather than "the invariant one type away still holds".
+            client.stopContainer(ContainerId(containerId), grace)
         }
     }
 

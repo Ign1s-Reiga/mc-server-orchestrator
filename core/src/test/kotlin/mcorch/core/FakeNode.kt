@@ -3,6 +3,7 @@ package mcorch.core
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import mcorch.core.paper.PaperCommands
+import mcorch.cri.StopGracePeriod
 import mcorch.schema.ImageRef
 import mcorch.schema.NodeName
 import mcorch.schema.ResourceName
@@ -292,7 +293,14 @@ internal class FakeNode(
         handle: WorkloadHandle,
         gracePeriod: Duration,
     ) {
-        require(gracePeriod.isPositive()) { "the fake node holds the real node to its contract" }
+        // The same rule the real node applies, asked of the same object, so this
+        // fake cannot accept a grace period `LocalNode` would refuse. It used to
+        // be a local `isPositive()`, which is the *weaker* half — a caller that
+        // reached this fake with an unbounded or overflowing value would have
+        // been told it was fine.
+        StopGracePeriod.of(gracePeriod).getOrElse {
+            throw IllegalArgumentException("the fake node holds the real node to its contract: ${it.message}", it)
+        }
         check(NodeOperation.STOP)
         stops += handle to gracePeriod
         val present = workload as? WorkloadObservation.Present ?: return
