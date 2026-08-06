@@ -216,11 +216,11 @@ server-side after the client deadline"* — and it is false; do not write it dow
   full sentence; a fleet with no backend draining does not. Closing it needs a
   place on `ControlEndpointStatus` for *"answering is not the problem"* — the same
   field `assertBackends`'s `UNAUTHENTICATED` branch is already waiting for.
-- **`restoreRegistration` re-registers a container that has been sent SIGTERM.**
-  Filed as a note at the site, not fixed. See [[gate-and-ceiling]] for the gate it
-  interacts with; the discriminator that looks right (`state == STOPPING`) misses
-  the case, because `stop`'s own `Timeout` catch fires with the drain still
-  `DEREGISTERED`.
+- ~~**`restoreRegistration` re-registers a container that has been sent
+  SIGTERM.**~~ Closed in round 32 by `DrainStatus.stopDispatchedAt` — see
+  [[dispatch-record]], which also records that the cap this file describes cannot
+  fire on any definition the loop acts on, `SpecBounds` having emptied that
+  population at the decode.
 
 See [[invariants-need-an-enforcement-point]] for the rule this is an instance of,
 and [[gate-and-ceiling]] for the cap-versus-refuse ruling it revises.

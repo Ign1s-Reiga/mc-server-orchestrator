@@ -268,6 +268,25 @@ two files, one of which I could not `git checkout --` because it also held real
 work. Commit first, then run the harness, then edit again — the same rule as
 sabotaging by hand, for the same reason.
 
+**A green `./gradlew build` did not mean the integration sources compiled.**
+Neither `:app`'s nor `:cri`'s `check` depended on `compileIntegrationTestKotlin`,
+so `EndpointTimeout` becoming `EndpointRequest.timeout`'s type left
+`VelocityProxyControlIT` passing a raw `Duration` for a whole round with every
+build green — and it would have surfaced only to whoever next had a containerd.
+Both are wired into `check` now (compiled, never run: a compile needs no runtime).
+The general form: **when told "the build covers X", run the task and watch it
+appear**, and prefer wiring the coverage over trusting the claim. `--rerun-tasks`
+is the cheap check — a task that never prints did not run.
+
+**`git stash pop` in a shared worktree can pop somebody else's stash.** A
+`git stash -q -u` on a clean tree creates nothing and silently succeeds, so the
+`pop` that follows takes `stash@{0}` — which here was an unrelated agent's WIP from
+another branch, and it landed as a conflict inside
+`.claude/agent-memory/code-reviewer/`. Nothing was lost (a conflicted pop keeps the
+entry), but a `git checkout .` would have. Never pair a blind `stash`/`pop` around
+a `checkout`; use `git stash create`/`git stash store` with an explicit ref, or
+copy the files, and check `git stash list` **before** and after.
+
 **Do not pipe a mutation harness through `tail`.** I ran one as
 `./harness.sh 2>&1 | tail -70`, saw "2 mutations were not caught", and had thrown
 away every `MISCAUGHT`/`GREEN`/`UNKNOWN` line — those go to stderr *interleaved*,
