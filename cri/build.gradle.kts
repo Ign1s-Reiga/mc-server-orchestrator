@@ -121,6 +121,13 @@ configurations["integrationTestImplementation"]
 configurations["integrationTestRuntimeOnly"]
     .extendsFrom(configurations["testRuntimeOnly"])
 
+// Compiled by `check`, and so by `build`, without being *run* by it. A run needs a
+// containerd nobody has in CI or in an agent's worktree; a compile needs nothing,
+// and it is the only thing that tells a change to a shared type that it has broken
+// this source set. Without it a signature change survives every green build and
+// fails for whoever next has a runtime to point at.
+tasks.named("check") { dependsOn("compileIntegrationTestKotlin") }
+
 tasks.register<Test>("integrationTest") {
     group = "verification"
     description = "Runs CRI-boundary tests against a real local containerd (see scripts/dev/containerd-up.sh)."

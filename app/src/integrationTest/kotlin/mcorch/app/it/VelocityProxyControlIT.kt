@@ -7,6 +7,7 @@ import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.types.shouldBeInstanceOf
 import mcorch.core.EndpointRequest
+import mcorch.core.EndpointTimeout
 import mcorch.core.HttpVerb
 import mcorch.core.WorkloadObservation
 import mcorch.core.WorkloadState
@@ -238,8 +239,14 @@ internal class VelocityProxyControlIT {
         }
 
     private companion object {
-        /** Generous: this crosses a container boundary to a JDK HTTP server. */
-        private val CALL_TIMEOUT = 15.seconds
+        /**
+         * Generous: this crosses a container boundary to a JDK HTTP server.
+         *
+         * Through [EndpointTimeout.of] since the thirty-second audit, like every
+         * other `EndpointRequest` — the type is the enforcement point for the
+         * ceiling, so a raw `Duration` here would not compile and should not.
+         */
+        private val CALL_TIMEOUT = EndpointTimeout.of(15.seconds)
 
         private const val OK: Int = 200
         private const val UNAUTHENTICATED: Int = 401

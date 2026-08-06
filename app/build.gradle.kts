@@ -68,6 +68,11 @@ dependencies {
     controlPlugin(project(mapOf("path" to ":velocity-plugin", "configuration" to "controlPlugin")))
 }
 
+// Compiled by `check`, and so by `build`, without being *run* by it — see the same
+// line in cri/build.gradle.kts. `EndpointTimeout` broke this source set for a whole
+// round and every build stayed green, because nothing compiled it.
+tasks.named("check") { dependsOn("compileIntegrationTestKotlin") }
+
 tasks.register<Test>("integrationTest") {
     group = "verification"
     description = "Runs integration tests against a real local containerd (see scripts/dev/containerd-up.sh)."
