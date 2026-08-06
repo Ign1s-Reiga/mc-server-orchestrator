@@ -270,6 +270,50 @@ internal class DrainWiringTest {
     }
 
     /**
+     * …and the ceiling itself is applied where both halves of the pair are visible,
+     * once, in this module.
+     *
+     * The test above closes the *field* half: nothing but [DrainController.stopGrace]
+     * reads `subject.stopGracePeriod`. This closes the *factory* half, which it
+     * leaves open. `StopGrace.of(requested, Duration.ZERO)` is a legal call from
+     * anywhere, and its second argument is the floor — so a caller that supplies zero
+     * for a workload that holds a world disables the floor and restores the thirtieth
+     * audit's finding, with the type still saying the ceiling was applied. The type
+     * proves the ceiling was applied; it cannot prove it was applied with the right
+     * save timeout.
+     *
+     * Two call sites already pass `Duration.ZERO` — the integration harness's scrub
+     * and `StopGraceGuardTest`'s own cases — and both are correct, because both are
+     * world-free. Both are test code, which is why the scan is over main sources: it
+     * is not that zero is wrong, it is that in a *reconcile path* the second argument
+     * has to come from the subject rather than from the author's confidence.
+     *
+     * Scoped and unitised like the container-ending scan below it: one entry per call
+     * site as `path to enclosingFunctionName`, so a second derivation added to the
+     * file that already holds the first is visible, and a list of files would not
+     * have been.
+     */
+    @Test
+    fun `the stop grace ceiling is applied at one site, with the pair in front of it`() {
+        val sources = mainSources()
+
+        // Vacuity guards, the same two the scan below carries: a walk that found
+        // nothing, or one that ran somewhere without the drain controller in it,
+        // satisfies the assertion by accident.
+        sources.size shouldBeGreaterThan 10
+        sources.map { it.path } shouldContain CONTROLLER_PATH
+
+        val built =
+            sources.flatMap { source ->
+                source.lines.indices
+                    .filter { mentions(source.lines[it], "StopGrace.of") }
+                    .map { source.path to source.enclosing(it).name }
+            }
+
+        built shouldBe listOf(CONTROLLER_PATH to "stopGrace")
+    }
+
+    /**
      * The backstop is a backstop, and this is what keeps it one.
      *
      * [DrainController.stop] re-asserts `mayStop` itself, and that re-assertion is
@@ -447,17 +491,7 @@ internal class DrainWiringTest {
      */
     @Test
     fun `the calls that end a container are decided at the sites named here`() {
-        val sources =
-            Path
-                .of("src/main/kotlin")
-                .toFile()
-                .walkTopDown()
-                .filter { it.isFile && it.extension == "kt" }
-                .map(Source::of)
-                // Sorted, so the list below is the source's own order and not the
-                // order the filesystem happened to hand the walk.
-                .sortedBy { it.path }
-                .toList()
+        val sources = mainSources()
 
         // Vacuity guards. A walk that found nothing, or that ran somewhere without
         // the reconcile loop in it, satisfies the assertions below by accident.
@@ -1006,6 +1040,25 @@ internal class DrainWiringTest {
         val CONTROLLER: Source = Source.of(CONTROLLER_PATH)
 
         val LINES: List<String> get() = CONTROLLER.lines
+
+        /**
+         * Every `.kt` file in this module's main sources, in the source tree's own
+         * order rather than the filesystem's.
+         *
+         * Shared by the two scans whose claims are about the *module* rather than
+         * about one file. Test sources are deliberately outside it: a fake node, a
+         * harness scrub and a guard test legitimately do things a reconcile path may
+         * not, and folding them in would make either scan a maintained exception list.
+         */
+        fun mainSources(): List<Source> =
+            Path
+                .of("src/main/kotlin")
+                .toFile()
+                .walkTopDown()
+                .filter { it.isFile && it.extension == "kt" }
+                .map(Source::of)
+                .sortedBy { it.path }
+                .toList()
 
         fun rangeOf(name: String): IntRange = CONTROLLER.rangeOf(name)
 

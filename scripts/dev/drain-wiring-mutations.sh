@@ -142,6 +142,16 @@
 #            derived one, which is a container reported overdue against a number the
 #            runtime was never given. The type bounds the value; only a source scan
 #            can bound who reads the field it came from.
+#   D44      the same scan's other half: a second *application* of the ceiling,
+#            supplying `Duration.ZERO` as the save timeout. The floor is an argument,
+#            so a caller can disable it and still hold a value whose type says the
+#            ceiling was applied. Two call sites already pass zero legitimately and
+#            both are world-free test code, which is why the claim is about main
+#            sources.
+#            D39 and D40 each grew a third name this round, and it is a result rather
+#            than a nuisance: the new residual case reads the ceiling's arithmetic
+#            *and* what the node was sent, so both mutations genuinely change what it
+#            sees.
 #   C1..C3   controls: the rule deleted outright, once per assertion arm. If these
 #            do not redden, the harness is not reaching the assertions at all.
 #   S1       the self-test. See below.
@@ -250,6 +260,14 @@ GRACE_STILL_CAPPED='the largest grace period the runtime honours is still capped
 # residual the floor leaves behind at the runtime's own bound.
 GRACE_FLOORED='a grace period is never capped below the save timeout it was validated against'
 RUNTIME_REFUSES="a save timeout past the runtime's own bound leaves the stop refused, not silently inverted"
+# The thirty-first audit's first finding: the *reachable* residual, where the floor
+# raises the ceiling above MAX and the stop that goes out is a month long. It reads
+# both the ceiling and what the node sent, so D39 and D40 each redden it as well —
+# a true dependency, declared in their claims rather than worked around.
+FLOOR_UNCAPPED='above a two-hour save timeout the ceiling is the save timeout, and a month-long stop goes out'
+# ...and the factory half of the derivation: the ceiling is applied at one site,
+# with the pair in front of it. The field half is ONE_DERIVATION above.
+ONE_FACTORY='the stop grace ceiling is applied at one site, with the pair in front of it'
 # ...and the scenario that drives both ceilings through a real drain, which is where
 # the two consumers of one field are asserted against each other.
 BOTH_CEILINGS='a store row past both ceilings keeps its grace above its save timeout, and its save exec bounded'
@@ -487,6 +505,18 @@ EXEC_UNBOUNDED='        public fun of(requested: Duration): ExecTimeout = ExecTi
 # bites, which is what the structural pin is for.
 DERIVED_GRACE_READ='            val grace = stopGrace(pass).period'
 DECLARED_GRACE_READ='            val grace = pass.subject.stopGracePeriod'
+# A second *application* of the ceiling, which is the half the field scan leaves
+# open. `StopGrace.of(x, Duration.ZERO)` is legal from anywhere and the second
+# argument is the floor, so this disables it for whatever it is given -- and the
+# type still says the ceiling was applied. Written in the shape somebody reaches for
+# when there is no drain subject to hand: a block body rather than an expression
+# one, so the scan resolves an enclosing function rather than running off the end of
+# the file, which would redden the same test for the wrong reason.
+GRACE_ELSEWHERE="$RECONCILER_TAIL"'
+
+private fun cleanupGrace(declared: kotlin.time.Duration): StopGrace {
+    return StopGrace.of(declared, kotlin.time.Duration.ZERO)
+}'
 BLACKOUT_LEADS='                LoginPath.ShutByThisDrain -> "${path.sentence}. ${message.replaceFirstChar { it.uppercase() }}"'
 BLACKOUT_BURIED='                LoginPath.ShutByThisDrain -> "$message. ${path.sentence}"'
 # Step 2 on the gated resume, and the version without it: the state the twenty-
@@ -736,12 +766,17 @@ MUTATIONS=(
     # node still refuses to hold a worker for, because the call's deadline is
     # derived from it. The drain-level case is the same mutation scored in a second
     # class, because the harness runs one class per entry.
-    "D39@@$NODE@@$STOP_GRACE@@$GRACE_CAPPED;$GRACE_STILL_CAPPED@@$GRACE_CEILING@@$GRACE_UNBOUNDED"
+    # The third name in each claim is the thirty-first audit's case, and its extra
+    # red is a true dependency: it reads both the ceiling's arithmetic and the value
+    # the node sent, so an unbounded factory and a floorless ceiling both change what
+    # it sees. Declared rather than tidied away -- weakening it to make these two
+    # entries shorter would delete the evidence that the residual is reachable.
+    "D39@@$NODE@@$STOP_GRACE@@$GRACE_CAPPED;$GRACE_STILL_CAPPED;$FLOOR_UNCAPPED@@$GRACE_CEILING@@$GRACE_UNBOUNDED"
     "D39D@@$NODE@@$DRAIN@@$BOTH_CEILINGS@@$GRACE_CEILING@@$GRACE_UNBOUNDED"
     # The floor under it: the thirtieth audit's first finding. Two cases in the node
     # class -- the floor itself, and the residual it leaves at containerd's own bound
     # -- plus the drain that carries the pair end to end.
-    "D40@@$NODE@@$STOP_GRACE@@$GRACE_FLOORED;$RUNTIME_REFUSES@@$GRACE_FLOOR@@$GRACE_NO_FLOOR"
+    "D40@@$NODE@@$STOP_GRACE@@$GRACE_FLOORED;$RUNTIME_REFUSES;$FLOOR_UNCAPPED@@$GRACE_FLOOR@@$GRACE_NO_FLOOR"
     "D40D@@$NODE@@$DRAIN@@$BOTH_CEILINGS@@$GRACE_FLOOR@@$GRACE_NO_FLOOR"
     # The exec deadline, unbounded. Only the drain scenario sees it: it is the one
     # test that reads what a save exec was actually allowed to take.
@@ -753,6 +788,11 @@ MUTATIONS=(
     # A second reader of the raw grace period. The type bounds the value; nothing
     # bounds who reads the field it came from, so that half is a source scan.
     "D43@@$CONTROLLER@@$WIRING@@$ONE_DERIVATION@@$DERIVED_GRACE_READ@@$DECLARED_GRACE_READ"
+    # ...and a second *application* of it, in another file. D43 covers who may read
+    # the raw field; nothing covered who may call the factory, and the factory takes
+    # the floor as an argument -- so a caller supplying zero for a workload that holds
+    # a world has the type's blessing on a ceiling with nothing under it.
+    "D44@@$RECONCILER@@$WIRING@@$ONE_FACTORY@@$RECONCILER_TAIL@@$GRACE_ELSEWHERE"
     "C1@@$CONTROLLER@@$WIRING@@$EXIT@@$RULE@@val recorded = progress"
     "C2@@$CONTROLLER@@$WIRING@@$STEPPED@@$ADOPTION@@val observed = drain"
     "C3@@$CONTROLLER@@$RULES@@$ADOPTS@@$CLAUSE@@is PlayerReading.Occupied -> this"
