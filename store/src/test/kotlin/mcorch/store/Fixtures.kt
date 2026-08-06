@@ -378,13 +378,21 @@ internal object Fixtures {
      * and a drain that needs a human.
      */
     fun confirmedDrain(
-        state: DrainState = DrainState.DEREGISTERED,
+        state: DrainState = DrainState.STOPPING,
         at: Instant = T0,
     ): DrainStatus =
         fullDrain(state, at).copy(
             saveRequestedAt = null,
             worldSavedAt = at.minusSeconds(20),
             deregisteredAt = at.minusSeconds(10),
+            // The record that a stop request left the orchestrator, and the one
+            // field here whose loss is a *reversal* rather than a repeat: a drain
+            // that comes back without it puts the backend into the proxy's routing
+            // table on its next park, sending players to a container that has been
+            // sent SIGTERM. It only makes sense past the deregistration, which is
+            // why it sits on this fixture and not on [fullDrain] — and why this one
+            // is `STOPPING`.
+            stopDispatchedAt = at.minusSeconds(5),
             failure = null,
         )
 

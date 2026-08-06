@@ -420,6 +420,11 @@ internal object StatusCodec {
         // which is the cycle it exists to make visible.
         scope.put("resaveForcedAt", drain.resaveForcedAt)
         scope.put("deregisteredAt", drain.deregisteredAt)
+        // "A stop request left this process." Also a side-effect record, and the one
+        // whose loss is not a repeat but a *reversal*: a drain that came back without
+        // it puts the backend back into the routing table on its next park, sending
+        // players to a container that has been sent SIGTERM.
+        scope.put("stopDispatchedAt", drain.stopDispatchedAt)
         // The anchor drain step 4's allowance is measured from. Set once, never
         // cleared, and losing it is not cosmetic: a drain that came back without it
         // would re-stamp on the next pass and be handed its full allowance again,
@@ -455,6 +460,7 @@ internal object StatusCodec {
             worldSavedAt = reader.instant("$prefix.worldSavedAt"),
             resaveForcedAt = reader.instant("$prefix.resaveForcedAt"),
             deregisteredAt = reader.instant("$prefix.deregisteredAt"),
+            stopDispatchedAt = reader.instant("$prefix.stopDispatchedAt"),
             transferStartedAt = reader.instant("$prefix.transferStartedAt"),
             transferAttempts = reader.requireInt("$prefix.transferAttempts"),
             destination = reader.value("$prefix.destination", ResourceName::of),

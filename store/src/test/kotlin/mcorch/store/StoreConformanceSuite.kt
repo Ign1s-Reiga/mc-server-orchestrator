@@ -336,6 +336,12 @@ abstract class StoreConformanceSuite {
      * `saveRequestedAt`, a drain that had finished its save comes back believing
      * a request went out and never returned — it wedges permanently and asks a
      * human to verify a world that is already on disk.
+     *
+     * It carries `stopDispatchedAt` too, and that one fails in the opposite
+     * direction from every other field here. Losing a side-effect record usually
+     * costs a **repeat**; losing this one costs a **reversal** — the drain comes
+     * back believing no stop was dispatched and hands the backend back to the
+     * proxy, which routes players onto a container that has been sent SIGTERM.
      */
     @Test
     fun `a confirmed world save comes back as a confirmation, not as an outstanding request`() =
@@ -362,6 +368,7 @@ abstract class StoreConformanceSuite {
             // Disjoint: a confirmed save has no request outstanding, and a store
             // that resurrected one would wedge the drain on the next pass.
             drain.saveRequestedAt.shouldBeNull()
+            drain.stopDispatchedAt shouldBe expected.stopDispatchedAt
         }
 
     /**

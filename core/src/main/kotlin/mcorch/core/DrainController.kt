@@ -1829,10 +1829,10 @@ internal class DrainController(
      * `DEREGISTERED` and not of a re-entry: the pass after a confirmed
      * deregistration comes back through here, and so does a resume that lands on
      * `DEREGISTERED` with a stop already issued. Both park safely — [abort]'s
-     * [restoreRegistration] is the compensation for the first, and a stop inside its
-     * grace period is a container the drain will observe down — but the *message*
-     * has to say which, or it tells an operator nothing has moved about a backend
-     * that has left the routing table.
+     * [restoreRegistration] is the compensation for the first, and for the second it
+     * deliberately declines, because a container that has been sent `SIGTERM` must not
+     * be handed players back — but the *message* has to say which, or it tells an
+     * operator nothing has moved about a backend that has left the routing table.
      *
      * ## Scope and class, both deliberate
      *
@@ -1933,20 +1933,24 @@ internal class DrainController(
      * anchor stops moving, so `escalates` reaches the threshold and a human is
      * called.
      *
-     * ## What the abort widens, written down rather than left to be rediscovered
+     * ## What this path does *not* do to the registration any more
      *
      * [abort] calls [restoreRegistration], and [awaitStopped] can reach here from
-     * `STOPPING` — so this can put a backend back into the proxy's routing table
-     * while a container stop with a **live grace period** is counting down to a
-     * SIGKILL, and stop asserting the seal in the same act. The two pre-existing
-     * paths that re-register from `STOPPING` do it after a stop the runtime
-     * *refused*, so no kill was pending; this one has one genuinely in flight.
+     * `STOPPING` — so this used to put a backend back into the proxy's routing table
+     * while a container stop with a **live grace period** was counting down to a
+     * SIGKILL. That was written up here as the accepted posture widened, on the
+     * argument that a running server nobody can reach is the worse failure. The
+     * thirty-second audit overturned it: what is behind that door is a process whose
+     * shutdown save has already run, so a player who gets in loses their session, and
+     * no later pass repairs that.
      *
-     * It is the accepted posture widened rather than a new one. A parked drain
-     * takes players again because a running server nobody can reach is the worse
-     * failure, and the exposure is bounded: once the grace period elapses the
-     * container is down, and the container-is-down branch releases the
-     * registration properly.
+     * Nothing here changed. [restoreRegistration] declines once
+     * [DrainStatus.stopDispatchedAt] is set, which covers this path and the *other*
+     * one this lap creates — the ordinary return below leaves `SAVING` carrying a
+     * dispatched stop, so the block a populated server hits on the next pass is a
+     * park with neither `STOPPING` nor a stop exception anywhere near it. The
+     * backend stays out of routing until the drain is over, which is availability
+     * rather than data.
      */
     private suspend fun goingRoundInCircles(
         pass: DrainPass,
@@ -2614,6 +2618,12 @@ internal class DrainController(
                 worldData = WorldDataHolding(contract.holdsWorldData),
             ),
         )
+        // Stamped **before** the call, and the ordering is the whole content of the
+        // record: see [DrainStatus.stopDispatchedAt] for why it is the opposite of
+        // `saveRequestedAt`. Everything downstream of here — the abort in the catch
+        // and the success below — carries `dispatching` rather than `drain`, because
+        // the failure path is exactly the one whose compensation this record governs.
+        val dispatching = drain.dispatchingStop(now)
         try {
             pass.node.stopWorkload(observation.handle, grace)
         } catch (failure: NodeException) {
@@ -2626,21 +2636,35 @@ internal class DrainController(
             //
             // It is also the more precise answer: a stop that the runtime refused is
             // a drain that could not finish, not a pass that could not be completed.
+            //
+            // What [abort] does about the registration is now decided by the record
+            // above rather than by this exception: a `Rejected` here never reached the
+            // container and is restored, a `Timeout` may have, and the class alone
+            // cannot tell them apart at the *other* stop site. See
+            // [restoreRegistration].
             return abort(
                 subject = pass.subject,
                 permanentFailureStopsPasses = pass.permanentFailureStopsPasses,
-                drain = drain,
+                drain = dispatching,
                 occupancy = occupancy,
                 now = now,
                 reason = FailureReason.DRAIN_STALLED,
                 failureClass = if (failure.retryable) FailureClass.RETRYABLE else FailureClass.PERMANENT,
                 message = "the container stop was refused: ${failure.message}",
+                sideEffectIssued = true,
             )
         }
         return DrainProgress(
-            drain = drain.moveTo(DrainState.STOPPING, now),
+            drain = dispatching.moveTo(DrainState.STOPPING, now),
             occupancy = occupancy,
             workDone = true,
+            // A request that this loop cannot ask the runtime about afterwards, and
+            // whose record decides a compensation rather than a repeat — so it goes
+            // under the same cancellation shield as a save request. A pass cancelled
+            // between the dispatch and the store write would otherwise come back with
+            // no record of it, and the first park after that re-admits players to a
+            // container inside its shutdown.
+            sideEffectIssued = true,
             outcome = ReconcileOutcome.Progressed("container stop issued"),
         )
     }
@@ -2725,18 +2749,34 @@ internal class DrainController(
             // left the routing table. A node blip escaping to `Reconciler.nodeFailure`
             // would leave the record untouched: deregistered, running, and with
             // nothing that would ever re-register it.
+            // Stamped before the call, as in [stop], and set-once — so on the ordinary
+            // path through here it changes nothing, because the first stop already
+            // wrote it. It is still written at both sites rather than at the first
+            // one, because "a stop request left this process" is a fact about *this*
+            // request: a drain that reached `STOPPING` and came back through a resume
+            // without the record must not be able to re-issue and still look
+            // undispatched.
+            val dispatching = drain.dispatchingStop(now)
             try {
                 pass.node.stopWorkload(observation.handle, stopGrace(pass))
             } catch (failure: NodeException) {
+                // Whatever this exception says, a stop has already been dispatched —
+                // reaching `STOPPING` is what a *successful* first stop does — so the
+                // abort must not put the registration back. That is the half a
+                // discriminator keyed on the exception class gets wrong, and it is the
+                // mirror of the half a discriminator keyed on the state gets wrong in
+                // [stop]. Neither is asked now: the record decides. See
+                // [restoreRegistration].
                 return abort(
                     subject = pass.subject,
                     permanentFailureStopsPasses = pass.permanentFailureStopsPasses,
-                    drain = drain,
+                    drain = dispatching,
                     occupancy = occupancy,
                     now = now,
                     reason = FailureReason.DRAIN_STALLED,
                     failureClass = if (failure.retryable) FailureClass.RETRYABLE else FailureClass.PERMANENT,
                     message = "the container stop could not be re-issued: ${failure.message}",
+                    sideEffectIssued = true,
                 )
             }
             // **`workDone` is false, and the branch is the argument.** This code is
@@ -2765,12 +2805,12 @@ internal class DrainController(
             // container overdue against a number nobody was asked to honour is a
             // sentence an investigator has to unpick.
             val grace = stopGrace(pass).period
-            val stuckFor = JavaDuration.between(drain.enteredStateAt, now).toKotlinDuration()
+            val stuckFor = JavaDuration.between(dispatching.enteredStateAt, now).toKotlinDuration()
             val overdue =
                 if (stuckFor > grace) {
                     noteFailure(
                         server = server,
-                        previous = drain.failure,
+                        previous = dispatching.failure,
                         occupancy = occupancy,
                         now = now,
                         reason = FailureReason.DRAIN_STALLED,
@@ -2783,11 +2823,16 @@ internal class DrainController(
                                 "container that will not exit is for the runtime to explain",
                     )
                 } else {
-                    drain.failure
+                    dispatching.failure
                 }
             return DrainProgress(
-                drain = drain.copy(failure = overdue),
+                drain = dispatching.copy(failure = overdue),
                 occupancy = occupancy,
+                // `workDone` stays false — see above — and this is a different
+                // question: a request went out that the runtime cannot be asked about
+                // afterwards, and its record governs a compensation. Same shield as
+                // [stop].
+                sideEffectIssued = true,
                 outcome = ReconcileOutcome.Retry("the container is still running after a stop was issued"),
             )
         }
@@ -2990,41 +3035,53 @@ internal class DrainController(
      * confirmed. A failure here leaves the field set, so the next pass through this
      * function tries again.
      *
-     * ## Open: this also fires after the stop has been *issued*, and there the
-     * justification above is false
+     * ## It does not fire once a stop request has left this process
      *
      * *"The drain is not going to move those players"* is the sentence that makes
      * re-admitting right, and it is a sentence about a drain that has **given up on
      * this container**. A park out of the stop is not that: the container has been
-     * sent `SIGTERM`, the loop re-issues the stop on the next pass, and this hands it
-     * an admitting registration in between. What arrives is a player routed to a
-     * process in shutdown — and if that process is wedged with its listener still
-     * open, they get in, `awaitStopped` reads a positive count on the next pass,
-     * voids the save and goes back to `SAVING`. That is the population refilling
-     * behind a drain, which is the exact harm [releaseSeal] gives as the reason
-     * [blocked] must not release a seal.
+     * sent `SIGTERM`, the loop re-issues the stop on the next pass, and re-registering
+     * hands it an admitting registration in between. What arrives is a player routed
+     * to a process in shutdown — one whose `savePlayers` step has already run against
+     * the set it had then — and if that process still has its listener open they get
+     * in, play, and are disconnected by the shutdown with **that session unsaved**. On
+     * the next pass `awaitStopped` reads a positive count, voids the save and goes
+     * back to `SAVING`: the population refilling behind a drain, which is the exact
+     * harm [releaseSeal] gives as the reason [blocked] must not release a seal.
      *
-     * It is reachable through `stop`'s own `NodeException.Timeout` catch — the stop
-     * was dispatched and this client stopped waiting, so the signal may well have
-     * landed — and since `:cri` capped a stop's deadline at
-     * `min(gracePeriod, CriTimeouts.stopDeadlineCap) + deadlineSlack` that is
-     * *deterministic* for a grace period above two hours, which is the same
-     * unvalidated-row population [StopGraceCeiling]'s floor leaves uncapped.
-     * containerd does not escalate to `SIGKILL` once the request context has expired,
-     * so the container really is still there.
+     * The discriminator is [DrainStatus.stopDispatchedAt] and nothing derived. Two
+     * proxies for it were proposed and each is wrong at one of the two stop sites:
      *
-     * **Not fixed here, deliberately, and the reason is which discriminator is
-     * right.** `drain.state == DrainState.STOPPING` is available at both call sites
-     * and is the obvious one — and it is wrong: it misses exactly the case above,
-     * where the timeout is caught in `stop` with the drain still `DEREGISTERED`. The
-     * honest test is *"was a stop request dispatched"*, which has to distinguish a
-     * `Timeout` (may have landed, treat as issued — the rule
-     * `PaperServerAgent.requestSave` already applies to a save) from a `Rejected` or
-     * an `Unreachable` (never left, so restoring is right). The other half already
-     * composes: `ProxyFleet`'s sweep skips a backend whose `deregisteredAt` is set,
-     * so *not* restoring keeps it out of routing without a second mechanism — which
-     * also means a wrong version of this strands a backend out of routing for as long
-     * as the field survives. It goes to `drain-auditor` with the rest of this change.
+     * - `drain.state == STOPPING` misses [stop]'s own `NodeException.Timeout` catch,
+     *   where the request went out, this client stopped waiting, and the drain is
+     *   still `DEREGISTERED`.
+     * - `failure is NodeException.Timeout` misses [awaitStopped]'s re-issue catch. A
+     *   `Rejected` or a `Busy` there still follows a *first* stop that returned
+     *   successfully — that is the only thing that puts a drain in `STOPPING` — so the
+     *   container has had its `SIGTERM` whatever the second call said.
+     *
+     * Their disjunction is correct at both catches and still short of the fact: the
+     * lap back through [goingRoundInCircles] leaves `SAVING` carrying a dispatched
+     * stop and neither clause true. containerd does not escalate to `SIGKILL` once the
+     * request context has expired, so a stop this loop stopped waiting for leaves the
+     * container running for longer rather than dying sooner — the window is real and
+     * it is the re-issue that ends it.
+     *
+     * **What not restoring costs, and why that is the direction to take.** The backend
+     * stays out of the proxy's routing table for as long as the drain does: nothing
+     * else re-adds it, because `ProxyFleet`'s sweep skips a backend whose
+     * [DrainStatus.deregisteredAt] is set (`Reconciler`'s `letGo`), which is also what
+     * makes this compensation the only mechanism. So the cost of the strand is
+     * **availability**, and it is recoverable without an operator: `Reconciler.converge`
+     * writes `drain = null` once the drain is no longer wanted, which clears
+     * `deregisteredAt` and lets the sweep re-register. The cost of the other direction
+     * is a player's session, and no later pass repairs that. That asymmetry decides it.
+     *
+     * The stop stays gated either way, and it is worth being exact about which defect
+     * this is: the pass after a restore runs [resume] → [holdSeal] → [requireEmpty],
+     * an `Occupied` reading blocks and voids the evidence, and both stop sites re-check
+     * `mayStop` — so no path here stops a container with players on it. What the
+     * restore did was **refill a container the drain was part-way through stopping**.
      */
     private suspend fun restoreRegistration(
         subject: DrainSubject,
@@ -3032,6 +3089,21 @@ internal class DrainController(
     ): DrainStatus {
         val router = subject.router ?: return drain
         if (drain.deregisteredAt == null) return drain
+        if (drain.stopDispatchedAt != null) {
+            // Info, not warn, and for [blocked]'s reason: nothing is wrong. The drain
+            // is doing the right thing and the operator's question — why is this
+            // backend not in the routing table — is answered by the record rather than
+            // by an alarm. The failure or block this park is recording carries the
+            // fault, if there is one.
+            LOG.info(
+                "not re-registering server={} with proxy={}: a container stop was dispatched at {}, so it is " +
+                    "left out of the routing table rather than admitting players to a shutting-down server",
+                subject.server,
+                router.proxy,
+                drain.stopDispatchedAt,
+            )
+            return drain
+        }
         return when (val outcome = router.reregister()) {
             is SealOutcome.Asserted -> {
                 LOG.info(
@@ -4380,6 +4452,22 @@ internal fun DrainStatus.unconfirmWorldSave(): DrainStatus = copy(worldSavedAt =
  * delivered save. Neither can ask any more, because there is nothing to ask.
  */
 internal fun DrainStatus.forgetSaveConfirmation(): DrainStatus = unconfirmWorldSave().copy(playersEvacuated = false)
+
+/**
+ * Records that a container stop request is about to leave this process.
+ *
+ * Set once: a drain that already carries the record keeps the *first* instant,
+ * because there is no un-dispatch and the question every reader asks is "may a
+ * `SIGTERM` already be in that container", not "when was the most recent one sent".
+ *
+ * Called immediately **before** `Node.stopWorkload`, which is the opposite of the
+ * rule for a save request and is not an oversight — see
+ * [mcorch.schema.DrainStatus.stopDispatchedAt]. `DrainWiringTest` pins the ordering
+ * at both call sites, because it is the whole content of the record and a stamp
+ * moved below the call would look identical to a reviewer.
+ */
+internal fun DrainStatus.dispatchingStop(now: Instant): DrainStatus =
+    if (stopDispatchedAt != null) this else copy(stopDispatchedAt = now)
 
 /** Moves to a new state, stamping the transition. Re-entering the same state does not restamp. */
 private fun DrainStatus.moveTo(
