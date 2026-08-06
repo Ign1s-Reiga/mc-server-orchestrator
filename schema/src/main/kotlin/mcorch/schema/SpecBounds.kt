@@ -234,11 +234,18 @@ public object SpecBounds {
                 clamped,
             )
         if (clamped.isEmpty()) return spec
+        // `drain.copy`, not `BackendDrainSpec(...)`. Naming all three of today's
+        // fields is correct today and stops being correct the day a fourth is
+        // added: the new field would be reset to its default on every proxy row
+        // where any of these clamps fired — silently, with no compile error, on
+        // exactly the population the clamp selects for. That is the "one of three
+        // identically-shaped siblings" recurrence this object exists to end, and
+        // it is not to be reproduced inside it. Same reason `boundPaper` copies.
         return spec.copy(
             backends =
                 spec.backends.copy(
                     drain =
-                        BackendDrainSpec(
+                        drain.copy(
                             sealTimeout = seal,
                             destinationTimeout = destination,
                             deregisterTimeout = deregister,
