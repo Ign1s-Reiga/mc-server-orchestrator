@@ -17,6 +17,12 @@ unbounded by design. So every spec-hash input is also a question about recovery:
 > after a deploy, existing players keep playing, **nobody can join**, and the
 > only exits are editing our source or `crictl stop`.
 
+Since round 33 the revert is honoured **one step later once a container stop has
+gone out**: the drain finishes what it signalled and the reverted definition comes
+back as the replacement, rather than the workload converging over the top of its
+own stop. Same outcome for the operator, different mechanism, and the difference
+is a player's session — see [[record-lifetime]].
+
 Round 25 found this in `velocity.build`. Blast radius was dev fleets only (the
 kind had never shipped), and the mechanism was live for every future bump.
 

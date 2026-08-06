@@ -173,6 +173,27 @@ open.** (a) would have exempted containers created before the entry existed and
 left the mechanism live for every future bump, and it adds a second derivation of
 the canonical spec — the shape that has produced repeated defects here.
 
+## The prescribed remedy can *introduce* the next defect, and the old suite says so
+
+Round 33 prescribed "make the `drain = null` writes conditional on
+`stopDispatchedAt == null`". Written exactly that way it kept a record alive past
+the container it described: on the proxy path the drain record is inherited across
+the create, so the pass after a replacement was built saw a stamp beside a
+brand-new container and drained it — for ever. The suite caught it in one run, on
+an *existing* test that counts creates ([[record-lifetime]]).
+
+Two things to carry:
+
+- **A remedy that makes a value survive longer needs an expiry that is a fact about
+  the world**, not the negation of the condition that used to delete it. Here that
+  is the observation: `CREATED` and `SANDBOX_ONLY` cannot be the container that was
+  signalled, and `Absent` is the retirement.
+- **Run the whole module before believing a one-line conditional**, and read a
+  pre-existing red as the prescription being incomplete rather than the test being
+  stale — which is this file's oldest rule, arriving from the other direction: not
+  "the fix breaks a test that was right", but "the fix creates a defect the old
+  test was already watching for".
+
 ## Arguing to leave something open
 
 When escalating a known hole rather than fixing it, **argue from what is at

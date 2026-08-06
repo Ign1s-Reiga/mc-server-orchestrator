@@ -38,6 +38,13 @@ The ordering is the whole content of the field and is invisible to a reviewer
 reading two lines, so it is pinned structurally (`every container stop records the
 dispatch before it issues one`) as well as behaviourally.
 
+**"Never cleared" was half the sentence and the missing half was the next
+critical.** Round 33: the record was cleared the way every other field here is —
+by the whole object going when the drain stops being *wanted* — and that deleted
+it while the `SIGTERM` was still inside the container. It has a lifetime of its
+own now (`stopIsInFlight` / `clearedDrainRecord`); see [[record-lifetime]] before
+reading anything below as current.
+
 ## The ruling I took past the brief, and it is open to overruling
 
 **A `Rejected` from the stop no longer restores the registration.** The auditor's
