@@ -602,14 +602,19 @@ EXIT_PREFERENCE='                                // an operator can do something
 # input reaches.
 CHANNEL_CLASSIFIES='return unbuildable(verb, path, rejected)'
 SAVE_CLASSIFIES='                return unbuildableSave(rejected)'
-CHANNEL_RETRYABLE='"sent and the proxy is unaffected. It clears when that definition is repaired",
-            retryable = true,'
-CHANNEL_PERMANENT='"sent and the proxy is unaffected. It clears when that definition is repaired",
-            retryable = false,'
-SAVE_PERMANENT_CLASS='"running with its players on it. Correct that field and the drain carries on from here",
-            retryable = false,'
-SAVE_RETRYABLE_CLASS='"running with its players on it. Correct that field and the drain carries on from here",
-            retryable = true,'
+# Anchored on the *indentation* rather than on the sentence above it. Coupling a
+# mutation to prose is what left D47 reporting a stale anchor the moment the
+# operator-facing message was reworded, and the classification is the subject here.
+CHANNEL_RETRYABLE='            retryable = true,'
+CHANNEL_PERMANENT='            retryable = false,'
+SAVE_PERMANENT_CLASS='            retryable = false,
+        )
+
+    /**'
+SAVE_RETRYABLE_CLASS='            retryable = true,
+        )
+
+    /**'
 # The whole guard at the proxy'"'"'s probe. It has to come out rather than be hollowed
 # out: the scan is a *presence* check on the enclosing function, so catching and
 # rethrowing keeps the token and passes — which the test says in its own words.
