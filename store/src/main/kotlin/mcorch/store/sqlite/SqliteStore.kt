@@ -5,6 +5,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import mcorch.schema.DrainState
+import mcorch.schema.DurationFormat
 import mcorch.schema.ResourceName
 import mcorch.schema.SchemaVersion
 import mcorch.schema.ServerDefinition
@@ -731,14 +732,42 @@ internal class SqliteStore(
         rawName: String?,
     ): String = if (rawName == null) "$part of an unnamed row" else "$part of `$rawName`"
 
-    private fun decodeDefinition(row: DefinitionRow): ServerDefinition =
-        DefinitionCodec.decode(
-            apiVersion = row.apiVersion,
-            kind = row.kind,
-            encodedMetadata = row.metadataDoc,
-            encodedSpec = row.specDoc,
-            what = "definition of `${row.name}`",
-        )
+    /**
+     * Rebuilds the definition in [row], bounded, and says so when the bound bit.
+     *
+     * [DefinitionCodec.decode] caps the durations that become transport deadlines;
+     * see [mcorch.schema.SpecBounds] for why a stored row can carry one that parks a
+     * reconcile worker and why the answer is a cap rather than a refusal. The
+     * reporting is here rather than in the codec because this is the module's
+     * logger, and because a clamp that nothing says out loud is the silent
+     * reinterpretation of stored data the whole codec is written to refuse.
+     *
+     * Logged on every read, deliberately, on the same reasoning as [report]: the row
+     * is unchanged on disk, so the condition persists until an operator edits it and
+     * they should keep being told. On a healthy store this costs one comparison of
+     * an empty list per row.
+     */
+    private fun decodeDefinition(row: DefinitionRow): ServerDefinition {
+        val bounded =
+            DefinitionCodec.decode(
+                apiVersion = row.apiVersion,
+                kind = row.kind,
+                encodedMetadata = row.metadataDoc,
+                encodedSpec = row.specDoc,
+                what = "definition of `${row.name}`",
+            )
+        for (clamp in bounded.clamped) {
+            LOG.warn(
+                "server={} field={} declares {} above the {} this build will act on; " +
+                    "using the ceiling. The stored value is unchanged — edit the definition to clear this",
+                row.name.value,
+                clamp.field,
+                DurationFormat.render(clamp.declared),
+                DurationFormat.render(clamp.applied),
+            )
+        }
+        return bounded.definition
+    }
 
     private fun requireEncoding(
         encoding: Int,

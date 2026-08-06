@@ -3,6 +3,7 @@ package mcorch.store.codec
 import mcorch.schema.BackendDrainSpec
 import mcorch.schema.BackendSelector
 import mcorch.schema.BackendsSpec
+import mcorch.schema.BoundedDefinition
 import mcorch.schema.ControlEndpointSpec
 import mcorch.schema.CpuQuantity
 import mcorch.schema.DrainPolicy
@@ -29,9 +30,9 @@ import mcorch.schema.ResourceName
 import mcorch.schema.ResourceSpec
 import mcorch.schema.SchemaVersion
 import mcorch.schema.SecretRef
-import mcorch.schema.ServerDefinition
 import mcorch.schema.ServerKind
 import mcorch.schema.ServerSpec
+import mcorch.schema.SpecBounds
 import mcorch.schema.StorageMode
 import mcorch.schema.StorageSpec
 import mcorch.schema.VelocityProxyDefinition
@@ -83,31 +84,65 @@ internal object DefinitionCodec {
         return writer.render()
     }
 
+    /**
+     * Rebuilds a definition from its two stored documents, with every
+     * deadline-bearing duration inside the ceiling [SpecBounds] states.
+     *
+     * ## Why the bound is here and not at the consumers
+     *
+     * `stopGracePeriod`, `drain.saveTimeout` and `backends.drain.sealTimeout` each
+     * become a transport deadline, and each is bounded by its YAML reader and by
+     * nothing else — no spec type enforces it. A row that did not come through a
+     * reader therefore carries whatever the column can express, and thirty hours in
+     * a column is a reconcile worker parked with no effective timeout. This is the
+     * point where a row stops being bytes and starts being a spec somebody will act
+     * on, and it is the only such point for this store, so one bound here replaces a
+     * ceiling at every consumer that will ever read one of those fields.
+     *
+     * It is also the only place holding **both** halves of the `stopGracePeriod` /
+     * `saveTimeout` pair, which is what stops the bound inverting the invariant that
+     * keeps a container alive until its save finishes. [SpecBounds] owns that
+     * argument.
+     *
+     * ## What it returns, and why it is not just the definition
+     *
+     * The clamped values come back beside it. A clamp nobody reports is a silent
+     * reinterpretation of stored data, which is the one thing this codec exists to
+     * refuse; the caller logs them ([mcorch.store.sqlite.SqliteStore]). The stored
+     * document is **not** rewritten — the operator's declared number stays on disk,
+     * so the row loses nothing and a fixed ceiling later restores it.
+     */
     fun decode(
         apiVersion: SchemaVersion,
         kind: ServerKind,
         encodedMetadata: String,
         encodedSpec: String,
         what: String,
-    ): ServerDefinition {
+    ): BoundedDefinition {
         val metadata = decodeMetadata(encodedMetadata, what)
-        return when (kind) {
-            ServerKind.PAPER_SERVER -> {
-                PaperServerDefinition(
-                    apiVersion = apiVersion,
-                    metadata = metadata,
-                    spec = readPaperSpec(PropertyDocument.parse(encodedSpec, what), what),
-                )
-            }
+        val definition =
+            when (kind) {
+                ServerKind.PAPER_SERVER -> {
+                    PaperServerDefinition(
+                        apiVersion = apiVersion,
+                        metadata = metadata,
+                        spec = readPaperSpec(PropertyDocument.parse(encodedSpec, what), what),
+                    )
+                }
 
-            ServerKind.VELOCITY_PROXY -> {
-                VelocityProxyDefinition(
-                    apiVersion = apiVersion,
-                    metadata = metadata,
-                    spec = readProxySpec(PropertyDocument.parse(encodedSpec, what), what),
-                )
+                ServerKind.VELOCITY_PROXY -> {
+                    VelocityProxyDefinition(
+                        apiVersion = apiVersion,
+                        metadata = metadata,
+                        spec = readProxySpec(PropertyDocument.parse(encodedSpec, what), what),
+                    )
+                }
             }
-        }
+        // Inside `rebuilding` for the reason every other constructor call here is:
+        // the clamped spec is rebuilt through `LifecycleSpec.init`, and a rejection
+        // there has to arrive as `StoreException.Corrupt` rather than as an
+        // `IllegalArgumentException` that escapes the per-row isolation.
+        return rebuilding(what) { SpecBounds.bound(definition) }
     }
 
     // ------------------------------------------------------------------ PaperServer

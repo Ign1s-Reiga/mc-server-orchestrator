@@ -14,10 +14,12 @@ import mcorch.schema.DrainState
 import mcorch.schema.FailureClass
 import mcorch.schema.FailureReason
 import mcorch.schema.PaperServerDefinition
+import mcorch.schema.PaperServerSpec
 import mcorch.schema.PaperServerStatus
 import mcorch.schema.SchemaVersion
 import mcorch.schema.ServerKind
 import mcorch.schema.ServerPhase
+import mcorch.schema.SpecBounds
 import mcorch.store.ChangeFeed
 import mcorch.store.ChangeKind
 import mcorch.store.Fixtures
@@ -34,6 +36,7 @@ import java.nio.file.Path
 import java.sql.Connection
 import java.sql.DriverManager
 import java.time.Instant
+import kotlin.time.Duration.Companion.hours
 
 /**
  * The on-disk schema moves forward without losing anything.
@@ -186,6 +189,79 @@ class MigrationTest {
                 appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
                 second.state.listServers().map { it.name.value } shouldBe listOf("survival-a")
             }
+        }
+
+    /**
+     * A row that was already out of range when the upgrade found it.
+     *
+     * Deadlines on a stored spec are bounded on the way *out*
+     * ([mcorch.schema.SpecBounds]), and nothing on the way in rewrites them. That
+     * is the answer to "what happens to an existing row that is out of range", and
+     * it is deliberate on both halves:
+     *
+     * *No migration rewrites the value.* Capping it on disk would discard the
+     * number the operator declared, and a migration must not lose data. The bound
+     * needs no on-disk change to reach an old row — the decode applies it whatever
+     * version wrote the row — so a migration here would spend a version number to
+     * destroy information.
+     *
+     * *No migration refuses the store either.* A store that will not open is worse
+     * than one that opens with one server's timeout shortened, and the row is not
+     * corrupt: it satisfies the schema, it just declares a wait this build will not
+     * perform.
+     *
+     * So this asserts the upgrade path end to end: written at version 1, migrated
+     * through every version, still on disk unchanged, and served bounded.
+     */
+    @Test
+    fun `a deadline already out of range at version 1 survives the migration and is bounded on read`() =
+        runTest {
+            val directory = stores.directory()
+            val grace = 30.hours
+            val save = 20.hours
+            val running = Fixtures.unboundedDefinition("survival-a", stopGracePeriod = grace, saveTimeout = save)
+            val terminating = Fixtures.unboundedDefinition("survival-b", stopGracePeriod = grace, saveTimeout = save)
+            val deletedAt = Instant.parse("2026-07-20T09:00:00Z")
+
+            writeVersion1Database(directory) { legacy ->
+                legacy.definition(running, generation = 1L, revision = 1L)
+                legacy.definition(terminating, generation = 1L, revision = 2L, deletedAt = deletedAt)
+                legacy.status(Fixtures.fullStatus("survival-b", drainState = DrainState.SAVING), revision = 3L)
+            }
+            appliedVersions(directory) shouldBe listOf(1)
+
+            stores.open(directory).use { migrated ->
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
+
+                val spec =
+                    migrated.state
+                        .getServer(Fixtures.resourceName("survival-a"))
+                        .shouldNotBeNull()
+                        .definition.definition.spec
+                        .shouldBeInstanceOf<PaperServerSpec>()
+                spec.lifecycle.stopGracePeriod shouldBe SpecBounds.MAX_STOP_GRACE_PERIOD
+                spec.lifecycle.drain.saveTimeout shouldBe SpecBounds.MAX_SAVE_TIMEOUT
+                // Not bounded, and this is the half a "tidy it up" change would break:
+                // these two are compared against a wall clock, never waited on.
+                spec.lifecycle.startupTimeout shouldBe running.spec.lifecycle.startupTimeout
+                spec.lifecycle.drain.playerTransferTimeout shouldBe
+                    running.spec.lifecycle.drain.playerTransferTimeout
+
+                // The tombstoned one is still deletable, which is the point of a clamp
+                // rather than a refusal: the drain it is in the middle of has a spec to
+                // work from, and the purge that ends it goes through.
+                val tombstoned = migrated.state.getServer(Fixtures.resourceName("survival-b")).shouldNotBeNull()
+                tombstoned.definition.terminating shouldBe true
+                tombstoned.definition.deletedAt shouldBe deletedAt
+                migrated.state.deleteDefinition(Fixtures.resourceName("survival-b")).getOrThrow()
+                migrated.state.purge(Fixtures.resourceName("survival-b")).getOrThrow()
+            }
+
+            // No data loss: the declared values are on disk exactly as version 1 wrote
+            // them, after five migrations and a read that served them bounded.
+            val document = specDocumentOf(directory, "survival-a")
+            document shouldContain "lifecycle.stopGracePeriod=${grace.inWholeNanoseconds}"
+            document shouldContain "lifecycle.drain.saveTimeout=${save.inWholeNanoseconds}"
         }
 
     // ------------------------------------------------------------------ version 4
@@ -1290,6 +1366,17 @@ class MigrationTest {
         DriverManager.getConnection(jdbcUrl(directory)).also { connection ->
             connection.createStatement().use { it.execute("PRAGMA foreign_keys = ON") }
             connection.autoCommit = false
+        }
+
+    private fun specDocumentOf(
+        directory: Path,
+        name: String,
+    ): String =
+        rawConnection(directory).use { connection ->
+            connection.query("SELECT spec_doc FROM server_definition WHERE name = ?", { setString(1, name) }) { rows ->
+                require(rows.next()) { "no definition row for `$name`" }
+                rows.getString("spec_doc")
+            }
         }
 
     private fun appliedVersions(directory: Path): List<Int> =

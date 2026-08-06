@@ -13,14 +13,18 @@ import mcorch.schema.BackendRoutingStatus
 import mcorch.schema.ControlEndpointSpec
 import mcorch.schema.DrainBlockReason
 import mcorch.schema.DrainState
+import mcorch.schema.PaperServerDefaults
+import mcorch.schema.PaperServerSpec
 import mcorch.schema.PaperServerStatus
 import mcorch.schema.ResourceName
 import mcorch.schema.SecretRef
 import mcorch.schema.ServerPhase
+import mcorch.schema.SpecBounds
 import mcorch.schema.VelocityProxySpec
 import mcorch.schema.VelocityProxyStatus
 import org.junit.jupiter.api.Assumptions
 import org.junit.jupiter.api.Test
+import kotlin.time.Duration.Companion.hours
 
 /**
  * The contract every [Store] has to satisfy, written against the interface and
@@ -938,6 +942,147 @@ abstract class StoreConformanceSuite {
 
             // The untouched server is untouched: one bad record costs one server.
             servers.single { it.name.value == "survival-b" }.status.shouldNotBeNull()
+        }
+
+    // ------------------------------------------------------- bounded deadlines
+
+    /**
+     * Three durations on a spec become transport deadlines, and only a YAML reader
+     * bounds them. A definition that reached the store another way — a hand-edited
+     * row, a restored backup, a migration — therefore carries whatever the record
+     * can express, and a reconcile worker that acts on it is parked with no
+     * effective timeout. Enough of those and the loop reconciles nothing.
+     *
+     * The bound is a property of the *interface*, not of an encoding: a store is
+     * where a definition nobody validated enters the system, and it is the only
+     * place holding both halves of the `stopGracePeriod` / `saveTimeout` pair.
+     * Every implementation owes this, which is why it is asserted here rather than
+     * in the embedded store's own tests.
+     */
+    @Test
+    fun `a definition read back has every deadline inside its ceiling`() =
+        withStore { store ->
+            val paper = Fixtures.unboundedDefinition("survival-a")
+            val proxy = Fixtures.unboundedProxyDefinition("edge-a")
+            store.putDefinition(paper).getOrThrow()
+            store.putDefinition(proxy).getOrThrow()
+
+            val paperSpec =
+                store
+                    .getServer(paper.metadata.name)
+                    .shouldNotBeNull()
+                    .definition.definition.spec
+                    .shouldBeInstanceOf<PaperServerSpec>()
+            paperSpec.lifecycle.stopGracePeriod shouldBe SpecBounds.MAX_STOP_GRACE_PERIOD
+            paperSpec.lifecycle.drain.saveTimeout shouldBe SpecBounds.MAX_SAVE_TIMEOUT
+
+            val proxySpec =
+                store
+                    .getServer(proxy.metadata.name)
+                    .shouldNotBeNull()
+                    .definition.definition.spec
+                    .shouldBeInstanceOf<VelocityProxySpec>()
+            proxySpec.backends.drain.sealTimeout shouldBe SpecBounds.MAX_HANDSHAKE_TIMEOUT
+            proxySpec.lifecycle.stopGracePeriod shouldBe SpecBounds.MAX_PROXY_STOP_GRACE_PERIOD
+
+            // A listing is the read the reconcile loop actually resyncs from, so
+            // the guarantee has to hold there and not only on a point read.
+            val listed =
+                store
+                    .listServers()
+                    .single { it.name == paper.metadata.name }
+                    .definition.definition.spec
+                    .shouldBeInstanceOf<PaperServerSpec>()
+            listed.lifecycle.stopGracePeriod shouldBe SpecBounds.MAX_STOP_GRACE_PERIOD
+        }
+
+    /**
+     * The bound must not break the pair it sits inside.
+     *
+     * `stopGracePeriod` has to exceed `saveTimeout` by
+     * [PaperServerDefaults.MIN_STOP_GRACE_MARGIN] or the container is SIGKILLed
+     * part-way through Paper's shutdown save — a torn region file, CLAUDE.md
+     * invariant 3. A ceiling applied to one half without the other in hand inverts
+     * exactly that, which is why the bound is here and not at a consumer.
+     */
+    @Test
+    fun `bounding a stored definition never inverts the stop grace invariant`() =
+        withStore { store ->
+            val definition =
+                Fixtures.unboundedDefinition(
+                    "survival-a",
+                    stopGracePeriod = 30.hours,
+                    saveTimeout = 20.hours,
+                )
+            store.putDefinition(definition).getOrThrow()
+
+            val spec =
+                store
+                    .getServer(definition.metadata.name)
+                    .shouldNotBeNull()
+                    .definition.definition.spec
+                    .shouldBeInstanceOf<PaperServerSpec>()
+
+            val minimum = spec.lifecycle.drain.saveTimeout + PaperServerDefaults.MIN_STOP_GRACE_MARGIN
+            (spec.lifecycle.stopGracePeriod >= minimum) shouldBe true
+        }
+
+    /**
+     * The whole reason this is a clamp rather than a refusal.
+     *
+     * An unreadable definition is one the loop cannot act on at all, so the
+     * container it describes keeps running, keeps its players, and the delete that
+     * would retire it has no spec to drain against — the state that ends in a
+     * manual `crictl stop`. A bounded one is an ordinary server that can be
+     * deleted, drained against and purged.
+     */
+    @Test
+    fun `a server whose deadlines were bounded can still be deleted and purged`() =
+        withStore { store ->
+            val definition = Fixtures.unboundedDefinition("survival-a")
+            store.putDefinition(definition).getOrThrow()
+            val name = definition.metadata.name
+
+            store.deleteDefinition(name).getOrThrow()
+
+            // Tombstoned, still readable, and still carrying the spec the drain
+            // needs — bounded, so the drain's own stop has a deadline it can meet.
+            val terminating = store.getServer(name).shouldNotBeNull()
+            terminating.definition.terminating shouldBe true
+            terminating.definition.definition.spec
+                .shouldBeInstanceOf<PaperServerSpec>()
+                .lifecycle.stopGracePeriod shouldBe SpecBounds.MAX_STOP_GRACE_PERIOD
+
+            // A drain still records progress against it.
+            store.putStatus(Fixtures.fullStatus("survival-a")).getOrThrow()
+
+            store.purge(name).getOrThrow()
+            store.getServer(name).shouldBeNull()
+        }
+
+    /**
+     * The bound is narrow on purpose. `startupTimeout` and `playerTransferTimeout`
+     * are wall-clock comparisons rather than deadlines on a call — the loop records
+     * an instant and compares against it on a later pass — so an absurd value there
+     * parks nothing and shortening it would be a behaviour change with no defect
+     * behind it. They were examined and cleared; this is the guard against a later
+     * pass tidying them in.
+     */
+    @Test
+    fun `durations that are not deadlines survive the round trip untouched`() =
+        withStore { store ->
+            val definition = Fixtures.unboundedDefinition("survival-a")
+            store.putDefinition(definition).getOrThrow()
+
+            val spec =
+                store
+                    .getServer(definition.metadata.name)
+                    .shouldNotBeNull()
+                    .definition.definition.spec
+                    .shouldBeInstanceOf<PaperServerSpec>()
+
+            spec.lifecycle.startupTimeout shouldBe definition.spec.lifecycle.startupTimeout
+            spec.lifecycle.drain.playerTransferTimeout shouldBe definition.spec.lifecycle.drain.playerTransferTimeout
         }
 
     // --------------------------------------------------------------- change feed

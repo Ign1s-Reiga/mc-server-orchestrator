@@ -31,6 +31,8 @@ import mcorch.schema.fixtures.ExampleDefinitions
 import mcorch.schema.getOrThrow
 import mcorch.schema.yaml.ServerDefinitionParser
 import java.time.Instant
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.hours
 
 /**
  * Test data.
@@ -73,6 +75,65 @@ internal object Fixtures {
     ): VelocityProxyDefinition {
         val parsed = proxyDefinition(example)
         return parsed.copy(metadata = parsed.metadata.copy(name = resourceName(name)))
+    }
+
+    /**
+     * A definition carrying deadlines no reader would have accepted.
+     *
+     * Built by copying a parsed example rather than by parsing one, because the
+     * parser is precisely what refuses these values. That is the population the
+     * bound exists for: a hand-edited row, a restored backup, a fixture — anything
+     * that reached the store without passing a reader.
+     *
+     * The pair is kept legal (`stopGracePeriod` above `saveTimeout` by more than
+     * the margin) so that the definition is one the schema itself accepts. A pair
+     * that was already inverted would be refused by `LifecycleSpec.init` long
+     * before any of this, and would be testing a different thing.
+     */
+    fun unboundedDefinition(
+        name: String,
+        stopGracePeriod: Duration = 30.hours,
+        saveTimeout: Duration = 20.hours,
+        playerTransferTimeout: Duration = 40.hours,
+        startupTimeout: Duration = 50.hours,
+    ): PaperServerDefinition {
+        val parsed = definitionNamed(name)
+        return parsed.copy(
+            spec =
+                parsed.spec.copy(
+                    lifecycle =
+                        parsed.spec.lifecycle.copy(
+                            drain =
+                                parsed.spec.lifecycle.drain.copy(
+                                    saveTimeout = saveTimeout,
+                                    playerTransferTimeout = playerTransferTimeout,
+                                ),
+                            stopGracePeriod = stopGracePeriod,
+                            startupTimeout = startupTimeout,
+                        ),
+                ),
+        )
+    }
+
+    /** [unboundedDefinition] for the kind whose seal timeout reaches a blocking HTTP call. */
+    fun unboundedProxyDefinition(
+        name: String,
+        sealTimeout: Duration = 30.hours,
+        stopGracePeriod: Duration = 9.hours,
+    ): VelocityProxyDefinition {
+        val parsed = proxyDefinitionNamed(name)
+        return parsed.copy(
+            spec =
+                parsed.spec.copy(
+                    backends =
+                        parsed.spec.backends.copy(
+                            drain =
+                                parsed.spec.backends.drain
+                                    .copy(sealTimeout = sealTimeout),
+                        ),
+                    lifecycle = parsed.spec.lifecycle.copy(stopGracePeriod = stopGracePeriod),
+                ),
+        )
     }
 
     fun resourceName(raw: String): ResourceName = ResourceName.of(raw).getOrThrow()
