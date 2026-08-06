@@ -190,6 +190,56 @@ class StopGraceGuardTest {
     }
 
     /**
+     * **The thirty-first audit's first finding: where the floor makes the ceiling
+     * inoperative, and it is not at the far end.**
+     *
+     * [StopGraceCeiling.ceilingFor] is `max(MAX, saveTimeout + margin)`, so the
+     * moment the save timeout passes `MAX - margin` the ceiling stops being two hours
+     * and becomes the save timeout — and from there it rises with it, all the way to
+     * the runtime's own refusal 292 years out. `saveTimeout = 30d` beside
+     * `stopGracePeriod = 31d` clears `LifecycleSpec.init`, decodes from a nanosecond
+     * column, and is *capped* — to a month. The stop the runtime is given is a month,
+     * and `GrpcCriClient.stopContainer` deadlines its call off that number, so the
+     * worker is parked for one.
+     *
+     * The trade is still the right way round and the floor stays: a parked worker
+     * loses no world, an inverted pair loses one. What was wrong was the sentence.
+     * The residual [StopGraceCeiling] named was the *refusal* at the top of the
+     * range, reachable only when both halves are absurd — while this, the reachable
+     * one, went unnamed. So it is pinned here, in both halves: the boundary where the
+     * floor takes over, and what actually reaches the runtime past it.
+     *
+     * What bounds the wait, therefore, is whatever bounds `drain.saveTimeout`, and
+     * that is the decode's job rather than this ceiling's.
+     */
+    @Test
+    fun `above a two-hour save timeout the ceiling is the save timeout, and a month-long stop goes out`(
+        @TempDir root: Path,
+    ) = coreTest {
+        val margin = PaperServerDefaults.MIN_STOP_GRACE_MARGIN
+
+        // The boundary itself, from both sides. Below it the floor sits under MAX and
+        // MAX is what bites; one second above it, the floor is what bites.
+        StopGraceCeiling.ceilingFor(StopGraceCeiling.MAX - margin) shouldBe StopGraceCeiling.MAX
+        StopGraceCeiling.ceilingFor(StopGraceCeiling.MAX - margin + 1.seconds) shouldBe
+            StopGraceCeiling.MAX + 1.seconds
+
+        // Past it there is no bound of this ceiling's own left: the reported case,
+        // and one two orders of magnitude larger.
+        StopGraceCeiling.bound(3.hours + 1.minutes, 3.hours) shouldBe 3.hours + margin
+        StopGraceCeiling.bound(31.days, 30.days) shouldBe 30.days + margin
+
+        // …and it is not arithmetic in a vacuum. This is what containerd is asked to
+        // wait, and what the call is deadlined off.
+        val client = RefusingCriClient()
+        node(client, root).stopWorkload(handle(), StopGrace.of(31.days, 30.days))
+
+        client.stops
+            .single()
+            .second.seconds shouldBe (30.days + margin).inWholeSeconds
+    }
+
+    /**
      * The residual named in [StopGraceCeiling], pinned so it is a decision rather
      * than a discovery.
      *

@@ -392,7 +392,32 @@ that could not be right.
 property.** The ceiling's argument was "this becomes a transport deadline"; a
 sibling field became one on a longer call and went unbounded for a round. When
 writing the justification for a bound, read it back as a predicate and grep for
-everything it is true of.
+everything it is true of. Round 31 found the *third* one the same way and by the
+same failure: the note claiming it was safe was a survey of call sites.
+
+## A type proves the rule ran; it does not prove what it ran on
+
+Round 31, and it is the limit of the previous section rather than a
+counter-example. `StopGrace.of(requested, saveTimeout)` makes the ceiling
+unskippable — but the **floor is an argument**, so `StopGrace.of(x,
+Duration.ZERO)` is a legal call from anywhere that disables it while handing back a
+value whose type says the bound was applied. Two call sites pass zero today and
+both are right (world-free workloads, in test code).
+
+- **When a factory takes the other half of the rule as a parameter, the type's
+  guarantee is conditional on the caller, so the call sites need their own pin.**
+  The field half ("nothing else reads the raw value") does not imply the factory
+  half ("nothing else applies the bound"), and closing one reads exactly like
+  closing both.
+- The pin is the same shape as every other one here: one entry per call site as
+  `path to enclosingFunctionName`, over main sources, so a new implementation
+  contributes none and a second derivation in the file that already holds the
+  first is still visible.
+- And say which subjects make the argument honest. Here the floor is real because
+  `PaperDrainSubject` reads both halves off one `LifecycleSpec`; `ProxyDrainSubject`
+  supplies a constant zero, correct only while a proxy holds no world — the single
+  place a future change removes the floor without touching the ceiling's file or
+  any test of it.
 
 See [[localnode-test-gap]] for the sibling rule about decisions,
 [[deadline-ceilings]] for the round this came from, and

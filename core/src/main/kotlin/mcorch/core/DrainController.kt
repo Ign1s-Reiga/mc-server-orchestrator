@@ -2521,9 +2521,15 @@ internal class DrainController(
      *
      * The warning is at this end for the same reason the derivation is: nothing
      * downstream has the declared value to compare against. It fires only for a
-     * definition no reader in this system could have produced, and it repeats on the
-     * overdue path — which is a container two hours past its stop *and* a row no
-     * reader wrote, and worth saying twice.
+     * definition no reader in this system could have produced, and it is **once per
+     * caller rather than once per pass**: step 7 warns once, and a pass that re-issues
+     * the stop warns twice, because [awaitStopped] asks separately for the value it
+     * stops with and for the value it measures the container against. Two lines there
+     * is a container past its grace period *and* a row no reader wrote, which is
+     * worth saying twice. Binding one value for both readers would halve it and is
+     * deliberately not done: each reader asking for itself is what makes "the number
+     * the runtime was given" true by construction, where a shared local is true only
+     * while nobody edits between the two uses.
      */
     private fun stopGrace(pass: DrainPass): StopGrace {
         val declared = pass.subject.stopGracePeriod
