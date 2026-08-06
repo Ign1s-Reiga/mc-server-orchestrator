@@ -8,6 +8,7 @@ import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.string.shouldNotContain
 import mcorch.core.NodeException
 import mcorch.core.NodeOperation
+import mcorch.core.StopGraceCeiling
 import mcorch.core.WorkloadHandle
 import mcorch.core.coreTest
 import mcorch.cri.ContainerFilter
@@ -63,8 +64,25 @@ import kotlin.time.Duration.Companion.seconds
  * sees.
  */
 class StopGraceGuardTest {
+    /**
+     * **Rewritten by the twenty-ninth audit's third finding, and the claim changed.**
+     *
+     * It used to assert that a value containerd's arithmetic would invert is
+     * *refused*. It is now **capped** at [StopGraceCeiling.MAX] and the stop goes
+     * out, so the refusal it asserted no longer happens. The property it existed for
+     * is stronger than before rather than weaker: such a value cannot reach
+     * containerd through this node at all, and now for a structural reason rather
+     * than because one guard says no.
+     *
+     * Why the verdict changed is in [StopGraceCeiling]: the operation being refused
+     * was the **stop**, and a stop nobody can issue is a populated, world-holding
+     * server nobody can retire. The cap is safe because nothing reaches
+     * `Node.stopWorkload` except through the zero-player gate and `mayStop`, so a
+     * completed save is already confirmed and the grace period is the last-resort
+     * net.
+     */
     @Test
-    fun `a grace period containerd would invert never leaves the node`(
+    fun `a grace period containerd would invert is capped, not sent`(
         @TempDir root: Path,
     ) = coreTest {
         // One second over StopGracePeriod.MAX_SECONDS. Measured against
@@ -74,17 +92,32 @@ class StopGraceGuardTest {
         val overflowing = (StopGracePeriod.MAX_SECONDS + 1).seconds
         val client = RefusingCriClient()
 
-        val thrown =
-            shouldThrow<NodeException.Rejected> { node(client, root).stopWorkload(handle(), overflowing) }
+        node(client, root).stopWorkload(handle(), overflowing)
 
-        thrown.operation shouldBe NodeOperation.STOP
-        // Names the constraint and where the value came from, so an operator
-        // reading a failed drain is not left with "the node failed in a way it
-        // does not classify".
-        thrown.message.shouldNotBeNull() shouldContain "${StopGracePeriod.MAX_SECONDS}"
-        thrown.message.shouldNotBeNull() shouldContain "spec.lifecycle.stopGracePeriod"
-        // The whole point: containerd was never asked.
-        client.stops.shouldBeEmpty()
+        // The whole point, unchanged: containerd was never asked to wait that
+        // long. It was asked to wait the ceiling.
+        client.stops shouldBe listOf(ContainerId("c1") to StopGracePeriod.ofSeconds(7200).getOrThrow())
+        StopGraceCeiling.MAX shouldBe 2.hours
+    }
+
+    /**
+     * The bound itself, called directly with the inputs no scenario can produce.
+     *
+     * A rule with call sites in one implementation is a rule a unit test has to be
+     * able to reach; the node test above can only drive the one path it drives.
+     */
+    @Test
+    fun `the ceiling caps a long finite grace period and leaves everything else alone`() {
+        StopGraceCeiling.bound(30.seconds) shouldBe 30.seconds
+        StopGraceCeiling.bound(StopGraceCeiling.MAX) shouldBe StopGraceCeiling.MAX
+        StopGraceCeiling.bound(StopGraceCeiling.MAX + 1.seconds) shouldBe StopGraceCeiling.MAX
+        StopGraceCeiling.bound(StopGracePeriod.MAX_SECONDS.seconds) shouldBe StopGraceCeiling.MAX
+        // Not a duration anybody meant. Capping it would turn an argument the code
+        // cannot interpret into a plausible-looking stop, so it is handed on
+        // untouched to the rule that refuses it and says why.
+        StopGraceCeiling.bound(Duration.INFINITE) shouldBe Duration.INFINITE
+        StopGraceCeiling.bound(Duration.ZERO) shouldBe Duration.ZERO
+        StopGraceCeiling.bound((-30).days) shouldBe (-30).days
     }
 
     @Test
@@ -129,8 +162,19 @@ class StopGraceGuardTest {
         client.stops shouldBe listOf(ContainerId("c1") to StopGracePeriod.ofSeconds(7200).getOrThrow())
     }
 
+    /**
+     * Also rewritten by the twenty-ninth audit's third finding — see the note on
+     * `a grace period containerd would invert is capped, not sent`.
+     *
+     * The largest value the *runtime* honours is 292 years, and the reason it may
+     * not be sent has nothing to do with containerd: `GrpcCriClient.stopContainer`
+     * derives its gRPC deadline as `gracePeriod + slack`, so a stop with that grace
+     * period is a reconcile worker parked at a container that will not exit, with no
+     * effective timeout — the one property CLAUDE.md requires of every call crossing
+     * the `:cri` boundary. The bound that bites here is the node's own.
+     */
     @Test
-    fun `the largest grace period the runtime honours is accepted`(
+    fun `the largest grace period the runtime honours is still capped, because the call is deadlined off it`(
         @TempDir root: Path,
     ) = coreTest {
         val client = RefusingCriClient()
@@ -138,7 +182,7 @@ class StopGraceGuardTest {
 
         client.stops
             .single()
-            .second.seconds shouldBe StopGracePeriod.MAX_SECONDS
+            .second.seconds shouldBe StopGraceCeiling.MAX.inWholeSeconds
     }
 
     @Test

@@ -2,6 +2,7 @@ package mcorch.core
 
 import mcorch.schema.ImageRef
 import mcorch.schema.NodeName
+import mcorch.schema.PaperServerDefaults
 import mcorch.schema.ResourceName
 import mcorch.schema.SecretRef
 import mcorch.schema.ServerKind
@@ -198,15 +199,23 @@ public interface Node {
      * Nothing may read this value *as* a save timeout on the strength of the first
      * half — `DrainSubject.saveTimeout` is the quantity for that.
      *
-     * **It is also bounded above, and not for tidiness.** A container runtime
-     * carries the grace period as a fixed-width count, and past some magnitude
-     * its own arithmetic wraps: the value stops meaning "wait longer" and starts
-     * meaning "kill now", while the call still reports success. So an
-     * implementation may refuse a grace period for being *too large*, and a
-     * caller must not read a bigger number as a safer one. Where the bound
-     * actually is belongs to the runtime, so it is the runtime-facing layer that
-     * knows it — `mcorch.cri.StopGracePeriod` for the containerd implementation,
-     * which carries the measurements it was derived from.
+     * **It is also bounded above, twice, and neither bound is for tidiness.**
+     *
+     * A container runtime carries the grace period as a fixed-width count, and past
+     * some magnitude its own arithmetic wraps: the value stops meaning "wait longer"
+     * and starts meaning "kill now", while the call still reports success. So an
+     * implementation may refuse a grace period for being *too large*, and a caller
+     * must not read a bigger number as a safer one. Where that bound actually is
+     * belongs to the runtime, so it is the runtime-facing layer that knows it —
+     * `mcorch.cri.StopGracePeriod` for the containerd implementation, which carries
+     * the measurements it was derived from.
+     *
+     * The second bound is this interface's own, and it is [StopGraceCeiling]: an
+     * implementation applies it to whatever it is handed and stops on the result.
+     * A `Node` call is a call over a transport with a deadline, and an
+     * implementation that derives that deadline from the grace period — which the
+     * containerd one does — has no effective timeout at all once the grace period
+     * is large enough. See [StopGraceCeiling] for why it caps rather than refuses.
      *
      * Idempotent: stopping an already-stopped workload succeeds.
      */
@@ -241,6 +250,75 @@ public interface Node {
      * still throws; there is nothing to record.
      */
     public suspend fun removeWorkload(handle: WorkloadHandle): WorkloadRemoval
+}
+
+/**
+ * The longest a [Node] will hold a stop open for, whatever it is handed.
+ *
+ * ## What it is defending against
+ *
+ * A stop is a call over a transport, and an implementation derives that
+ * transport's deadline from the grace period — `GrpcCriClient.stopContainer` does
+ * exactly that, `gracePeriod + slack`. So the grace period is not only what the
+ * runtime waits, it is how long a reconcile worker is parked at a container that
+ * does not exit, and CLAUDE.md requires every call crossing the `:cri` boundary to
+ * have a timeout. `StopGracePeriod` bounds it only where containerd's own
+ * arithmetic would wrap, which is 292 years away: a value anywhere below that
+ * clears every check in the system and parks a worker with no effective timeout.
+ *
+ * ## Where such a value comes from, since no reader will produce one
+ *
+ * `PaperServerReader` caps `spec.lifecycle.stopGracePeriod` at
+ * [PaperServerDefaults.MAX_STOP_GRACE_PERIOD] and `VelocityProxyReader` caps its
+ * own lower still, but neither type enforces it: `LifecycleSpec.init` checks only
+ * the save-timeout relation and `ProxyLifecycleSpec` has no `init` at all. A
+ * definition that did not come through a reader — a hand-edited store row, a
+ * migration, a fixture — therefore carries anything, and `DefinitionCodec` does not
+ * re-run the reader's validation. That is the same second arrival route
+ * `WorkloadSpec`'s `init` is written around.
+ *
+ * ## Why it caps rather than refuses, which is the interesting half
+ *
+ * A `require` in `LifecycleSpec` would make the whole definition undecodable, and a
+ * row the store cannot decode costs the fleet rather than the server. A refusal
+ * *here* is charged to one server and looks tidier — but the operation it refuses
+ * is the **stop**, and a stop nobody can issue is a populated, world-holding server
+ * nobody can retire, which is the state that ends in a manual `crictl stop`. That is
+ * a certain harm traded for a conditional one.
+ *
+ * Capping is safe because of where in the protocol the stop sits: nothing reaches
+ * [Node.stopWorkload] except through the zero-player gate followed by `mayStop`, so
+ * a completed world save has already been confirmed (CLAUDE.md invariant 3) and the
+ * grace period is the last-resort net rather than the save path. And [MAX] is the
+ * largest value any reader in this system accepts, so no definition an operator
+ * could legitimately write is shortened by a single second.
+ *
+ * The constant is *borrowed* rather than restated: the property being relied on is
+ * "no reader accepts more than this", which is exactly what
+ * [PaperServerDefaults.MAX_STOP_GRACE_PERIOD] means, so raising the reader's cap
+ * moves this with it instead of silently making the cap bite.
+ */
+public object StopGraceCeiling {
+    /** See the note above. Two hours, borrowed from the widest cap any reader applies. */
+    public val MAX: Duration = PaperServerDefaults.MAX_STOP_GRACE_PERIOD
+
+    /**
+     * [requested], or [MAX] if that is a longer **finite** duration.
+     *
+     * Deliberately returns the duration alone and no flag about it: a caller that
+     * wants to log the difference has both values in hand, and a value beside a
+     * boolean about itself is the shape this codebase keeps having to unpick.
+     *
+     * Non-positive and non-finite values pass through untouched, and that is the
+     * whole of the split: a grace period that is too long is a number somebody
+     * meant, and capping it costs nothing because a confirmed save is already
+     * behind it. `Duration.INFINITE`, zero and a negative are not durations anybody
+     * meant — capping `INFINITE` to two hours would turn an argument the code cannot
+     * interpret into a plausible-looking stop — so they stay refusals, and they
+     * belong to the rule that owns them at the runtime edge (`StopGracePeriod.of`),
+     * which is also the rule whose message an operator reads.
+     */
+    public fun bound(requested: Duration): Duration = if (requested.isFinite() && requested > MAX) MAX else requested
 }
 
 /** What a node reports about itself. */

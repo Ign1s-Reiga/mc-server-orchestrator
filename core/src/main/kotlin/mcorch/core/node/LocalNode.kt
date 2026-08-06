@@ -13,6 +13,7 @@ import mcorch.core.NodeCapacity
 import mcorch.core.NodeException
 import mcorch.core.NodeOperation
 import mcorch.core.NodeStatus
+import mcorch.core.StopGraceCeiling
 import mcorch.core.StorageRequest
 import mcorch.core.WorkloadHandle
 import mcorch.core.WorkloadObservation
@@ -617,8 +618,32 @@ public class LocalNode internal constructor(
         // shortened, and it refuses anything containerd's own arithmetic would
         // wrap — see [StopGracePeriod.MAX_SECONDS], where a very long grace
         // period becomes a very short one.
+        //
+        // The runtime's bound is not this node's only one, because the *call* is
+        // deadlined off this value: `GrpcCriClient.stopContainer` asks for
+        // `gracePeriod + slack`, so a grace period below `MAX_SECONDS` and above
+        // anything a human meant parks this worker at a container that will not
+        // exit, with no effective timeout — the one property CLAUDE.md requires of
+        // every call crossing the `:cri` boundary. [StopGraceCeiling] is that
+        // second bound. It caps rather than refuses, and the reason is written
+        // there: refusing a *stop* is a populated server nobody can retire.
+        val effective = StopGraceCeiling.bound(gracePeriod)
+        if (effective != gracePeriod) {
+            // At warn, because no reader in this system can produce such a value:
+            // it means a definition arrived from somewhere that does not validate,
+            // and the row is worth fixing even though this stop is safe.
+            LOG.warn(
+                "stop grace period {} for sandbox {} is above the operational ceiling {} and is capped at it. " +
+                    "No server definition read from YAML can carry this, so it came from a store row or a " +
+                    "migration; the world save was confirmed before this stop, so the grace period is the " +
+                    "last-resort net rather than the save path",
+                gracePeriod,
+                handle.sandboxId,
+                StopGraceCeiling.MAX,
+            )
+        }
         val grace =
-            StopGracePeriod.of(gracePeriod).getOrElse { rejection ->
+            StopGracePeriod.of(effective).getOrElse { rejection ->
                 // Refused rather than thrown on: [Node] promises callers see
                 // nothing but a [NodeException], and an
                 // `IllegalArgumentException` from here would be the one thing a
