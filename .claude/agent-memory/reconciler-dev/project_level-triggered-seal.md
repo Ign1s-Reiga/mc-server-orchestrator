@@ -249,6 +249,33 @@ with a seal and **no router** — the same shape `sealIsPrecondition` keys on, a
 stated as *"is there anything else that asserts this workload's admission"* so a
 future self-sealing subject gets it without being named.
 
+### …and the compensation is for a *permanent* park only
+
+Round 26's critical, and it retired ruling 5 below. The edge was implemented on
+every abort. The accepted cost was "a parked proxy drain flaps its own seal,
+because the abort releases and the next pass's resume re-asserts" — and the
+second half is **false**. For a subject with no router the `DRAIN_FAILED` resume
+is wrapped in `requireEmpty`; with anybody online it lands in `blocked`, which
+does not seal, and the six forward states that do are unreachable while a player
+is on. So a retryable abort gave the login path back and *nothing could ever take
+it again*: population refills, the wait for zero never ends, delete parked for
+ever.
+
+Three things to carry:
+
+- **"The next pass repairs it" is a claim about a specific branch, not about the
+  loop.** Name the branch and check what it calls before accepting a flap as the
+  cost of a compensation.
+- **The justification names the class.** *"This drain has stopped advancing"* is
+  `isBlockedByPermanentFailure`, i.e. `PERMANENT`. A retryable abort is a drain
+  still being attempted, and there the seal is the mechanism of the wait — the
+  same sentence `blocked` gets.
+- The audit's alternative — release always, and re-assert with `holdSeal` before
+  `requireEmpty` on the gated resume — was rejected on its merits: it hands the
+  door back for a whole backoff per cycle (enough to refill a busy fleet), and it
+  turns a healthy block into an abort exactly when the control endpoint is what is
+  down.
+
 **`blocked` deliberately does not**, and that asymmetry is the interesting part:
 a block is the protocol working, the drain is waiting for the last player to log
 off, and the seal is *the mechanism of that wait*. Releasing it there refills the
@@ -262,11 +289,16 @@ removes the reason the wait can end.
 1. **`DRAIN_FAILED` unseals.** A blocked-with-a-proxy drain therefore takes new
    players while parked. The alternative is an invisible running server, which
    the audit named as the harm.
-5. **A parked proxy drain flaps its own seal**, because the abort releases and
-   the next pass's resume re-asserts. Accepted: the window is one backoff and it
-   is the residual `requireEmpty` already re-reads for. The alternative — release
-   only on a *permanent* abort — leaves a retryable park sealed for however long
-   the fault lasts, which is the same harm with a slower clock.
+5. ~~**A parked proxy drain flaps its own seal**, because the abort releases and
+   the next pass's resume re-asserts.~~ **Overruled by round 26**, and the ruling
+   is kept struck through rather than deleted because the *reasoning* is the
+   instructive part: the resume it relied on is gated on zero players, so with
+   anybody on there was no flap and no re-assertion at all. The release is
+   `PERMANENT`-only now. What the old ruling feared — a retryable park staying
+   sealed while the fault lasts — is real and is the accepted cost: the loop keeps
+   retrying, the escalation fires after `drainAttentionAfter`, and reverting the
+   definition (or the build pin) makes the cause vanish so a *converging* pass
+   re-asserts admission through `assertBackends`.
 2. **More than one proxy claiming a backend is a retryable failure on the
    *backend's* status**, and the container is not created while it holds. The
    refusal is **exempt for a terminating definition** — it returns before

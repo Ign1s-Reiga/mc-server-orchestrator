@@ -53,6 +53,30 @@ mounted JAR *speaks*, so pinning it would be asserting something about an
 artefact rather than choosing a version, and the honest repair is the recreate.
 Named rather than papered over.
 
+## The pre-flight is asked twice, at the two ends of the window
+
+Round 26's fourth warning. `Reconciler.replacementBlocker` exempts a drain
+already in flight — *"the container it would have saved is gone or going"* —
+which is true from the stop onwards and false for every pass before it. On a
+populated proxy that window is hours, and an orchestrator upgrade restaging the
+asset directory (or a secret rotated behind its reference) inside it still
+committed the teardown into a permanently refusing create.
+
+So `DrainController.letGoAndStop` asks `Node.checkWorkload` again at the entry to
+steps 6 and 7 — `REPLACEMENT` only, `RETRYABLE`, and *before* the deregistration
+rather than before the stop, so a refusal costs no proxy churn. Two properties
+worth keeping:
+
+- **The subject carries the spec** (`DrainSubject.replacementSpec`), not a
+  closure, so the two askers cannot disagree about what is being asked.
+- **`Node.checkWorkload` is the create's *spec* derivation, not the whole
+  create.** `LocalNode.ensureWorkload` also runs `prepareHostPaths`, which can
+  refuse permanently on an unmounted or read-only volume/log root and cannot be
+  checked without creating something. That residual is named in both KDocs rather
+  than approximated: a writability probe is a *second* derivation and can refuse a
+  create the real one would accept, which would freeze every replacement on that
+  host.
+
 ## Still open: the wait itself is unbounded
 
 The lever fixes the *trigger*. It does not bound the *wait*: a proxy replacement

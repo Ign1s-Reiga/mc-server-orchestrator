@@ -208,6 +208,15 @@ retired version, in the header, which is the string read first. The identifiers
 are what the tooling sees; the sentences are what a human uses to decide whether
 a green run means anything.
 
+**Adding a test can grow an existing mutation's red set, and that is a result to
+read rather than a nuisance to suppress.** Round 26's new retryable-abort test
+spends six passes in `blocked` proving the seal is never handed back, so D23 —
+the mutation that releases the seal on a block — went from two names to three and
+the harness reported MISCAUGHT until the entry was updated. The extra red was a
+true dependency both times this has happened. **After adding a test to a class a
+mutation names, re-run the whole harness before trusting it**; a MISCAUGHT there
+is the instrument working.
+
 **A test that first demonstrates the defect inherits every rule the defect rests
 on.** Round 25's pin-exit test asserts the login path is *shut* while the
 replacement drain waits, before asserting the operator's lever reopens it — so a
