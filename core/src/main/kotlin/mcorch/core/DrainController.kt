@@ -2778,12 +2778,37 @@ internal class DrainController(
      * null`, so the *"needs nobody"* sentence disappears exactly here, and `:api`
      * renders the failure.
      *
+     * ### …and the consumer that reads the class to **stop reconciling**
+     *
+     * The twenty-ninth audit's first finding, and it is this retention meeting
+     * `Reconciler.isBlockedByPermanentFailure`. The status this returns carries the
+     * standing failure — `Reconciler.drain` copies `drain.failure` onto it — so the
+     * pass that wrote the block used to arm that gate at the current generation,
+     * and the *next* pass never ran. On a delete that gate is lifted anyway, which
+     * is the case the paragraph above is about and is why it was not noticed; on a
+     * **replacement** it fires, and then a definition edit — the documented remedy
+     * — is spent on one blocked pass while the step it was meant to repair never
+     * runs, for as long as anybody is connected.
+     *
+     * It is closed at the gate rather than here, by
+     * [parkedOnTheFailure]: a drain waiting for the last player to log off is
+     * parked on *players*, and that is the one park a later pass can get past with
+     * nobody doing anything. Keeping the record here is what the paragraph above
+     * argued for and it still holds — the anchor, the class and the wedge below all
+     * survive — and the sentence this function writes into the block, *"the drain
+     * hits it again as soon as the server empties"*, is only true because the gate
+     * lets that pass happen.
+     *
      * What this does **not** close: a flapping control endpoint alternates a
      * retryable abort with a block, and each block clears the anchor, so a fault that
      * is present half the time never escalates. Closing it needs a carrier that
      * survives the recovery — the same undecidable question `since` faces above —
      * and a wrong-way narrowing here would leave a healthy wait reporting a fault
-     * that has genuinely gone.
+     * that has genuinely gone. A set-once instant is **not** that carrier: it cannot
+     * tell one fault four hours ago followed by a healthy evening from a fault
+     * present every other pass for four hours, and reading the first as the second
+     * is the alarm fatigue `escalated()`'s anchor was moved onto
+     * `FailureStatus.occurredAt` to avoid.
      */
     private suspend fun blocked(
         subject: DrainSubject,
@@ -3539,6 +3564,56 @@ internal fun DrainStatus.escalated(
             after = after,
         )
     } ?: false
+
+/**
+ * Whether a drain record leaves a `PERMANENT` failure standing with **nothing a
+ * later pass could see change** — the middle clause of both
+ * `Reconciler.isBlockedByPermanentFailure` implementations, in one expression.
+ *
+ * Written here rather than twice at the two gates for the reason
+ * `Reconciler.permanentFailureStopsPasses` is: two derivations of one rule is how
+ * the twenty-seventh audit's critical happened, and a gate that freezes the loop
+ * is the worst place to keep a copy.
+ *
+ * Two things make it false, and they are different findings:
+ *
+ * - **The drain is not parked.** A permanent failure sitting on a drain in any
+ *   other state is one the drain has already moved past, retained on purpose by
+ *   [DrainController.settleRecords]' hysteresis so the escalation anchor survives a
+ *   resume. Without this clause that retention armed the gate, and the sixteenth
+ *   audit's second critical was the result: an operator edits the definition to
+ *   repair a permanently failed drain, the generation moves, the gate opens for
+ *   exactly one pass, that pass stops the container and moves to `STOPPING` — and
+ *   then the retained failure is written at the new generation, the gate closes
+ *   again, and `awaitStopped` and `teardown` never run. Container stopped, workload
+ *   never removed, replacement never created, status frozen quoting a node fault
+ *   the operator had already fixed.
+ * - **The drain is parked on *players*, not on the failure.** Since the
+ *   twenty-eighth audit a [DrainController.blocked] keeps a standing permanent
+ *   failure, and it parks in `DRAIN_FAILED` like an abort — so the pass that wrote
+ *   the block armed this gate, and the twenty-ninth audit's first finding was the
+ *   result. A non-terminating server reaches a block with a permanent failure
+ *   standing exactly once per generation bump: the operator edits the definition to
+ *   repair the drain, the gate opens for one pass, somebody is online, the resume
+ *   parks in [DrainController.blocked] — and the edit is spent on the block while
+ *   the step it was meant to repair never runs. Every further edit goes the same
+ *   way for as long as anybody is connected, no status is written meanwhile so
+ *   nobody can see the server empty, and for a workload that seals *itself* the
+ *   frozen state is a fleet-wide login blackout with the loop no longer looking.
+ *
+ *   A block is the one park the loop can get past without a human: nobody has to do
+ *   anything, the last player logs off, and the drain hits the repaired step. So it
+ *   is not what this gate is for, and re-entering costs one probe per backoff and
+ *   issues nothing — the same price a delete already pays, for the same reason. It
+ *   is also what makes [DrainController.blocked]'s own sentence *"the drain hits it
+ *   again as soon as the server empties"* true rather than a promise the gate
+ *   cancels.
+ *
+ * Both clauses narrow the gate, so neither can freeze a workload that would
+ * otherwise be reconciled; they can only un-freeze one.
+ */
+internal fun DrainStatus?.parkedOnTheFailure(): Boolean =
+    this == null || (state == DrainState.DRAIN_FAILED && blocked == null)
 
 /** Why a drain is happening. It changes nothing about the procedure, only the message. */
 internal enum class DrainCause(

@@ -11,6 +11,7 @@ import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.types.shouldBeInstanceOf
 import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
+import mcorch.schema.DrainBlockReason
 import mcorch.schema.DrainState
 import mcorch.schema.FailureClass
 import mcorch.schema.MemoryQuantity
@@ -100,6 +101,95 @@ internal class ReplacementTest {
             harness.settle(name, limit = 24)
 
             // The whole point: it got all the way through, not one step in.
+            harness.node.removals shouldHaveSize 1
+            harness.node.creates shouldHaveSize 2
+            harness.node.creates[1]
+                .image.canonical shouldBe "docker.io/itzg/minecraft-server:2026.7.1"
+        }
+
+    /**
+     * The twenty-ninth audit's first finding: the same repair, with somebody
+     * playing at the moment the operator makes it.
+     *
+     * A generation bump is the only thing that lifts
+     * `isBlockedByPermanentFailure` on a server nobody has deleted, and it lifts it
+     * for exactly one pass. Since the twenty-eighth audit a block *keeps* a standing
+     * permanent failure and parks in `DRAIN_FAILED` like an abort — so that one pass
+     * used to write the retained failure back at the new generation and close the
+     * gate behind itself, and the drain never got to the repaired step. Every
+     * further edit went the same way for as long as anybody was connected, and no
+     * status was written meanwhile, so the operator could not even see the server
+     * empty.
+     *
+     * Asserted on the **replacement running**, not on the failure being cleared: a
+     * cleared record is not what the operator was promised, and it is the assertion
+     * the sibling test above already chose for the same reason.
+     *
+     * The player logs on *before* the edit, so the very first pass at the new
+     * generation is the blocked one. That is the ordering the defect needs, and
+     * writing it the other way round — edit, then player — would let a converging
+     * pass slip through and pass against the defect.
+     */
+    @Test
+    fun `an operator edit is not spent on a player who logged on while the drain was frozen`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.node.creates shouldHaveSize 1
+
+            harness.node.failAlways(
+                NodeOperation.STOP,
+                NodeException.Rejected(harness.node.name, NodeOperation.STOP, "the runtime refused the stop"),
+            )
+            harness.declare(paperDefinition(image = "docker.io/itzg/minecraft-server:2026.7.0"))
+            harness.settle(name, limit = 14)
+
+            val frozen = harness.status(name).shouldNotBeNull()
+            frozen.drain.shouldNotBeNull().state shouldBe DrainState.DRAIN_FAILED
+            frozen.drain
+                .shouldNotBeNull()
+                .failure
+                .shouldNotBeNull()
+                .failureClass shouldBe FailureClass.PERMANENT
+            harness.node.removals.shouldBeEmpty()
+
+            // Somebody logs back on to the server that is still running, and only
+            // then does the operator fix the node and edit the definition.
+            harness.node.online = 3
+            harness.node.clearFailures(NodeOperation.STOP)
+            harness.declare(paperDefinition(image = "docker.io/itzg/minecraft-server:2026.7.1"))
+
+            // The loop keeps looking while they play. It has to: nobody is going to
+            // bump the generation again to tell it the server emptied.
+            repeat(6) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+            val waiting = harness.status(name).shouldNotBeNull()
+            waiting.drain
+                .shouldNotBeNull()
+                .blocked
+                .shouldNotBeNull()
+                .reason shouldBe DrainBlockReason.AWAITING_ZERO_PLAYERS
+            // Waiting is all it did: no stop was issued at a populated container and
+            // the container is still there.
+            harness.node.removals.shouldBeEmpty()
+            harness.node.creates shouldHaveSize 1
+            // The permanent diagnosis is still standing beside the block — the block
+            // is what stops the gate arming, not a clear of the record.
+            waiting.drain
+                .shouldNotBeNull()
+                .failure
+                .shouldNotBeNull()
+                .failureClass shouldBe FailureClass.PERMANENT
+
+            // They log off. Nothing else changes, and no further edit is made.
+            harness.node.online = 0
+            harness.settle(name, limit = 24)
+
             harness.node.removals shouldHaveSize 1
             harness.node.creates shouldHaveSize 2
             harness.node.creates[1]

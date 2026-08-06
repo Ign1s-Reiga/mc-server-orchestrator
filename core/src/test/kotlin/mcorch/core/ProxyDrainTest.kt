@@ -2025,6 +2025,90 @@ internal class ProxyDrainTest {
         }
 
     /**
+     * …and a definition edit made while people are playing must not be spent on the
+     * block, because for this kind the frozen state is a fleet-wide blackout.
+     *
+     * The twenty-ninth audit's first finding, on the workload it costs the most. A
+     * generation bump is the only thing that lifts `isBlockedByPermanentFailure` on a
+     * proxy nobody has deleted, and it lifts it for one pass. Since the
+     * twenty-seventh audit the gated resume asserts [DrainController.holdSeal]
+     * *before* the zero-player gate, so that one pass shuts the front door and then
+     * lands in `blocked` — and since the twenty-eighth a block keeps a standing
+     * permanent failure, so the pass wrote it back at the new generation and closed
+     * the gate behind itself. End state: every login into the fleet refused, the loop
+     * no longer looking, `releaseSeal` reachable only from an abort no pass will
+     * reach, and each further edit re-shutting the door and re-freezing.
+     *
+     * The assertion is the door coming back **without a further edit** once the last
+     * player logs off — the drain resumes, aborts permanently again, and that abort
+     * is what releases the seal. Reading the flag mid-wait would say nothing: the
+     * resume re-asserts the seal every pass by design, so `false` there is the
+     * correct answer and the defect and the fix agree about it.
+     */
+    @Test
+    fun `an edit made while a proxy is populated does not leave the fleet locked out`() =
+        coreTest {
+            val harness = ProxyHarness(backends = listOf(backendDefinition("survival-01")))
+            val name = harness.proxyDefinition.metadata.name
+            harness.bringUp()
+            harness.plugin.proxyAdmits.shouldBeTrue()
+
+            // The container predates the `WORLD_DATA` label, so the drain must assume
+            // it holds a world and no proxy can ever confirm a save: `PERMANENT` at
+            // `SAVING`. An edit rather than a delete, so the passes really do stop.
+            val observed = harness.proxyNode.workload as WorkloadObservation.Present
+            harness.proxyNode.workload = observed.copy(labels = observed.labels - Labels.WORLD_DATA)
+            harness.declare(proxyDefinition(maxPlayers = 300))
+            repeat(6) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+            harness
+                .proxyStatus()
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .failure
+                .shouldNotBeNull()
+                .failureClass shouldBe FailureClass.PERMANENT
+            // The park gave the door back, which is the twenty-sixth audit's edge
+            // working. This is the state an operator then tries to repair.
+            harness.plugin.proxyAdmits.shouldBeTrue()
+
+            // People come back to the running proxy, and only then does the operator
+            // edit the definition again — the documented way to lift the gate.
+            harness.proxyNode.online = 4
+            harness.declare(proxyDefinition(maxPlayers = 400))
+
+            repeat(6) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+            // The resume shut the door before the gate, and the drain is waiting.
+            harness
+                .proxyStatus()
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .blocked
+                .shouldNotBeNull()
+                .reason shouldBe DrainBlockReason.AWAITING_ZERO_PLAYERS
+            harness.plugin.proxyAdmits.shouldBeFalse()
+            harness.proxyNode.stops.shouldBeEmpty()
+
+            // The last player logs off. No further edit, no operator action: the loop
+            // has to still be looking, or the fleet's front door never opens again.
+            harness.proxyNode.online = 0
+            repeat(6) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+            harness.plugin.proxyAdmits.shouldBeTrue()
+            harness.proxyNode.stops.shouldBeEmpty()
+            harness.proxyNode.removals.shouldBeEmpty()
+        }
+
+    /**
      * …and a permanent abort under a **delete** keeps the login path shut, because
      * those passes do not stop.
      *
