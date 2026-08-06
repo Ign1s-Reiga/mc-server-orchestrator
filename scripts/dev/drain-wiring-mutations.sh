@@ -479,15 +479,18 @@ RELEASE_DISCARDED='                failureClass = failureClass,
 # occurs in any scenario in this suite, so the value is the pass'"'"'s on every path a
 # test can drive and only the wiring assertion can see the difference — which is
 # what makes it the edit worth pinning rather than the one worth a scenario.
+# Re-derived for the thirty-second audit: the argument is `dispatching` now, the
+# drain carrying `stopDispatchedAt`. The indent is still what makes this literal
+# `stop`'"'"'s catch and not `awaitStopped`'"'"'s, which is four spaces deeper.
 STOP_ABORT='                permanentFailureStopsPasses = pass.permanentFailureStopsPasses,
-                drain = drain,
+                drain = dispatching,
                 occupancy = occupancy,
                 now = now,
                 reason = FailureReason.DRAIN_STALLED,
                 failureClass = if (failure.retryable) FailureClass.RETRYABLE else FailureClass.PERMANENT,'
 STOP_ABORT_DERIVED='                permanentFailureStopsPasses =
                     pass.permanentFailureStopsPasses && pass.cause != DrainCause.RELOCATION,
-                drain = drain,
+                drain = dispatching,
                 occupancy = occupancy,
                 now = now,
                 reason = FailureReason.DRAIN_STALLED,
