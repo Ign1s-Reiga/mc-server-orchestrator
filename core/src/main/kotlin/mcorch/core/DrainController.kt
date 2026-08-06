@@ -2989,6 +2989,42 @@ internal class DrainController(
      * Best-effort, and it clears [DrainStatus.deregisteredAt] only when the proxy
      * confirmed. A failure here leaves the field set, so the next pass through this
      * function tries again.
+     *
+     * ## Open: this also fires after the stop has been *issued*, and there the
+     * justification above is false
+     *
+     * *"The drain is not going to move those players"* is the sentence that makes
+     * re-admitting right, and it is a sentence about a drain that has **given up on
+     * this container**. A park out of the stop is not that: the container has been
+     * sent `SIGTERM`, the loop re-issues the stop on the next pass, and this hands it
+     * an admitting registration in between. What arrives is a player routed to a
+     * process in shutdown — and if that process is wedged with its listener still
+     * open, they get in, `awaitStopped` reads a positive count on the next pass,
+     * voids the save and goes back to `SAVING`. That is the population refilling
+     * behind a drain, which is the exact harm [releaseSeal] gives as the reason
+     * [blocked] must not release a seal.
+     *
+     * It is reachable through `stop`'s own `NodeException.Timeout` catch — the stop
+     * was dispatched and this client stopped waiting, so the signal may well have
+     * landed — and since `:cri` capped a stop's deadline at
+     * `min(gracePeriod, CriTimeouts.stopDeadlineCap) + deadlineSlack` that is
+     * *deterministic* for a grace period above two hours, which is the same
+     * unvalidated-row population [StopGraceCeiling]'s floor leaves uncapped.
+     * containerd does not escalate to `SIGKILL` once the request context has expired,
+     * so the container really is still there.
+     *
+     * **Not fixed here, deliberately, and the reason is which discriminator is
+     * right.** `drain.state == DrainState.STOPPING` is available at both call sites
+     * and is the obvious one — and it is wrong: it misses exactly the case above,
+     * where the timeout is caught in `stop` with the drain still `DEREGISTERED`. The
+     * honest test is *"was a stop request dispatched"*, which has to distinguish a
+     * `Timeout` (may have landed, treat as issued — the rule
+     * `PaperServerAgent.requestSave` already applies to a save) from a `Rejected` or
+     * an `Unreachable` (never left, so restoring is right). The other half already
+     * composes: `ProxyFleet`'s sweep skips a backend whose `deregisteredAt` is set,
+     * so *not* restoring keeps it out of routing without a second mechanism — which
+     * also means a wrong version of this strands a backend out of routing for as long
+     * as the field survives. It goes to `drain-auditor` with the rest of this change.
      */
     private suspend fun restoreRegistration(
         subject: DrainSubject,
