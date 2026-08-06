@@ -562,7 +562,7 @@ public class LocalNode internal constructor(
             val builder =
                 HttpRequest
                     .newBuilder(URI.create("http://$host:${request.port}${request.path}"))
-                    .timeout(request.timeout.toJavaDuration())
+                    .timeout(request.timeout.period.toJavaDuration())
             val publisher =
                 request.body?.let { HttpRequest.BodyPublishers.ofString(it, StandardCharsets.UTF_8) }
                     ?: HttpRequest.BodyPublishers.noBody()
@@ -577,7 +577,7 @@ public class LocalNode internal constructor(
                         name,
                         NodeOperation.ENDPOINT,
                         "port ${request.port} did not answer ${request.verb} ${request.path} within " +
-                            "${request.timeout.inWholeSeconds}s",
+                            "${request.timeout.period.inWholeSeconds}s",
                         timeout,
                         // The *call* ran out of time, not a command the caller
                         // asked the node to run. `commandTimeout` is reserved for

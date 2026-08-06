@@ -6,6 +6,7 @@ import mcorch.schema.PaperServerDefaults
 import mcorch.schema.ResourceName
 import mcorch.schema.SecretRef
 import mcorch.schema.ServerKind
+import mcorch.schema.VelocityProxyDefaults
 import java.time.Instant
 import kotlin.time.Duration
 
@@ -55,15 +56,30 @@ import kotlin.time.Duration
  * ## Every duration crossing this interface is a transport deadline
  *
  * An implementation of a `Node` is a client of something, and the durations a
- * caller hands it become that transport's deadlines: the containerd
- * implementation derives `stopContainer`'s from the grace period and `execSync`'s
- * from [ExecRequest.timeout] directly. CLAUDE.md requires every call crossing the
- * `:cri` boundary to have a timeout, and a deadline derived from an unbounded
- * argument is not one. So both of those arguments are **bounded types** —
- * [StopGrace] and [ExecTimeout] — whose factories are the only way to obtain one.
- * That is deliberately not a rule each implementation applies for itself: a rule
- * every implementation has to remember is a rule the second implementation
+ * caller hands it become that transport's deadlines: the containerd implementation
+ * derives `execSync`'s from [ExecRequest.timeout] and an HTTP client's from
+ * [EndpointRequest.timeout], each directly, and `stopContainer`'s from the grace
+ * period up to a cap of its own. CLAUDE.md requires every call crossing the `:cri`
+ * boundary to have a timeout, and a deadline derived from an unbounded argument is
+ * not one. So all three of those arguments are **bounded types** — [StopGrace],
+ * [ExecTimeout] and [EndpointTimeout] — whose factories are the only way to obtain
+ * one. That is deliberately not a rule each implementation applies for itself: a
+ * rule every implementation has to remember is a rule the second implementation
  * breaks, and this interface is the distribution seam.
+ *
+ * The stop is the one where the two numbers have come apart, and a reader has to
+ * keep them apart: [StopGrace] bounds what the *container* is given, `:cri` bounds
+ * how long this process *waits* for it, and neither substitutes for the other.
+ *
+ * **A ceiling is not a floor, and the difference is where the two halves live.**
+ * Each factory caps; none of them raises a zero or a negative into a plausible
+ * wait, because a value the code cannot interpret must not be made to look like one
+ * somebody meant. What is left is refused by the request type's own `init`, as an
+ * `IllegalArgumentException` — so **a caller that builds a request from a
+ * definition field classifies that refusal** rather than letting it escape as an
+ * unclassified throwable. `UnbuildableRequestTest` holds the rule
+ * against this module's sources; see [EndpointRequest] for what it costs when one
+ * site forgets.
  */
 public interface Node {
     /** How this node is addressed. Stable for the node's lifetime. */
@@ -216,14 +232,22 @@ public interface Node {
      *
      * The first is this interface's own operational ceiling, and it is carried by
      * the argument's *type*: a [StopGrace] can only be obtained from
-     * [StopGrace.of], which applies [StopGraceCeiling]. A `Node` call is a call
-     * over a transport with a deadline, and an implementation that derives that
-     * deadline from the grace period — which the containerd one does — has no
-     * effective timeout at all once the grace period is large enough. See
-     * [StopGraceCeiling] for why it caps rather than refuses, why the cap has a
-     * floor, and — the part not to skip — what that floor leaves uncapped: above a
-     * save timeout of two hours the ceiling *is* the save timeout, so this is a bound
-     * on the pair's relation and not a bound on how long the call can take.
+     * [StopGrace.of], which applies [StopGraceCeiling]. It bounds the **relation**
+     * between this value and the save timeout it was validated against, and — the
+     * part not to skip — above a save timeout of two hours it stops bounding the
+     * magnitude of either: the floor raises the ceiling to the save timeout and it
+     * rises with it. See [StopGraceCeiling].
+     *
+     * So it is not what stops a long grace period parking a reconcile worker. That
+     * belongs to the layer that issues the call and it is a separate number:
+     * `GrpcCriClient` deadlines a stop at
+     * `min(gracePeriod, CriTimeouts.stopDeadlineCap) + deadlineSlack`, two hours by
+     * default, while sending the whole grace period on the wire. An implementation
+     * that let its deadline *be* the grace period would have no effective timeout at
+     * all once the grace period was large enough, and a caller that read the cap as
+     * a bound on the container's grace would be wrong about the value the runtime
+     * was given — the overdue accounting in `DrainController.awaitStopped` measures
+     * against what was sent.
      *
      * The second belongs to the runtime and stays with the implementation. A
      * container runtime carries the grace period as a fixed-width count, and past
@@ -282,14 +306,27 @@ public interface Node {
  *
  * ## What it is defending against
  *
- * A stop is a call over a transport, and an implementation derives that
- * transport's deadline from the grace period — `GrpcCriClient.stopContainer` does
- * exactly that, `gracePeriod + slack`. So the grace period is not only what the
- * runtime waits, it is how long a reconcile worker is parked at a container that
- * does not exit, and CLAUDE.md requires every call crossing the `:cri` boundary to
- * have a timeout. `StopGracePeriod` bounds it only where containerd's own
- * arithmetic would wrap, which is 292 years away: a value anywhere below that
- * clears every check in the system and parks a worker with no effective timeout.
+ * A stop is a call over a transport, and the grace period is what the runtime is
+ * asked to wait. `GrpcCriClient.stopContainer` used to make it the *deadline* as
+ * well — `gracePeriod + slack` — so a definition carrying a very long grace period
+ * parked a reconcile worker for exactly as long as it asked for, with no effective
+ * timeout, which is the CLAUDE.md rule that every call crossing the `:cri` boundary
+ * is deadlined. `StopGracePeriod` bounds the value only where containerd's own
+ * arithmetic would wrap, 292 years away, so nothing below that was refused either.
+ *
+ * **That half now belongs to `:cri` and not to this constant**, and the split is
+ * the thing to carry: `GrpcCriClient` deadlines the call at
+ * `min(gracePeriod, CriTimeouts.stopDeadlineCap) + deadlineSlack` while sending the
+ * *whole* grace period on the wire. The cap shortens what this process waits and
+ * never what the container is given — so it can only leave a container running
+ * longer, never kill it sooner, and the overdue accounting in
+ * `DrainController.awaitStopped` still measures against the value the runtime was
+ * given.
+ *
+ * What is left here is a bound on the **pair**, and that is what the sections below
+ * are about. Being wrong about which layer owns which is how a reader concludes that
+ * capping the grace period would be safe because "the call is deadlined anyway", or
+ * that a capped deadline kills a container early. Neither is true.
  *
  * ## Where such a value comes from, since no reader will produce one
  *
@@ -354,19 +391,30 @@ public interface Node {
  * until the *runtime's* own bound refuses the stop outright. A row carrying
  * `saveTimeout = 30d` beside `stopGracePeriod = 31d` satisfies `LifecycleSpec.init`,
  * decodes from a nanosecond column, and is capped to `30d30s`: shortened, landed
- * exactly on the smallest grace the schema would have accepted for that pair, and
- * still a reconcile worker parked for a month. Over that whole range this bounds
- * **the relation** and does not bound **the wait**.
+ * exactly on the smallest grace the schema would have accepted for that pair. Over
+ * that whole range this bounds **the relation** and does not bound **the wait**.
  *
  * That is the trade taken deliberately and it is the right way round — a parked
- * worker loses no world, an inverted pair loses one — but the consequence has to be
- * read off it rather than assumed away: what bounds the stop's deadline is whatever
- * bounds `drain.saveTimeout`, and **nothing in this file does**. [ExecTimeoutCeiling]
- * bounds a *copy* of that field on its way to an exec; the field itself arrives from
- * the store unbounded, and closing that belongs at the decode, where a duration
- * column is turned into a `Duration`. So read this as *"a grace period may not
- * exceed the save it is protecting by more than a reader would allow"*, never as
- * *"a stop is deadlined at two hours"*.
+ * worker loses no world, an inverted pair loses one. **The wait it does not bound
+ * now has an owner**, and naming it is what keeps this section from reading as an
+ * open hole: `GrpcCriClient` deadlines the call at
+ * `min(gracePeriod, CriTimeouts.stopDeadlineCap) + deadlineSlack`, so the month-long
+ * grace above parks a worker for two hours and not for a month. Two consequences
+ * worth stating rather than implying:
+ *
+ * - **The container still gets the whole month.** The cap is on this process's
+ *   deadline, never on what is sent, so a capped stop can only leave a container
+ *   running *longer* than an uncapped one — containerd does not escalate to
+ *   `SIGKILL` once the request context has expired. It is finished by the drain
+ *   re-issuing the stop, which is why that timeout is retryable.
+ * - **Nothing here should be re-tightened on the strength of it.** "The call is
+ *   deadlined anyway" is not an argument for capping the grace period below the save
+ *   timeout: the deadline bounds the wait, and the grace period is the last-resort
+ *   net a save depends on.
+ *
+ * So read this as *"a grace period may not exceed the save it is protecting by more
+ * than a reader would allow"*, never as *"a stop is deadlined at two hours"* — that
+ * second sentence is true, and it is `:cri`'s to make.
  *
  * **At the top of the range the trade inverts, on purpose.** A save timeout large
  * enough that the derived floor passes what the runtime accepts leaves the stop
@@ -898,24 +946,28 @@ public data class ExecRequest(
  * zero-player report. **Re-derive the licence at that construction site rather than
  * reading it off this sentence.**
  *
- * ## What the cap does not close
+ * ## What the cap does not close, and where the other half went
  *
  * It removes `Duration.INFINITE` as a route into [ExecRequest]'s own `init`, and
  * that is all it removes. **Zero and negative are still refused there**, as an
- * `IllegalArgumentException` built *outside* `requestSave`'s try — so it is not a
- * [NodeException], it passes `Reconciler`'s `catch (NodeException)` and
- * `catch (StoreException)` untouched, and it lands in `ReconcileLoop.work`'s
- * `catch (Throwable)` as a `ReconcileOutcome.Retry` **with no status write**: the
- * drain is never recorded as failed, nothing raises `NEEDS_ATTENTION`, the dashboard
- * keeps whatever it had, and one error line per pass is the entire signal. A
- * `saveTimeout` of zero on a store row reaches that today.
+ * `IllegalArgumentException` — and raising a zero into a real wait here would be the
+ * "plausible-looking" move the paragraph above refuses, so this type is the wrong
+ * place to close it. It is closed in two others instead:
  *
- * Raising a zero into a real wait here would be the "plausible-looking" move the
- * paragraph above refuses, so the fix is not in this type: it is a bound at the
- * decode, plus a classification at the construction site. The same is owed by
- * [EndpointRequest]: its `timeout` is a `VelocityProxy`'s seal timeout arriving
- * through `ControlChannel` — a definition field, **unbounded above**, with the same
- * unclassified `IllegalArgumentException` below it.
+ * - **At the decode.** `mcorch.schema.SpecBounds` caps a stored row's deadlines, so
+ *   no definition that came through a store carries an absurd one. It deliberately
+ *   applies no *floor*: flooring `saveTimeout` up to one second raises the minimum
+ *   `SpecInvariants.stopGraceProblem` demands of the grace period beside it, which
+ *   inverts a pair that satisfied the schema on disk.
+ * - **At the construction site.** `PaperServerAgent.requestSave` builds this request
+ *   inside a `try` and turns the refusal into `SaveOutcome.NotDelivered`, so a zero
+ *   in the row is recorded as a drain failure an operator can see and repair.
+ *   Uncaught it was a bare requeue with **no status write** — no failure recorded,
+ *   nothing raising `NEEDS_ATTENTION`, the dashboard keeping whatever it had.
+ *
+ * [EndpointRequest] is the same shape and now carries the same pair; see
+ * [EndpointTimeout] for the ceiling and for why its licence to cap is derived at its
+ * own call rather than read off this one.
  */
 @JvmInline
 public value class ExecTimeout private constructor(
@@ -970,16 +1022,30 @@ public enum class HttpVerb {
  * waits on this one, so an unbounded wait here is a container the orchestrator can
  * never stop.
  *
- * **It is the third duration that becomes a transport deadline, and the only one
- * still unbounded.** [StopGrace] and [ExecTimeout] carry a ceiling in the argument's
- * type; this is a bare `Duration`, and the survey that justified leaving it so —
- * *"every construction site is a compile-time constant"* — is false: the one site,
- * `ControlChannel.call`, is handed `backends.drain.sealTimeout` off a `VelocityProxy`
- * definition, which reaches `:core` from a store row as well as from a reader. Above,
- * an absurd value is a reconcile worker parked on a proxy that will not answer;
- * below, a zero or a negative is an `IllegalArgumentException` out of the `init`
- * beneath, thrown inside a drain and outside every typed catch on the way up — see
- * [ExecTimeout]'s *What the cap does not close* for where that lands.
+ * ## Every field here can arrive from a definition, which is why the whole
+ * construction is classified
+ *
+ * [timeout] is `backends.drain.sealTimeout` off a `VelocityProxy`, and [port] is
+ * `spec.control.port` off the same one. Both reach `:core` from a store row as well
+ * as from a reader, and `DefinitionCodec` does not re-run the reader's validation —
+ * so the checks below are about **operator data**, not about what a planner can get
+ * wrong, and they can fail on a definition an operator can also repair.
+ *
+ * That is the whole argument for the shape at the call sites. The ceiling above is
+ * carried by the argument's *type* ([EndpointTimeout]), because a bound every
+ * construction site has to remember is a bound the next one forgets. The floor
+ * cannot be: raising a zero into a real wait is the "make an uninterpretable value
+ * plausible" move a ceiling exists to refuse, so it stays an
+ * `IllegalArgumentException` here — and a caller building this from a definition
+ * catches it and says what it means. Left uncaught it is thrown inside a drain,
+ * outside every typed catch on the way up, and lands in `ReconcileLoop.work`'s
+ * `catch (Throwable)` as a bare requeue **with no status write**: no failure
+ * recorded, nothing raising `NEEDS_ATTENTION`, the dashboard keeping whatever it
+ * had, and the server undeletable for as long as the row says zero.
+ *
+ * A `require` in the *spec* type would be worse still, for the reason
+ * `mcorch.schema.SpecBounds` gives: it makes the row undecodable, which costs the
+ * fleet rather than the server.
  */
 public data class EndpointRequest(
     val port: Int,
@@ -992,13 +1058,99 @@ public data class EndpointRequest(
      * and needs none. **Never material** — the node resolves it.
      */
     val bearerToken: SecretRef? = null,
-    val timeout: Duration,
+    /**
+     * How long the endpoint has to answer.
+     *
+     * An [EndpointTimeout] rather than a bare duration, for the reason
+     * [ExecRequest.timeout] is an [ExecTimeout]: an implementation turns it straight
+     * into the transport's deadline, so an unbounded value here is a reconcile
+     * worker with no effective timeout — on the *drain's* control path, where a
+     * parked worker is a backend that cannot be sealed.
+     */
+    val timeout: EndpointTimeout,
 ) {
     init {
         require(port in 1..65535) { "port must be in 1..65535, got: $port" }
         require(path.startsWith("/")) { "path must be absolute, got: $path" }
-        require(timeout.isPositive() && timeout.isFinite()) { "endpoint timeout must be positive and finite" }
+        // Finiteness is structural — [EndpointTimeout.of] caps it — so what is left
+        // is the half a ceiling must not fix. See the note above for why a zero is
+        // refused rather than raised, and where the refusal is turned into something
+        // an operator can read.
+        require(timeout.period.isPositive()) { "endpoint timeout must be positive, found ${timeout.period}" }
     }
+}
+
+/**
+ * How long a request to a port inside a workload may take, bounded by
+ * [EndpointTimeoutCeiling].
+ *
+ * The third of the three durations that become transport deadlines, and the last to
+ * get its type. The note left on it in round 30 — *"every construction site is a
+ * compile-time constant"* — was a survey of call sites, and it was false:
+ * `ControlChannel`'s one site is handed `spec.backends.drain.sealTimeout` off a
+ * `VelocityProxy` at both of `ControlChannel`'s own construction sites. `SpecBounds`
+ * now caps that field where a stored row is decoded, which closes the row-level half
+ * for every definition that came through a store; this closes the **type** half, for
+ * a fixture, a hand-built spec, or a caller a store never saw. Two bounds, and the
+ * one here is the one no future caller can route around.
+ *
+ * ## The licence to cap is derived for *this* call, not read off [ExecTimeout]
+ *
+ * [ExecTimeout]'s KDoc caps on the argument that cutting a wait short can do no more
+ * than withhold a confirmation — and that sentence is **false of a probe**, whose
+ * silence `DrainController.save` reads as consent. So it is re-derived here rather
+ * than inherited: what does this orchestrator conclude from a control call that ran
+ * out of time?
+ *
+ * Nothing that lets a container go. Every unanswered control call becomes
+ * `ControlOutcome.Unavailable`, and every consumer of one either parks the drain
+ * (`holdSeal`, `transfer`, `deregister`, `reregister`) or discards the answer
+ * (`BackendLink.observedPlayers`, which is *"corroboration only, and never a gate"*
+ * and returns null). No branch reads an unanswered endpoint as *nobody is
+ * connected*, as *the backend is sealed* or as *the registration is gone* — which is
+ * what makes shortening this wait safe in the direction that matters: it can only
+ * park a drain, never advance one.
+ *
+ * **The day a branch reads the absence of an answer as an answer, this argument
+ * expires** and the cap has to be re-derived — the same way the probe expired
+ * [ExecTimeout]'s.
+ */
+@JvmInline
+public value class EndpointTimeout private constructor(
+    /** What the call is actually given. Never above [EndpointTimeoutCeiling.MAX]. */
+    public val period: Duration,
+) {
+    override fun toString(): String = period.toString()
+
+    public companion object {
+        /** The only way to obtain an [EndpointTimeout]. Total: it caps rather than refusing. */
+        public fun of(requested: Duration): EndpointTimeout = EndpointTimeout(EndpointTimeoutCeiling.bound(requested))
+    }
+}
+
+/**
+ * The longest a [Node] will wait for a port inside a workload to answer.
+ *
+ * Borrowed rather than restated, for the reason [StopGraceCeiling.MAX] and
+ * [ExecTimeoutCeiling.MAX] are: [VelocityProxyDefaults.MAX_TIMEOUT] is what
+ * `VelocityProxyReader.handshakeTimeout` caps all three of the proxy's drain
+ * timeouts at — and what `mcorch.schema.SpecBounds.MAX_HANDSHAKE_TIMEOUT` borrows
+ * for the same field at the decode — so no definition an operator could legitimately
+ * write is shortened by a single second, and raising the reader's cap moves this
+ * with it.
+ *
+ * It is the *proxy's* constant rather than `PaperServerDefaults`', although the two
+ * are the same hour today, because the only definition-fed value that reaches an
+ * endpoint call is a proxy's. If a second protocol ever speaks through
+ * [Node.callEndpoint] with a timeout off some other kind's spec, the honest change
+ * is to say which reader bounds it — not to keep quoting this one.
+ */
+public object EndpointTimeoutCeiling {
+    /** One hour, borrowed from the widest cap `VelocityProxyReader` applies to a handshake timeout. */
+    public val MAX: Duration = VelocityProxyDefaults.MAX_TIMEOUT
+
+    /** [requested], or [MAX] if that is lower. Non-finite is capped; see [EndpointTimeout]. */
+    public fun bound(requested: Duration): Duration = if (requested > MAX) MAX else requested
 }
 
 /**

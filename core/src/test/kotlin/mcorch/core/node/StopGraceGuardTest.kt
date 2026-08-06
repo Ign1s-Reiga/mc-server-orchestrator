@@ -198,9 +198,8 @@ class StopGraceGuardTest {
      * and becomes the save timeout — and from there it rises with it, all the way to
      * the runtime's own refusal 292 years out. `saveTimeout = 30d` beside
      * `stopGracePeriod = 31d` clears `LifecycleSpec.init`, decodes from a nanosecond
-     * column, and is *capped* — to a month. The stop the runtime is given is a month,
-     * and `GrpcCriClient.stopContainer` deadlines its call off that number, so the
-     * worker is parked for one.
+     * column, and is *capped* — to a month. A month is what containerd is asked to
+     * wait, and that is what the assertion at the bottom reads.
      *
      * The trade is still the right way round and the floor stays: a parked worker
      * loses no world, an inverted pair loses one. What was wrong was the sentence.
@@ -209,8 +208,14 @@ class StopGraceGuardTest {
      * one, went unnamed. So it is pinned here, in both halves: the boundary where the
      * floor takes over, and what actually reaches the runtime past it.
      *
-     * What bounds the wait, therefore, is whatever bounds `drain.saveTimeout`, and
-     * that is the decode's job rather than this ceiling's.
+     * **The worker is not parked for a month, and that is `:cri`'s doing rather than
+     * this ceiling's.** `GrpcCriClient` deadlines the call at
+     * `min(gracePeriod, CriTimeouts.stopDeadlineCap) + deadlineSlack` — two hours by
+     * default — while sending the whole grace period, so the value asserted below is
+     * unchanged and the wait is bounded somewhere else. This test says nothing about
+     * that deadline on purpose: it is measured in `:cri`, against a real containerd,
+     * and asserting it here from a fake would be this module claiming a property it
+     * cannot observe.
      */
     @Test
     fun `above a two-hour save timeout the ceiling is the save timeout, and a month-long stop goes out`(
@@ -230,7 +235,8 @@ class StopGraceGuardTest {
         StopGraceCeiling.bound(31.days, 30.days) shouldBe 30.days + margin
 
         // …and it is not arithmetic in a vacuum. This is what containerd is asked to
-        // wait, and what the call is deadlined off.
+        // wait, and what `awaitStopped` measures the container against. What the call
+        // is *deadlined* at is a separate number and a separate module's.
         val client = RefusingCriClient()
         node(client, root).stopWorkload(handle(), StopGrace.of(31.days, 30.days))
 
@@ -314,15 +320,22 @@ class StopGraceGuardTest {
      * Also rewritten by the twenty-ninth audit's third finding — see the note on
      * `a grace period containerd would invert is capped, not sent`.
      *
-     * The largest value the *runtime* honours is 292 years, and the reason it may
-     * not be sent has nothing to do with containerd: `GrpcCriClient.stopContainer`
-     * derives its gRPC deadline as `gracePeriod + slack`, so a stop with that grace
-     * period is a reconcile worker parked at a container that will not exit, with no
-     * effective timeout — the one property CLAUDE.md requires of every call crossing
-     * the `:cri` boundary. The bound that bites here is the node's own.
+     * The largest value the *runtime* honours is 292 years, and the reason it may not
+     * be sent is not containerd's. It is that no reader in this system accepts more
+     * than two hours, so a grace period above that came from a row nobody validated,
+     * and what the container is given is not a number anybody chose.
+     *
+     * **The justification used to be the call's deadline** — `gracePeriod + slack`,
+     * so a 292-year grace was a worker parked with no effective timeout. That is no
+     * longer this bound's to claim: `GrpcCriClient` deadlines a stop at
+     * `min(gracePeriod, CriTimeouts.stopDeadlineCap) + deadlineSlack`, so the wait is
+     * bounded whatever is sent. What is *still* this bound's is what the runtime is
+     * asked to wait, and the drain reads that number back — `awaitStopped` measures a
+     * container against the period the runtime was given, so a grace period nobody
+     * chose is a container that is never overdue.
      */
     @Test
-    fun `the largest grace period the runtime honours is still capped, because the call is deadlined off it`(
+    fun `the largest grace period the runtime honours is still capped to the widest a reader accepts`(
         @TempDir root: Path,
     ) = coreTest {
         val client = RefusingCriClient()

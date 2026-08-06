@@ -1,5 +1,6 @@
 package mcorch.core
 
+import mcorch.schema.BackendDrainSpec
 import mcorch.schema.BackendSelector
 import mcorch.schema.BackendsSpec
 import mcorch.schema.ControlEndpointSpec
@@ -25,6 +26,7 @@ import mcorch.schema.VelocityProxyStatus
 import mcorch.schema.VolumeSpec
 import mcorch.store.StoredDefinition
 import mcorch.store.getOrThrow
+import kotlin.time.Duration
 
 /** The label a fixture proxy's selector matches. Nothing else in the fleet carries it. */
 internal const val BACKEND_LABEL: String = "mcorch.example/pool"
@@ -54,6 +56,16 @@ internal fun proxyDefinition(
      */
     tokenSecret: SecretRef? = null,
     maxPlayers: Int = 200,
+    /**
+     * How long the proxy gets to answer each control call, and the one field a test
+     * can put a value in that no reader would have produced.
+     *
+     * `VelocityProxyReader` accepts `1s..1h`; `BackendDrainSpec` has no `init`, so a
+     * store row, a migration or a fixture carries anything. Both ends of that gap are
+     * exercised — `EndpointTimeoutCeiling` above, and `ControlChannel.unbuildable`
+     * below, where zero is a request no call can be made from.
+     */
+    sealTimeout: Duration = VelocityProxyDefaults.SEAL_TIMEOUT,
 ): VelocityProxyDefinition =
     VelocityProxyDefinition(
         apiVersion = SchemaVersion.CURRENT,
@@ -71,6 +83,7 @@ internal fun proxyDefinition(
                     BackendsSpec(
                         selector = BackendSelector(selector),
                         fallback = fallback,
+                        drain = BackendDrainSpec(sealTimeout = sealTimeout),
                     ),
                 control = ControlEndpointSpec(port = controlPort, tokenSecret = tokenSecret),
                 maxPlayers = maxPlayers,
