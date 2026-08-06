@@ -512,8 +512,15 @@ public enum class ConditionType {
      * This is the answer to the only question an operator asks about a drain that
      * is not moving: *is it stuck, or is it just waiting for people to log off?*
      * Today it means the latter — see [DrainBlockReason.AWAITING_ZERO_PLAYERS] —
-     * and the honest report is that the container keeps running, the server stays
-     * joinable, and the drain resumes on its own.
+     * and the honest report is that the container keeps running and the drain
+     * resumes on its own.
+     *
+     * **It does not mean the workload is joinable**, and this sentence used to say
+     * it was. A workload that seals its own login path shuts that path *before* the
+     * gate it is blocked on, so a blocked drain is often a blackout that resolves
+     * precisely because nobody new can get in. Whether players can join is a
+     * separate fact, and [DrainStatus.blocked]'s own message is where the
+     * reconciler states it.
      *
      * Deliberately a separate signal from [NEEDS_ATTENTION] rather than a shade
      * of it: this one says **do not act** *about the drain*, that one says

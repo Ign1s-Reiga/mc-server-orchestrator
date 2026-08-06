@@ -2249,6 +2249,16 @@ internal class ProxyDrainTest {
      * seal is the mechanism of that wait. Releasing it there would refill the
      * population the drain is waiting to drain, and a delete on a busy fleet could
      * never complete — which is the state that ends in a manual `crictl stop`.
+     *
+     * ## …and what the operator is told about it
+     *
+     * The twenty-ninth audit's second finding, asserted here beside the wire flag
+     * because the pair is the assertion: the record alone passes against a build
+     * that says the right thing without shutting anything, and the flag alone says
+     * nothing about what a person reads. A block renders as `DRAIN_BLOCKED` —
+     * *waiting, needs nobody* — so its message is the only sentence there is about a
+     * fleet nobody can log in to, and it used to say *"the server keeps running and
+     * stays joinable"*.
      */
     @Test
     fun `a proxy drain waiting for players to leave keeps its login seal on`() =
@@ -2277,6 +2287,15 @@ internal class ProxyDrainTest {
             // …and the login path stays shut, which is what lets the wait end.
             harness.plugin.proxyAdmits.shouldBeFalse()
             harness.proxyNode.stops.shouldBeEmpty()
+
+            // The message an operator reads about that shut door, asserted with the
+            // door itself. The premise is that this drain really did shut it — the
+            // stamp is what `loginPathAfterAPark` branches on, and without it the
+            // sentence would be right by accident.
+            waiting.sealRequestedAt.shouldNotBeNull()
+            val message = waiting.blocked.shouldNotBeNull().message
+            message shouldContain "nobody can join it"
+            message shouldNotContain "stays joinable"
         }
 
     /**

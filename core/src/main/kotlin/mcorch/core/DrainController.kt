@@ -1122,8 +1122,19 @@ internal class DrainController(
     }
 
     /**
-     * What a park leaves the workload's login path in — the half of a step-2 failure
-     * an operator acts on.
+     * What a park leaves the workload's login path in — the half an operator acts on.
+     *
+     * **Asked by both kinds of park**, and that is the twenty-ninth audit's second
+     * finding. It was written for [abortSeal] and the three block messages each
+     * stated joinability for themselves; [requireEmpty]'s said *"the server keeps
+     * running and stays joinable"*, which since the twenty-seventh audit is exactly
+     * false for a workload that seals itself — the gated [resume] asserts
+     * [holdSeal] **before** the gate, so the pass that records the block is often
+     * the pass that shut the front door, and a blocked drain renders as
+     * `DRAIN_BLOCKED`: *waiting, needs nobody*, about a fleet nobody can log in to.
+     * The sentence is composed in [blocked] so all three block sites get it,
+     * for the reason `SealHold.recordedOn` exists: a fact stated at one of the
+     * places that produce it goes stale at the others.
      *
      * Three states, and the record distinguishes them:
      *
@@ -1169,8 +1180,10 @@ internal class DrainController(
      *
      * ## The residual, and the premise that keeps it unreachable
      *
-     * This is composed before [abort] runs, and [abort] may release the seal — so on
-     * a *permanent* park whose release lands, this sentence over-states the blackout.
+     * On the [abortSeal] path this is composed before [abort] runs, and [abort] may
+     * release the seal — so on a *permanent* park whose release lands, this sentence
+     * over-states the blackout. ([blocked] releases nothing, so its caller has no
+     * such window: what this says is what that pass leaves behind.)
      * It cannot happen through the seal this controller has: `ProxyLink` makes every
      * `SealOutcome.Refused` retryable, so a permanent step-2 abort means a
      * `SealOutcome.Unavailable` the channel raised (an unreadable body, an unknown
@@ -2117,11 +2130,16 @@ internal class DrainController(
                     occupancy = reading.occupancy,
                     now = pass.now,
                     reason = DrainBlockReason.AWAITING_ZERO_PLAYERS,
+                    // What the login path is left in is deliberately **not** stated
+                    // here: [blocked] composes it from [loginPathAfterAPark], the
+                    // one function that knows the three answers. This branch used
+                    // to claim "the server keeps running and stays joinable", which
+                    // is false of a workload that seals itself and has a seal in
+                    // place — the state the gated [resume] produces.
                     message =
                         "waiting for the server to empty. ${reading.online} of ${reading.max} player slots " +
                             "are in use and $why, so the protocol waits rather than disconnecting anybody. The " +
-                            "server keeps running and stays joinable; the drain resumes on its own once it " +
-                            "is empty" +
+                            "drain resumes on its own once it is empty" +
                             if (resaves) ", and saves the world again before it stops" else "",
                 )
             }
@@ -2830,7 +2848,20 @@ internal class DrainController(
                     "drain hits it again as soon as the server empties, so waiting alone does not finish this: " +
                     "${it.message}"
             }
-        val block = recordBlock(reason, message + wedge.orEmpty(), now, drain.blocked)
+        // The same sentence an abort composes, from the same function, because a
+        // block is a park too — see the note above. The three call sites used to
+        // state joinability for themselves, and the one in [requireEmpty] said *"the
+        // server keeps running and stays joinable"*, which is exactly false of a
+        // workload that seals itself: since the twenty-seventh audit the gated
+        // [resume] asserts [holdSeal] before the gate, so the pass that records this
+        // block is often the pass that shut the front door.
+        val block =
+            recordBlock(
+                reason,
+                "$message. ${loginPathAfterAPark(subject, drain)}${wedge.orEmpty()}",
+                now,
+                drain.blocked,
+            )
         if (standing == null) {
             // Info, not warn. Nothing is wrong, and a warning every backoff interval
             // for a whole play session is the log-level version of the alert this
@@ -3013,9 +3044,17 @@ internal class DrainController(
      * The answer is to make the *class* depend on whether the compensation landed:
      * [abort] records `RETRYABLE` when this returns true, because a permanence whose
      * own compensation is unrecoverable is not a permanence anyone can act on. The
-     * loop then keeps coming back, and the pass that finally reaches the endpoint
-     * either releases the seal — and the abort settles as `PERMANENT`, freezing the
-     * server with its door open, which is the intended end state — or parks again.
+     * loop then keeps coming back, and the next pass that reaches [abort] with the
+     * endpoint answering releases the seal — the abort then settles as `PERMANENT`,
+     * freezing the server with its door open, which is the intended end state.
+     *
+     * **The pass after a stuck release is not usually that pass**, and the sentence
+     * an operator reads had to be corrected for it (see [SEAL_STUCK_SHUT]). This has
+     * one caller, so the retry rides on a park; the pass in between runs [resume] and
+     * parks in [blocked] whenever anybody is still connected, and [blocked] releases
+     * nothing — deliberately, for the reason two sections down. It converges anyway,
+     * because a shut door is what makes the population fall, but "the next pass
+     * reopens it" would be a promise the machine does not keep.
      *
      * @return whether the login path is **left shut** by this drain: true only when a
      *   release was needed and did not land. A subject with nothing to release, or
@@ -3141,8 +3180,11 @@ internal class DrainController(
         // definition edit, whose generation bump resumes straight into [holdSeal] and
         // shuts the door again. Retryable is the honest class: the fault is real, the
         // count and the anchor carry on rising, and the compensation is attempted
-        // again on the pass after this one. It settles as `PERMANENT` on the pass
-        // where the release finally lands, which is the state this edge is for.
+        // again on the next pass that parks *here* — not simply on the pass after
+        // this one, which runs [resume] and, with anybody connected, [blocked], and
+        // [blocked] releases nothing. It settles as `PERMANENT` on the pass where the
+        // release finally lands, which is the state this edge is for. See
+        // [SEAL_STUCK_SHUT], which is the sentence an operator reads.
         val recorded = if (heldShut) FailureClass.RETRYABLE else failureClass
         val failure =
             noteFailure(
@@ -3374,11 +3416,25 @@ internal class DrainController(
          * this drain declared permanent is recorded as retryable, and somebody
          * reading "the loop keeps trying" needs to know it is trying the release as
          * well as the step that failed. See [releaseSeal].
+         *
+         * **It used to say the loop "releases the seal on the first pass that reaches
+         * the endpoint", and that is not the machine** — the twenty-ninth audit's
+         * second finding. [releaseSeal] has one caller, [abort], so the release is
+         * attempted on the next pass that *parks again*; the pass after this one runs
+         * [resume], which asserts [holdSeal] and then [requireEmpty], and with anybody
+         * connected it lands in [blocked], which releases nothing. The state does
+         * converge — nobody new can join, so the population falls and a pass reaches
+         * the step that aborts again — but a sentence promising the next pass will
+         * reopen the door is read as *wait, it is about to fix itself*, which is how
+         * a blackout lasts an evening. What it says now is what happens, and the
+         * waiting passes report themselves through [loginPathAfterAPark].
          */
         private const val SEAL_STUCK_SHUT =
             "The login seal this drain put on could not be released either, so the server is running and " +
                 "nobody can join it. That is recorded as retryable rather than permanent on purpose: the " +
-                "loop keeps coming back and releases the seal on the first pass that reaches the endpoint"
+                "loop keeps coming back, and it tries the release again on the next pass that parks here. " +
+                "A pass that finds players still connected waits for them instead and says so; nobody new " +
+                "can join while the seal is on, so that wait is what ends"
 
         /**
          * Added to `spec.lifecycle.drain.playerTransferTimeout` per player.

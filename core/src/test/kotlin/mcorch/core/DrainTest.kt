@@ -111,6 +111,13 @@ internal class DrainTest {
             blocked.observations shouldBe 1
             blocked.message shouldContain "3 of 20 player slots"
             blocked.message shouldContain "keeps running"
+            // What the login path is left in, from the one function that knows —
+            // and this is its *third* branch, the standalone server with nothing
+            // that could stop a join. The proxy branch is asserted in
+            // `a proxy drain waiting for players to leave keeps its login seal on`,
+            // and the pair is what makes the sentence a derivation rather than a
+            // constant that happens to be right here.
+            blocked.message shouldContain "keeps taking players"
 
             // The condition a dashboard reads, and its opposite number.
             status.conditions.single { it.type == ConditionType.DRAIN_BLOCKED }.status shouldBe ConditionStatus.TRUE
