@@ -1,6 +1,6 @@
 ---
 name: deadline-ceilings
-description: Round 30 — why a ceiling on one half of a validated pair inverts it, why the bound moved onto the argument's type at the Node seam, the sibling ceiling on the exec that was left unwritten for a round, and the block message whose reassurance came first
+description: Rounds 30–31 on the three durations that become transport deadlines — why a ceiling on one half of a validated pair inverts it, why the bound moved onto the argument's type at the Node seam, why the floor then makes that ceiling bound the relation rather than the wait, and the third duration that is definition-fed and still unbounded
 metadata:
   type: project
 ---
@@ -109,16 +109,65 @@ still; only the order moves. Two follow-ons:
   `:api`'s lower-case lead-in, so second in a sentence it reads as a typo — and a
   status line that looks broken is one an operator trusts less.
 
+## Round 31: a ceiling with a floor bounds the relation, not the wait
+
+The floor above is correct and stays. What was wrong was the sentence describing
+it, and the gap is not small: `ceilingFor` is `max(MAX, saveTimeout + margin)`, so
+**the moment the save timeout passes `MAX - margin` the effective ceiling is the
+save timeout**, and it rises with it up to the runtime's own refusal.
+`saveTimeout = 30d` beside `stopGracePeriod = 31d` clears `LifecycleSpec.init`,
+decodes, and is *capped* — to a month. The residual the KDoc had named was the
+refusal at 292 years, which needs both halves absurd; the reachable one, over
+essentially the whole range the cap fires in, was unnamed.
+
+**The general form, worth carrying past this field:** a bound written
+`max(K, f(other))` promises `K` only where `f(other) <= K`, and past that it
+promises whatever bounds `other`. So it bounds the *relation* between the two
+values and not the magnitude of either, and the sentence has to be written over
+the range where the second term wins. Here that means the thing which actually
+bounds the stop's deadline is whatever bounds `drain.saveTimeout` — and nothing in
+`:core` does; `ExecTimeoutCeiling` bounds a *copy* of that field on its way to an
+exec. The row-level half belongs at the decode and `store-dev` closed it in the
+same round.
+
+The trade is still the right way round and was not touched: a parked worker loses
+no world, an inverted pair loses one.
+
+## A licence to shorten is derived per construction site
+
+`ExecTimeout`'s KDoc justified capping with *"cutting an exec short can do no more
+than withhold a confirmation"*. True of the save exec. **False of the probe**:
+`DrainController.save` re-probes after the flush and stamps `worldSavedAt` on an
+`Unanswered` reading exactly as on an `Empty` one, so a probe that merely timed out
+*mints* the confirmation the stop is gated on, and `awaitStopped` lets an
+unanswered probe fall through without holding the re-issue. Unreachable today —
+both probe timeouts are private 10s constants against a one-hour ceiling — and
+reachable the day one comes off a definition the way `saveTimeout` does.
+
+**Before writing "shortening this is safe", ask what reads the *absence* of an
+answer.** A wait whose silence is read as consent is not a wait that can be cut
+short, whatever the value authorises on its face.
+
 ## What is still open
 
 - Integration suites did **not** run again: `containerd-up.sh` needs an
-  interactive `sudo`. Three rounds now. `LocalNode.stopWorkload`'s capped value
-  and the exec's bounded deadline have unit coverage only.
-- `EndpointRequest.timeout` is the third duration that becomes a transport
-  deadline. Every construction site is a compile-time constant today, so nothing
-  unvalidated reaches it — but that is a survey of call sites, which is the
-  argument this project keeps being caught by. If a definition field ever feeds
-  it, it needs the same treatment.
+  interactive `sudo`. Four rounds now.
+- **`EndpointRequest.timeout` is definition-fed, and round 30's note here was
+  wrong to say otherwise.** I wrote *"every construction site is a compile-time
+  constant today"* — a survey, and a false one: `ControlChannel`'s single
+  construction site is handed `spec.backends.drain.sealTimeout` from a
+  `VelocityProxy`, at both of `ControlChannel`'s own construction sites
+  (`Reconciler.channel`, `ProxyFleet`). So the third transport deadline is
+  unbounded above, and below it is the same unclassified `IllegalArgumentException`
+  as `ExecRequest`'s. Written into the type's KDoc rather than fixed, deliberately:
+  the fix is a bound at the decode plus a classification at the construction site,
+  and the second lands in the drain's control path.
+- **Zero and negative still escape unclassified.** `ExecTimeout.of` caps above and
+  cannot floor — raising a zero into a real wait is the "make an uninterpretable
+  value plausible" move the ceiling refuses — so `ExecRequest.init` throws an IAE
+  built outside `requestSave`'s try, past `Reconciler`'s two typed catches, into
+  `ReconcileLoop.work`'s `catch (Throwable)`: a `Retry` with **no status write**.
+  No failure recorded, no `NEEDS_ATTENTION`, one error line per pass.
 
 See [[invariants-need-an-enforcement-point]] for the rule this is an instance of,
 and [[gate-and-ceiling]] for the cap-versus-refuse ruling it revises.
