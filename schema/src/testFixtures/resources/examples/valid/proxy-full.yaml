@@ -1,4 +1,17 @@
-# Every field a VelocityProxy accepts in mcorch.dev/v1alpha1, set explicitly.
+# Every field a VelocityProxy accepts in mcorch.dev/v1alpha1, set explicitly —
+# and every value deliberately different from that field's default.
+#
+# Both halves are load-bearing, and the second is easy to break by accident.
+# Three tests read this file to prove a field survives a round trip:
+# SpecBoundsTest's clamp-carries-every-field case, :store's `a stored proxy
+# definition comes back exactly as it went in`, and a MigrationTest case. A
+# field left at its default still matches after a rebuild that dropped it, so
+# setting one here to its default fails nothing — it quietly stops testing that
+# field in all three places.
+#
+# Only SpecBoundsTest asserts the promise out loud; the other two just go
+# silent. Add a field to the record, add it here, and give it a value nothing
+# else would produce.
 apiVersion: mcorch.dev/v1alpha1
 kind: VelocityProxy
 metadata:
