@@ -1418,3 +1418,61 @@ Related: [[standalone-paper-drain-shape]]
      (over-stating availability), and the flap the KDoc worries about is genuinely
      absent because the second refusal finds `deregisteredAt` already cleared. Check
      the re-entry set of any step a new guard is placed at the entry of.
+
+## Round 28: the new assertion site that records nothing, and the compensation that fails inside its own gate
+
+121. **A second site that asserts a level-triggered seal, without writing down that
+     it did, silently falsifies every reader of the record.** Round 28 put
+     `holdSeal` ahead of `requireEmpty` on the gated resume
+     (`DrainController.resume`), which is right — it is the only place a routerless
+     subject can re-seal while somebody is on. But only `DRAIN_REQUESTED` stamps
+     `sealRequestedAt` (`.copy(sealRequestedAt = if (sealed) … else null)`), and the
+     new site stamps nothing. `loginPathAfterAPark` keys its three messages on that
+     field, so the sequence *first seal fails with players on → park → resume seals
+     successfully → block → endpoint drops again → abort* prints **"The server keeps
+     running and keeps taking players"** about a fleet whose front door this
+     controller shut one pass earlier. Danger pattern 119 re-created by the fix for
+     119, through a call site rather than through a stale sentence. Whenever a
+     level-triggered assertion gains a second call site, find every field that
+     records the assertion and every reader keyed on it: the *state* is now asserted
+     from two places and the *record* from one.
+122. **A best-effort compensation guarded by "no pass will look at this again" is
+     unrecoverable in exactly the case where it fails.** `abort` runs
+     `releaseSeal(subject)` under `PERMANENT && permanentFailureStopsPasses`, and
+     `releaseSeal` discards its outcome — a refused or unanswered `PUT /v1/proxy`
+     is a log line. The abort is recorded permanent anyway, so
+     `isBlockedByPermanentFailure` freezes the proxy and no later pass retries the
+     release. One transient timeout on that single call therefore leaves the fleet's
+     login path shut with the loop no longer looking at it, and a definition edit
+     does not repair it — the generation bump resumes the passes straight into
+     `resume`'s `holdSeal`, which shuts the door again. The contrast that proves the
+     shape: `restoreRegistration` is best-effort too and is *safe*, because the
+     proxy's `assertBackends` sweep re-registers a parked backend on every pass.
+     Rule: where the compensation has no third-party repairer, the class must depend
+     on whether the compensation landed — a failed release should demote the abort to
+     `RETRYABLE`, or the release must be retried from a state the loop still visits.
+123. **`blocked`'s unconditional `failure = null` erases a *permanent* diagnosis and
+     the escalation anchor with it, and the "the door is now shut" defence does not
+     cover the subjects that reach it.** The argument for tolerating it — a wait
+     whose seal is held is a real wait — is about the proxy. A standalone Paper
+     server has `seal == null`, so `holdSeal` returns `NothingToSeal` and the
+     population is free to refill. Under a delete (`permanentFailureStopsPasses` is
+     false, so the passes carry on) the sequence is: save requested, never confirmed
+     → `PERMANENT` `DRAIN_SAVE_TIMEOUT` → somebody logs on → `blocked` clears the
+     failure and `requireEmpty`'s message says *"the drain resumes on its own once it
+     is empty"*, which is false: `save`'s `saveRequestedAt != null` branch aborts
+     permanently again. The wedge itself survives (nothing stops), so this is a
+     reporting defect — but it is the report that decides whether an operator reaches
+     for `crictl stop`, and every flap of the population also resets
+     `FailureStatus.occurredAt`, so a retryable fault on a busy server never reaches
+     `drainAttentionAfter`. Narrow the clear to `RETRYABLE`, or carry the wedge into
+     the block message.
+124. **A remedy sentence keyed on the subject's shape names an action the *cause*
+     may not permit.** `loginPathAfterAPark`'s sealed branch offers "until whatever
+     asked for this drain is withdrawn". A `REPLACEMENT` can be withdrawn — revert
+     the edit, `proxyDrainCause` returns null, `assertBackends` re-admits. A
+     `DELETION` cannot: `deletedAt` is one-way and there is no un-delete route in
+     `:api`. So the one operator-facing sentence about a fleet-wide blackout names a
+     remedy that does not exist in the case where the blackout lasts longest. When a
+     message is keyed on `router`/`seal` state, check it against each `DrainCause`
+     as well.

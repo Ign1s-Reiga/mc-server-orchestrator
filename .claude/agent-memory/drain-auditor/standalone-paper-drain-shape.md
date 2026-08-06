@@ -659,3 +659,22 @@ of round 26's fix rather than on the fix itself. `stop`, `awaitStopped`, `maySto
   critical if it releases the seal and is a permanent fleet blackout if it does not;
   a declared maintenance window that ends in a stop is `failure-modes.md` item 7.
   What is missing is reporting, not a lever.
+
+## Round 28: the gated resume's new seal assertion does not reach this shape
+
+`DrainController.resume` now runs `holdSeal` before `requireEmpty` whenever
+`gated` — and `gated` is `subject.router == null`, which is true of a standalone
+`PaperServer` as well as of a proxy. It is a no-op here: `PaperDrainSubject` takes
+one `ProxyFleet.linkFor` result as both `seal` and `router`, so a standalone
+server has `seal == null` and `holdSeal` returns `NothingToSeal` on the first
+line. Consequences worth keeping:
+
+- Every behavioural change of round 28 — the extra control call per parked pass,
+  `blocked` becoming a `RETRYABLE` `PROXY_CONTROL_UNREACHABLE`, `NEEDS_ATTENTION`
+  after `drainAttentionAfter` — is **proxy-only**, one object per fleet. That
+  bounds the alarm-fatigue exposure and is the answer to give when the change is
+  argued against round 8.
+- The same fact removes the defence for `blocked`'s `failure = null` on this
+  shape. "The door is shut, so the wait is real" is a sentence about a subject
+  that has a door. This one does not; see danger pattern 123 for the delete +
+  unconfirmed-save sequence it produces.
