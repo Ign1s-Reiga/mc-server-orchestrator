@@ -1476,3 +1476,56 @@ Related: [[standalone-paper-drain-shape]]
      remedy that does not exist in the case where the blackout lasts longest. When a
      message is keyed on `router`/`seal` state, check it against each `DrainCause`
      as well.
+
+## Round 29: the record that re-arms the gate
+
+125. **Making a park's record *more honest* can re-arm `isBlockedByPermanentFailure`,
+     and the fix's own reachability argument is narrower than the fix.** Round 28
+     asked `blocked` to stop erasing a **permanent** failure. It now writes
+     `copy(blocked = block, failure = standing)`, `Reconciler.drain` copies
+     `progress.drain.failure` into `status.failure`, and the gate is
+     `observedGeneration == generation && PERMANENT && (drain == null || DRAIN_FAILED)
+     && permanentFailureStopsPasses` — a block parks in `DRAIN_FAILED`, so the pass
+     that records the block arms the gate for the next one. The KDoc argues
+     reachability only for a **delete** (where `permanentFailureStopsPasses` is false
+     and nothing freezes), but the *other* way a pass runs with a permanent failure
+     standing is a **generation bump**: the operator's edit buys exactly one pass, and
+     if anybody is online that pass spends it on a block instead of on the step the
+     edit was meant to repair — then re-freezes with the edit consumed. For a
+     self-sealing proxy the gated resume shuts the login path *before* `requireEmpty`
+     (round 28's own fix), and `releaseSeal` lives in `abort`, which a block never
+     reaches, so the frozen state is a fleet-wide blackout that no pass can lift and
+     that every further edit re-creates. The generalisation: `blocked`'s KDoc
+     enumerated `StatusDrafting` and `:api` as the consumers that "already rank the
+     two" and missed the one consumer that reads the class to **stop reconciling** —
+     danger pattern 67, from the other end. Whenever a record is widened, grep the
+     gate, not just the renderers. Smallest correct narrowing: retain the permanent
+     failure only where the fix's own argument holds (`!permanentFailureStopsPasses`),
+     or carry the wedge in the block's message and not in `drain.failure`.
+126. **A compensation that only runs from one branch is not "retried next pass" if
+     another branch is reachable first.** `abort`'s `heldShut` downgrade
+     (`PERMANENT` recorded `RETRYABLE` when `releaseSeal` did not land) is sound —
+     it is confined to self-sealing subjects, because `releaseSeal` returns false for
+     `router != null` and `Reconciler.drain` passes one `link` as both `seal` and
+     `router`, so no world-holding Paper subject can be reclassified — but its
+     message and KDoc promise "the loop keeps coming back and releases the seal on the
+     first pass that reaches the endpoint". The release is reachable **only** through
+     `abort`; the pass after a park runs `resume` → `holdSeal` → `requireEmpty`, and
+     with anybody online that lands in `blocked`, which skips the release *and* clears
+     the retryable record that named the stuck door. Before believing "the
+     compensation is attempted again next pass", walk the next pass to the line that
+     calls it.
+127. **A bound stated once is not the bound the system runs on, and the new one is
+     also a transport deadline.** `StopGracePeriod.MAX_SECONDS` (9_223_372_036) is
+     containerd's arithmetic boundary, not a policy — and
+     `GrpcCriClient.stopContainer` derives the gRPC deadline as
+     `gracePeriod.duration + deadlineSlack`, so a legal-but-absurd grace period parks a
+     reconcile worker for centuries with no timeout, which is the one thing CLAUDE.md
+     says every `:cri` call must have. The only operational ceiling is the YAML
+     readers (`MAX_STOP_GRACE_PERIOD` 2h, `VelocityProxyDefaults.MAX_TIMEOUT`), and
+     unlike the *minimum* — stated in `SpecInvariants` and enforced twice, at parse and
+     in `LifecycleSpec.init` — the maximum is enforced **once**, so a store row that
+     did not come through a reader carries anything. Do not close it with a new
+     `init` `require`: `Reconciler.rejectDefinition` records `PERMANENT` and does not
+     exempt `terminating` (danger pattern 104), so that trade makes a populated server
+     undeletable. Close it at the decode (tolerant, one server) or at the node.
