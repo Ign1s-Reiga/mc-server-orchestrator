@@ -1116,7 +1116,7 @@ internal class DrainController(
                 failureClass = if (retryable) FailureClass.RETRYABLE else FailureClass.PERMANENT,
                 message =
                     "new joins could not be stopped at the proxy, so the drain is not going further: $detail. " +
-                        loginPathAfterAPark(pass.subject, drain),
+                        loginPathAfterAPark(pass.subject, drain).sentence,
             ),
         )
     }
@@ -1135,6 +1135,20 @@ internal class DrainController(
      * The sentence is composed in [blocked] so all three block sites get it,
      * for the reason `SealHold.recordedOn` exists: a fact stated at one of the
      * places that produce it goes stale at the others.
+     *
+     * ## It is a value rather than a string, and the thirtieth audit's fourth finding
+     *
+     * `:api` renders a blocked drain as `"waiting, not stuck — <block message>"`, and
+     * a block message leads with the wait. That put the reassurance first and the
+     * blackout about 250 characters in — so a fleet table that truncates shows only
+     * the half agreeing with `DRAIN_BLOCKED`'s *needs nobody*, and an evening of
+     * refused logins reads as a healthy wait. The fix belongs here rather than in
+     * `:api`, which cannot see [DrainSubject.router] and would have to key on
+     * `sealRequestedAt` alone — over-stating a blackout on every backend mid-drain.
+     *
+     * So this answers with **which of the three states** it found, and [blocked] puts
+     * [LoginPath.ShutByThisDrain] ahead of the wait sentence. One derivation still;
+     * only the order moves, and only for the one case where something is shut.
      *
      * Three states, and the record distinguishes them:
      *
@@ -1196,22 +1210,11 @@ internal class DrainController(
     private fun loginPathAfterAPark(
         subject: DrainSubject,
         drain: DrainStatus,
-    ): String =
+    ): LoginPath =
         when {
-            subject.router != null -> {
-                "The server keeps running, and the proxy admits players to it again while the drain is parked"
-            }
-
-            drain.sealRequestedAt != null -> {
-                "It keeps running with the login seal this drain put on still in place, so nobody can join it " +
-                    "until the endpoint answers again and this drain gets past step 2. Reverting a definition " +
-                    "edit that asked for this drain lifts it too, by putting the server back on a converging " +
-                    "pass that re-admits players; a delete cannot be withdrawn and clears only by finishing"
-            }
-
-            else -> {
-                "The server keeps running and keeps taking players"
-            }
+            subject.router != null -> LoginPath.Restored
+            drain.sealRequestedAt != null -> LoginPath.ShutByThisDrain
+            else -> LoginPath.Open
         }
 
     /**
@@ -2855,13 +2858,27 @@ internal class DrainController(
         // workload that seals itself: since the twenty-seventh audit the gated
         // [resume] asserts [holdSeal] before the gate, so the pass that records this
         // block is often the pass that shut the front door.
-        val block =
-            recordBlock(
-                reason,
-                "$message. ${loginPathAfterAPark(subject, drain)}${wedge.orEmpty()}",
-                now,
-                drain.blocked,
-            )
+        //
+        // **A blackout leads.** `:api` renders this as "waiting, not stuck — " plus
+        // this string, and [message] opens with the wait and the reason for it —
+        // roughly 250 characters before the login path was reached. A truncated
+        // fleet table therefore showed only the half that agrees with
+        // `DRAIN_BLOCKED`'s *needs nobody*, about a fleet nobody can log in to. The
+        // other two answers stay where they were: neither describes anything an
+        // operator has to act on, and leading with "the server keeps taking players"
+        // would bury the wait instead.
+        val path = loginPathAfterAPark(subject, drain)
+        val body =
+            when (path) {
+                // Sentence-cased on the way, because every [message] here is
+                // written to follow `:api`'s "waiting, not stuck — " and so opens
+                // lower case. Second in a sentence it reads as a typo, and a status
+                // line that looks broken is one an operator trusts less.
+                LoginPath.ShutByThisDrain -> "${path.sentence}. ${message.replaceFirstChar { it.uppercase() }}"
+
+                LoginPath.Restored, LoginPath.Open -> "$message. ${path.sentence}"
+            }
+        val block = recordBlock(reason, "$body${wedge.orEmpty()}", now, drain.blocked)
         if (standing == null) {
             // Info, not warn. Nothing is wrong, and a warning every backoff interval
             // for a whole play session is the log-level version of the alert this
@@ -3670,6 +3687,50 @@ internal fun DrainStatus.escalated(
  */
 internal fun DrainStatus?.parkedOnTheFailure(): Boolean =
     this == null || (state == DrainState.DRAIN_FAILED && blocked == null)
+
+/**
+ * What a park leaves a workload's login path in, as a value the composing site can
+ * order rather than a sentence it can only append.
+ *
+ * See `DrainController.loginPathAfterAPark`, which is the single derivation, for
+ * which record distinguishes the three and why. The reason this is a type at all is
+ * the thirtieth audit's fourth finding: `:api` renders a block as *"waiting, not
+ * stuck — <message>"*, so whichever half of the message comes first is the half a
+ * truncated fleet table shows, and a blackout that arrives in the tail reads as a
+ * healthy wait. `:api` cannot make that decision — it cannot see whether the
+ * workload has a router — so the ordering is made here, where the three cases are
+ * already told apart.
+ *
+ * Each [sentence] has to read correctly **both** as a lead and as a continuation,
+ * because a park under a failed step 2 appends it and a block leads with it.
+ */
+internal sealed interface LoginPath {
+    /** Operator-facing, self-contained, and never an address or a player name. */
+    val sentence: String
+
+    /** A backend: the proxy's own pass hands its joins back while this drain is parked. */
+    data object Restored : LoginPath {
+        override val sentence: String =
+            "The server keeps running, and the proxy admits players to it again while the drain is parked"
+    }
+
+    /**
+     * A workload that seals itself, with a seal in place. The blackout, and the only
+     * surface that reports it.
+     */
+    data object ShutByThisDrain : LoginPath {
+        override val sentence: String =
+            "Nobody can log in: the login seal this drain put on is still in place, and it stays until the " +
+                "drain finishes. Reverting a definition edit that asked for this drain lifts it, by putting " +
+                "the workload back on a converging pass that re-admits players; a delete cannot be withdrawn " +
+                "and clears only by finishing"
+    }
+
+    /** A workload that seals itself and never got one, or has nothing that could. */
+    data object Open : LoginPath {
+        override val sentence: String = "The server keeps running and keeps taking players"
+    }
+}
 
 /** Why a drain is happening. It changes nothing about the procedure, only the message. */
 internal enum class DrainCause(

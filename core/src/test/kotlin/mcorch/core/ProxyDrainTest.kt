@@ -14,6 +14,7 @@ import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.string.shouldNotContain
+import io.kotest.matchers.string.shouldStartWith
 import io.kotest.matchers.types.shouldBeInstanceOf
 import mcorch.core.proxy.VelocityWorkloadPlanner
 import mcorch.schema.ConditionStatus
@@ -871,8 +872,8 @@ internal class ProxyDrainTest {
             harness.plugin.proxyAdmits.shouldBeFalse()
             // …so the sentence about it must be the blackout one, not its opposite.
             failure.message shouldNotContain "keeps taking players"
-            failure.message shouldContain "login seal this drain put on still in place"
-            failure.message shouldContain "nobody can join it"
+            failure.message shouldContain "login seal this drain put on is still in place"
+            failure.message shouldContain "Nobody can log in"
             // The remedy offered is one this cause has. A delete has no un-delete.
             failure.message shouldContain "a delete cannot be withdrawn"
 
@@ -2294,8 +2295,24 @@ internal class ProxyDrainTest {
             // sentence would be right by accident.
             waiting.sealRequestedAt.shouldNotBeNull()
             val message = waiting.blocked.shouldNotBeNull().message
-            message shouldContain "nobody can join it"
+            message shouldContain "Nobody can log in"
             message shouldNotContain "stays joinable"
+
+            // **The blackout leads, and that is the thirtieth audit's fourth
+            // finding.** `:api` renders a blocked drain as "waiting, not stuck — "
+            // plus this string; the wait sentence used to come first and the
+            // blackout arrived around 250 characters in, so a truncated fleet table
+            // showed only the half that agrees with `DRAIN_BLOCKED`'s *needs
+            // nobody*. An evening of refused logins read as a healthy wait.
+            //
+            // Asserted as a position rather than as presence: the old message
+            // contained the same sentence and was the defect.
+            message shouldStartWith "Nobody can log in"
+            // …and nothing was dropped to get it there. The wait is still stated,
+            // which is the half that is also true — sentence-cased, because it was
+            // written to follow `:api`'s "waiting, not stuck — " and now follows a
+            // full stop instead.
+            message shouldContain "Waiting for the server to empty"
         }
 
     /**
