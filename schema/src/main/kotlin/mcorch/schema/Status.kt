@@ -477,12 +477,19 @@ public data class DrainStatus(
      * for a request that then failed to leave costs availability; a dispatch with no
      * stamp costs a player's session.
      *
-     * **Set once and never cleared.** There is no un-dispatch, so a later pass can
-     * only learn that another stop is *also* outstanding, never that the first one is
-     * not. It is cleared the way every other field here is: a drain that is no longer
-     * wanted takes its whole record with it (`Reconciler.converge` writes
-     * `drain = null`), and that is what returns the workload to a proxy's routing
-     * sweep.
+     * **Set once, and retired by the workload rather than by the drain.** There is no
+     * un-dispatch, so a later pass can only learn that another stop is *also*
+     * outstanding, never that the first one is not. Every other field here is cleared
+     * by the whole record going when the drain is no longer wanted — and that rule is
+     * wrong for this one, because **"no longer wanted" and "the `SIGTERM` is already
+     * out" are different questions, and only the first is the operator's to answer.**
+     * Reverting the edit that asked for a `REPLACEMENT` withdraws the cause while the
+     * container is still inside its stop grace period, reporting `RUNNING` throughout;
+     * a pass that took this field with the cause would hand the workload straight back
+     * to a proxy's routing sweep, which admits players to a process whose shutdown
+     * save has already run. It is therefore retired where the container is *observed
+     * gone* — `Reconciler.teardown`, through `clearedDrainRecord`, which is what every
+     * site in the loop that would clear a drain record asks first.
      *
      * A row written before this field existed reads null, so a drain caught mid-stop
      * by an upgrade can re-admit once — the same one-cycle cost every anchor here

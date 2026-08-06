@@ -3072,10 +3072,16 @@ internal class DrainController(
      * else re-adds it, because `ProxyFleet`'s sweep skips a backend whose
      * [DrainStatus.deregisteredAt] is set (`Reconciler`'s `letGo`), which is also what
      * makes this compensation the only mechanism. So the cost of the strand is
-     * **availability**, and it is recoverable without an operator: `Reconciler.converge`
-     * writes `drain = null` once the drain is no longer wanted, which clears
-     * `deregisteredAt` and lets the sweep re-register. The cost of the other direction
-     * is a player's session, and no later pass repairs that. That asymmetry decides it.
+     * **availability**, and it lasts exactly as long as the drain does: the park is
+     * retried, the stop is re-issued, the container goes, and `Reconciler.teardown`
+     * retires the whole record. No operator has to do anything for that, and the
+     * thirty-third audit is why it is not described as *"a converging pass writes
+     * `drain = null` once the drain is no longer wanted"* any more — that recovery was
+     * real and it was also this defect: the withdrawal of a cause deleted the record
+     * of a stop that was still in flight, and the sweep it freed re-admitted players
+     * to a container inside its grace period. See [clearedDrainRecord]. The cost of the
+     * other direction is a player's session, and no later pass repairs that. That
+     * asymmetry decides it.
      *
      * The stop stays gated either way, and it is worth being exact about which defect
      * this is: the pass after a restore runs [resume] → [holdSeal] → [requireEmpty],
@@ -3854,6 +3860,118 @@ internal fun DrainStatus?.parkedOnTheFailure(): Boolean =
     this == null || (state == DrainState.DRAIN_FAILED && blocked == null)
 
 /**
+ * Whether a container stop issued by this drain may still be inside the container
+ * the runtime is reporting.
+ *
+ * [DrainStatus.stopDispatchedAt] says a `SIGTERM` left this process; the
+ * observation says the runtime is still reporting the container it was aimed at.
+ * Both halves are needed and neither is the other: a stamp beside an
+ * [WorkloadObservation.Absent] is a record of something that has already finished
+ * happening, and a container with no stamp has been signalled by nobody.
+ *
+ * ## Which observations can be the container that was signalled
+ *
+ * A stop is only ever dispatched against a container this loop has **started** and
+ * just probed — every path into [DrainController.stop] runs through a zero-player
+ * reading taken from a Server List Ping, which a container that was never started
+ * cannot answer. So:
+ *
+ * - `RUNNING` — the ordinary case, and the whole grace period long. This is the one
+ *   the record exists for.
+ * - `EXITED` — the stop landed. Retained so that nothing re-admits players to a dead
+ *   backend in the pass or two before the teardown removes it.
+ * - `UNKNOWN` — the runtime cannot describe it, which is not evidence that the stop
+ *   finished.
+ * - `CREATED` and `SANDBOX_ONLY` — **not**, and this is the clause that keeps the
+ *   record from outliving its container. A container in `CREATED` has never been
+ *   started, so nothing can have been signalled into it; both states are what the
+ *   pass *after* a create sees. Without this a record survived the container it named
+ *   and the next pass drained the replacement that had just been built, for ever.
+ * - [WorkloadObservation.Absent] — gone. This is the evidence the drain's own
+ *   `containerIsDown` reads, and the only thing that retires the record.
+ *
+ * **The direction of the error is chosen.** The stamp is written before the request
+ * is issued, so this reads true for a stop that never reached the runtime; what it
+ * costs is a workload left out of routing until the drain ends, and what the other
+ * direction costs is a player's session. See [mcorch.schema.DrainStatus.stopDispatchedAt].
+ */
+internal fun stopIsInFlight(
+    drain: DrainStatus?,
+    observation: WorkloadObservation,
+): Boolean {
+    if (drain?.stopDispatchedAt == null) return false
+    val present = observation as? WorkloadObservation.Present ?: return false
+    return when (present.state) {
+        WorkloadState.RUNNING, WorkloadState.EXITED, WorkloadState.UNKNOWN -> true
+        WorkloadState.CREATED, WorkloadState.SANDBOX_ONLY -> false
+    }
+}
+
+/**
+ * The cause a drain carries on under once whatever asked for it has been withdrawn.
+ *
+ * ## The critical this exists for
+ *
+ * Reverting the edit that asked for a `REPLACEMENT` is the documented way to
+ * withdraw one, and it is the *only* lever an operator has over a drain that is
+ * waiting. `Reconciler.drainCause` compares a hash and answers null the moment the
+ * edit is reverted — which is right for every pass before step 7 and wrong from the
+ * dispatch onwards. Between the stop leaving this process and the container
+ * actually exiting there is a whole grace period (240s by default, hours if a
+ * definition says so), and for all of it the container reports `RUNNING`. A pass
+ * that converged there wrote `drain = null`, which is what a proxy's routing sweep
+ * reads as *"this backend takes players again"* — routing them onto a process whose
+ * shutdown save has already run against the set it had. Every session played
+ * between the confirmed save and the exit is lost.
+ *
+ * So the withdrawal is honoured one step later than it is asked for: the drain
+ * finishes the container it has already signalled, `Reconciler.teardown` removes it,
+ * and the create on the pass after that applies the reverted definition — which is
+ * what the revert asked for and all it can now mean.
+ *
+ * ## Why `REPLACEMENT` and not the cause the drain started under
+ *
+ * Nothing records that cause, and inventing a field for it would be recording the
+ * wrong fact: what happens next is decided by what is *wanted now*. A `DELETION`
+ * cannot reach here — [Reconciler.drainCause] answers it off the terminating flag,
+ * which is not withdrawable — and a `RELOCATION` is decided by placement before
+ * this is asked. What is left is a container being taken away and replaced by one
+ * built from the definition as it stands, which is a replacement whatever asked for
+ * the original drain, and it is what makes `replacementIsBuildable` pre-flight the
+ * spec that is really about to be created.
+ */
+internal fun outstandingStopCause(
+    drain: DrainStatus?,
+    observation: WorkloadObservation,
+): DrainCause? = if (stopIsInFlight(drain, observation)) DrainCause.REPLACEMENT else null
+
+/**
+ * The drain record a pass that has concluded no drain is wanted may write.
+ *
+ * Null — the record goes with the drain — unless a stop is already in flight, in
+ * which case it survives untouched. **"No longer wanted" and "the `SIGTERM` is
+ * already out" are different questions, and only the first is the operator's to
+ * answer.**
+ *
+ * Every other field on a `DrainStatus` describes the drain itself and dies with it.
+ * [mcorch.schema.DrainStatus.stopDispatchedAt] describes something *outside* the
+ * drain, in a container this loop cannot recall, and it inherited a lifetime built
+ * for facts that expire when the drain stops being wanted.
+ *
+ * Used at every site that retires a drain record, so the rule is one expression
+ * rather than a condition each site has to remember — the enforcement point matters
+ * more than the condition here, because the sites that clear are ordinary
+ * converging code that has no reason to be thinking about a stop. The one place a
+ * record is retired *unconditionally* is where the container is confirmed gone, and
+ * this returns null there anyway: an [WorkloadObservation.Absent] observation is the
+ * evidence that the stop finished.
+ */
+internal fun clearedDrainRecord(
+    drain: DrainStatus?,
+    observation: WorkloadObservation,
+): DrainStatus? = if (stopIsInFlight(drain, observation)) drain else null
+
+/**
  * What a park leaves a workload's login path in, as a value the composing site can
  * order rather than a sentence it can only append.
  *
@@ -3882,13 +4000,20 @@ internal sealed interface LoginPath {
     /**
      * A workload that seals itself, with a seal in place. The blackout, and the only
      * surface that reports it.
+     *
+     * The lever is named without naming its mechanism, deliberately. A revert lifts
+     * this by putting the workload back on a converging pass — *unless* a container
+     * stop has already gone out, in which case the drain finishes what it signalled
+     * and the reverted definition comes up as the replacement ([clearedDrainRecord]).
+     * Both end with players able to log in, and an operator reading a status line has
+     * no use for the difference.
      */
     data object ShutByThisDrain : LoginPath {
         override val sentence: String =
             "Nobody can log in: the login seal this drain put on is still in place, and it stays until the " +
-                "drain finishes. Reverting a definition edit that asked for this drain lifts it, by putting " +
-                "the workload back on a converging pass that re-admits players; a delete cannot be withdrawn " +
-                "and clears only by finishing"
+                "drain finishes. Reverting a definition edit that asked for this drain lifts it — the " +
+                "workload goes back to running and admitting players, or finishes the stop already issued " +
+                "and comes back as the replacement; a delete cannot be withdrawn and clears only by finishing"
     }
 
     /** A workload that seals itself and never got one, or has nothing that could. */

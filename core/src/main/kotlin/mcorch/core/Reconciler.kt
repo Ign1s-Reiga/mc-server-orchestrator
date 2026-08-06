@@ -194,7 +194,14 @@ public class Reconciler(
 
                 is Placement.On -> {
                     val observation = placement.node.observe(pass.name)
-                    val cause = placement.cause ?: drainCause(pass, observation)
+                    val cause =
+                        placement.cause
+                            ?: drainCause(pass, observation)
+                            // Nothing wants a drain any more, and one has already
+                            // signalled this container. It finishes rather than
+                            // converging back over the top of its own stop — see
+                            // [outstandingStopCause] for what that costs a player.
+                            ?: outstandingStopCause(pass.previous?.drain, observation)
                     // Before the drain, never after: a replacement this node cannot
                     // build must not take a populated server away first. See
                     // [replacementBlocker].
@@ -309,7 +316,16 @@ public class Reconciler(
 
                 is Placement.On -> {
                     val observation = placement.node.observe(pass.name)
-                    val cause = placement.cause ?: proxyDrainCause(pass, observation)
+                    val cause =
+                        placement.cause
+                            ?: proxyDrainCause(pass, observation)
+                            // The same rule, on the kind whose stop takes the
+                            // fleet's front door with it. A proxy holds no world, so
+                            // what converging over a dispatched stop costs here is a
+                            // mass disconnect and an availability report nobody can
+                            // act on rather than a lost session — the same missing
+                            // guard all the same.
+                            ?: outstandingStopCause(pass.previous?.drain, observation)
                     val blocker = replacementBlocker(pass, placement.node, cause)
                     when {
                         blocker != null -> convergeProxy(pass, placement.node, observation, blocker)
@@ -576,7 +592,23 @@ public class Reconciler(
                     created.handle.sandboxId,
                     created.handle.containerId,
                 )
-                write(pass, pass.draft(ServerPhase.CREATING, image = image, runtime = pass.identity(created))) {
+                write(
+                    pass,
+                    pass.draft(
+                        ServerPhase.CREATING,
+                        image = image,
+                        runtime = pass.identity(created),
+                        // The record of the drain that took the *old* container away
+                        // does not follow the new one. This branch used to leave it
+                        // in place, which the pass that turned the replacement
+                        // joinable then cleared; that made the clear load-bearing at
+                        // a site whose job is readiness, and a record retained there
+                        // for a stop in flight was a record describing a container
+                        // that no longer existed. It dies where the replacement is
+                        // built — see [clearedDrainRecord].
+                        drain = clearedDrainRecord(pass.previous?.drain, observation),
+                    ),
+                ) {
                     ReconcileOutcome.Progressed("proxy workload created")
                 }
             }
@@ -591,6 +623,8 @@ public class Reconciler(
                                 ServerPhase.CREATING,
                                 image = image,
                                 runtime = pass.identity(created),
+                                // The other create, and the same rule.
+                                drain = clearedDrainRecord(pass.previous?.drain, observation),
                                 failure = blocker,
                             ),
                         ) { ReconcileOutcome.Progressed("proxy container created in the existing sandbox") }
@@ -604,6 +638,13 @@ public class Reconciler(
                                 ServerPhase.STARTING,
                                 image = image,
                                 runtime = pass.identity(observation),
+                                // A container that has never been started cannot be
+                                // one anything was signalled into, so this can only
+                                // inherit a record the create above already cleared.
+                                // It asks anyway: a record that reached here would
+                                // otherwise be inherited by every pass that follows,
+                                // and nothing downstream would ever clear it.
+                                drain = clearedDrainRecord(pass.previous?.drain, observation),
                                 failure = blocker,
                             ),
                         ) { ReconcileOutcome.Progressed("proxy container started") }
@@ -776,7 +817,11 @@ public class Reconciler(
                 players = players,
                 backends = routing.status,
                 control = control,
-                drain = null,
+                // A drain that had aborted and then became unnecessary leaves a
+                // stale record behind, and a joinable proxy means it is over —
+                // unless this proxy has a stop of its own outstanding, which is a
+                // fact about the container rather than about the drain.
+                drain = clearedDrainRecord(pass.previous?.drain, observation),
                 // The blocker wins where both are set. A proxy that cannot be
                 // replaced *and* cannot assert its routing table has two problems
                 // and one field; the one an operator has to act on is the artefact,
@@ -1221,7 +1266,13 @@ public class Reconciler(
                 players = null,
                 backends = null,
                 control = null,
-                drain = null,
+                // The retirement point, and the one clear that is not conditional in
+                // substance: this is only reached with the workload observed
+                // [WorkloadObservation.Absent], which is the evidence that the stop
+                // this record is about has finished. It asks anyway, because a site
+                // that clears by construction and a site that clears by argument look
+                // identical to the next reader.
+                drain = clearedDrainRecord(pass.previous?.drain, observation),
             )
         return write(pass, cleared) {
             ReconcileOutcome.Progressed("the old proxy workload is gone; ${cause.detail} is applied next pass")
@@ -1726,7 +1777,7 @@ public class Reconciler(
                         image = image,
                         runtime = pass.runtimeIdentity(created),
                         storage = storage,
-                        drain = null,
+                        drain = clearedDrainRecord(pass.previous?.drain, observation),
                     )
                 write(pass, status) { ReconcileOutcome.Progressed("workload created") }
             }
@@ -1740,7 +1791,11 @@ public class Reconciler(
                     image = image,
                     runtime = pass.runtimeIdentity(observation),
                     storage = storage,
-                    drain = null,
+                    // Not `null`: a converging pass concludes that no drain is
+                    // *wanted*, which says nothing about a stop that has already
+                    // been issued against the container it is looking at. See
+                    // [clearedDrainRecord].
+                    drain = clearedDrainRecord(pass.previous?.drain, observation),
                     // The blocker wins where both are set. A server that cannot be
                     // replaced *and* has something else wrong with it has two
                     // problems and one field; the one an operator has to act on is
@@ -1765,7 +1820,7 @@ public class Reconciler(
                                 image = image,
                                 runtime = pass.runtimeIdentity(created),
                                 storage = storage,
-                                drain = null,
+                                drain = clearedDrainRecord(pass.previous?.drain, observation),
                             )
                         write(pass, drafted) {
                             ReconcileOutcome.Progressed("container created in the existing sandbox")
@@ -1869,8 +1924,11 @@ public class Reconciler(
             storage = storage,
             // A drain that had aborted and then became unnecessary — the last
             // player left, the node came back — leaves a stale record behind.
-            // Reaching a joinable server means it is over.
-            drain = null,
+            // Reaching a joinable server means it is over: a *drain* is over, and
+            // a container that has been sent `SIGTERM` answers a ping right up to
+            // the moment it stops, so the record of that survives this. See
+            // [clearedDrainRecord].
+            drain = clearedDrainRecord(pass.previous?.drain, observation),
             // See the note in [converge]: an unbuildable replacement outranks
             // whatever else this pass found.
             failure = blocker ?: failure,
@@ -2202,7 +2260,15 @@ public class Reconciler(
                 phase = ServerPhase.RUNNING,
                 runtime = pass.runtimeIdentity(present),
                 storage = pass.storageStatus(observation),
-                drain = null,
+                // Refusing the *edit* is not withdrawing a drain that is already
+                // stopping this container, and this is the third site that would
+                // have deleted the dispatch record to say so: the edit can land
+                // while a drain started by some earlier edit is inside its stop
+                // grace period. What the refusal is about — memory that would be
+                // discarded rather than flushed — has been flushed by then, and
+                // the record that keeps the backend out of routing must outlive
+                // the refusal either way.
+                drain = clearedDrainRecord(pass.previous?.drain, observation),
                 failure = failure,
             )
         return write(pass, status) { ReconcileOutcome.Failed(message) }
@@ -2283,6 +2349,12 @@ public class Reconciler(
         // record goes with it and the next pass creates the new one from
         // scratch — never alongside the old one. Redrafted rather than copied,
         // so the derived conditions do not keep describing a drain that is over.
+        //
+        // **This is where the dispatch record is retired**, and it is the only
+        // place that may: the container it names has been observed absent, which
+        // is the one thing that makes "a stop may still be inside it" false. It
+        // still asks, so that no site in this file clears a drain record on its
+        // own authority. See [clearedDrainRecord].
         val cleared =
             pass.draft(
                 phase = status.phase,
@@ -2291,7 +2363,7 @@ public class Reconciler(
                 endpoint = null,
                 players = null,
                 storage = status.storage,
-                drain = null,
+                drain = clearedDrainRecord(pass.previous?.drain, observation),
             )
         return write(pass, cleared) {
             ReconcileOutcome.Progressed("the old workload is gone; ${cause.detail} is applied next pass")

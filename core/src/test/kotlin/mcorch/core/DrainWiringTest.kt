@@ -888,6 +888,79 @@ internal class DrainWiringTest {
     }
 
     /**
+     * Nothing in this module deletes a drain record on its own authority.
+     *
+     * The thirty-third audit's critical is a *lifetime*, and the shape it takes is
+     * one token: `drain = null`, written by a pass that has concluded no drain is
+     * wanted. That conclusion is correct about the drain and says nothing about
+     * `DrainStatus.stopDispatchedAt`, which describes a `SIGTERM` already inside a
+     * container — so the site that wrote it deleted the one record standing between a
+     * proxy's routing sweep and a player's lost session.
+     *
+     * ## Why the shape rather than the behaviour
+     *
+     * Three scenarios in `ProxyDrainTest` cover the three sites that could reach it
+     * *today*, and the sites are the problem: there were eight lines in one file
+     * writing that token, on paths that have nothing to do with each other — a
+     * readiness probe, a refused edit, two creates, a teardown. The audit named three
+     * of them. Each is ordinary converging code with no reason to be thinking about a
+     * stop, which is exactly the population a scenario suite cannot enumerate: the
+     * ninth line is written by somebody adding a phase, and no test would notice.
+     *
+     * So the rule has one home, and this asserts that every site asks it. What it
+     * cannot see is what the rule *does* — that is `DrainRecordLifetimeTest`, which
+     * calls it directly, and the class note above says why that split is kept.
+     *
+     * ## The arguments are pinned too, and that is not decoration
+     *
+     * `clearedDrainRecord(null, observation)` and
+     * `clearedDrainRecord(previous?.drain, someOtherObservation)` both satisfy "the
+     * site asks", and the first is `drain = null` with more letters. The shape
+     * required is a record read off a status and an observation named rather than
+     * built, which follows a rename and refuses a substitution.
+     */
+    @Test
+    fun `every drain record this loop retires is retired through the one rule`() {
+        val sources = mainSources()
+
+        // Vacuity guards: a walk that found nothing, or one that ran somewhere
+        // without the reconcile loop in it, satisfies an absence by accident.
+        sources.size shouldBeGreaterThan 10
+        sources.map { it.path } shouldContain RECONCILER_PATH
+
+        val deleted =
+            sources.flatMap { source ->
+                source.lines.indices
+                    .filter { isCode(source.lines[it]) && CLEARS_DRAIN.containsMatchIn(codeOf(source.lines[it])) }
+                    .map { source.path to source.enclosing(it).name }
+            }
+        withClue("a drain record is deleted without asking whether a stop is in flight: $deleted") {
+            deleted shouldBe emptyList()
+        }
+
+        // …and the sites that do ask are asking about something. One entry per
+        // `drain = <value>` argument in the loop, classified: the rule, the record
+        // the drain itself produced, or the parameter a drafting helper forwards.
+        val reconciler = Source.of(RECONCILER_PATH)
+        val written =
+            reconciler.lines
+                .filter(::isCode)
+                .map { codeOf(it).trim() }
+                .filter { it.startsWith("drain = ") }
+                .map { it.removePrefix("drain = ").removeSuffix(",") }
+
+        // A count of assignments rather than of call sites: what must not happen is
+        // a scan that found none, and a new phase legitimately raises it.
+        written.count { it.startsWith("clearedDrainRecord(") } shouldBeGreaterThan 8
+        written.filterNot { it.startsWith("clearedDrainRecord(") }.toSet() shouldBe setOf("progress.drain", "drain")
+        written.filter { it.startsWith("clearedDrainRecord(") }.forEach { call ->
+            withClue("a drain record is retired on something other than this pass's own record: $call") {
+                call shouldMatch ASKS_THE_RULE
+            }
+        }
+    }
+
+    /**
      * The pre-flight is the create's own derivation, not a subset of it.
      *
      * `LocalNode` is the one file `:core`'s tests may not call into, so this is a
@@ -1080,6 +1153,24 @@ internal class DrainWiringTest {
 
         /** `drainCause(` or `proxyDrainCause(` — a call, never the `DrainCause` type. */
         val DRAIN_CAUSE = Regex("""\w*[Dd]rainCause\(""")
+
+        /**
+         * A drain record deleted outright — the thirty-third audit's critical, as a
+         * token.
+         *
+         * `\s*=\s*` rather than `" = "` so that a reformat cannot slip one past, and
+         * anchored on the argument name so that `failure = null` beside it is not one.
+         */
+        val CLEARS_DRAIN = Regex("""\bdrain\s*=\s*null\b""")
+
+        /**
+         * `clearedDrainRecord(<something>.drain, <name>)`.
+         *
+         * The first argument has to be a record read off a status and the second an
+         * observation this pass already has, because both are ways of writing
+         * `drain = null` in a form that satisfies a scan for the call alone.
+         */
+        val ASKS_THE_RULE = Regex("""^clearedDrainRecord\([\w.?]*\bdrain,\s*\w+\)$""")
 
         /**
          * The one expression that answers *"will a permanent failure recorded here

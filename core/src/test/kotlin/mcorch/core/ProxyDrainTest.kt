@@ -680,6 +680,259 @@ internal class ProxyDrainTest {
         }
 
     /**
+     * Withdrawing the *cause* does not withdraw the stop, and the record of one
+     * survives the withdrawal.
+     *
+     * The thirty-third audit's critical, and it arrives through the record added for
+     * the thirty-second. Reverting the edit is the documented way to call off a
+     * `REPLACEMENT`, and it is the only lever an operator has. Taken while the drain
+     * is between step 7 and the container's exit, it used to:
+     *
+     * 1. make `drainCause` answer null — the hashes match again — so the pass
+     *    converged instead of draining;
+     * 2. reach `awaitJoinable`, which writes `drain = null` on **every** branch,
+     *    because a joinable server means a drain is over — and a container inside its
+     *    grace period answers a ping right up to the moment it stops;
+     * 3. leave the proxy's sweep reading a backend with no drain record at all:
+     *    `letGo` false, `sealed` false, so `PUT /v1/backends/{name}` puts it back
+     *    **admitting**.
+     *
+     * Players then land on a process whose `savePlayers` has already run against the
+     * set it held at the stop, and containerd `SIGKILL`s it at the end of the grace
+     * period. Everything played in between is gone — up to `stopGracePeriod`, four
+     * minutes by default.
+     *
+     * ## What is asserted, and why the record is asserted beside the wire
+     *
+     * The wire, for the reason the two tests above give: the proxy re-asserts every
+     * backend's admission on every pass, so a level read afterwards can be satisfied
+     * by something other than the edge under test. The baseline is taken at the
+     * moment the property starts holding.
+     *
+     * The drain record is asserted too, and not as a proxy for the wire: it is the
+     * fact the whole compensation family is decided on, and a build that kept the
+     * backend out of routing for some other reason — a sweep that never ran, a
+     * proxy that stopped answering — would satisfy the wire assertion while having
+     * lost the thing that makes the next pass safe.
+     *
+     * ## …and the revert is not swallowed
+     *
+     * The second half matters as much as the first: the withdrawal is honoured one
+     * step later rather than ignored. The container that was already signalled goes,
+     * the workload is removed, and the definition that stands *now* — the one the
+     * operator reverted to — is what comes back. Asserting on the create's image is
+     * what tells a stalled drain apart from a completed withdrawal, and only the
+     * second is a fix.
+     *
+     * The clock does not move: with the save confirmation still current, the pass
+     * after the revert re-issues the stop rather than going round for another save,
+     * which is the window an admitting registration is harmful in.
+     */
+    @Test
+    fun `reverting the edit does not undo a stop that has already been dispatched`() =
+        coreTest {
+            val leaving = backendDefinition("survival-01")
+            val harness = ProxyHarness(backends = listOf(leaving))
+            val node = harness.nodeOf(leaving)
+            harness.bringUp()
+
+            // A container that takes the stop and does not exit — which is what every
+            // container looks like for the length of its grace period.
+            node.onStop = { present -> present }
+            harness.declare(backendDefinition("survival-01", image = REPLACEMENT_SERVER_IMAGE))
+
+            // Start, seal, no destination needed, transfer (nobody), zero confirmed,
+            // save, deregister, stop. One step each.
+            repeat(8) { harness.pass(leaving.metadata.name) }
+            val stopping =
+                harness
+                    .status(leaving.metadata.name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            stopping.state shouldBe DrainState.STOPPING
+            stopping.stopDispatchedAt.shouldNotBeNull()
+            stopping.deregisteredAt.shouldNotBeNull()
+            node.stops shouldHaveSize 1
+            harness.plugin.backend("survival-01") shouldBe null
+
+            // From here on nothing may re-admit this backend.
+            val baseline = harness.plugin.asserts.size
+
+            // The operator reverts the image. The definition now matches the running
+            // container's spec hash again, so nothing wants a drain any more.
+            harness.declare(leaving)
+            repeat(3) { harness.sweep() }
+
+            harness.plugin.asserts.drop(baseline) shouldNotContain ("survival-01" to true)
+            harness.plugin.backend("survival-01") shouldBe null
+            val carried =
+                harness
+                    .status(leaving.metadata.name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            carried.stopDispatchedAt shouldBe stopping.stopDispatchedAt
+            carried.deregisteredAt shouldBe stopping.deregisteredAt
+            // The drain is still the thing in charge of this container, which is what
+            // the surviving record buys: the stop is re-issued rather than the loop
+            // converging over the top of it.
+            node.stops.size shouldBeGreaterThan 1
+
+            // …and the withdrawal is honoured, one step later than it was asked for:
+            // the signalled container goes, and what comes back is the *reverted*
+            // definition rather than the edit that started the drain.
+            node.onStop = { present ->
+                present.copy(state = WorkloadState.EXITED, finishedAt = harness.clock.instant(), exitCode = 0)
+            }
+            repeat(5) { harness.pass(leaving.metadata.name) }
+            node.removals shouldHaveSize 1
+            node.creates shouldHaveSize 2
+            node.creates[1]
+                .image.canonical shouldBe DEFAULT_SERVER_IMAGE
+        }
+
+    /**
+     * The proxy mirror, and the same missing guard.
+     *
+     * `proxyDrainCause` is withdrawable exactly as `drainCause` is, and
+     * `awaitProxyReady` cleared the record on the same unconditional line. What
+     * follows differs only in what it costs: `assertProxyAdmission(admits = true)`
+     * reopens the *fleet's* login path onto a front door inside its own stop grace
+     * period, so it is a mass disconnect and an availability report nobody can act
+     * on rather than a lost world — a proxy holds none, and its backends save on
+     * disconnect.
+     *
+     * The assertion is `proxyAsserts` rather than `proxyAdmits` for the reason round
+     * 27 established: the door is a level that the next pass re-asserts, so a build
+     * that opens it and shuts it again reads `false` at every point a test could
+     * look. One backend, so the door is genuinely open at bring-up rather than shut
+     * by `assertBackends` finding nothing admitting.
+     */
+    @Test
+    fun `reverting a proxy's edit does not undo a stop that has already been dispatched`() =
+        coreTest {
+            val harness = ProxyHarness(backends = listOf(backendDefinition("survival-01")))
+            val name = harness.proxyDefinition.metadata.name
+            harness.bringUp()
+            harness.plugin.proxyAdmits.shouldBeTrue()
+
+            harness.proxyNode.onStop = { present -> present }
+            // A hash-bearing edit. `maxPlayers` is in the proxy's spec hash.
+            harness.declare(proxyDefinition(maxPlayers = 300))
+            // One step each, to the stop: start, seal, nothing to transfer, zero
+            // confirmed, no world to save, nothing to deregister, stop.
+            repeat(7) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+            val stopping =
+                harness
+                    .proxyStatus()
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            stopping.state shouldBe DrainState.STOPPING
+            stopping.stopDispatchedAt.shouldNotBeNull()
+            harness.proxyNode.stops shouldHaveSize 1
+            harness.plugin.proxyAdmits.shouldBeFalse()
+
+            // From here on no `PUT /v1/proxy` may assert `true`.
+            val baseline = harness.plugin.proxyAsserts.size
+
+            harness.declare(harness.proxyDefinition)
+            repeat(4) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+
+            harness.plugin.proxyAsserts.drop(baseline) shouldNotContain true
+            harness
+                .proxyStatus()
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .stopDispatchedAt shouldBe stopping.stopDispatchedAt
+            harness.proxyNode.stops.size shouldBeGreaterThan 1
+        }
+
+    /**
+     * …and the third door into the same defect: an edit the loop **refuses** also
+     * used to take the record with it.
+     *
+     * `forbiddenTransition` turns `storage.mode: persistent → ephemeral` on a
+     * running, world-holding container into a permanent refusal, and drafted its
+     * status with `drain = null` — the refusal being, in every case anybody had
+     * considered, about a drain that had not started. It can land while one is
+     * inside its stop grace period, and then the refusal deleted the evidence that a
+     * `SIGTERM` was already out and the proxy re-admitted players to it. The audit
+     * named `converge`, `awaitJoinable` and `awaitProxyReady`; this site is on none
+     * of those paths, and no scenario would have reached it from the fix as
+     * prescribed.
+     *
+     * **The refusal itself is untouched, and that is deliberate.** What the guard is
+     * about — memory that would be discarded rather than flushed — is a question
+     * about a container that is still serving, and the edit is still refused with the
+     * same wording and the same class. All that changes is that refusing an edit is
+     * no longer a way of forgetting a stop.
+     *
+     * The residual, named rather than fixed: the container this drain signalled will
+     * exit, the drain will finish, and the create after it applies the ephemeral
+     * definition — the world files stay on the volume, untouched and unmounted, and
+     * nothing is discarded that the confirmed save did not already flush. Whether
+     * that is the right end state for an edit the loop spent several passes refusing
+     * is a ruling for the drain audit, not for this test.
+     */
+    @Test
+    fun `an edit refused mid-stop does not delete the record of the stop`() =
+        coreTest {
+            val leaving = backendDefinition("survival-01")
+            val harness = ProxyHarness(backends = listOf(leaving))
+            val node = harness.nodeOf(leaving)
+            harness.bringUp()
+
+            node.onStop = { present -> present }
+            harness.declare(backendDefinition("survival-01", image = REPLACEMENT_SERVER_IMAGE))
+            repeat(8) { harness.pass(leaving.metadata.name) }
+            val stopping =
+                harness
+                    .status(leaving.metadata.name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            stopping.state shouldBe DrainState.STOPPING
+            stopping.stopDispatchedAt.shouldNotBeNull()
+            node.stops shouldHaveSize 1
+
+            val baseline = harness.plugin.asserts.size
+
+            // A second edit, landing inside the grace period of the stop the first
+            // one asked for. The container is still `RUNNING` — that is what a
+            // container inside its grace period is — and its label still says it
+            // holds a world, so the guard fires.
+            harness.declare(
+                backendDefinition(
+                    "survival-01",
+                    image = REPLACEMENT_SERVER_IMAGE,
+                    storage = StorageSpec.Ephemeral(),
+                ),
+            )
+            repeat(2) { harness.sweep() }
+
+            val status = harness.status(leaving.metadata.name).shouldNotBeNull()
+            // The refusal still happens, in the same words.
+            val refusal = status.failure.shouldNotBeNull()
+            refusal.failureClass shouldBe FailureClass.PERMANENT
+            refusal.message shouldContain "storage.mode"
+            // …and it is no longer a way of forgetting a dispatched stop.
+            val carried = status.drain.shouldNotBeNull()
+            carried.stopDispatchedAt shouldBe stopping.stopDispatchedAt
+            carried.deregisteredAt shouldBe stopping.deregisteredAt
+            harness.plugin.asserts.drop(baseline) shouldNotContain ("survival-01" to true)
+            harness.plugin.backend("survival-01") shouldBe null
+        }
+
+    /**
      * A control endpoint that stops answering aborts the drain rather than
      * carrying on unsealed.
      *

@@ -100,6 +100,18 @@ internal fun secretRef(
     key: String = "password",
 ): SecretRef = SecretRef.of(name, key).getOrThrow()
 
+/** What a fixture server runs unless a test is asking for a replacement. */
+internal const val DEFAULT_SERVER_IMAGE: String = "docker.io/itzg/minecraft-server:2026.6.1"
+
+/**
+ * A second image, so that declaring it is a container replacement.
+ *
+ * Named because a test that withdraws a replacement has to declare the *first*
+ * image again, and two spellings of "the one it was created with" is how such a
+ * test comes to assert against an edit it never reverted.
+ */
+internal const val REPLACEMENT_SERVER_IMAGE: String = "docker.io/itzg/minecraft-server:2026.7.0"
+
 /**
  * A deliberately boring definition, close to `schema/src/testFixtures/resources/examples`.
  *
@@ -115,7 +127,7 @@ internal fun secretRef(
 internal fun paperDefinition(
     name: String = "survival-01",
     labels: Map<String, String> = emptyMap(),
-    image: String = "docker.io/itzg/minecraft-server:2026.6.1",
+    image: String = DEFAULT_SERVER_IMAGE,
     storage: StorageSpec = StorageSpec.Persistent(VolumeSpec(resourceName("$name-world"))),
     rcon: RconSpec = RconSpec.Enabled(passwordSecret = secretRef()),
     maxPlayers: Int = 20,

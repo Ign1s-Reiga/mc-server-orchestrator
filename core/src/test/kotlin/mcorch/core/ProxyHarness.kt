@@ -198,10 +198,19 @@ internal fun backendDefinition(
     maxPlayers: Int = 20,
     hostPort: Int? = null,
     storage: StorageSpec = StorageSpec.Persistent(VolumeSpec(resourceName("$name-world"))),
+    /**
+     * The one field a test edits to ask for a replacement of a *backend*.
+     *
+     * `maxPlayers` is the lever the proxy tests use on the proxy, and it is not one
+     * here: a backend's max is in the registration the proxy holds rather than in
+     * its container's spec hash. An image is in the hash on both kinds.
+     */
+    image: String = DEFAULT_SERVER_IMAGE,
 ): PaperServerDefinition =
     paperDefinition(
         name = name,
         labels = mapOf(BACKEND_LABEL to BACKEND_POOL),
+        image = image,
         maxPlayers = maxPlayers,
         hostPort = hostPort,
         storage = storage,
