@@ -1589,3 +1589,52 @@ Related: [[standalone-paper-drain-shape]]
      can only land on `SEALED`/`TARGET_RESOLVED` and a fresh confirmed save is
      always taken before the stop. Re-check all three before accepting any future
      widening of what `blocked` records.
+
+## Round 31: the floor that unmakes the ceiling, and a licence written on a type
+
+132. **A ceiling given a floor derived from a second unbounded field stops being a
+     ceiling over the whole reachable range of that field, and the residual gets
+     stated at the unreachable end.** Round 30's finding was right — clamping
+     `stopGracePeriod` without seeing `saveTimeout` inverts a validated pair — and
+     the fix is `ceilingFor(saveTimeout) = max(MAX, saveTimeout + MIN_STOP_GRACE_MARGIN)`.
+     But `saveTimeout` has no type-level bound either, so for **every** value in
+     `(2h, ~292y)` the derived ceiling is above what `StopGracePeriod.of` refuses and
+     the declared grace goes to `GrpcCriClient.stopContainer` uncapped — whose gRPC
+     deadline is `grace + slack`. `saveTimeout = 30d, stopGracePeriod = 31d` is
+     `LifecycleSpec.init`-legal, decodes from a Long-nanos store column, and parks a
+     reconcile worker for a month with no effective timeout: the exact CLAUDE.md
+     property the ceiling was written for. `StopGraceCeiling`'s KDoc names the
+     residual as "292 years away, so it needs both halves absurd" — that is the
+     *refusal* end, reachable only inside a sub-second band at the top of what a
+     Long-nanos column can express. The trade is still the right way round (a parked
+     worker loses no world; an inverted pair loses one), but whenever a bound is
+     relaxed by a floor, work out the range over which the bound now does nothing and
+     state *that*, not the far end where a different rule takes over. The structural
+     answer is to stop deriving the transport deadline from the policy value: a
+     `stopContainer` deadline of `min(grace, MAX) + slack` with the full grace in the
+     CRI `timeout` field gives both properties — at the cost of a `DEADLINE_EXCEEDED`
+     on a legitimately long grace, which is a `:cri` decision, not a drain one.
+133. **A safety licence written on a *type* is a claim about every value of that
+     type, and `ExecTimeout`'s is true of only one of its three users.** The KDoc's
+     whole argument for capping — *"an exec timeout only authorises waiting, so
+     cutting it short can do no more than withhold a confirmation"* — holds for
+     `save-all flush`. It is false for the **probe** exec, which is the other two
+     `ExecRequest` sites: a probe that runs out of time is `ProbeOutcome.Unanswered`
+     → `PlayerReading.Unanswered`, and two places read that as permission rather than
+     as a withheld answer — `save`'s re-probe stamps `worldSavedAt` on
+     `Empty, Unanswered` alike (so a timed-out probe *mints* the confirmation the
+     stop is gated on), and `awaitStopped` lets it fall through to the re-issue.
+     Unreachable today only because both probe timeouts are private 10-second
+     constants against a one-hour ceiling. When a bound moves from a call site to a
+     type, re-derive the licence at every construction of that type, not at the one
+     the finding was written against.
+134. **"Every construction site is a compile-time constant" is a survey of call
+     sites, and this one was wrong.** `EndpointRequest.timeout` was left unbounded on
+     the stated grounds that no definition field feeds it. It is fed by one:
+     `ControlChannel` is built at `Reconciler.channel` and `ProxyFleet` with
+     `timeout = definition.spec.backends.drain.sealTimeout` (`BackendDrainSpec`, no
+     `init`, reader-only max), and `LocalNode.send` makes it the sole bound on a
+     *blocking, uncancellable* `httpClient.send`. Same store row, same absent
+     type-level bound, same population as the other two. Read the constructor's
+     arguments at every call site; a parameter that is a constant in the type that
+     declares it says nothing about what is passed to it.

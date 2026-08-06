@@ -723,3 +723,58 @@ and `StopGraceCeiling` in `LocalNode.stopWorkload`.
   the same defect plus a wrong badge (`DRAIN_BLOCKED` is `blocked != null &&
   failure == null`). Do not re-propose either; the only sound carrier clears on
   evidence proportional to what set it — some count of clean passes.
+
+## Round 31 rulings: the bound moved into the type, and where the yield went
+
+Audited at `06e29a9` (`fix/save-evidence-stamping` = `feat/velocity-proxy-kind`). No
+critical — the sixth clean round. Both `Node.stopWorkload` call sites, `mayStop`,
+`requireEmpty`, `saveIsCurrent`, `letGoAndStop`, `Reconciler.teardown`/`teardownProxy`
+and `LocalNode.removeWorkload`'s teardown plan are unchanged in substance; the round's
+executable changes are `StopGrace`/`ExecTimeout` as parameter types, the
+`DrainController.stopGrace` derivation, and `LoginPath`.
+
+- **Shortening an operator's declared grace period is acceptable, and the argument is
+  the schema's own.** `bound` always returns at least `saveTimeout +
+  MIN_STOP_GRACE_MARGIN`, which `SpecInvariants.stopGraceProblem` states *is* the
+  smallest grace that does not kill a container part-way through a save. The
+  operation is monotone downward and lands exactly on the schema's boundary; leaving
+  the row whole reopens the unbounded park. Sustained. It holds **only because**
+  `PaperDrainSubject` takes both halves off one `LifecycleSpec`, so `init`'s
+  guarantee applies to the pair `stopGrace` sees. `ProxyDrainSubject` pairs a
+  `ProxyLifecycleSpec` grace with a hard-coded `Duration.ZERO`, so a proxy gets no
+  floor — right today, and the one place a future "proxies can save" change silently
+  removes it.
+- **`awaitStopped`'s overdue check as a third caller of `stopGrace`: sustained, and
+  the stronger half of the change.** Reporting a container overdue against a period
+  the runtime was never given is danger pattern 27's shape. The `DrainWiringTest` pin
+  on the *enclosing function* rather than on a count is the right instrument.
+- **"No mutation left, because the node cannot express one" is sustained and is
+  language-enforced**, not conventional: `StopGrace` is a `@JvmInline value class`
+  with a private constructor and one factory, so there is no `copy` and no second
+  path. The residual is that the type proves the ceiling was *applied*, not that it
+  was applied with the right `saveTimeout` — `StopGrace.of(x, Duration.ZERO)` is a
+  legal call from anywhere and disables the floor, which two test call sites already
+  make. The cheapest close is one more `DrainWiringTest` line: `StopGrace.of` is
+  called only from `stopGrace`.
+- **Re-deriving D6/D13 rather than counting them caught: right.** A non-compiling
+  mutation scores UNKNOWN and proves neither "the type caught it" nor "the test caught
+  it". *"The type is a bound, not a gate"* is exact: `StopGrace` constrains the value
+  and says nothing about who may call `stopWorkload`. Counting it would have been the
+  fifth instrument-that-cannot-fail here.
+- **Open item 1 was accepted on a false premise; the other two rulings stand.** See
+  [[drain-audit-danger-patterns]] item 134. On item 3, the fixture for
+  adopt-after-collision belongs at `FakeNode` (a create answering `ALREADY_EXISTS` on
+  the first call), not at a real-runtime race — the branch under test is `:core`'s,
+  and two concurrent suites on one containerd manufacture phantoms that read like
+  label defects.
+
+**Where the yield is, after 31 rounds.** The stop *ordering* is done: three
+consecutive rounds have found nothing in it, and the last two rounds' real findings
+both came from outside the drain code — `:cri` deadline derivation and `:api`
+rendering. Point the next rounds at (1) definition durations that become transport
+deadlines, closed **once at the decode** rather than as N ceilings at N consumers
+(item 127's ruling, now three rounds unactioned — a spec `init` is still wrong there,
+because `rejectDefinition` makes a populated server undeletable), (2) paths with no
+test at all, of which adopt-after-collision is the named one, and (3) the
+message-derivation family (items 119/121/123/124 and this round's `LoginPath`), which
+loses no world directly but is what produces a manual `crictl stop`.
