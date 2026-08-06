@@ -1,12 +1,17 @@
 package mcorch.schema
 
+import io.kotest.assertions.withClue
 import io.kotest.matchers.collections.shouldBeEmpty
+import io.kotest.matchers.collections.shouldNotBeEmpty
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.types.shouldBeInstanceOf
 import io.kotest.matchers.types.shouldBeSameInstanceAs
 import mcorch.schema.fixtures.ExampleDefinitions
 import mcorch.schema.yaml.ServerDefinitionParser
 import org.junit.jupiter.api.Test
+import java.lang.reflect.Field
+import java.lang.reflect.Modifier
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.minutes
@@ -209,11 +214,12 @@ class SpecBoundsTest {
                         backends =
                             definition.spec.backends.copy(
                                 drain =
-                                    BackendDrainSpec(
-                                        sealTimeout = 30.hours,
-                                        destinationTimeout = 40.hours,
-                                        deregisterTimeout = 50.hours,
-                                    ),
+                                    definition.spec.backends.drain
+                                        .copy(
+                                            sealTimeout = 30.hours,
+                                            destinationTimeout = 40.hours,
+                                            deregisterTimeout = 50.hours,
+                                        ),
                             ),
                     ),
             )
@@ -230,6 +236,73 @@ class SpecBoundsTest {
                 "spec.backends.drain.destinationTimeout",
                 "spec.backends.drain.deregisterTimeout",
             )
+    }
+
+    /**
+     * The rebuild carries every field it did not clamp — including the ones added
+     * after this was written.
+     *
+     * `boundProxy` rebuilt [BackendDrainSpec] by naming all three of its fields,
+     * which is correct while there are three and stops being correct on the day
+     * there are four: the new field would be reset to its default on every proxy row
+     * where any of these clamps fired. No compile error, no other failing test, and
+     * a behaviour change on precisely the population a clamp selects for — the "one
+     * of three identically-shaped siblings" recurrence [SpecBounds] exists to end,
+     * reproduced inside it.
+     *
+     * Reflection over the record's own fields is what lets this case cover a field
+     * nobody has written yet; a list of names here would be maintained by exactly
+     * the change that needs catching. The fixture is `proxy-full.yaml` because
+     * "every field a VelocityProxy accepts, set explicitly" is a promise that file
+     * already makes, and the first guard below is what holds it to it.
+     */
+    @Test
+    fun `a clamp carries every backend drain field it did not clamp`() {
+        val definition = proxy()
+        val declared = definition.spec.backends.drain
+
+        // Vacuity guard one. A field the fixture leaves at its default is a field
+        // this case cannot see dropped, because a dropped field lands on that same
+        // default. So a field arriving without a value in proxy-full.yaml fails here
+        // rather than being waved through as covered.
+        BACKEND_DRAIN_FIELDS.shouldNotBeEmpty()
+        val defaults = BackendDrainSpec().fieldValues()
+        for ((name, value) in declared.fieldValues()) {
+            withClue(
+                "proxy-full.yaml sets every field a VelocityProxy accepts, but " +
+                    "spec.backends.drain.$name is at its default there, so a rebuild " +
+                    "that dropped it would look identical to one that carried it",
+            ) {
+                value shouldNotBe defaults.getValue(name)
+            }
+        }
+
+        val over =
+            definition.copy(
+                spec =
+                    definition.spec.copy(
+                        backends =
+                            definition.spec.backends.copy(
+                                drain = declared.copy(sealTimeout = 30.hours),
+                            ),
+                    ),
+            )
+
+        val bounded = SpecBounds.bound(over)
+
+        // Vacuity guard two, and the load-bearing one: `bound` returns its argument
+        // untouched when nothing needed moving, and an untouched argument satisfies
+        // the assertion below for free. Exactly one field clamped is what makes this
+        // a statement about the rebuild.
+        bounded.clamped.single().field shouldBe "spec.backends.drain.sealTimeout"
+
+        // The record the fixture declared, with the one clamped field replaced and
+        // nothing else moved.
+        bounded
+            .proxySpec()
+            .backends.drain
+            .fieldValues() shouldBe
+            declared.copy(sealTimeout = SpecBounds.MAX_HANDSHAKE_TIMEOUT).fieldValues()
     }
 
     @Test
@@ -314,3 +387,19 @@ class SpecBoundsTest {
         SpecBounds.MAX_HANDSHAKE_TIMEOUT shouldBe VelocityProxyDefaults.MAX_TIMEOUT
     }
 }
+
+/**
+ * Every declared instance field of [BackendDrainSpec], discovered rather than
+ * listed.
+ *
+ * `Duration` is a value class, so at this level these are `long`s. Nothing here
+ * interprets one — the values are only ever compared against other values read
+ * the same way, so the encoding does not have to be known.
+ */
+private val BACKEND_DRAIN_FIELDS: List<Field> =
+    BackendDrainSpec::class.java.declaredFields
+        .filterNot { it.isSynthetic || Modifier.isStatic(it.modifiers) }
+        .onEach { it.isAccessible = true }
+
+private fun BackendDrainSpec.fieldValues(): Map<String, Any?> =
+    BACKEND_DRAIN_FIELDS.associate { it.name to it.get(this) }
