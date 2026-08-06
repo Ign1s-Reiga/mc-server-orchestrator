@@ -631,3 +631,31 @@ are byte-identical to round 24.
   aggregate count to reach zero; and (b) `spec.backends.selector` is **not** in
   `canonicalSpec`, so narrowing the selector un-claims the backend instantly with
   no container operation at all. (b) is the remedy to document.
+
+## Round 27 rulings: the permanent-only release, and what bounds the wait
+
+Audited at `d4bda89` (`feat/paper-server-kind`). One critical, on the *completeness*
+of round 26's fix rather than on the fix itself. `stop`, `awaitStopped`, `mayStop`,
+`requireEmpty`, `saveIsCurrent`, `Reconciler.teardown`/`teardownProxy`,
+`WorkloadView.kt` and `LocalNode.kt` executable code are byte-identical to round 26.
+
+- **The `deregisteredAt`-guard pushback is right and the relayed severity was
+  wrong.** `releaseSeal` returns on `subject.router != null`, and `deregisteredAt`
+  is written only by `letGoAndStop` and `releaseRegistration`, both of which need a
+  `DrainRouter`. The body is therefore unreachable with `deregisteredAt` set, and if
+  it ever were reachable the `PUT`'s register half is the same compensation
+  `restoreRegistration` performs on a park — a record inconsistency, not a stop
+  hazard. Do not re-raise this as a stop-ordering finding.
+- **The retryable-park-stays-sealed cost is bounded, and by a mechanism worth
+  naming.** A sealed proxy's population is monotonically non-increasing, and the
+  round-25 waiver (`sealIsPrecondition` → `Waived` on a fresh `PlayerReading.Empty`)
+  lets the drain finish *through* a dead control endpoint once it reaches zero. So
+  the exit is "the last live session ends", not "the fault clears" — the three exits
+  the implementer listed understate it. The genuinely unbounded case is the drain
+  that never got its seal on in the first place; see
+  [[drain-audit-danger-patterns]] item 118.
+- **On the open product decision (a fleet that never empties):** "leave it" is the
+  only safe option of the three. A sticky give-up state reproduces round 26's
+  critical if it releases the seal and is a permanent fleet blackout if it does not;
+  a declared maintenance window that ends in a stop is `failure-modes.md` item 7.
+  What is missing is reporting, not a lever.

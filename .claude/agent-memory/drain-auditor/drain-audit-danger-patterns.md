@@ -1363,3 +1363,58 @@ Related: [[standalone-paper-drain-shape]]
      server is hours. The artefact or secret can vanish inside that window and the
      teardown still commits. If the cheap question exists, the place it belongs is
      immediately before the irreversible step, not only before the reversible ones.
+
+## Round 27: the class-keyed compensation and the clause the gate has that the key does not
+
+117. **A compensation keyed on `FailureClass.PERMANENT` inherits `isBlockedByPermanentFailure`'s
+     *whole* predicate, and that predicate ends in `&& !stored.definition.terminating`.**
+     Round 26 moved `DrainController.abort`'s `releaseSeal` behind
+     `failureClass == PERMANENT` on the argument that a permanent abort stops this
+     server's passes, so nothing will ever re-assert the seal. `Reconciler.Pass.
+     isBlockedByPermanentFailure` is `failed && !terminating` — so for a **deleted**
+     workload a permanent abort stops nothing: the loop keeps reconciling, the door
+     is reopened by the compensation, players refill through it, and the gated resume
+     (`resume(gated = router == null)` → `requireEmpty` → `blocked`) can never reach
+     `holdSeal` again. `blocked` then clears the failure, so the permanent diagnosis
+     that caused it disappears and the drain reads "waiting for players, nothing
+     wrong" for ever. Danger pattern 113 with `PERMANENT` in place of `RETRYABLE`,
+     on the one cause — delete — where non-convergence is worst. General rule: when a
+     compensating edge is keyed on the *input* to a gate rather than on the gate's own
+     answer, copy the gate's whole predicate or call it; a trailing `&& !x` clause is
+     exactly what gets dropped.
+118. **A seal that is only asserted from the six forward states is asserted at most
+     twice in a wait that lasts hours.** For a routerless subject the `DRAIN_FAILED`
+     branch is `requireEmpty { resumeInto }`, so a pass with anybody online lands in
+     `blocked`, which does not seal. `holdSeal` therefore runs only while the fleet
+     reads zero. Consequences: (a) a proxy drain whose control endpoint was down on
+     its *first* pass with players on never asserts the seal at all and can never
+     assert it later — the door stays open, the population never reaches zero, and
+     the drain does not converge even after the endpoint recovers; (b) any loss of
+     the plugin's in-memory `AdmissionRegistry` during the wait is unrepairable by
+     the same route (mostly closed by `containerIsDown`, which ends the drain when
+     the container exits). The rejected alternative — `holdSeal` before `requireEmpty`
+     on the gated resume — costs only turning a healthy `blocked` into a retryable
+     abort while the endpoint is down, which is a reporting change, not a door
+     opening, now that the release is permanent-only. Re-take that trade against the
+     *current* release rule rather than against the unconditional one it was argued
+     under.
+119. **The operator sentence that survives a compensation change is the one that
+     described the old behaviour.** `abortSeal`'s abort message still reads *"The
+     server keeps running and keeps taking players"*. True while a retryable abort
+     released the seal; false now, and the case it is false in is a proxy whose front
+     door is shut fleet-wide. Item 27's direction test says over-stating availability
+     errs safe, and it does — but here the over-statement hides the *only* symptom
+     (nobody can log in) from the one surface an operator reads. Whenever a
+     compensating edge is narrowed, grep the messages written on the paths that no
+     longer run it.
+120. **A pre-flight moved to the entry of a two-pass step is asked once per pass of
+     that step, including the pass after the irreversible half already ran.**
+     `replacementIsBuildable` guards `letGoAndStop`, which is re-entered in
+     `DEREGISTERED` after a successful deregistration (`deregisteredAt != null`), and
+     is also re-entered after a resume out of `STOPPING`. So its message — *"Nothing
+     has been stopped, removed or deregistered"* — is written on passes where a stop
+     has been issued and its grace period is running, and on passes where the
+     re-registration in `abort` failed. Both err on the safe side of item 27
+     (over-stating availability), and the flap the KDoc worries about is genuinely
+     absent because the second refusal finds `deregisteredAt` already cleared. Check
+     the re-entry set of any step a new guard is placed at the entry of.
