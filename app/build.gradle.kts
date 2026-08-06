@@ -68,17 +68,17 @@ dependencies {
     controlPlugin(project(mapOf("path" to ":velocity-plugin", "configuration" to "controlPlugin")))
 }
 
-// The integration source sets are compiled by `check`, and never run by it.
+// Compiled by `check`, and so by `build`, without being *run* by it.
 //
-// `integrationTest` is a separate source set, so an ordinary `./gradlew build`
-// did not compile it — a type change in `:core` could break these suites and
-// every green build would keep saying so until somebody ran containerd. That
-// happened: `EndpointRequest.timeout` became a value class and this module's
-// suite stopped compiling, invisibly, for a whole round.
+// A run needs a containerd nobody has in CI or in an agent's worktree; a compile
+// needs nothing, and it is the only thing that tells a change to a shared type
+// that it has broken this source set. Without it a signature change survives
+// every green build and fails for whoever next has a runtime to point at.
 //
-// Compiling is free and needs no runtime; running still needs
-// scripts/dev/containerd-up.sh and stays opt-in.
-tasks.named("check") { dependsOn(tasks.named("compileIntegrationTestKotlin")) }
+// That is not hypothetical: `EndpointRequest.timeout` became a value class and
+// this source set stopped compiling, invisibly, for a whole round while the
+// suite reported green over code that excluded it.
+tasks.named("check") { dependsOn("compileIntegrationTestKotlin") }
 
 tasks.register<Test>("integrationTest") {
     group = "verification"

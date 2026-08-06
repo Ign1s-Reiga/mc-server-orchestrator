@@ -328,16 +328,34 @@ public interface Node {
  * capping the grace period would be safe because "the call is deadlined anyway", or
  * that a capped deadline kills a container early. Neither is true.
  *
- * ## Where such a value comes from, since no reader will produce one
+ * ## Where such a value comes from — and why nothing in the loop produces one today
  *
  * `PaperServerReader` caps `spec.lifecycle.stopGracePeriod` at
  * [PaperServerDefaults.MAX_STOP_GRACE_PERIOD] and `VelocityProxyReader` caps its
  * own lower still, but neither type enforces it: `LifecycleSpec.init` checks only
  * the save-timeout relation and `ProxyLifecycleSpec` has no `init` at all. A
  * definition that did not come through a reader — a hand-edited store row, a
- * migration, a fixture — therefore carries anything, and `DefinitionCodec` does not
- * re-run the reader's validation. That is the same second arrival route
- * `WorkloadSpec`'s `init` is written around.
+ * migration, a fixture — therefore carries anything. That was the arrival route this
+ * ceiling was written for.
+ *
+ * **It is closed one layer up now, and saying so is the point of this section.**
+ * `DefinitionCodec.decode` runs every stored row through `SpecBounds.bound`, which
+ * caps `stopGracePeriod` at the same two hours and `saveTimeout` at one, and
+ * `Reconciler` acts on nothing else — every `Pass` takes its definition from the
+ * store. So for the whole population this module reconciles, `requested` is already
+ * inside [ceilingFor]'s answer and **the cap never fires**: not on the stop, and not
+ * on `:cri`'s deadline either, whose `gracePeriod > stopDeadlineCap` is unreachable
+ * for the same reason.
+ *
+ * That makes this a second line of defence rather than a live mechanism, and it stays
+ * for three reasons worth writing down rather than rediscovering when somebody reads
+ * the same arithmetic and deletes it: a [Node] is an interface whose callers are not
+ * all `Reconciler` (`:app`, tests, a future admission path), the bound belongs to the
+ * seam rather than to whoever happens to clamp upstream, and the clamp itself is one
+ * `require`-free object that a store implementation could be written without. What
+ * *would* re-open the range is any of those changing — say so in the same breath as
+ * the change, because a reachability argument that rests on another module's decode
+ * is exactly the kind this codebase has had falsified twice.
  *
  * ## Why it caps rather than refuses, which is the interesting half
  *
@@ -374,25 +392,35 @@ public interface Node {
  * confirms its save, and used to be stopped with two hours — SIGKILL part-way
  * through Paper's own shutdown save, which is a torn region file.
  *
- * That population is not independent of this one. The cap only ever fires on a
- * definition that bypassed `PaperServerReader` (nothing else produces a grace
- * period above two hours), and that is exactly the population that can also carry a
- * save timeout above `PaperServerDefaults.MAX_TIMEOUT`. So [bound] takes the save
- * timeout and caps to `max(MAX, saveTimeout + MIN_STOP_GRACE_MARGIN)`: the schema's
- * relation survives whatever this does, and for every pair a reader would accept
- * the floor is below [MAX] and changes nothing.
+ * That population is not independent of this one, and the correlation is the part to
+ * keep. The cap can only fire on a definition that bypassed `PaperServerReader`
+ * (nothing else produces a grace period above two hours), and that is exactly the
+ * population that can also carry a save timeout above
+ * `PaperServerDefaults.MAX_TIMEOUT` — so "each condition is rare" says nothing about
+ * their conjunction when one implies the other's opportunity. So [bound] takes the
+ * save timeout and caps to `max(MAX, saveTimeout + MIN_STOP_GRACE_MARGIN)`: the
+ * schema's relation survives whatever this does, and for every pair a reader would
+ * accept the floor is below [MAX] and changes nothing. (Since `SpecBounds` that
+ * bypassing population no longer reaches the loop at all — see above — which retires
+ * the *reachability* of this defect without retiring the reasoning.)
  *
- * ## What the floor costs, over the range where it actually applies
+ * ## What the floor costs, over the range where it would apply
  *
  * The floor is not free, and its price is not at the far end. [ceilingFor] returns
  * `max(MAX, saveTimeout + MIN_STOP_GRACE_MARGIN)`, so **for every save timeout above
  * `MAX - MIN_STOP_GRACE_MARGIN` — one hour fifty-nine and a half — the effective
  * ceiling is the save timeout, not two hours**, and it rises with it without limit
- * until the *runtime's* own bound refuses the stop outright. A row carrying
- * `saveTimeout = 30d` beside `stopGracePeriod = 31d` satisfies `LifecycleSpec.init`,
- * decodes from a nanosecond column, and is capped to `30d30s`: shortened, landed
- * exactly on the smallest grace the schema would have accepted for that pair. Over
- * that whole range this bounds **the relation** and does not bound **the wait**.
+ * until the *runtime's* own bound refuses the stop outright. A caller holding
+ * `saveTimeout = 30d` beside `stopGracePeriod = 31d` satisfies `LifecycleSpec.init`
+ * and is capped to `30d30s`: shortened, landed exactly on the smallest grace the
+ * schema would have accepted for that pair. Over that whole range this bounds **the
+ * relation** and does not bound **the wait**.
+ *
+ * A stored row cannot be that caller — `SpecBounds` caps `saveTimeout` at one hour,
+ * so every pair the loop presents lands on the flat part of [ceilingFor] and the
+ * floor is inert there. The range is stated anyway because it is the property of the
+ * function, and because the section above says exactly what would make it reachable
+ * again.
  *
  * That is the trade taken deliberately and it is the right way round — a parked
  * worker loses no world, an inverted pair loses one. **The wait it does not bound

@@ -463,15 +463,33 @@ internal class ProxyDrainTest {
         }
 
     /**
-     * A drain that gets as far as deregistering and then fails puts the
-     * registration back.
+     * A drain that gets as far as deregistering and then fails **before dispatching
+     * a stop** puts the registration back.
      *
      * Deregistration is the one proxy step that cannot be level-triggered — it is
      * the last thing before the stop, so re-asserting it every pass would mean
      * asserting it from states that must not reach it. It therefore needs an
      * explicit edge on the abort path, and without one a drain that deregistered and
-     * then could not stop leaves a running server unreachable through the proxy with
-     * nothing left that would re-add it.
+     * then failed leaves a running server unreachable through the proxy with nothing
+     * left that would re-add it.
+     *
+     * ## Why the failure is a probe and no longer a refused stop
+     *
+     * This scenario used to arm `NodeException.Rejected` on the stop, and the
+     * thirty-second audit is why it cannot any more: `DrainController` records
+     * `stopDispatchedAt` **before** the request is issued, and from there on the
+     * registration is deliberately not handed back. A `Rejected` from a `Node` is not
+     * evidence that nothing was signalled — `LocalNode` uses it both for a grace
+     * period it refused before calling anything *and* as the bucket for a failure its
+     * translator did not recognise — so the record cannot be rolled back on it
+     * without guessing.
+     *
+     * A ping that cannot be answered is the honest "before any stop" failure and it
+     * is the more common one: `requireEmpty` guards `DEREGISTERED`, so an unanswered
+     * probe aborts with the runtime never asked for anything. `stops` and
+     * `stopDispatchedAt` are asserted together, because "no stop was dispatched" is
+     * the premise the restore now rests on and an assertion about the registration
+     * alone would not notice it moving.
      */
     @Test
     fun `a drain that aborts after deregistering re-registers the backend`() =
@@ -487,13 +505,12 @@ internal class ProxyDrainTest {
             harness.plugin.deregistrations shouldContain "survival-01"
             harness.plugin.backend("survival-01") shouldBe null
 
-            // The stop then fails permanently. The drain parks with the container
-            // still running and the backend out of the routing table.
-            harness
-                .nodeOf(leaving)
-                .failAlways(NodeOperation.STOP, harness.nodeOf(leaving).rejected(NodeOperation.STOP))
+            // The server stops answering its ping, so the pass that would have
+            // stopped it aborts at the zero-player gate instead.
+            harness.nodeOf(leaving).joinable = false
             harness.pass(leaving.metadata.name)
 
+            harness.nodeOf(leaving).stops.shouldBeEmpty()
             harness.plugin
                 .backend("survival-01")
                 .shouldNotBeNull()
@@ -503,12 +520,163 @@ internal class ProxyDrainTest {
                 .shouldNotBeNull()
                 .admits
                 .shouldBeTrue()
-            harness
-                .status(leaving.metadata.name)
-                .shouldNotBeNull()
-                .drain
-                .shouldNotBeNull()
-                .deregisteredAt shouldBe null
+            val drain =
+                harness
+                    .status(leaving.metadata.name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            drain.deregisteredAt shouldBe null
+            drain.stopDispatchedAt shouldBe null
+        }
+
+    /**
+     * A stop whose deadline elapsed is a stop that may have landed, and the backend
+     * is **not** handed back to the proxy while it may be shutting down.
+     *
+     * The thirty-second audit's must-fix. containerd delivers the `SIGTERM` and does
+     * not escalate once the request context has expired, so what the client's timeout
+     * leaves behind is a container inside Paper's shutdown hook. Re-registering it
+     * *admitting* — which is what `PUT /v1/backends/{name}` does, there being no
+     * register-without-admitting call — routes a player onto a process whose
+     * `savePlayers` step has already run against the set it had then. They get in,
+     * they play, the shutdown disconnects them, and **that session is not saved**.
+     *
+     * ## What the assertion is on, and why it is not the routing table alone
+     *
+     * The wire. `plugin.asserts` is every `PUT /v1/backends/{name}` that landed, and
+     * the baseline is taken at the moment the property starts holding rather than at
+     * the end — the proxy's own pass re-asserts a backend's admission every time it
+     * runs, so a level read afterwards can be satisfied by something other than the
+     * edge under test. The routing-table read is kept beside it as the coarser
+     * control.
+     *
+     * ## What is deliberately *not* claimed
+     *
+     * That the drain is now safe from refilling in general: the stop was already
+     * gated at both ends and still is (`requireEmpty` → `mayStop` on the way in, an
+     * `Occupied` reading blocking and voiding the evidence on the way out). The
+     * defect this pins is narrower and is a defect all the same — the drain actively
+     * refilling a container it is part-way through stopping.
+     *
+     * The clock does not move, on purpose: with the save confirmation still current
+     * the resume after the park goes back to the stop rather than round to another
+     * save, which is exactly the window in which an admitting registration is
+     * harmful.
+     */
+    @Test
+    fun `a drain whose stop timed out does not hand the backend back to the proxy`() =
+        coreTest {
+            val leaving = backendDefinition("survival-01")
+            val harness = ProxyHarness(backends = listOf(leaving))
+            val node = harness.nodeOf(leaving)
+            harness.bringUp()
+            harness.store.deleteDefinition(leaving.metadata.name)
+
+            repeat(7) { harness.pass(leaving.metadata.name) }
+            harness.plugin.backend("survival-01") shouldBe null
+            node.stops.shouldBeEmpty()
+
+            // From here on nothing may re-admit this backend.
+            val baseline = harness.plugin.asserts.size
+
+            // The stop is issued and this client stops waiting for it. The container
+            // is still there — containerd does not escalate after the deadline — and
+            // whether the signal landed is exactly what nobody can know.
+            node.failOnce(NodeOperation.STOP, node.unanswered(NodeOperation.STOP))
+            harness.pass(leaving.metadata.name)
+
+            harness.plugin.asserts.drop(baseline) shouldNotContain ("survival-01" to true)
+            harness.plugin.backend("survival-01") shouldBe null
+
+            val parked =
+                harness
+                    .status(leaving.metadata.name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            parked.state shouldBe DrainState.DRAIN_FAILED
+            // The record the decision is made on, asserted beside the decision: a
+            // build that skipped the restore for some other reason would satisfy
+            // everything above.
+            parked.stopDispatchedAt.shouldNotBeNull()
+            parked.deregisteredAt.shouldNotBeNull()
+            val failure = parked.failure.shouldNotBeNull()
+            failure.reason shouldBe FailureReason.DRAIN_STALLED
+            // Retryable: a node that did not answer is a node to ask again, and the
+            // strand below lasts only as long as the drain does.
+            failure.failureClass shouldBe FailureClass.RETRYABLE
+
+            // …and it is not a wedge. With the node answering again the drain finishes
+            // from where it parked, which is what makes the cost of not restoring
+            // availability rather than a server nobody can retire.
+            repeat(4) { harness.pass(leaving.metadata.name) }
+            node.stops.shouldNotBeEmpty()
+            harness.plugin.asserts.drop(baseline) shouldNotContain ("survival-01" to true)
+        }
+
+    /**
+     * The mirror, and the half an exception-class discriminator gets wrong: a stop
+     * that could not be **re-issued** still follows one that was dispatched.
+     *
+     * `awaitStopped` only runs because a *first* stop returned successfully — that is
+     * the only thing that puts a drain in `STOPPING` — so a plain `Rejected` on the
+     * re-issue is a permanent park at a container that has had its `SIGTERM`. Keying
+     * the compensation on `failure is NodeException.Timeout` would restore the
+     * registration here; keying it on `state == STOPPING` would restore it in the
+     * scenario above. The record is neither, which is why it is a record.
+     *
+     * The container is made not to exit (`onStop` returns the workload unchanged),
+     * which is the state `awaitStopped` exists for and the only way to reach the
+     * re-issue at all.
+     */
+    @Test
+    fun `a stop that could not be re-issued does not hand the backend back either`() =
+        coreTest {
+            val leaving = backendDefinition("survival-01")
+            val harness = ProxyHarness(backends = listOf(leaving))
+            val node = harness.nodeOf(leaving)
+            harness.bringUp()
+            harness.store.deleteDefinition(leaving.metadata.name)
+
+            // A container that takes the stop and does not go away.
+            node.onStop = { present -> present }
+
+            repeat(8) { harness.pass(leaving.metadata.name) }
+            val stopping =
+                harness
+                    .status(leaving.metadata.name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            stopping.state shouldBe DrainState.STOPPING
+            node.stops shouldHaveSize 1
+
+            val baseline = harness.plugin.asserts.size
+
+            // The re-issue is refused outright. Nothing about *this* call says a
+            // signal was delivered; the one before it does.
+            node.failAlways(NodeOperation.STOP, node.rejected(NodeOperation.STOP))
+            harness.pass(leaving.metadata.name)
+
+            harness.plugin.asserts.drop(baseline) shouldNotContain ("survival-01" to true)
+            harness.plugin.backend("survival-01") shouldBe null
+
+            val parked =
+                harness
+                    .status(leaving.metadata.name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            parked.state shouldBe DrainState.DRAIN_FAILED
+            parked.deregisteredAt.shouldNotBeNull()
+            // Stamped by the *first* stop and not restamped by the refused re-issue:
+            // the question is whether a signal may be in that container, not when the
+            // most recent attempt was made.
+            parked.stopDispatchedAt shouldBe stopping.stopDispatchedAt
+            val failure = parked.failure.shouldNotBeNull()
+            failure.failureClass shouldBe FailureClass.PERMANENT
+            failure.message shouldContain "could not be re-issued"
         }
 
     /**

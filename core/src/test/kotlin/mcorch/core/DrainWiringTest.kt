@@ -243,6 +243,77 @@ internal class DrainWiringTest {
     }
 
     /**
+     * …and every container stop writes the record of itself **before** issuing the
+     * request.
+     *
+     * The thirty-second audit's must-fix rests on `DrainStatus.stopDispatchedAt`, and
+     * the ordering is the whole content of that field. A stamp moved below the call
+     * is a record that exists only for a request that came *back* — which is the one
+     * case the compensation does not need it for. The `saveRequestedAt` rule is the
+     * opposite way round for the opposite reason, so "make them consistent" is a
+     * plausible edit rather than a careless one, and a reviewer reading two lines in
+     * either order cannot tell which is right from the lines alone.
+     *
+     * ## What this covers that a scenario cannot
+     *
+     * A **third** stop site. Both of today's are behaviourally covered — reversing
+     * either order reddens `ProxyDrainTest` — but a stop added in a new function
+     * would carry no stamp, and nothing would notice until a drain re-admitted
+     * players to a container it was stopping. That is the same argument as the
+     * `mayStop` test above, so the two are kept side by side and the count is
+     * asserted in both: they must agree about how many stops this controller makes.
+     *
+     * ## What it deliberately does not assert
+     *
+     * Where the stamped value goes. That it reaches [DrainController.abort] rather
+     * than the unstamped drain is *behaviour* — `a drain whose stop timed out does
+     * not hand the backend back to the proxy` and `a stop that could not be re-issued
+     * does not hand the backend back either` both fail on it — and the class note
+     * above is why that split is kept. What is asserted here is the shape a
+     * behavioural test cannot see: that the binding is unconditional, and that
+     * something downstream reads it, so a stamp bound and dropped is not mistaken for
+     * a record.
+     */
+    @Test
+    fun `every container stop records the dispatch before it issues one`() {
+        val calls = LINES.indices.filter { isCode(LINES[it]) && codeOf(LINES[it]).contains("stopWorkload(") }
+
+        // The same count as the gate test, for the same reason: a third site has to
+        // satisfy this one too before it passes again.
+        calls shouldHaveSize 2
+
+        calls.forEach { call ->
+            val gate = enclosing(call)
+            val stamps = gate.body.filter { isCode(LINES[it]) && codeOf(LINES[it]).contains("dispatchingStop(") }
+            withClue("${gate.name} issues a container stop without recording that one was dispatched") {
+                stamps shouldHaveSize 1
+            }
+            val stamp = stamps.single()
+            withClue("${gate.name} records the dispatch below the call, so a request that never returns leaves none") {
+                (stamp < call) shouldBe true
+            }
+
+            // Unconditionally, and on the drain the function was handed. A predicate
+            // around this — `if (contract.holdsWorldData)`, say — is the mutation the
+            // ordering check cannot see, and it is the shape the class note above
+            // says a structural test *may* carry.
+            val recorded = binding(LINES[stamp])
+            recorded.value shouldMatch Regex("""\w+\.dispatchingStop\(\w+\)""")
+
+            // …and something below reads it. A binding nothing uses is a record in
+            // name only, and the compiler is content with one.
+            val readers =
+                gate.body.filter {
+                    it > stamp && isCode(LINES[it]) &&
+                        codeOf(LINES[it]).contains(recorded.name)
+                }
+            withClue("${gate.name} binds ${recorded.name} and nothing downstream of the stop reads it") {
+                readers.size shouldBeGreaterThan 1
+            }
+        }
+    }
+
+    /**
      * The declared stop grace period is read in one place, and everything else reads
      * the derived one.
      *

@@ -491,6 +491,13 @@ internal object ServerJson {
             // is going round the save rather than stuck on one attempt.
             put("resaveForcedAt", drain.resaveForcedAt)
             put("deregisteredAt", drain.deregisteredAt)
+            // Rendered beside `deregisteredAt` because together they answer the
+            // question a parked drain raises: the backend is out of the proxy's
+            // routing table and is *deliberately* being left there, because a stop
+            // request has already gone to the container. Without this key the pair
+            // "parked, and not joinable through the proxy" looks like the
+            // compensation having failed.
+            put("stopDispatchedAt", drain.stopDispatchedAt)
             // Rendered beside the attempt count because the two answer the
             // dashboard's question together: how many times the loop has asked, and
             // how long it has been asking. The *duration* is the bound step 4

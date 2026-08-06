@@ -1528,6 +1528,14 @@ export interface DrainStatus {
    */
   resaveForcedAt: string | null;
   deregisteredAt: string | null;
+  /**
+   * When a container stop request for this drain left the orchestrator. Set once
+   * and never cleared. Read it beside `deregisteredAt`: a parked drain with both
+   * set is a backend deliberately kept out of the proxy's routing table, because
+   * the container has been sent SIGTERM and re-admitting players to a process in
+   * shutdown loses their session. Non-null does NOT mean the container stopped.
+   */
+  stopDispatchedAt: string | null;
   transferStartedAt: string | null; // the anchor step 4's allowance is measured from
   transferAttempts: number;
   destination: string | null;       // a server name, never a player

@@ -454,6 +454,43 @@ public data class DrainStatus(
     val resaveForcedAt: Instant? = null,
     val deregisteredAt: Instant? = null,
     /**
+     * When a container stop request for this drain **left this process**.
+     *
+     * The one fact a compensating edge needs and nothing else records: not whether
+     * the stop succeeded, not whether the container is going away, but whether a
+     * `SIGTERM` may already have been delivered to the process a compensation is
+     * about to send players back to. [state] `== STOPPING` is not that fact — a stop
+     * whose deadline elapsed is caught with the drain still `DEREGISTERED` — and
+     * neither is the exception class, because a *first* stop that returned cleanly is
+     * the only thing that puts a drain in `STOPPING`, so a plain refusal of the
+     * re-issue after it still follows a dispatch. Both were proposed as discriminators
+     * and each is wrong at a different call site; this is the fact they were proxies
+     * for.
+     *
+     * **Stamped before the request is issued, which is deliberately the opposite of
+     * [saveRequestedAt].** The two records have opposite purposes. A save record
+     * exists to stop a *second* send, so stamping one for a request that never left
+     * would wedge a drain on a save the server never got: it is written after the
+     * call, from what the call reported. This record exists to tell a later pass there
+     * is something **not** to reverse, so losing it errs towards re-admitting players
+     * to a container that is shutting down — the direction to design against. A stamp
+     * for a request that then failed to leave costs availability; a dispatch with no
+     * stamp costs a player's session.
+     *
+     * **Set once and never cleared.** There is no un-dispatch, so a later pass can
+     * only learn that another stop is *also* outstanding, never that the first one is
+     * not. It is cleared the way every other field here is: a drain that is no longer
+     * wanted takes its whole record with it (`Reconciler.converge` writes
+     * `drain = null`), and that is what returns the workload to a proxy's routing
+     * sweep.
+     *
+     * A row written before this field existed reads null, so a drain caught mid-stop
+     * by an upgrade can re-admit once — the same one-cycle cost every anchor here
+     * pays, and cheaper than inferring a dispatch from the state, which is the proxy
+     * this field replaces.
+     */
+    val stopDispatchedAt: Instant? = null,
+    /**
      * When this drain first entered drain step 4, and the anchor its allowance is
      * measured from.
      *

@@ -239,12 +239,13 @@ internal class VelocityProxyControlIT {
         }
 
     private companion object {
-/**
+        /**
          * Generous: this crosses a container boundary to a JDK HTTP server.
          *
-         * An [EndpointTimeout] rather than a `Duration`, because the ceiling is
-         * applied by the only factory there is — so this fixture cannot ask for a
-         * deadline the production path would refuse.
+         * Through [EndpointTimeout.of], like every other `EndpointRequest` — the
+         * type is the enforcement point for the ceiling, so a raw `Duration` here
+         * would not compile and should not. This fixture therefore cannot ask for
+         * a deadline the production path would refuse.
          */
         private val CALL_TIMEOUT = EndpointTimeout.of(15.seconds)
 
