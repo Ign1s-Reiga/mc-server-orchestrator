@@ -108,6 +108,19 @@ internal class ProxyDrainSubject(
      * mid-drain could be told it is circling after thirty seconds. That abort is
      * `RETRYABLE` and reports a container whose labels cannot be read, and the
      * permanent abort from `SAVING` — the accurate diagnosis — is one pass behind it.
+     *
+     * ## The second consumer, which is not about laps at all
+     *
+     * `StopGrace.of` takes this as the **floor** under the stop's operational
+     * ceiling, so zero here means a proxy's grace period is capped at
+     * `StopGraceCeiling.MAX` flat, with nothing underneath it. That is right for the
+     * same reason as everything above — there is no save for a shortened grace period
+     * to interrupt — and it is the one place the floor is disarmed rather than
+     * derived. `PaperDrainSubject` reads both halves off one `LifecycleSpec`; this
+     * one supplies a constant. **A change that gives a proxy something to flush has
+     * to change this line**, or the ceiling silently starts cutting a grace period
+     * below a save again, which is the thirtieth audit's finding restored on the kind
+     * nobody was watching.
      */
     override val saveTimeout: Duration get() = Duration.ZERO
 

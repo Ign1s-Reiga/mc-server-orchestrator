@@ -220,8 +220,10 @@ public interface Node {
      * over a transport with a deadline, and an implementation that derives that
      * deadline from the grace period — which the containerd one does — has no
      * effective timeout at all once the grace period is large enough. See
-     * [StopGraceCeiling] for why it caps rather than refuses, and why the cap has a
-     * floor.
+     * [StopGraceCeiling] for why it caps rather than refuses, why the cap has a
+     * floor, and — the part not to skip — what that floor leaves uncapped: above a
+     * save timeout of two hours the ceiling *is* the save timeout, so this is a bound
+     * on the pair's relation and not a bound on how long the call can take.
      *
      * The second belongs to the runtime and stays with the implementation. A
      * container runtime carries the grace period as a fixed-width count, and past
@@ -270,7 +272,13 @@ public interface Node {
 }
 
 /**
- * The longest a [Node] will hold a stop open for, whatever it is handed.
+ * The bound a [Node] puts on a stop grace period before any runtime is asked to
+ * honour it.
+ *
+ * Not "two hours, whatever it is handed" — [ceilingFor] is the ceiling and it has a
+ * floor under it, so above a certain save timeout the effective ceiling is the save
+ * timeout rather than [MAX]. What that leaves uncapped is written out below, under
+ * *What the floor costs*, and it is the part a reader looking for a deadline needs.
  *
  * ## What it is defending against
  *
@@ -337,13 +345,35 @@ public interface Node {
  * relation survives whatever this does, and for every pair a reader would accept
  * the floor is below [MAX] and changes nothing.
  *
- * **The residual, stated rather than discovered.** A save timeout large enough that
- * the derived floor passes what the *runtime* accepts leaves the stop refused by
- * `StopGracePeriod` — which for containerd is 292 years away, so it needs both
- * halves of the pair to be absurd rather than merely unvalidated. That refusal is
- * the cap-versus-refuse trade pointing the other way, and it is the right way round
- * here: a refusal is recorded and loud, where a cap that inverts the pair is silent
- * and costs a world. It is also the same answer `Duration.INFINITE` already gets.
+ * ## What the floor costs, over the range where it actually applies
+ *
+ * The floor is not free, and its price is not at the far end. [ceilingFor] returns
+ * `max(MAX, saveTimeout + MIN_STOP_GRACE_MARGIN)`, so **for every save timeout above
+ * `MAX - MIN_STOP_GRACE_MARGIN` — one hour fifty-nine and a half — the effective
+ * ceiling is the save timeout, not two hours**, and it rises with it without limit
+ * until the *runtime's* own bound refuses the stop outright. A row carrying
+ * `saveTimeout = 30d` beside `stopGracePeriod = 31d` satisfies `LifecycleSpec.init`,
+ * decodes from a nanosecond column, and is capped to `30d30s`: shortened, landed
+ * exactly on the smallest grace the schema would have accepted for that pair, and
+ * still a reconcile worker parked for a month. Over that whole range this bounds
+ * **the relation** and does not bound **the wait**.
+ *
+ * That is the trade taken deliberately and it is the right way round — a parked
+ * worker loses no world, an inverted pair loses one — but the consequence has to be
+ * read off it rather than assumed away: what bounds the stop's deadline is whatever
+ * bounds `drain.saveTimeout`, and **nothing in this file does**. [ExecTimeoutCeiling]
+ * bounds a *copy* of that field on its way to an exec; the field itself arrives from
+ * the store unbounded, and closing that belongs at the decode, where a duration
+ * column is turned into a `Duration`. So read this as *"a grace period may not
+ * exceed the save it is protecting by more than a reader would allow"*, never as
+ * *"a stop is deadlined at two hours"*.
+ *
+ * **At the top of the range the trade inverts, on purpose.** A save timeout large
+ * enough that the derived floor passes what the runtime accepts leaves the stop
+ * refused by `StopGracePeriod` rather than capped — 292 years for containerd, so it
+ * needs both halves of the pair absurd rather than merely unvalidated. A refusal
+ * there is recorded and loud where a cap that inverts the pair is silent and costs a
+ * world, and it is the same answer `Duration.INFINITE` already gets.
  */
 public object StopGraceCeiling {
     /** See the note above. Two hours, borrowed from the widest cap any reader applies. */
@@ -430,6 +460,18 @@ public value class StopGrace private constructor(
          * not cut below. Both quantities are read from one definition at the call
          * site, which is what makes clamping one of a validated pair impossible
          * here.
+         *
+         * **The floor is only a floor while both halves come off one definition**,
+         * and that is a property of the *subjects*, not of this signature.
+         * `PaperDrainSubject` reads `stopGracePeriod` and `saveTimeout` off the same
+         * `LifecycleSpec`, so the pair handed here is the pair
+         * `SpecInvariants.stopGraceProblem` validated together and the floor lands on
+         * the schema's own boundary. `ProxyDrainSubject` pairs its grace period with
+         * a hard-coded `Duration.ZERO`, which is **no floor at all** — correct today
+         * because a proxy holds no world to be killed part-way through saving, and
+         * the single place a change that gives proxies something to save would remove
+         * the floor without touching this file or any test of it. A third subject
+         * inherits whichever of the two it was copied from, silently.
          */
         public fun of(
             requested: Duration,
@@ -837,12 +879,43 @@ public data class ExecRequest(
  *
  * The two are not inconsistent; what the number authorises differs. A stop's grace
  * period authorises a **kill**, and a shorter one is the more dangerous direction,
- * so an uninterpretable value must not be silently made plausible. An exec timeout
- * authorises only **waiting**: cutting it short can never do more than withhold a
+ * so an uninterpretable value must not be silently made plausible.
+ *
+ * **The licence to cap is derived for the save exec, and it does not carry to the
+ * others.** Cutting `save-all flush` short can do no more than withhold a
  * confirmation, and a save that is not confirmed is a container this orchestrator
- * will not stop. So capping costs nothing here, and it removes the one route by
- * which an `IllegalArgumentException` from [ExecRequest]'s own `init` could leave an
- * agent as an unclassified failure.
+ * will not stop — the safe direction, and `PaperServerAgent.requestSave` is the one
+ * construction site whose timeout comes off a definition at all. A **probe** cut
+ * short is not read as silence, it is read as consent: `DrainController.save`
+ * re-probes after the flush and stamps `worldSavedAt` on an `Unanswered` reading
+ * exactly as on an `Empty` one, so a probe that merely ran out of time mints the
+ * confirmation the stop is gated on, and `awaitStopped` states outright that an
+ * unanswered probe falls through with the drain untouched, so it does not hold the
+ * re-issue back either. Both probe timeouts are private ten-second constants against
+ * a one-hour ceiling, so nothing there is capped and this is not a live defect —
+ * but the day a probe timeout comes off a definition field the way `saveTimeout`
+ * does, this cap becomes a shortener of the one call whose silence is taken for a
+ * zero-player report. **Re-derive the licence at that construction site rather than
+ * reading it off this sentence.**
+ *
+ * ## What the cap does not close
+ *
+ * It removes `Duration.INFINITE` as a route into [ExecRequest]'s own `init`, and
+ * that is all it removes. **Zero and negative are still refused there**, as an
+ * `IllegalArgumentException` built *outside* `requestSave`'s try — so it is not a
+ * [NodeException], it passes `Reconciler`'s `catch (NodeException)` and
+ * `catch (StoreException)` untouched, and it lands in `ReconcileLoop.work`'s
+ * `catch (Throwable)` as a `ReconcileOutcome.Retry` **with no status write**: the
+ * drain is never recorded as failed, nothing raises `NEEDS_ATTENTION`, the dashboard
+ * keeps whatever it had, and one error line per pass is the entire signal. A
+ * `saveTimeout` of zero on a store row reaches that today.
+ *
+ * Raising a zero into a real wait here would be the "plausible-looking" move the
+ * paragraph above refuses, so the fix is not in this type: it is a bound at the
+ * decode, plus a classification at the construction site. The same is owed by
+ * [EndpointRequest]: its `timeout` is a `VelocityProxy`'s seal timeout arriving
+ * through `ControlChannel` — a definition field, **unbounded above**, with the same
+ * unclassified `IllegalArgumentException` below it.
  */
 @JvmInline
 public value class ExecTimeout private constructor(
@@ -896,6 +969,17 @@ public enum class HttpVerb {
  * is: a control plane that stops answering must not pin a reconcile pass. A drain
  * waits on this one, so an unbounded wait here is a container the orchestrator can
  * never stop.
+ *
+ * **It is the third duration that becomes a transport deadline, and the only one
+ * still unbounded.** [StopGrace] and [ExecTimeout] carry a ceiling in the argument's
+ * type; this is a bare `Duration`, and the survey that justified leaving it so —
+ * *"every construction site is a compile-time constant"* — is false: the one site,
+ * `ControlChannel.call`, is handed `backends.drain.sealTimeout` off a `VelocityProxy`
+ * definition, which reaches `:core` from a store row as well as from a reader. Above,
+ * an absurd value is a reconcile worker parked on a proxy that will not answer;
+ * below, a zero or a negative is an `IllegalArgumentException` out of the `init`
+ * beneath, thrown inside a drain and outside every typed catch on the way up — see
+ * [ExecTimeout]'s *What the cap does not close* for where that lands.
  */
 public data class EndpointRequest(
     val port: Int,
