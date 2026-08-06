@@ -1311,3 +1311,55 @@ Related: [[standalone-paper-drain-shape]]
      prevent, on the kind that holds worlds. When a refusal is relocated from
      "before the pass" to "at the create", check every kind whose hash carries the
      value, not just the one the fix was written for.
+
+## Round 26: the compensation that removes the mechanism of the wait
+
+112. **A compensating edge keyed on "abort vs block" is keyed on the wrong axis;
+     the axis is "will this drain be retried".** `DrainController.abort` calls
+     `releaseSeal` unconditionally, and its KDoc justifies the asymmetry with
+     "an abort has stopped advancing, so the seal buys nothing". That sentence is
+     true of a `PERMANENT` abort — `isBlockedByPermanentFailure` genuinely stops
+     the passes — and false of a `RETRYABLE` one, which re-enters on the very next
+     pass. `abort` already takes `failureClass` and does not consult it. Whenever a
+     compensation is added to a park, ask which of the two park classes its
+     argument is about, and check the parameter that already distinguishes them is
+     in the condition.
+113. **Releasing a level-triggered seal is only safe if the path that re-asserts it
+     is reachable from where the release leaves the drain.** After
+     `releaseSeal`, the drain sits in `DRAIN_FAILED`; `step`'s `DRAIN_FAILED`
+     branch is `resume(gated = router == null)` → `requireEmpty` → `blocked` for a
+     routerless subject with anybody online, and `holdSeal` is called only from the
+     six forward states. So one retryable abort with players on releases the login
+     seal and **no later pass can re-assert it until a pass reads zero** — which,
+     with the door open on a live fleet, never happens. The self-healing wait
+     becomes a non-converging one, and the only exit is the `crictl stop` the
+     design exists to avoid. The general check: for every state a compensation can
+     leave the machine in, walk forward and find the line that undoes it.
+114. **A pre-flight that names one helper as "the create's whole derivation" is a
+     claim about the create's *call list*, not about that helper.**
+     `LocalNode.checkWorkload` runs `containerSpecFor`, and `ensureWorkload` runs
+     `sandboxSpecFor` + `prepareHostPaths` + `containerSpecFor`.
+     `prepareHostPaths` throws `NodeException.Rejected` (permanent) for an
+     unwritable or missing volume/log root, and no pre-flight asks it. Narrow today
+     (a replacement's directories already exist, so `createDirectories` is a no-op)
+     but the KDoc's promise — "a third refusal added tomorrow is pre-flighted
+     without anybody remembering to come back here" — holds only for refusals added
+     inside the one helper named. Enumerate the create's *calls*, not its
+     derivation.
+115. **`PRESENCE_ONLY` makes the pre-flight's derived object structurally
+     different from the create's, so any validation over the omitted field is
+     blind.** `secretsFor(PRESENCE_ONLY)` returns `emptyMap()`, so the pre-flight's
+     `ContainerSpec` is built without the secret env entries, and
+     `ContainerSpec.init`'s `require(env.keys.none { it.isBlank() })` cannot see a
+     blank `secretEnv` key. Unreachable today (the keys are compile-time
+     constants), and it would surface as a `RuntimeException` that `translating`
+     maps to a permanent `Rejected` after the teardown. When a pre-flight variant
+     drops a field, list the validations that read that field.
+116. **A drain-in-flight exemption is justified by the end of the drain and applied
+     from its beginning.** `replacementBlocker` returns null once
+     `pass.previous?.drain != null`, on the grounds that "the container it would
+     have saved is gone or going". That is true from the stop onwards and false for
+     every pass before it — sealing, waiting for players, saving — which on a busy
+     server is hours. The artefact or secret can vanish inside that window and the
+     teardown still commits. If the cheap question exists, the place it belongs is
+     immediately before the irreversible step, not only before the reversible ones.
