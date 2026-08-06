@@ -1638,3 +1638,47 @@ Related: [[standalone-paper-drain-shape]]
      type-level bound, same population as the other two. Read the constructor's
      arguments at every call site; a parameter that is a constant in the type that
      declares it says nothing about what is passed to it.
+
+## Round 32: the compensation that needs a fact the record does not hold
+
+135. **A "was this side effect issued" test that is split across two catch sites needs
+     both halves, and each half misses the other's case.** `restoreRegistration` must
+     not re-admit players to a container that has already been sent `SIGTERM`, and the
+     discriminator is *"was a stop dispatched"*. `drain.state == STOPPING` misses
+     `stop`'s own `NodeException.Timeout` catch, where the drain is still
+     `DEREGISTERED` — the case `reconciler-dev` correctly identified. But
+     `failure is NodeException.Timeout` alone misses `awaitStopped`'s re-issue catch,
+     where a `Rejected`/`Busy` on the *second* stop still follows a *first* stop that
+     returned. The right test is the **disjunction**; ruling at round 32. The structural
+     answer is a recorded `stopDispatchedAt` on `DrainStatus`, so the compensation tests
+     a field instead of inheriting a paragraph. Whenever a compensation's correctness
+     rests on "which call site am I reached from", enumerate *every* call site and check
+     the proposed discriminator against each — a discriminator derived from one bug
+     report covers one site.
+136. **A reachability argument can be killed by a change in the same round, and the KDoc
+     will not notice.** `restoreRegistration`'s KDoc justifies its residual as *now
+     deterministic for a grace period above two hours*, because `:cri` caps the stop
+     deadline there. But `SpecBounds` (same round) caps a stored `saveTimeout` at 1h,
+     so `StopGraceCeiling.ceilingFor` returns 2h, so `StopGrace` never exceeds 2h, so
+     `GrpcCriClient`'s `capped` is never true for any definition the `Reconciler` acts
+     on — every one comes from the store. The residual is still real, through an
+     ordinary retryable `Timeout` on a slow containerd, but the *stated* population is
+     empty. Before accepting "this became reachable/unreachable because of X", re-run
+     the arithmetic through every bound the same change added; a finding closed on a
+     stale reachability claim is a finding closed one round early.
+137. **A clamp that rebuilds a spec by full construction resets any field it does not
+     enumerate.** `SpecBounds.boundPaper` uses `.copy(...)`; `boundProxy` writes
+     `BackendDrainSpec(seal, destination, deregister)` positionally-by-name. Correct for
+     today's three fields and silently wrong the day a fourth is added — reset to its
+     default on exactly the rows a clamp fired for, with no compile error. This is the
+     "one of three identically-shaped siblings" recurrence the fix was written to stop,
+     reproduced inside the fix. Grep every spec rebuild in a bounding/migrating path for
+     full construction rather than `copy`.
+138. **Verified this round, so do not re-derive from scratch:** `PropertyDocument`
+     cannot produce a non-finite `Duration` (`require(isFinite())` on write,
+     `long(key)?.nanoseconds` on read), so every `!isFinite()` passthrough in a
+     store-fed clamp is unreachable from a row; `IMMEDIATE_KILL` has no call site in
+     `:core`/`:api`/`:app`; there are exactly two `Node.stopWorkload` call sites and
+     both are preceded by `mayStop`; `Reconciler.kt`'s `letGo = deregisteredAt != null`
+     closes danger pattern 55, so *not* restoring a registration keeps a backend out of
+     routing without a second mechanism, and `converge`'s `drain = null` is the recovery.

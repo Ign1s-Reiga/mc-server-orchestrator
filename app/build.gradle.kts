@@ -68,6 +68,18 @@ dependencies {
     controlPlugin(project(mapOf("path" to ":velocity-plugin", "configuration" to "controlPlugin")))
 }
 
+// The integration source sets are compiled by `check`, and never run by it.
+//
+// `integrationTest` is a separate source set, so an ordinary `./gradlew build`
+// did not compile it — a type change in `:core` could break these suites and
+// every green build would keep saying so until somebody ran containerd. That
+// happened: `EndpointRequest.timeout` became a value class and this module's
+// suite stopped compiling, invisibly, for a whole round.
+//
+// Compiling is free and needs no runtime; running still needs
+// scripts/dev/containerd-up.sh and stays opt-in.
+tasks.named("check") { dependsOn(tasks.named("compileIntegrationTestKotlin")) }
+
 tasks.register<Test>("integrationTest") {
     group = "verification"
     description = "Runs integration tests against a real local containerd (see scripts/dev/containerd-up.sh)."
