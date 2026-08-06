@@ -7,6 +7,7 @@ import mcorch.cri.ContainerState
 import mcorch.cri.CriClient
 import mcorch.cri.CriClientConfig
 import mcorch.cri.CriEndpoint
+import mcorch.cri.CriTimeouts
 import mcorch.cri.ImageName
 import mcorch.cri.LinuxSandboxSpec
 import mcorch.cri.SandboxFilter
@@ -32,8 +33,17 @@ import kotlin.time.Duration.Companion.seconds
  * socket — the endpoint defaults to the instance `scripts/dev/containerd-up.sh`
  * creates under `/run/mcorch-dev`.
  */
-internal class RuntimeHarness : AutoCloseable {
-    val client: CriClient = CriClient.connect(CriClientConfig(endpoint = CriEndpoint.parse(endpoint())))
+internal class RuntimeHarness(
+    /**
+     * Defaulted, because a suite that does not care about deadlines should be
+     * measuring the runtime with the same ones production uses. A suite that
+     * *is* measuring a deadline overrides it — waiting out the shipped
+     * `stopDeadlineCap` would be a two-hour test.
+     */
+    timeouts: CriTimeouts = CriTimeouts(),
+) : AutoCloseable {
+    val client: CriClient =
+        CriClient.connect(CriClientConfig(endpoint = CriEndpoint.parse(endpoint()), timeouts = timeouts))
 
     private val sandboxes = mutableListOf<SandboxId>()
 

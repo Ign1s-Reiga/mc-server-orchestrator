@@ -51,6 +51,13 @@ internal class StopGracePeriodBoundaryIT {
                 // period under test is about 292 years. That it *can* be
                 // cancelled is half the claim: a stop with a long grace period
                 // must not be a call the reconcile loop cannot get out of.
+                //
+                // Cancellation is not the only way out any more: this client's
+                // deadline is capped at [CriTimeouts.stopDeadlineCap], so the
+                // call would have ended on its own two hours in. That is
+                // `StopDeadlineCapIT`'s subject and is deliberately not what
+                // this measures — what is under test here is containerd still
+                // waiting, which needs a call that has not given up.
                 val finished =
                     withTimeoutOrNull(RuntimeHarness.WATCH) {
                         harness.client.stopContainer(container, grace)

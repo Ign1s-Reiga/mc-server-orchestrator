@@ -221,8 +221,24 @@ public interface CriClient : AutoCloseable {
      *
      * There is no default: see [StopGracePeriod].
      *
-     * The transport deadline is [gracePeriod] plus [CriTimeouts.deadlineSlack],
-     * so the kill fires before the RPC gives up.
+     * ## The deadline is not the grace period
+     *
+     * The transport deadline is `min([gracePeriod], `[CriTimeouts.stopDeadlineCap]`)`
+     * plus [CriTimeouts.deadlineSlack]. Below the cap — where every grace period
+     * a server definition can legitimately carry sits — that is
+     * `gracePeriod + slack` and the kill fires before the RPC gives up, as
+     * before. Above it the call gives up first, with a retryable
+     * [CriException.Timeout] that says so, so that a very long grace period
+     * cannot park a caller indefinitely on a call with no effective deadline.
+     *
+     * **What containerd is asked to wait is always the whole [gracePeriod].**
+     * The cap shortens the deadline and never the grace period, so this call can
+     * only ever leave a container running longer, never kill it sooner.
+     *
+     * A timeout therefore does not mean the stop failed: containerd has the stop
+     * signal and goes on with it. It does mean the kill at the end of the grace
+     * period will not happen for *this* call — re-issue the stop, which is
+     * idempotent, or read the container's state.
      *
      * @throws CriException on any failure.
      */
