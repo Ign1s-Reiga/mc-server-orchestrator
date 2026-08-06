@@ -1,6 +1,6 @@
 ---
 name: deadline-ceilings
-description: Rounds 30–31 on the three durations that become transport deadlines — why a ceiling on one half of a validated pair inverts it, why the bound moved onto the argument's type at the Node seam, why the floor then makes that ceiling bound the relation rather than the wait, and the third duration that is definition-fed and still unbounded
+description: Rounds 30–32 on the three durations that become transport deadlines — why a ceiling on one half of a validated pair inverts it, why the bound moved onto the argument's type at the Node seam, why the floor makes that ceiling bound the relation rather than the wait, who owns the wait now, and why one unbuildable request is classified retryable at one call site and permanent at another
 metadata:
   type: project
 ---
@@ -148,26 +148,79 @@ reachable the day one comes off a definition the way `saveTimeout` does.
 answer.** A wait whose silence is read as consent is not a wait that can be cut
 short, whatever the value authorises on its face.
 
+## Round 32: the third type, and the floor's other half
+
+Both open items below are closed. `EndpointTimeout` is the type of
+`EndpointRequest.timeout`, bounded by `VelocityProxyDefaults.MAX_TIMEOUT` — the
+same constant `SpecBounds.MAX_HANDSHAKE_TIMEOUT` borrows for the same field, which
+is what makes the two layers agree by construction rather than by coincidence.
+
+**The licence to cap was re-derived at the call, and this time the derivation is
+per-consumer rather than per-number.** For the control channel every unanswered
+call becomes `ControlOutcome.Unavailable`, and every consumer either parks the
+drain or discards the answer (`observedPlayers` is *"corroboration only, and never
+a gate"*). So shortening it can only park a drain, never advance one — and the
+sentence to write down is the *test*: **what reads the absence of an answer**, not
+what the number authorises.
+
+**The classification is a caller's decision, and the two callers land opposite.**
+Same defect, same shape, different class, because what a `PERMANENT` failure arms
+is `isBlockedByPermanentFailure`, and the only thing that lifts it is a generation
+bump **on the server it froze**:
+
+- `ControlChannel` → `Unavailable(retryable = true)`. The row is the *proxy's* and
+  the drain reading it is usually a *backend's*, so permanence freezes every
+  backend behind that proxy with no lever on any of them. Precedent already in the
+  repo: `ProxyLink.transfer`'s `UNAUTHENTICATED`. And on the proxy's own drain it
+  would not even be a permanence — `abort`'s compensation runs back through the
+  same unbuildable request, so it down-classifies to retryable anyway and appends
+  `SEAL_STUCK_SHUT`, a sentence about a blackout that never happened.
+- `requestSave` → `NotDelivered(retryable = false)`. Own definition, so the repair
+  bumps this server's generation. `NotDelivered` and not `Unconfirmed`: nothing was
+  dispatched, so the never-re-send wedge must stay unarmed.
+
+**Ask of any permanent verdict: does the repair bump the generation of the server
+this freezes?** If the field belongs to another object, the answer is no and the
+verdict is a fleet-wide wedge.
+
+The catch wraps the **whole construction**, which is what makes it worth more than
+a nullable factory: `EndpointRequest.init` also validates `port`, and that is
+`spec.control.port` — a second definition field from the same row.
+
+## The wait the ceiling does not bound now has an owner, and it is `:cri`
+
+`GrpcCriClient` deadlines a stop at
+`min(gracePeriod, CriTimeouts.stopDeadlineCap) + deadlineSlack`, two hours by
+default, and **sends the whole grace period on the wire**. So round 31's "nothing
+bounds the wait" is answered without moving the grace period an inch, and
+`awaitStopped`'s overdue check still measures against the value the runtime was
+given. Three `:core` sentences described the old `gracePeriod + slack` derivation
+and one *test name* carried it as its justification — renamed, and the mutation
+harness's anchor with it.
+
+**The measured fact worth keeping, because it decides the classification:**
+containerd does **not** escalate to `SIGKILL` once the request context has expired
+(`container_stop.go`: `if ctx.Err() != nil { return ctx.Err() }` between the wait
+and the kill; observed on 2.3.3 — a 12s grace deadlined at 4s left the container
+RUNNING 17s later). A capped deadline can therefore only leave a container running
+**longer**, never kill it sooner, and the re-issue is the only thing that finishes
+it. I was told the opposite in relay first — *"containerd keeps stopping
+server-side after the client deadline"* — and it is false; do not write it down.
+
 ## What is still open
 
 - Integration suites did **not** run again: `containerd-up.sh` needs an
-  interactive `sudo`. Four rounds now.
-- **`EndpointRequest.timeout` is definition-fed, and round 30's note here was
-  wrong to say otherwise.** I wrote *"every construction site is a compile-time
-  constant today"* — a survey, and a false one: `ControlChannel`'s single
-  construction site is handed `spec.backends.drain.sealTimeout` from a
-  `VelocityProxy`, at both of `ControlChannel`'s own construction sites
-  (`Reconciler.channel`, `ProxyFleet`). So the third transport deadline is
-  unbounded above, and below it is the same unclassified `IllegalArgumentException`
-  as `ExecRequest`'s. Written into the type's KDoc rather than fixed, deliberately:
-  the fix is a bound at the decode plus a classification at the construction site,
-  and the second lands in the drain's control path.
-- **Zero and negative still escape unclassified.** `ExecTimeout.of` caps above and
-  cannot floor — raising a zero into a real wait is the "make an uninterpretable
-  value plausible" move the ceiling refuses — so `ExecRequest.init` throws an IAE
-  built outside `requestSave`'s try, past `Reconciler`'s two typed catches, into
-  `ReconcileLoop.work`'s `catch (Throwable)`: a `Retry` with **no status write**.
-  No failure recorded, no `NEEDS_ATTENTION`, one error line per pass.
+  interactive `sudo`. Five rounds now.
+- **`Reconciler.readControl` discards the detail**, so on a proxy's *own* status a
+  bad row reads as "the control endpoint did not answer". The backends carry the
+  full sentence; a fleet with no backend draining does not. Closing it needs a
+  place on `ControlEndpointStatus` for *"answering is not the problem"* — the same
+  field `assertBackends`'s `UNAUTHENTICATED` branch is already waiting for.
+- **`restoreRegistration` re-registers a container that has been sent SIGTERM.**
+  Filed as a note at the site, not fixed. See [[gate-and-ceiling]] for the gate it
+  interacts with; the discriminator that looks right (`state == STOPPING`) misses
+  the case, because `stop`'s own `Timeout` catch fires with the drain still
+  `DEREGISTERED`.
 
 See [[invariants-need-an-enforcement-point]] for the rule this is an instance of,
 and [[gate-and-ceiling]] for the cap-versus-refuse ruling it revises.

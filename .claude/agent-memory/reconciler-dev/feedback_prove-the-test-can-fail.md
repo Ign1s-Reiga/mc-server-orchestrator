@@ -249,6 +249,25 @@ goes red again. The general form: after changing a signature, every mutation tha
 *writes new code* against it needs re-deriving, not only the ones whose literal you
 edited.
 
+**A self-closing tag breaks an open..close regex, and the harness then names the
+wrong test.** JUnit writes a *passing* case as `<testcase … />` and a failing one
+as `<testcase …>…</testcase>`, so a non-greedy `>(.*?)</testcase>` runs from one
+open tag past every self-closed case to the next close tag and attributes the
+failure it finds there to a test that passed. A throwaway harness of mine reported
+seven MISCAUGHT verdicts naming tests that were green, and the code was fine.
+Split on the *opening* tag instead. (`drain-wiring-mutations.sh`'s awk is already
+correct — it tracks the last name seen.) The tell: a mutation in file A reddening
+a test that cannot possibly read file A.
+
+**Never run a mutation harness in the background while you are still editing.** It
+backs the sources up at start and restores them at exit, so every edit made during
+the run is either silently reverted at the end or mutated underneath the run — and
+a `pkill` that catches a child rather than the script leaves a mutation *committed
+to your working tree*. It cost me a reverted edit and five leftover mutations in
+two files, one of which I could not `git checkout --` because it also held real
+work. Commit first, then run the harness, then edit again — the same rule as
+sabotaging by hand, for the same reason.
+
 **Do not pipe a mutation harness through `tail`.** I ran one as
 `./harness.sh 2>&1 | tail -70`, saw "2 mutations were not caught", and had thrown
 away every `MISCAUGHT`/`GREEN`/`UNKNOWN` line — those go to stderr *interleaved*,
