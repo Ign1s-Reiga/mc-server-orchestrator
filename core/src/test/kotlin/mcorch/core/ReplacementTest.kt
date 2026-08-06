@@ -194,6 +194,17 @@ internal class ReplacementTest {
             harness.node.creates shouldHaveSize 2
             harness.node.creates[1]
                 .image.canonical shouldBe "docker.io/itzg/minecraft-server:2026.7.1"
+            // **A second `save-all flush`, and this is the test that owns that
+            // claim.** The first save happened before the play session; somebody
+            // then logged on and built for it, which is the one thing that makes an
+            // earlier flush worthless. `readPlayers` voids the confirmation and
+            // `resumeInto`'s ladder has to go back through `SAVING`, so the world on
+            // disk describes what they did rather than what was there before.
+            // Everything above holds structurally without this — a container was
+            // removed and recreated either way — and a replacement that recreated
+            // the container over a stale world is the failure this scenario is
+            // uniquely placed to see.
+            harness.node.saves shouldHaveSize 2
         }
 
     @Test
