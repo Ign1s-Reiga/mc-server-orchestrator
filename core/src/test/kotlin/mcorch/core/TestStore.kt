@@ -49,6 +49,23 @@ import java.time.Instant
  * identical status write is a no-op, a stale `observedDefinition` conflicts,
  * and a purge of a live definition is refused.
  *
+ * ## One clause it does not implement, on purpose
+ *
+ * [Store] promises that every definition a read hands back has been through
+ * `SpecBounds` — no duration that becomes a transport deadline above the widest
+ * value a reader would have accepted. **This fake hands the record back exactly as
+ * it was stored**, and that is a ruling rather than a gap: `:core` keeps its own
+ * ceilings for definitions that never went through a store, several tests drive
+ * those ceilings through this fake, and a fake that clamped would make every one of
+ * them assert its own arithmetic. The reasoning, and what would change it, is in
+ * `TestStoreContractTest`'s
+ * `a definition with a deadline past its ceiling comes back exactly as it was
+ * stored` — which pins the divergence so that closing it is a decision.
+ *
+ * Note the direction. Permissive about a *read* means the loop is tested against
+ * inputs wider than a real store can produce; permissive about a *write* is the one
+ * that turns a suite into a tautology, and this fake is strict there.
+ *
  * [statusWrites] is what the idempotency test asserts on: a settled server must
  * not produce store traffic.
  */
