@@ -477,6 +477,15 @@ public data class DrainStatus(
      * for a request that then failed to leave costs availability; a dispatch with no
      * stamp costs a player's session.
      *
+     * **So what it records is that a call was made, not that a request reached a
+     * runtime**, and the ordering above is the whole content of the field, so the one
+     * path that breaks the equivalence is named here rather than left to be
+     * rediscovered: a `Node` is free to return without issuing anything, and the
+     * single-host one does exactly that for a handle carrying no container id. It errs
+     * the safe way — a stamp with nothing behind it withholds a re-admission rather
+     * than granting one — and nothing routes into a stop with such a handle today. The
+     * field is named for the boundary it can actually observe, which is this process.
+     *
      * **Set once, and retired by the workload rather than by the drain.** There is no
      * un-dispatch, so a later pass can only learn that another stop is *also*
      * outstanding, never that the first one is not. Every other field here is cleared
