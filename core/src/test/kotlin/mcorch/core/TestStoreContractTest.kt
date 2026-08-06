@@ -12,6 +12,8 @@ import mcorch.store.Precondition
 import mcorch.store.WriteOutcome
 import mcorch.store.getOrThrow
 import org.junit.jupiter.api.Test
+import kotlin.time.Duration.Companion.hours
+import kotlin.time.Duration.Companion.minutes
 
 /**
  * [TestStore] against the [mcorch.store.Store] contract it claims to implement.
@@ -213,6 +215,56 @@ internal class TestStoreContractTest {
 
             store.statusWrites shouldBe writes
             store.getServer(name).shouldNotBeNull().status shouldBe null
+        }
+
+    /**
+     * The one clause of the contract this fake **deliberately does not deliver**,
+     * pinned so that closing it is a decision rather than a tidy-up.
+     *
+     * `Store`'s KDoc says every definition handed back by a read has been through
+     * `SpecBounds`, and `:store`'s conformance suite holds both of its
+     * implementations to it. [TestStore] does not, and the direction matters: it is
+     * *more permissive than the real store*, which for a read-side guarantee means
+     * `:core` is exercised against a **wider** input set than a real store can
+     * produce, not a narrower one. The fake that got this project into trouble was
+     * permissive about *writes* — accepting what the real store refuses — and that
+     * is the opposite direction.
+     *
+     * Delivering it here would be actively harmful, and this is the argument to read
+     * before "fixing" it. `SpecBounds` is explicit that `:core`'s own ceilings stay
+     * load-bearing for anything that never went through a store, and the tests that
+     * hold them — `DrainTest`'s `a store row past both ceilings …`, and
+     * `UnbuildableRequestTest`'s two proxy cases — all reach `:core` through this
+     * fake. Clamping here would make every one of them assert a value the fake
+     * produced, and a later change that deleted `StopGraceCeiling`,
+     * `ExecTimeoutCeiling` or `EndpointTimeout` outright would leave the suite green.
+     *
+     * So the divergence is a ruling. What would change it is `:store` publishing its
+     * conformance suite as a test fixture — at which point this whole class goes, and
+     * the right answer is a *second* fake for the bound reads rather than one that
+     * has to be both.
+     */
+    @Test
+    fun `a definition with a deadline past its ceiling comes back exactly as it was stored`() =
+        coreTest {
+            val store = TestStore(MutableClock())
+            // Past `SpecBounds.MAX_SAVE_TIMEOUT` and `MAX_STOP_GRACE_PERIOD` alike,
+            // and a pair `LifecycleSpec.init` accepts — which is what makes it a row
+            // a real store would have clamped on the way out.
+            val definition = paperDefinition(saveTimeout = 3.hours, stopGracePeriod = 3.hours + 1.minutes)
+            val name = definition.metadata.name
+            store.putDefinition(definition).getOrThrow()
+
+            val read =
+                store
+                    .getServer(name)
+                    .shouldNotBeNull()
+                    .definition.definition
+            read shouldBe definition
+            store
+                .listServers()
+                .single()
+                .definition.definition shouldBe definition
         }
 }
 

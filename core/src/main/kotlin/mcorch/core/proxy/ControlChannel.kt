@@ -2,6 +2,7 @@ package mcorch.core.proxy
 
 import mcorch.core.EndpointRequest
 import mcorch.core.EndpointResponse
+import mcorch.core.EndpointTimeout
 import mcorch.core.HttpVerb
 import mcorch.core.Node
 import mcorch.core.NodeException
@@ -32,11 +33,13 @@ import kotlin.time.Duration
  *   `BACKEND_OCCUPIED` means *this* caller ran step 6 before step 4 finished, and
  *   `SOURCE_NOT_SEALED` means it ran step 4 before step 2. The remedy is in the
  *   caller, so the code has to survive the trip.
- * - **The proxy could not be reached, or said something unreadable** —
- *   [ControlOutcome.Unavailable]. This is where `PROXY_CONTROL_UNREACHABLE` and
- *   `PROXY_PLUGIN_INCOMPATIBLE` come from, and it is where the [NodeException]
- *   translation happens. Nothing above this line sees a node failure from the
- *   control channel, for the same reason nothing above [Node] sees a CRI one.
+ * - **The proxy could not be reached, said something unreadable, or could not be
+ *   asked at all** — [ControlOutcome.Unavailable]. This is where
+ *   `PROXY_CONTROL_UNREACHABLE` and `PROXY_PLUGIN_INCOMPATIBLE` come from, and it is
+ *   where the [NodeException] translation happens. Nothing above this line sees a
+ *   node failure from the control channel, for the same reason nothing above [Node]
+ *   sees a CRI one — and nothing above it sees an `IllegalArgumentException` out of
+ *   a request built from an unrepaired definition either; see [unbuildable].
  *
  * ## Compatibility is set membership
  *
@@ -51,6 +54,15 @@ internal class ControlChannel(
     private val handle: WorkloadHandle,
     private val port: Int,
     private val token: SecretRef?,
+    /**
+     * How long each call gets, declared rather than bounded.
+     *
+     * It arrives raw — `spec.backends.drain.sealTimeout` at both construction sites,
+     * which `UnbuildableRequestTest` pins rather than this sentence — and
+     * is bounded in [call], where the request is built and where a value no request
+     * can be made from is classified. Doing it here instead would put the ceiling one
+     * layer away from the refusal that shares its subject.
+     */
     private val timeout: Duration,
 ) {
     /**
@@ -157,20 +169,28 @@ internal class ControlChannel(
         body: String? = null,
         read: (ControlObject) -> T,
     ): ControlOutcome<T> {
+        val request =
+            try {
+                EndpointRequest(
+                    port = port,
+                    verb = verb,
+                    path = path,
+                    body = body,
+                    contentType = if (body == null) null else ControlProtocol.CONTENT_TYPE,
+                    bearerToken = token,
+                    // Bounded above by the argument's own type, which caps rather
+                    // than refusing — see [EndpointTimeout]. What it cannot do is
+                    // raise a zero, so the `init` beneath still refuses one, and the
+                    // `catch` below is what stops that refusal leaving this file as
+                    // an unclassified throwable.
+                    timeout = EndpointTimeout.of(timeout),
+                )
+            } catch (rejected: IllegalArgumentException) {
+                return unbuildable(verb, path, rejected)
+            }
         val response =
             try {
-                node.callEndpoint(
-                    handle,
-                    EndpointRequest(
-                        port = port,
-                        verb = verb,
-                        path = path,
-                        body = body,
-                        contentType = if (body == null) null else ControlProtocol.CONTENT_TYPE,
-                        bearerToken = token,
-                        timeout = timeout,
-                    ),
-                )
+                node.callEndpoint(handle, request)
             } catch (failure: NodeException) {
                 // Translated at this edge, exactly as `LocalNode` translates a CRI
                 // failure at its own. Above here a control failure is a control
@@ -186,6 +206,79 @@ internal class ControlChannel(
             }
         return interpret(verb, path, response, read)
     }
+
+    /**
+     * A request this definition cannot express, turned into an outcome the drain
+     * already knows what to do with.
+     *
+     * ## Why it is classified here at all
+     *
+     * `EndpointRequest`'s `init` refuses a non-positive timeout and a port outside
+     * 1..65535, and **both of those values come off a `VelocityProxy` definition** —
+     * `spec.backends.drain.sealTimeout` and `spec.control.port` — which reaches
+     * `:core` from a store row as well as from a reader. Left to propagate, the
+     * `IllegalArgumentException` is thrown inside a drain, misses `Reconciler`'s
+     * `catch (NodeException)` and `catch (StoreException)` alike, and ends in
+     * `ReconcileLoop.work`'s `catch (Throwable)` as a bare requeue **with no status
+     * write**: the drain is never recorded as failed, nothing raises
+     * `NEEDS_ATTENTION`, the dashboard keeps whatever it had, and the server cannot
+     * be deleted. One error line per pass is the entire signal.
+     *
+     * [ControlOutcome.Unavailable] is the right case rather than [ControlOutcome.Refused]:
+     * the proxy did not decline anything, because the proxy was never asked. It is
+     * the same case a malformed reply gets, and for the same reason — this build
+     * cannot conduct the conversation.
+     *
+     * ## Retryable, which is the decision worth reading twice
+     *
+     * Nothing about this fixes itself: every pass rebuilds the same request from the
+     * same field, so on the face of it "stop trying" is the honest class. It is
+     * still **retryable**, for two reasons that both come off where the field lives.
+     *
+     * - **The row belongs to the proxy and the drain reading it is usually a
+     *   backend's.** A `PERMANENT` failure recorded against a backend arms
+     *   `Reconciler.isBlockedByPermanentFailure`, and the only thing that lifts that
+     *   gate is a generation bump **on that backend**. Repairing the proxy's
+     *   definition does not produce one — so one bad field would freeze every
+     *   backend behind that proxy, each needing its own edit to come back. This is
+     *   the same call [ProxyLink]'s `transfer` already makes for `UNAUTHENTICATED`,
+     *   in the same words: a fault an operator repairs *elsewhere* must not stop the
+     *   passes here.
+     * - **On the proxy's own drain a permanence would not even be one.** A permanent
+     *   abort owes `DrainController.releaseSeal`, which goes back through this same
+     *   unbuildable request and cannot land — so `abort` down-classifies it to
+     *   `RETRYABLE` anyway and appends `SEAL_STUCK_SHUT`, a sentence telling an
+     *   operator the fleet's front door is shut when no seal was ever asserted.
+     *
+     * What retryable costs is a park and a status write per backoff, with nothing
+     * issued at the proxy — no seal, no transfer, no deregistration — and
+     * `NEEDS_ATTENTION` once the failure has stood for `attentionAfter`. What it
+     * buys is that the repair is one edit to one definition.
+     *
+     * ## What an operator is told
+     *
+     * The detail names both definition fields and the value that was refused, which
+     * is what a `PROXY_CONTROL_UNREACHABLE` on a *backend* then carries. The
+     * **proxy's own** status is a residual: `Reconciler.readControl` discards this
+     * detail and reports `reachable = false`, so a fleet with no backend draining
+     * sees "the control endpoint did not answer" and not the field. Closing that
+     * needs a place on `ControlEndpointStatus` for "answering is not the problem",
+     * which is the same field the `UNAUTHENTICATED` branch in `assertBackends` is
+     * waiting for.
+     */
+    private fun <T> unbuildable(
+        verb: HttpVerb,
+        path: String,
+        rejected: IllegalArgumentException,
+    ): ControlOutcome<T> =
+        ControlOutcome.Unavailable(
+            detail =
+                "$verb $path could not be built for the proxy's control endpoint: ${rejected.message}. The " +
+                    "values this request is built from are the proxy's own — spec.control.port and " +
+                    "spec.backends.drain.sealTimeout — so nothing was sent and the proxy itself is unaffected. " +
+                    "This clears when that definition is repaired",
+            retryable = true,
+        )
 
     private fun <T> interpret(
         verb: HttpVerb,

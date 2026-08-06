@@ -99,16 +99,31 @@ internal class PaperServerAgent(
         )
     }
 
-    /** Asks the server whether it is accepting players, and how many it has. */
+    /**
+     * Asks the server whether it is accepting players, and how many it has.
+     *
+     * The `try` around the request is the rule [Node] states for every construction
+     * site, applied here where **no input can reach it**: [PROBE_TIMEOUT] is a
+     * constant, and the one definition-fed input — `spec.network.port` — becomes a
+     * `toString()`, which `ExecRequest`'s `init` has nothing to refuse. So it is a
+     * guard rather than a fix, and it is written down as one instead of being left
+     * out: the day a probe timeout comes off a definition the way `saveTimeout` does,
+     * the site that needs classifying already has it, and a rule with an exception at
+     * two of its three sites is a rule the fourth site is not going to keep.
+     */
     suspend fun probe(
         node: Node,
         handle: WorkloadHandle,
     ): ProbeOutcome {
         val request =
-            ExecRequest(
-                command = PaperCommands.serverListPing(spec.network.port),
-                timeout = ExecTimeout.of(PROBE_TIMEOUT),
-            )
+            try {
+                ExecRequest(
+                    command = PaperCommands.serverListPing(spec.network.port),
+                    timeout = ExecTimeout.of(PROBE_TIMEOUT),
+                )
+            } catch (rejected: IllegalArgumentException) {
+                return ProbeOutcome.Unavailable(detail = unbuildableProbe(rejected), retryable = false)
+            }
         val result =
             try {
                 node.exec(handle, request)
@@ -189,8 +204,13 @@ internal class PaperServerAgent(
      * for as long as it liked. The cap can only ever make a save go unconfirmed
      * earlier, and an unconfirmed save is a container this orchestrator does not
      * stop — the safe direction, and the reason a cap is right here where a refusal
-     * would abort the drain. See [ExecTimeoutCeiling] for why it is not the same
+     * would abort the drain. See `ExecTimeoutCeiling` for why it is not the same
      * bound as the stop grace period's, from the same field.
+     *
+     * A cap has no answer for the *bottom* of the range, and that half is
+     * [unbuildableSave]: a `saveTimeout` of zero or less is refused by
+     * `ExecRequest`'s own `init`, and this is the site that turns that refusal into a
+     * recorded drain failure rather than an exception nobody classifies.
      */
     suspend fun requestSave(
         node: Node,
@@ -201,10 +221,14 @@ internal class PaperServerAgent(
             return SaveOutcome.Unconfirmable(noSaveChannel(contract))
         }
         val request =
-            ExecRequest(
-                command = PaperCommands.saveAll(),
-                timeout = ExecTimeout.of(spec.lifecycle.drain.saveTimeout),
-            )
+            try {
+                ExecRequest(
+                    command = PaperCommands.saveAll(),
+                    timeout = ExecTimeout.of(spec.lifecycle.drain.saveTimeout),
+                )
+            } catch (rejected: IllegalArgumentException) {
+                return unbuildableSave(rejected)
+            }
         val result =
             try {
                 node.exec(observation.handle, request)
@@ -270,6 +294,57 @@ internal class PaperServerAgent(
             )
         }
     }
+
+    /**
+     * A save request this definition cannot express, recorded as a failure instead
+     * of thrown.
+     *
+     * ## What it is for
+     *
+     * `ExecRequest`'s `init` refuses a non-positive timeout, and this one is
+     * `spec.lifecycle.drain.saveTimeout` — operator data that also arrives from a
+     * store row, which `DefinitionCodec` does not re-validate. `SpecBounds` caps that
+     * field on the way out of the store and deliberately does **not** floor it: a row
+     * holding `saveTimeout = 0` beside `stopGracePeriod = 30s` satisfies
+     * `SpecInvariants.stopGraceProblem` exactly, and flooring the save to one second
+     * would push the pair's minimum above the grace period declared beside it. So
+     * zero reaches here, by design, and this is where it stops.
+     *
+     * Uncaught, the exception is built *outside* the `try` that catches
+     * [NodeException], passes `Reconciler`'s two typed catches, and lands in
+     * `ReconcileLoop.work`'s `catch (Throwable)` as a bare requeue with **no status
+     * write**: the drain is never recorded as failed, nothing raises
+     * `NEEDS_ATTENTION`, and the server cannot be deleted. That is CLAUDE.md's
+     * *"permanent failures surface on the server's observed status"* not happening.
+     *
+     * ## `NotDelivered`, and permanently
+     *
+     * `NotDelivered` is the truthful case: no exec was dispatched, so nothing reached
+     * the server and the never-re-send wedge ([SaveOutcome.Unconfirmed]) must not be
+     * armed — `saveRequestedAt` stays null and a repaired definition saves normally.
+     *
+     * It is the **permanent** side of that case, which is the narrow bucket this
+     * project keeps narrow, so the evidence is worth naming: the value is in hand,
+     * nothing was asked of any third party, and every later pass rebuilds the same
+     * request from the same field. Asking again is not a different question.
+     *
+     * The gate that permanence arms is `Reconciler.isBlockedByPermanentFailure`, and
+     * it is liftable **here** in a way it is not on the proxy's control path: the
+     * field is on *this* server's own definition, so the edit that repairs it is the
+     * edit that bumps this server's generation and resumes its passes. And
+     * `permanentFailureStopsPasses` exempts a terminating definition, so a delete
+     * keeps reconciling — it still will not stop the container, because no save was
+     * confirmed (CLAUDE.md invariant 3), which is the correct answer and not a
+     * consequence of the class.
+     */
+    private fun unbuildableSave(rejected: IllegalArgumentException): SaveOutcome.NotDelivered =
+        SaveOutcome.NotDelivered(
+            detail =
+                "no world save could be requested, because spec.lifecycle.drain.saveTimeout is not a duration a " +
+                    "command can be run with: ${rejected.message}. Nothing was sent to the server, which keeps " +
+                    "running with its players on it. Correct that field and the drain carries on from here",
+            retryable = false,
+        )
 
     /**
      * Why this container cannot report a completed save, and what an operator
@@ -520,6 +595,22 @@ internal object PaperCommands {
         return DIAGNOSTICS.filter { it in haystack }
     }
 }
+
+/**
+ * What a probe request that could not be built says to an operator.
+ *
+ * Shared by both agents' probes so the sentence is one thing rather than two that
+ * drift. It is deliberately vaguer than the save's: a probe's inputs are a constant
+ * and a port, so there is no single field to point at, and pointing at the wrong one
+ * is worse than describing what happened.
+ *
+ * No branch that reaches this exists today — see `PaperServerAgent.probe` — so this
+ * is a sentence nothing prints, kept because the alternative is a construction site
+ * with no classification at all.
+ */
+internal fun unbuildableProbe(rejected: IllegalArgumentException): String =
+    "the readiness probe could not be built from this server's definition: ${rejected.message}. Nothing was run " +
+        "inside the container, so this says nothing about whether the server is joinable or who is on it"
 
 /**
  * What went wrong with a command, said without repeating what it printed.

@@ -11,6 +11,7 @@ import mcorch.core.paper.PaperCommands
 import mcorch.core.paper.ProbeOutcome
 import mcorch.core.paper.WorkloadContract
 import mcorch.core.paper.diagnose
+import mcorch.core.paper.unbuildableProbe
 import mcorch.schema.VelocityProxyDefinition
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
@@ -48,16 +49,25 @@ internal class VelocityProxyAgent(
      * needs a limit. Taking it from the declaration is what the plugin author
      * asked for rather than having the proxy guess at somebody else's
      * configuration.
+     *
+     * The `try` is the same guard `PaperServerAgent.probe` carries, unreachable for
+     * the same reason and kept for the same one: [Node] states that a request built
+     * from a definition is classified rather than thrown, and a rule with exceptions
+     * is not a rule.
      */
     suspend fun probe(
         node: Node,
         handle: WorkloadHandle,
     ): ProbeOutcome {
         val request =
-            ExecRequest(
-                command = PaperCommands.serverListPing(spec.network.port),
-                timeout = ExecTimeout.of(PROBE_TIMEOUT),
-            )
+            try {
+                ExecRequest(
+                    command = PaperCommands.serverListPing(spec.network.port),
+                    timeout = ExecTimeout.of(PROBE_TIMEOUT),
+                )
+            } catch (rejected: IllegalArgumentException) {
+                return ProbeOutcome.Unavailable(detail = unbuildableProbe(rejected), retryable = false)
+            }
         val result =
             try {
                 node.exec(handle, request)

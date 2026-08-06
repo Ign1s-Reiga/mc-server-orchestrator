@@ -152,6 +152,20 @@
 #            than a nuisance: the new residual case reads the ceiling's arithmetic
 #            *and* what the node was sent, so both mutations genuinely change what it
 #            sees.
+#   D45..D51 the *bottom* of the range those ceilings bound at the top: a duration no
+#            request can be built from, which is an `IllegalArgumentException` thrown
+#            inside a drain and outside every typed catch on the way up — a requeue
+#            with no status write, so nothing is recorded, nothing escalates and the
+#            server cannot be deleted. D45 and D46 restore that at each site whose
+#            timeout comes off a definition. D47 and D48 swap the two classifications
+#            for each other: they are opposite on purpose, because the proxy's row
+#            cannot be repaired by an edit to the backend a permanent failure would
+#            freeze, and the server's own row can. D49 removes a guard at the site no
+#            input reaches, which is what the shape scan is for. D50 feeds a channel
+#            the *other* `sealTimeout` — three reds, because a healthy default there
+#            means the bad row never reaches a request. D51 routes the refusal into
+#            the bucket that is never retried, which would leave a repaired
+#            definition unable to save at all.
 #   C1..C3   controls: the rule deleted outright, once per assertion arm. If these
 #            do not redden, the harness is not reaching the assertions at all.
 #   S1       the self-test. See below.
@@ -203,6 +217,14 @@ LOCAL_NODE=core/src/main/kotlin/mcorch/core/node/LocalNode.kt
 # moved with them.
 NODE=core/src/main/kotlin/mcorch/core/Node.kt
 PLANNER=core/src/main/kotlin/mcorch/core/proxy/VelocityWorkloadPlanner.kt
+# The three files that build a node request out of a definition, plus the second
+# place a control channel is constructed. A request that cannot be built is an
+# exception thrown inside a drain, and where it is classified is the subject of
+# D45..D51.
+CHANNEL=core/src/main/kotlin/mcorch/core/proxy/ControlChannel.kt
+PAPER_AGENT=core/src/main/kotlin/mcorch/core/paper/PaperServerAgent.kt
+PROXY_AGENT=core/src/main/kotlin/mcorch/core/proxy/VelocityProxyAgent.kt
+FLEET=core/src/main/kotlin/mcorch/core/ProxyFleet.kt
 
 WIRING=mcorch.core.DrainWiringTest
 RULES=mcorch.core.SaveEvidenceTest
@@ -212,6 +234,7 @@ PROXY_RECONCILE=mcorch.core.ProxyReconcileTest
 REPLACEMENT=mcorch.core.ReplacementTest
 PLANNING=mcorch.core.proxy.VelocityWorkloadPlannerTest
 STOP_GRACE=mcorch.core.node.StopGraceGuardTest
+UNBUILDABLE=mcorch.core.UnbuildableRequestTest
 
 # The test cases, by name. A mutation names the ones it must redden and no others.
 EXIT='nothing leaves advance that has not been through the record-level rule'
@@ -255,7 +278,10 @@ FLEET_LOCKED_OUT='an edit made while a proxy is populated does not leave the fle
 # these moved subject with the thirtieth audit's fix — they now drive a value the
 # argument's *type* bounded, so the mutation for them is in Node.kt.
 GRACE_CAPPED='a grace period containerd would invert is capped, not sent'
-GRACE_STILL_CAPPED='the largest grace period the runtime honours is still capped, because the call is deadlined off it'
+# Renamed when `:cri` took the deadline: the case is the same, its *reason* is not.
+# The call is deadlined at `min(grace, stopDeadlineCap) + slack` now, so "because the
+# call is deadlined off it" was a claim this ceiling no longer makes.
+GRACE_STILL_CAPPED='the largest grace period the runtime honours is still capped to the widest a reader accepts'
 # The thirtieth audit's first finding: the floor under that ceiling, and the
 # residual the floor leaves behind at the runtime's own bound.
 GRACE_FLOORED='a grace period is never capped below the save timeout it was validated against'
@@ -280,6 +306,14 @@ DELETE_COMPLETES='a delete still completes while the node refuses every create'
 PIN_EXIT='an operator can pin a proxy fleet back onto the build its containers were created with'
 ONE_VALUE='a pinned Velocity build reaches the container and the hash as one value'
 ARTEFACT='a proxy that exited and cannot be rebuilt reports the artefact, not the exit'
+# The bottom of the same range the two ceilings bound at the top: a duration a
+# request cannot be built from at all. Two behavioural cases on the proxy path, one
+# on the save path, and the two shapes that cover the sites no scenario reaches.
+PARKS_BACKEND='a proxy row with a zero seal timeout parks the backend drain and records why'
+ISSUES_NOTHING='a second pass against the same bad row issues nothing and lands in the same place'
+SAVE_REFUSED='a zero save timeout is recorded as a permanent drain failure with no exec sent'
+CLASSIFIED='every request built from a definition is built where its refusal is classified'
+CHANNEL_TIMEOUT='every control channel is given the seal timeout its message names'
 
 # Single-quoted throughout: these are literals, and one of them contains the
 # quoting characters of two languages.
@@ -563,6 +597,43 @@ PIN_IN_ENVIRONMENT='                    put(VELOCITY_VERSION, velocity)'
 # The blocker preferred over the exit failure, on the branch where both are true.
 EXIT_PREFERENCE='                                // an operator can do something about.
                                 failure = blocker ?: failure,'
+# The classification of a request that cannot be built, at each of the two sites
+# whose timeout comes off a definition, and the guard that carries it at a site no
+# input reaches.
+CHANNEL_CLASSIFIES='return unbuildable(verb, path, rejected)'
+SAVE_CLASSIFIES='                return unbuildableSave(rejected)'
+# Anchored on the *indentation* rather than on the sentence above it. Coupling a
+# mutation to prose is what left D47 reporting a stale anchor the moment the
+# operator-facing message was reworded, and the classification is the subject here.
+CHANNEL_RETRYABLE='            retryable = true,'
+CHANNEL_PERMANENT='            retryable = false,'
+SAVE_PERMANENT_CLASS='            retryable = false,
+        )
+
+    /**'
+SAVE_RETRYABLE_CLASS='            retryable = true,
+        )
+
+    /**'
+# The whole guard at the proxy'"'"'s probe. It has to come out rather than be hollowed
+# out: the scan is a *presence* check on the enclosing function, so catching and
+# rethrowing keeps the token and passes — which the test says in its own words.
+PROBE_GUARDED='            try {
+                ExecRequest(
+                    command = PaperCommands.serverListPing(spec.network.port),
+                    timeout = ExecTimeout.of(PROBE_TIMEOUT),
+                )
+            } catch (rejected: IllegalArgumentException) {
+                return ProbeOutcome.Unavailable(detail = unbuildableProbe(rejected), retryable = false)
+            }'
+PROBE_UNGUARDED='            ExecRequest(
+                command = PaperCommands.serverListPing(spec.network.port),
+                timeout = ExecTimeout.of(PROBE_TIMEOUT),
+            )'
+# The field a control channel is built from, and the sibling with the same name on
+# another spec — which is what "make these consistent" reaches for.
+CHANNEL_FIELD='timeout = spec.backends.drain.sealTimeout,'
+CHANNEL_OTHER_FIELD='timeout = spec.lifecycle.drain.sealTimeout,'
 
 # name @@ file @@ class @@ testcases that must redden (";"-separated) @@ literal @@ replacement
 #
@@ -793,6 +864,31 @@ MUTATIONS=(
     # the floor as an argument -- so a caller supplying zero for a workload that holds
     # a world has the type's blessing on a ceiling with nothing under it.
     "D44@@$RECONCILER@@$WIRING@@$ONE_FACTORY@@$RECONCILER_TAIL@@$GRACE_ELSEWHERE"
+    # A request that cannot be built, rethrown instead of classified — which is what
+    # the code did before, and what "this cannot happen" reaches for. Both proxy
+    # scenarios redden because both drive a drain through a channel whose row is bad.
+    "D45@@$CHANNEL@@$UNBUILDABLE@@$PARKS_BACKEND;$ISSUES_NOTHING@@$CHANNEL_CLASSIFIES@@throw rejected"
+    "D46@@$PAPER_AGENT@@$UNBUILDABLE@@$SAVE_REFUSED@@$SAVE_CLASSIFIES@@                throw rejected"
+    # The two classifications, each swapped for the other's. They are opposite on
+    # purpose — the proxy's row cannot be repaired by an edit to the backend it
+    # freezes, and the server's own row can — so "make these consistent" is the edit
+    # this pair exists to catch.
+    "D47@@$CHANNEL@@$UNBUILDABLE@@$PARKS_BACKEND@@$CHANNEL_RETRYABLE@@$CHANNEL_PERMANENT"
+    "D48@@$PAPER_AGENT@@$UNBUILDABLE@@$SAVE_REFUSED@@$SAVE_PERMANENT_CLASS@@$SAVE_RETRYABLE_CLASS"
+    # A construction site with no guard at all, at the site no input reaches — the
+    # one the shape scan exists for, since no scenario can drive it.
+    "D49@@$PROXY_AGENT@@$UNBUILDABLE@@$CLASSIFIED@@$PROBE_GUARDED@@$PROBE_UNGUARDED"
+    # A channel built from the *other* `sealTimeout`. Three reds, and the extra two
+    # are a true dependency rather than noise: `ProxyDrainSpec` carries a healthy
+    # default, so a channel fed from it never sees the bad row and both scenarios
+    # converge normally. That is the property the entry demonstrates — which field
+    # reaches the wire — and weakening the scenarios to make this entry tidy would
+    # delete the evidence.
+    "D50@@$FLEET@@$UNBUILDABLE@@$CHANNEL_TIMEOUT;$PARKS_BACKEND;$ISSUES_NOTHING@@$CHANNEL_FIELD@@$CHANNEL_OTHER_FIELD"
+    # The refusal routed into the bucket that is never retried. No exec was
+    # dispatched, so arming the wedge would leave a repaired definition unable to
+    # save at all — the failure `SaveOutcome`'s three cases exist to keep apart.
+    "D51@@$PAPER_AGENT@@$UNBUILDABLE@@$SAVE_REFUSED@@$SAVE_CLASSIFIES@@                return SaveOutcome.Unconfirmed(unbuildableSave(rejected).detail)"
     "C1@@$CONTROLLER@@$WIRING@@$EXIT@@$RULE@@val recorded = progress"
     "C2@@$CONTROLLER@@$WIRING@@$STEPPED@@$ADOPTION@@val observed = drain"
     "C3@@$CONTROLLER@@$RULES@@$ADOPTS@@$CLAUSE@@is PlayerReading.Occupied -> this"
@@ -807,6 +903,10 @@ restore() {
             LocalNode.kt) cp -- "$backup" "$REPO_ROOT/$LOCAL_NODE" ;;
             Node.kt) cp -- "$backup" "$REPO_ROOT/$NODE" ;;
             VelocityWorkloadPlanner.kt) cp -- "$backup" "$REPO_ROOT/$PLANNER" ;;
+            ControlChannel.kt) cp -- "$backup" "$REPO_ROOT/$CHANNEL" ;;
+            PaperServerAgent.kt) cp -- "$backup" "$REPO_ROOT/$PAPER_AGENT" ;;
+            VelocityProxyAgent.kt) cp -- "$backup" "$REPO_ROOT/$PROXY_AGENT" ;;
+            ProxyFleet.kt) cp -- "$backup" "$REPO_ROOT/$FLEET" ;;
         esac
     done
 }
@@ -817,7 +917,8 @@ restore() {
 # the same trap that restores the source: this script's own printed verdict is the
 # record of the run, and it names the tests it reddened.
 discard_reports() {
-    for class in "$WIRING" "$RULES" "$DRAIN" "$PROXY_DRAIN" "$PROXY_RECONCILE" "$REPLACEMENT" "$PLANNING"; do
+    for class in "$WIRING" "$RULES" "$DRAIN" "$PROXY_DRAIN" "$PROXY_RECONCILE" "$REPLACEMENT" "$PLANNING" \
+        "$STOP_GRACE" "$UNBUILDABLE"; do
         rm -f -- "$RESULTS/TEST-$class.xml"
     done
 }
@@ -834,6 +935,10 @@ cp -- "$REPO_ROOT/$RECONCILER" "$BACKUP_DIR/Reconciler.kt"
 cp -- "$REPO_ROOT/$LOCAL_NODE" "$BACKUP_DIR/LocalNode.kt"
 cp -- "$REPO_ROOT/$NODE" "$BACKUP_DIR/Node.kt"
 cp -- "$REPO_ROOT/$PLANNER" "$BACKUP_DIR/VelocityWorkloadPlanner.kt"
+cp -- "$REPO_ROOT/$CHANNEL" "$BACKUP_DIR/ControlChannel.kt"
+cp -- "$REPO_ROOT/$PAPER_AGENT" "$BACKUP_DIR/PaperServerAgent.kt"
+cp -- "$REPO_ROOT/$PROXY_AGENT" "$BACKUP_DIR/VelocityProxyAgent.kt"
+cp -- "$REPO_ROOT/$FLEET" "$BACKUP_DIR/ProxyFleet.kt"
 
 apply() {
     LITERAL="$2" REPLACEMENT="$3" python3 - "$1" <<'PY'

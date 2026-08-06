@@ -20,4 +20,4 @@
 - [Invariants need an enforcement point](feedback_invariants-need-an-enforcement-point.md) — pin wiring by shape and every premise of an unreachability argument; two gates need a side-effect assertion.
 - [Replacement needs an exit](project_replacement-exit.md) — a hash input no operator can edit closes the fleet's login path; the lever, the pre-flight asked at both ends, the wait still unbounded.
 - [Gate and ceiling](project_gate-and-ceiling.md) — a block must not arm the permanent gate; a park is a park; the node caps a grace period rather than refusing it; why troubleSince was declined.
-- [Deadline ceilings](project_deadline-ceilings.md) — clamping half a validated pair inverts it; a `max(K, f(other))` bound promises the relation, not the wait; the third deadline is definition-fed and open.
+- [Deadline ceilings](project_deadline-ceilings.md) — clamping half a validated pair inverts it; `max(K, f(other))` bounds the relation, not the wait; `:cri` owns the wait; one refusal, two classes.
