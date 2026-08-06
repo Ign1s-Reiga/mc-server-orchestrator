@@ -110,6 +110,19 @@
 #            into the seal.
 #   D37      a block clearing a *permanent* failure. Nothing is stopped by it, and
 #            the report is what decides whether somebody reaches for `crictl stop`.
+#   D38      D37's consequence, and the twenty-ninth audit's first finding: the
+#            permanent-failure gate armed by a drain that is merely *waiting*. A
+#            block parks in `DRAIN_FAILED` and keeps the standing failure, so the
+#            pass that recorded it froze the loop — and a generation bump, the only
+#            remedy on a server nobody has deleted, was then spent on one blocked
+#            pass. The mutation removes the clause that reads the block, which is
+#            exactly the narrowing a reader who only knows the sixteenth audit's
+#            version of this gate would undo.
+#   D39      the operational ceiling on the stop grace period taken off the value
+#            the node stops with. The call is deadlined off that number, so what it
+#            costs is a reconcile worker parked at a container that will not exit,
+#            with no effective timeout — and the runtime's own bound is 292 years
+#            away, so nothing else refuses it.
 #   C1..C3   controls: the rule deleted outright, once per assertion arm. If these
 #            do not redden, the harness is not reaching the assertions at all.
 #   S1       the self-test. See below.
@@ -165,6 +178,7 @@ PROXY_DRAIN=mcorch.core.ProxyDrainTest
 PROXY_RECONCILE=mcorch.core.ProxyReconcileTest
 REPLACEMENT=mcorch.core.ReplacementTest
 PLANNING=mcorch.core.proxy.VelocityWorkloadPlannerTest
+STOP_GRACE=mcorch.core.node.StopGraceGuardTest
 
 # The test cases, by name. A mutation names the ones it must redden and no others.
 EXIT='nothing leaves advance that has not been through the record-level rule'
@@ -199,6 +213,14 @@ RECORDS_THE_SEAL='every step-2 assertion is recorded on the drain the pass carri
 # frozen, and its third, where a block finds a permanent diagnosis and keeps it.
 RELEASE_RETRIED='a permanent park whose seal release fails keeps being retried until it lands'
 WEDGE_SURVIVES='a permanent save wedge survives a player logging back on'
+# The twenty-ninth audit's first finding, in its two halves: the kind that only
+# loses its recoverability, and the kind whose frozen state is a fleet-wide
+# blackout.
+EDIT_NOT_SPENT='an operator edit is not spent on a player who logged on while the drain was frozen'
+FLEET_LOCKED_OUT='an edit made while a proxy is populated does not leave the fleet locked out'
+# Its third: the node's own bound on the grace period it stops with.
+GRACE_CAPPED='a grace period containerd would invert is capped, not sent'
+GRACE_STILL_CAPPED='the largest grace period the runtime honours is still capped, because the call is deadlined off it'
 HANDED="the drain is handed the loop's permanence gate rather than deriving one"
 GATED_RELEASE='the seal release is gated on the answer the abort was handed'
 MID_DRAIN='a replacement that becomes unbuildable mid-drain parks before the stop'
@@ -379,10 +401,19 @@ STOP_ABORT_DERIVED='                permanentFailureStopsPasses =
                 failureClass = if (failure.retryable) FailureClass.RETRYABLE else FailureClass.PERMANENT,'
 # The proxy kind'"'"'s permanence gate, carrying the line above it so the literal is
 # not the Paper kind'"'"'s as well.
-PROXY_GATE='                    previous.drain.let { it == null || it.state == DrainState.DRAIN_FAILED }
+# Re-derived for the twenty-ninth audit: the middle clause is now one expression
+# asked by both kinds, so the anchor is the two lines that remain around it.
+PROXY_GATE='                    previous.drain.parkedOnTheFailure()
             return failed && stored.permanentFailureStopsPasses()'
-PROXY_GATE_COPIED='                    previous.drain.let { it == null || it.state == DrainState.DRAIN_FAILED }
+PROXY_GATE_COPIED='                    previous.drain.parkedOnTheFailure()
             return failed && !stored.definition.terminating'
+# The clause that keeps a drain waiting on players out of the gate, and the version
+# without it — which is the gate exactly as the sixteenth audit left it.
+PARKED_ON_FAILURE='    this == null || (state == DrainState.DRAIN_FAILED && blocked == null)'
+PARKED_IGNORING_BLOCK='    this == null || state == DrainState.DRAIN_FAILED'
+# The node'"'"'s own bound on the grace period, and the value going out unbounded.
+GRACE_CEILING='        val effective = StopGraceCeiling.bound(gracePeriod)'
+GRACE_UNBOUNDED='        val effective = gracePeriod'
 # Step 2 on the gated resume, and the version without it: the state the twenty-
 # seventh audit'"'"'s second finding is about, where `holdSeal` sits behind
 # `requireEmpty` and is unreachable while anybody is connected.
@@ -523,7 +554,13 @@ MUTATIONS=(
     # It claims the retry test as well, and that is a fact about the defect: with no
     # release attempted there is no outcome to record, so the park that was supposed
     # to be retried until the door reopens settles as permanent on the first pass.
-    "D22@@$CONTROLLER@@$PROXY_DRAIN@@$RELEASES;$RELEASE_RETRIED@@$SEAL_RELEASE@@$SEAL_RELEASE_NONE"
+    #
+    # And the lock-out test, added in the twenty-ninth round: its last assertion is
+    # that the fleet's door comes back once the last player logs off, and what
+    # opens it is the release on the abort this mutation removes. A true dependency
+    # — the whole scenario is about a door that must be able to reopen — and the
+    # entry that isolates the edge on its own is still this one.
+    "D22@@$CONTROLLER@@$PROXY_DRAIN@@$RELEASES;$RELEASE_RETRIED;$FLEET_LOCKED_OUT@@$SEAL_RELEASE@@$SEAL_RELEASE_NONE"
     # And added where it must not be. A block is the protocol working, and the seal
     # is what lets the wait end.
     #
@@ -537,9 +574,11 @@ MUTATIONS=(
     # /v1/proxy` may assert `true`; and the first-seal test's recovery pass seals and
     # then blocks, so the door it just shut is handed straight back and the fleet
     # never empties. The sixth is the twenty-eighth audit's blackout report, whose
-    # park follows a block that would have handed the door back. All six redden for
-    # the one reason, and D22 is the entry that isolates the edge on its own.
-    "D23@@$CONTROLLER@@$PROXY_DRAIN@@$KEEPS_SEAL;$PIN_EXIT;$RETRYABLE_SEAL;$DELETE_SEALED;$FIRST_SEAL;$BLACKOUT_REPORTED@@$BLOCK_ENTRY@@$BLOCK_ENTRY
+    # park follows a block that would have handed the door back. The seventh is the
+    # twenty-ninth's lock-out test, which asserts the door is shut across the whole
+    # wait it drives; all seven redden for the one reason, and D22 is the entry that
+    # isolates the edge on its own.
+    "D23@@$CONTROLLER@@$PROXY_DRAIN@@$KEEPS_SEAL;$PIN_EXIT;$RETRYABLE_SEAL;$DELETE_SEALED;$FIRST_SEAL;$BLACKOUT_REPORTED;$FLEET_LOCKED_OUT@@$BLOCK_ENTRY@@$BLOCK_ENTRY
         releaseSeal(subject)"
     # The operator's lever dropped between the configuration and the planner: the
     # knob still exists, and nothing reads it.
@@ -589,8 +628,9 @@ MUTATIONS=(
     # help. It reddens the report half too, and that is a true dependency: with the
     # seal unreachable the park settles into a healthy-looking block. The blackout
     # report is red for the plainest reason of all: this is the site that shuts the
-    # door it describes.
-    "D33@@$CONTROLLER@@$PROXY_DRAIN@@$FIRST_SEAL;$PARKED_ENDPOINT;$BLACKOUT_REPORTED@@$RESUME_SEAL@@$RESUME_WITHOUT_SEAL"
+    # door it describes — and so is the lock-out test, whose blocked-with-the-door-
+    # shut assertion is a direct reading of this line.
+    "D33@@$CONTROLLER@@$PROXY_DRAIN@@$FIRST_SEAL;$PARKED_ENDPOINT;$BLACKOUT_REPORTED;$FLEET_LOCKED_OUT@@$RESUME_SEAL@@$RESUME_WITHOUT_SEAL"
     # …and the same site with step 2 kept and its *record* dropped, which is the
     # twenty-eighth audit's first critical. One mutation, scored twice, because a
     # class is the unit here and the pairing is the point: the scenario covers the
@@ -606,6 +646,21 @@ MUTATIONS=(
     # stopped by it — the wedge survives — so only the report moves, and the report
     # is what decides whether somebody reaches for `crictl stop`.
     "D37@@$CONTROLLER@@$DRAIN@@$WEDGE_SURVIVES@@$BLOCK_KEEPS_PERMANENT@@$BLOCK_CLEARS_EVERYTHING"
+    # …and the gate that retention arms. Removing the block clause restores the
+    # twenty-ninth audit's first finding: the pass that records a block writes the
+    # standing permanent failure at the current generation and freezes the loop, so
+    # the definition edit an operator makes to lift it is spent on that one blocked
+    # pass. Only the Paper half is claimed here; the proxy half is D38P below,
+    # because the two land in different classes and the harness runs one class per
+    # mutation.
+    "D38@@$CONTROLLER@@$REPLACEMENT@@$EDIT_NOT_SPENT@@$PARKED_ON_FAILURE@@$PARKED_IGNORING_BLOCK"
+    "D38P@@$CONTROLLER@@$PROXY_DRAIN@@$FLEET_LOCKED_OUT@@$PARKED_ON_FAILURE@@$PARKED_IGNORING_BLOCK"
+    # The stop grace period leaving the node unbounded. Both node tests redden,
+    # and that is the pair rather than a duplicate: one is the value containerd's
+    # own arithmetic inverts, the other the largest value it honours — which this
+    # node still refuses to hold a worker for, because the call's deadline is
+    # derived from it.
+    "D39@@$LOCAL_NODE@@$STOP_GRACE@@$GRACE_CAPPED;$GRACE_STILL_CAPPED@@$GRACE_CEILING@@$GRACE_UNBOUNDED"
     "C1@@$CONTROLLER@@$WIRING@@$EXIT@@$RULE@@val recorded = progress"
     "C2@@$CONTROLLER@@$WIRING@@$STEPPED@@$ADOPTION@@val observed = drain"
     "C3@@$CONTROLLER@@$RULES@@$ADOPTS@@$CLAUSE@@is PlayerReading.Occupied -> this"
@@ -664,15 +719,23 @@ with open(path, "w", encoding="utf-8") as handle:
 PY
 }
 
-# The test cases that went red in a report, one per line, without the `()` the
-# runner appends. Scanned rather than parsed: the file is this build's own output,
-# and a dev script should need nothing but a shell.
+# The test cases that went red in a report, one per line, without the parameter
+# list the runner appends. Scanned rather than parsed: the file is this build's own
+# output, and a dev script should need nothing but a shell.
+#
+# `(...)`, not `()`. A test taking an injected parameter is reported as
+# `... (Path)` — every `@TempDir` test is — so stripping the empty pair alone
+# produces a name no claim can ever match, and *every* entry naming such a test
+# reads MISCAUGHT. That is indistinguishable at a glance from a real finding, and
+# it fails in the opposite direction from a false green. The sibling harness
+# already strips the list; this one did not, and the first entry to name a
+# `StopGraceGuardTest` case found out.
 reddened() {
     awk 'match($0, /<testcase name="[^"]*"/) {
              name = substr($0, RSTART + 16, RLENGTH - 17)
          }
          (/<failure/ || /<error/) && name != "" {
-             sub(/\(\)$/, "", name)
+             sub(/\([^()]*\)$/, "", name)
              print name
              name = ""
          }' "$1" | sort -u
