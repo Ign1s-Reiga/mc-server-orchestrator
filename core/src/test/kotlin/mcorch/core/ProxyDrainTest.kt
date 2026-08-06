@@ -919,6 +919,13 @@ internal class ProxyDrainTest {
             )
             repeat(2) { harness.sweep() }
 
+            // The wire first, and the record after it. Deleting the record is what
+            // lets the sweep re-admit, so an assertion about the record placed first
+            // fails first and leaves the harm itself unasserted — which is how a test
+            // comes to pin the mechanism rather than the consequence.
+            harness.plugin.asserts.drop(baseline) shouldNotContain ("survival-01" to true)
+            harness.plugin.backend("survival-01") shouldBe null
+
             val status = harness.status(leaving.metadata.name).shouldNotBeNull()
             // The refusal still happens, in the same words.
             val refusal = status.failure.shouldNotBeNull()
@@ -928,8 +935,6 @@ internal class ProxyDrainTest {
             val carried = status.drain.shouldNotBeNull()
             carried.stopDispatchedAt shouldBe stopping.stopDispatchedAt
             carried.deregisteredAt shouldBe stopping.deregisteredAt
-            harness.plugin.asserts.drop(baseline) shouldNotContain ("survival-01" to true)
-            harness.plugin.backend("survival-01") shouldBe null
         }
 
     /**
