@@ -46,10 +46,24 @@ import kotlin.time.Duration
  *
  * ## Stopping
  *
- * [stopWorkload] takes a strictly positive grace period, so a zero-grace kill
- * is not expressible through this interface at all. Stopping is never
- * unconditional either: the caller has confirmed zero players and a completed
- * save first — see `.claude/skills/drain-protocol/`.
+ * [stopWorkload] takes a [StopGrace] rather than a bare duration, so this
+ * interface's own operational ceiling is applied by construction and no
+ * implementation can fail to apply it. Stopping is never unconditional either:
+ * the caller has confirmed zero players and a completed save first — see
+ * `.claude/skills/drain-protocol/`.
+ *
+ * ## Every duration crossing this interface is a transport deadline
+ *
+ * An implementation of a `Node` is a client of something, and the durations a
+ * caller hands it become that transport's deadlines: the containerd
+ * implementation derives `stopContainer`'s from the grace period and `execSync`'s
+ * from [ExecRequest.timeout] directly. CLAUDE.md requires every call crossing the
+ * `:cri` boundary to have a timeout, and a deadline derived from an unbounded
+ * argument is not one. So both of those arguments are **bounded types** —
+ * [StopGrace] and [ExecTimeout] — whose factories are the only way to obtain one.
+ * That is deliberately not a rule each implementation applies for itself: a rule
+ * every implementation has to remember is a rule the second implementation
+ * breaks, and this interface is the distribution seam.
  */
 public interface Node {
     /** How this node is addressed. Stable for the node's lifetime. */
@@ -191,37 +205,40 @@ public interface Node {
      * last-resort safety net for a container that reaches here anyway, not the
      * save path.
      *
-     * [gracePeriod] must be strictly positive — a zero-grace kill is not
-     * expressible through this interface, on purpose. Implementations derive it
-     * from `spec.lifecycle.stopGracePeriod`. For a `PaperServer` the schema
-     * guarantees that exceeds the save timeout (`SpecInvariants.stopGraceProblem`);
-     * a `VelocityProxy` has no such rule and needs none, because it holds no world.
-     * Nothing may read this value *as* a save timeout on the strength of the first
-     * half — `DrainSubject.saveTimeout` is the quantity for that.
+     * [gracePeriod] comes from `spec.lifecycle.stopGracePeriod` and is used as
+     * nothing else. For a `PaperServer` the schema guarantees it exceeds the save
+     * timeout (`SpecInvariants.stopGraceProblem`); a `VelocityProxy` has no such
+     * rule and needs none, because it holds no world. Nothing may read this value
+     * *as* a save timeout on the strength of the first half —
+     * `DrainSubject.saveTimeout` is the quantity for that.
      *
-     * **It is also bounded above, twice, and neither bound is for tidiness.**
+     * **It is bounded above twice, and neither bound is for tidiness.**
      *
-     * A container runtime carries the grace period as a fixed-width count, and past
-     * some magnitude its own arithmetic wraps: the value stops meaning "wait longer"
-     * and starts meaning "kill now", while the call still reports success. So an
-     * implementation may refuse a grace period for being *too large*, and a caller
-     * must not read a bigger number as a safer one. Where that bound actually is
-     * belongs to the runtime, so it is the runtime-facing layer that knows it —
-     * `mcorch.cri.StopGracePeriod` for the containerd implementation, which carries
-     * the measurements it was derived from.
+     * The first is this interface's own operational ceiling, and it is carried by
+     * the argument's *type*: a [StopGrace] can only be obtained from
+     * [StopGrace.of], which applies [StopGraceCeiling]. A `Node` call is a call
+     * over a transport with a deadline, and an implementation that derives that
+     * deadline from the grace period — which the containerd one does — has no
+     * effective timeout at all once the grace period is large enough. See
+     * [StopGraceCeiling] for why it caps rather than refuses, and why the cap has a
+     * floor.
      *
-     * The second bound is this interface's own, and it is [StopGraceCeiling]: an
-     * implementation applies it to whatever it is handed and stops on the result.
-     * A `Node` call is a call over a transport with a deadline, and an
-     * implementation that derives that deadline from the grace period — which the
-     * containerd one does — has no effective timeout at all once the grace period
-     * is large enough. See [StopGraceCeiling] for why it caps rather than refuses.
+     * The second belongs to the runtime and stays with the implementation. A
+     * container runtime carries the grace period as a fixed-width count, and past
+     * some magnitude its own arithmetic wraps: the value stops meaning "wait
+     * longer" and starts meaning "kill now", while the call still reports success.
+     * So an implementation may refuse a grace period for being *too large*, and a
+     * caller must not read a bigger number as a safer one. Where that bound
+     * actually is belongs to the runtime — `mcorch.cri.StopGracePeriod` for the
+     * containerd implementation, which carries the measurements it was derived
+     * from. Zero, negative and `Duration.INFINITE` reach here intact and are
+     * refused there for the same reason: they are not durations anybody meant.
      *
      * Idempotent: stopping an already-stopped workload succeeds.
      */
     public suspend fun stopWorkload(
         handle: WorkloadHandle,
-        gracePeriod: Duration,
+        gracePeriod: StopGrace,
     )
 
     /**
@@ -286,9 +303,11 @@ public interface Node {
  * nobody can retire, which is the state that ends in a manual `crictl stop`. That is
  * a certain harm traded for a conditional one.
  *
- * Capping is safe because of where in the protocol the stop sits: nothing reaches
- * [Node.stopWorkload] except through the zero-player gate followed by `mayStop`, so
- * a completed world save has already been confirmed (CLAUDE.md invariant 3) and the
+ * Capping is safe because of where in the protocol the stop sits: every path to
+ * [Node.stopWorkload] ends in `mayStop` — there are **two** of them and
+ * `DrainWiringTest` holds the count, not this sentence; see `DrainController`'s
+ * class note, which is where the difference between them is written — so a
+ * completed world save has already been confirmed (CLAUDE.md invariant 3) and the
  * grace period is the last-resort net rather than the save path. And [MAX] is the
  * largest value any reader in this system accepts, so no definition an operator
  * could legitimately write is shortened by a single second.
@@ -297,13 +316,61 @@ public interface Node {
  * "no reader accepts more than this", which is exactly what
  * [PaperServerDefaults.MAX_STOP_GRACE_PERIOD] means, so raising the reader's cap
  * moves this with it instead of silently making the cap bite.
+ *
+ * ## Why the ceiling has a floor, which is the thirtieth audit's finding
+ *
+ * `stopGracePeriod` and `drain.saveTimeout` are a **validated pair**:
+ * `LifecycleSpec.init` refuses a `PaperServer` whose grace period does not exceed
+ * its save timeout by [PaperServerDefaults.MIN_STOP_GRACE_MARGIN], because — in the
+ * schema's own words — *"a grace period shorter than the save timeout kills the
+ * container part-way through the save"*. A ceiling applied to one half of that pair
+ * by a consumer that cannot see the other half can **invert it**: a row carrying
+ * `saveTimeout = 3h` and `stopGracePeriod = 3h1m` satisfies the schema, decodes,
+ * confirms its save, and used to be stopped with two hours — SIGKILL part-way
+ * through Paper's own shutdown save, which is a torn region file.
+ *
+ * That population is not independent of this one. The cap only ever fires on a
+ * definition that bypassed `PaperServerReader` (nothing else produces a grace
+ * period above two hours), and that is exactly the population that can also carry a
+ * save timeout above `PaperServerDefaults.MAX_TIMEOUT`. So [bound] takes the save
+ * timeout and caps to `max(MAX, saveTimeout + MIN_STOP_GRACE_MARGIN)`: the schema's
+ * relation survives whatever this does, and for every pair a reader would accept
+ * the floor is below [MAX] and changes nothing.
+ *
+ * **The residual, stated rather than discovered.** A save timeout large enough that
+ * the derived floor passes what the *runtime* accepts leaves the stop refused by
+ * `StopGracePeriod` — which for containerd is 292 years away, so it needs both
+ * halves of the pair to be absurd rather than merely unvalidated. That refusal is
+ * the cap-versus-refuse trade pointing the other way, and it is the right way round
+ * here: a refusal is recorded and loud, where a cap that inverts the pair is silent
+ * and costs a world. It is also the same answer `Duration.INFINITE` already gets.
  */
 public object StopGraceCeiling {
     /** See the note above. Two hours, borrowed from the widest cap any reader applies. */
     public val MAX: Duration = PaperServerDefaults.MAX_STOP_GRACE_PERIOD
 
     /**
-     * [requested], or [MAX] if that is a longer **finite** duration.
+     * The ceiling that applies to a workload whose world save may take
+     * [saveTimeout]: [MAX], or high enough to keep the schema's margin above the
+     * save timeout when that is higher.
+     *
+     * A save timeout that is not a finite positive duration gets [MAX] and no
+     * floor. `Duration.ZERO` is the honest answer from a workload that holds no
+     * world (`DrainSubject.saveTimeout`), and there is nothing to protect there;
+     * anything else in that bucket is not a duration anybody meant, and reading one
+     * as a licence to raise this ceiling is how an uninterpretable field becomes a
+     * plausible-looking stop.
+     */
+    public fun ceilingFor(saveTimeout: Duration): Duration =
+        if (saveTimeout.isFinite() && saveTimeout.isPositive()) {
+            maxOf(MAX, saveTimeout + PaperServerDefaults.MIN_STOP_GRACE_MARGIN)
+        } else {
+            MAX
+        }
+
+    /**
+     * [requested], or [ceilingFor] [saveTimeout] if that is lower and [requested] is
+     * **finite**.
      *
      * Deliberately returns the duration alone and no flag about it: a caller that
      * wants to log the difference has both values in hand, and a value beside a
@@ -318,7 +385,57 @@ public object StopGraceCeiling {
      * belong to the rule that owns them at the runtime edge (`StopGracePeriod.of`),
      * which is also the rule whose message an operator reads.
      */
-    public fun bound(requested: Duration): Duration = if (requested.isFinite() && requested > MAX) MAX else requested
+    public fun bound(
+        requested: Duration,
+        saveTimeout: Duration,
+    ): Duration {
+        val ceiling = ceilingFor(saveTimeout)
+        return if (requested.isFinite() && requested > ceiling) ceiling else requested
+    }
+}
+
+/**
+ * A stop grace period that has been through [StopGraceCeiling].
+ *
+ * The type exists because of what the thirtieth audit said about the shape of the
+ * old fix: the ceiling was applied inside `LocalNode.stopWorkload`, so the property
+ * "a `Node` never holds a stop open past the operational ceiling" was held by one
+ * implementation doing the right thing, and pinned by a test *a second
+ * implementation is not required to pass*. [Node] is the distribution seam; an
+ * invariant of the seam that each implementation has to remember is an invariant
+ * the second implementation breaks. A parameter type whose only factory applies the
+ * bound turns "every implementation must remember" into "no implementation can
+ * fail to".
+ *
+ * It carries the **policy** ceiling only. Each implementation keeps its own runtime
+ * bound — `StopGracePeriod.of` for the containerd one — because where a runtime's
+ * arithmetic wraps is a fact about that runtime and not about this interface. See
+ * [Node.stopWorkload] for the two-bound structure.
+ */
+@JvmInline
+public value class StopGrace private constructor(
+    /** What the stop is actually given. Never above [StopGraceCeiling.ceilingFor]. */
+    public val period: Duration,
+) {
+    override fun toString(): String = period.toString()
+
+    public companion object {
+        /**
+         * The only way to obtain a [StopGrace].
+         *
+         * Total, and that is the point: it caps rather than refusing, so no caller
+         * has a failure to handle and none is tempted to build one another way.
+         * [saveTimeout] is the workload's own — `DrainSubject.saveTimeout`, which
+         * every subject answers for itself — and it is the *floor* the ceiling may
+         * not cut below. Both quantities are read from one definition at the call
+         * site, which is what makes clamping one of a validated pair impossible
+         * here.
+         */
+        public fun of(
+            requested: Duration,
+            saveTimeout: Duration,
+        ): StopGrace = StopGrace(StopGraceCeiling.bound(requested, saveTimeout))
+    }
 }
 
 /** What a node reports about itself. */
@@ -679,16 +796,89 @@ public data class PortRequest(
 public data class ExecRequest(
     val command: List<String>,
     /**
-     * How long the command may run. Required and strictly positive: an
-     * unbounded exec would pin the reconcile loop on a call that never returns.
+     * How long the command may run.
+     *
+     * An [ExecTimeout] rather than a bare duration, for the reason
+     * [StopGrace] is one: an implementation turns this straight into a transport
+     * deadline (`GrpcCriClient.execSync` does exactly that), so an unbounded value
+     * here is a reconcile worker with no effective timeout — the same defect the
+     * stop path was fixed for, on the *longer* of the two calls.
      */
-    val timeout: Duration,
+    val timeout: ExecTimeout,
 ) {
     init {
         require(command.isNotEmpty()) { "exec command must not be empty" }
         require(command.none { it.isBlank() }) { "exec command arguments must not be blank" }
-        require(timeout.isPositive() && timeout.isFinite()) { "exec timeout must be positive and finite" }
+        // Finiteness is structural now — [ExecTimeout.of] caps it — so what is left
+        // to check is the half a ceiling cannot fix. Zero and negative are refused
+        // rather than raised: an exec that may run for no time is not a call
+        // anybody meant, and quietly turning it into a real wait would hide the
+        // row that produced it.
+        require(timeout.period.isPositive()) { "exec timeout must be positive, found ${timeout.period}" }
     }
+}
+
+/**
+ * How long a command inside a workload may run, bounded by [ExecTimeoutCeiling].
+ *
+ * ## The number that becomes a gRPC deadline
+ *
+ * The thirtieth audit's second finding. [StopGraceCeiling]'s whole argument is
+ * *"this becomes a transport deadline, so an absurd value parks a worker with no
+ * effective timeout"*, and `GrpcCriClient.execSync` does the identical thing with
+ * `spec.lifecycle.drain.saveTimeout` — from the same store row, with the same
+ * absent type-level bound, on the **longer** of the two calls. A row carrying a
+ * 292-year save timeout parked a reconcile worker in `save-all flush`, which is the
+ * CLAUDE.md "every `:cri` call has a timeout" violation the stop's ceiling was
+ * written to close, left open on the sibling path. A fix derived from *"this number
+ * becomes a deadline"* belongs at every number that does.
+ *
+ * ## Why this one caps `INFINITE` where the stop's ceiling refuses it
+ *
+ * The two are not inconsistent; what the number authorises differs. A stop's grace
+ * period authorises a **kill**, and a shorter one is the more dangerous direction,
+ * so an uninterpretable value must not be silently made plausible. An exec timeout
+ * authorises only **waiting**: cutting it short can never do more than withhold a
+ * confirmation, and a save that is not confirmed is a container this orchestrator
+ * will not stop. So capping costs nothing here, and it removes the one route by
+ * which an `IllegalArgumentException` from [ExecRequest]'s own `init` could leave an
+ * agent as an unclassified failure.
+ */
+@JvmInline
+public value class ExecTimeout private constructor(
+    /** What the exec is actually given. Never above [ExecTimeoutCeiling.MAX]. */
+    public val period: Duration,
+) {
+    override fun toString(): String = period.toString()
+
+    public companion object {
+        /** The only way to obtain an [ExecTimeout]. Total: it caps rather than refusing. */
+        public fun of(requested: Duration): ExecTimeout = ExecTimeout(ExecTimeoutCeiling.bound(requested))
+    }
+}
+
+/**
+ * The longest a [Node] will wait for a command inside a workload.
+ *
+ * Borrowed rather than restated, for the reason [StopGraceCeiling.MAX] is:
+ * [PaperServerDefaults.MAX_TIMEOUT] is what every reader caps a lifecycle timeout
+ * at — *"longer than this is a stuck loop, not a slow save"* — so no definition an
+ * operator could legitimately write is shortened by a single second, and raising
+ * the reader's cap moves this with it.
+ *
+ * This is **not** a claim about how long a world save takes. It bounds how long
+ * *this orchestrator* waits for its own flush to be acknowledged; how long the
+ * container is given to finish Paper's shutdown save is the stop grace period, and
+ * [StopGraceCeiling] deliberately keeps that above the declared save timeout rather
+ * than above this. Two consumers of one field, two bounds, and the difference is
+ * which side of the call is doing the waiting.
+ */
+public object ExecTimeoutCeiling {
+    /** One hour, borrowed from the widest cap any reader applies to a lifecycle timeout. */
+    public val MAX: Duration = PaperServerDefaults.MAX_TIMEOUT
+
+    /** [requested], or [MAX] if that is lower. Non-finite is capped; see [ExecTimeout]. */
+    public fun bound(requested: Duration): Duration = if (requested > MAX) MAX else requested
 }
 
 /** The verbs the control protocol uses. A closed set, so a typo is a compile error. */

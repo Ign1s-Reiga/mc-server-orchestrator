@@ -2503,6 +2503,48 @@ internal class DrainController(
     }
 
     /**
+     * The grace period the stop is given, derived once for **every** reader of it.
+     *
+     * The two quantities [StopGrace.of] needs sit side by side on the subject, and
+     * that is the whole reason the derivation is here rather than at the node: the
+     * ceiling and its floor are a rule about a **pair** of fields, and the node can
+     * see one of them. Applying it there inverted the pair —
+     * `SpecInvariants.stopGraceProblem`'s relation, on the rows the cap fires for.
+     * See [StopGraceCeiling].
+     *
+     * Its callers are not only the stops: the overdue check in [awaitStopped]
+     * measures a container against the period **the runtime was given**, reads no
+     * `Node`, and is exactly the kind of reader that ends up quoting a number nobody
+     * was asked to honour. How many there are is not written here, because a KDoc
+     * counting call sites is what was wrong the last three times — `DrainWiringTest`
+     * asserts instead that `subject.stopGracePeriod` is read *nowhere else*.
+     *
+     * The warning is at this end for the same reason the derivation is: nothing
+     * downstream has the declared value to compare against. It fires only for a
+     * definition no reader in this system could have produced, and it repeats on the
+     * overdue path — which is a container two hours past its stop *and* a row no
+     * reader wrote, and worth saying twice.
+     */
+    private fun stopGrace(pass: DrainPass): StopGrace {
+        val declared = pass.subject.stopGracePeriod
+        val grace = StopGrace.of(declared, pass.subject.saveTimeout)
+        if (grace.period != declared) {
+            LOG.warn(
+                "stop grace period {} declared for server={} is above the operational ceiling and is capped at " +
+                    "{}. No server definition read from YAML can carry this, so it came from a store row or a " +
+                    "migration; the cap never goes below this workload's own save timeout ({}), and the world " +
+                    "save was confirmed before this stop, so the grace period is the last-resort net rather " +
+                    "than the save path",
+                declared,
+                pass.server,
+                grace.period,
+                pass.subject.saveTimeout,
+            )
+        }
+        return grace
+    }
+
+    /**
      * Step 7. The stop that ends a drain, and one of the two calls to
      * [Node.stopWorkload] in `:core`'s main sources — the other is [awaitStopped]'s
      * re-issue of *this* stop, behind its own gate. See the class note for both.
@@ -2514,12 +2556,12 @@ internal class DrainController(
      * world data — a save the server itself reported as completed.
      *
      * The grace period is `spec.lifecycle.stopGracePeriod`, read through
-     * [DrainSubject.stopGracePeriod] and used as nothing but what the container stop
-     * is given. For a `PaperServer` the schema guarantees it exceeds that server's
-     * save timeout (`SpecInvariants.stopGraceProblem`); `ProxyLifecycleSpec` has no
-     * such rule and needs none, because a proxy holds no world to flush. Nothing
-     * here may read the value *as* a save timeout on the strength of the first half
-     * — [DrainSubject.saveTimeout] is the quantity for that, and the one place that
+     * [stopGrace] and used as nothing but what the container stop is given. For a
+     * `PaperServer` the schema guarantees it exceeds that server's save timeout
+     * (`SpecInvariants.stopGraceProblem`); `ProxyLifecycleSpec` has no such rule and
+     * needs none, because a proxy holds no world to flush. Nothing here may read the
+     * value *as* a save timeout on the strength of the first half —
+     * [DrainSubject.saveTimeout] is the quantity for that, and the one place that
      * made the substitution is written up in [goingRoundInCircles].
      */
     private suspend fun stop(
@@ -2549,7 +2591,7 @@ internal class DrainController(
             )
         }
 
-        val grace = pass.subject.stopGracePeriod
+        val grace = stopGrace(pass)
         // Through a typed record, because this is the line an investigator reads
         // first after a world is lost and the two booleans used to be adjacent
         // `Any?` arguments — a swap would have reported a save that never
@@ -2557,7 +2599,11 @@ internal class DrainController(
         LOG.stoppingContainer(
             ContainerStopRecord(
                 workload = WorkloadRef(server = server, node = pass.node.name),
-                gracePeriod = grace,
+                // What the runtime is actually asked for, not what the definition
+                // declares. They differ only when [StopGraceCeiling] bit, and this
+                // record is read after a world is lost: the declared value would be
+                // the one number in it that is not what happened.
+                gracePeriod = grace.period,
                 save = WorldSaveEvidence(drain.worldSaved),
                 worldData = WorldDataHolding(contract.holdsWorldData),
             ),
@@ -2674,7 +2720,7 @@ internal class DrainController(
             // would leave the record untouched: deregistered, running, and with
             // nothing that would ever re-register it.
             try {
-                pass.node.stopWorkload(observation.handle, pass.subject.stopGracePeriod)
+                pass.node.stopWorkload(observation.handle, stopGrace(pass))
             } catch (failure: NodeException) {
                 return abort(
                     subject = pass.subject,
@@ -2707,7 +2753,12 @@ internal class DrainController(
             // wait goes on. The lap that does leave — back to `SAVING` for a fresh
             // save — is measured by [goingRoundInCircles] instead, for exactly that
             // reason.
-            val grace = pass.subject.stopGracePeriod
+            // Through [stopGrace], not off the definition: this measures the
+            // container against the period **the runtime was given**, and those
+            // differ on exactly the rows the ceiling fires for. Reporting a
+            // container overdue against a number nobody was asked to honour is a
+            // sentence an investigator has to unpick.
+            val grace = stopGrace(pass).period
             val stuckFor = JavaDuration.between(drain.enteredStateAt, now).toKotlinDuration()
             val overdue =
                 if (stuckFor > grace) {

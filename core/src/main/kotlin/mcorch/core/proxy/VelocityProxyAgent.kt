@@ -1,6 +1,7 @@
 package mcorch.core.proxy
 
 import mcorch.core.ExecRequest
+import mcorch.core.ExecTimeout
 import mcorch.core.Labels
 import mcorch.core.Node
 import mcorch.core.NodeException
@@ -55,7 +56,7 @@ internal class VelocityProxyAgent(
         val request =
             ExecRequest(
                 command = PaperCommands.serverListPing(spec.network.port),
-                timeout = PROBE_TIMEOUT,
+                timeout = ExecTimeout.of(PROBE_TIMEOUT),
             )
         val result =
             try {

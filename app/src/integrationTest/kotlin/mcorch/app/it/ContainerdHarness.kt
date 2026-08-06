@@ -11,6 +11,7 @@ import mcorch.app.OrchestratorConfig
 import mcorch.core.Node
 import mcorch.core.ReconcileLoopConfig
 import mcorch.core.ReconcilerConfig
+import mcorch.core.StopGrace
 import mcorch.core.WorkloadAsset
 import mcorch.core.WorkloadObservation
 import mcorch.core.WorkloadState
@@ -266,7 +267,10 @@ internal class ContainerdHarness(
         var observation = node.observe(name)
         val running = observation as? WorkloadObservation.Present
         if (running != null && running.state == WorkloadState.RUNNING) {
-            runCatching { node.stopWorkload(running.handle, CLEANUP_GRACE) }
+            // No world to protect in a scrub, so the ceiling's floor has nothing to
+            // keep it above: `Duration.ZERO` is the honest save timeout here, the
+            // same answer a workload with no world data gives.
+            runCatching { node.stopWorkload(running.handle, StopGrace.of(CLEANUP_GRACE, Duration.ZERO)) }
             repeat(CLEANUP_ATTEMPTS) {
                 observation = node.observe(name)
                 if ((observation as? WorkloadObservation.Present)?.state != WorkloadState.RUNNING) return@repeat

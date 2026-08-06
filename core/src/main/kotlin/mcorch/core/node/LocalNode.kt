@@ -13,7 +13,7 @@ import mcorch.core.NodeCapacity
 import mcorch.core.NodeException
 import mcorch.core.NodeOperation
 import mcorch.core.NodeStatus
-import mcorch.core.StopGraceCeiling
+import mcorch.core.StopGrace
 import mcorch.core.StorageRequest
 import mcorch.core.WorkloadHandle
 import mcorch.core.WorkloadObservation
@@ -472,7 +472,11 @@ public class LocalNode internal constructor(
     ): ExecOutcome {
         val containerId = handle.requireContainer(NodeOperation.EXEC)
         return translating(NodeOperation.EXEC) {
-            val result = client.execSync(containerId, request.command, request.timeout)
+            // Already bounded: [ExecTimeout] is the only thing [ExecRequest] accepts
+            // and its factory applies [ExecTimeoutCeiling]. This is the value
+            // `GrpcCriClient.execSync` turns into the call's gRPC deadline, which is
+            // why the bound is on the type rather than asked for here.
+            val result = client.execSync(containerId, request.command, request.timeout.period)
             ExecOutcome(exitCode = result.exitCode, stdout = result.stdout, stderr = result.stderr)
         }
     }
@@ -602,7 +606,7 @@ public class LocalNode internal constructor(
      */
     override suspend fun stopWorkload(
         handle: WorkloadHandle,
-        gracePeriod: Duration,
+        gracePeriod: StopGrace,
     ) {
         // One rule, asked once, of the type that owns it. This used to be a
         // local `isPositive()` check standing in front of a `StopGracePeriod.of`
@@ -617,33 +621,19 @@ public class LocalNode internal constructor(
         // `of` rounds up to whole seconds, so a grace period is never silently
         // shortened, and it refuses anything containerd's own arithmetic would
         // wrap — see [StopGracePeriod.MAX_SECONDS], where a very long grace
-        // period becomes a very short one.
+        // period becomes a very short one. That is **this runtime's** bound and it
+        // stays here for that reason.
         //
-        // The runtime's bound is not this node's only one, because the *call* is
-        // deadlined off this value: `GrpcCriClient.stopContainer` asks for
-        // `gracePeriod + slack`, so a grace period below `MAX_SECONDS` and above
-        // anything a human meant parks this worker at a container that will not
-        // exit, with no effective timeout — the one property CLAUDE.md requires of
-        // every call crossing the `:cri` boundary. [StopGraceCeiling] is that
-        // second bound. It caps rather than refuses, and the reason is written
-        // there: refusing a *stop* is a populated server nobody can retire.
-        val effective = StopGraceCeiling.bound(gracePeriod)
-        if (effective != gracePeriod) {
-            // At warn, because no reader in this system can produce such a value:
-            // it means a definition arrived from somewhere that does not validate,
-            // and the row is worth fixing even though this stop is safe.
-            LOG.warn(
-                "stop grace period {} for sandbox {} is above the operational ceiling {} and is capped at it. " +
-                    "No server definition read from YAML can carry this, so it came from a store row or a " +
-                    "migration; the world save was confirmed before this stop, so the grace period is the " +
-                    "last-resort net rather than the save path",
-                gracePeriod,
-                handle.sandboxId,
-                StopGraceCeiling.MAX,
-            )
-        }
+        // The interface's own bound is not applied here at all any more, and that
+        // is the thirtieth audit's ruling on the seam: it is carried by the
+        // argument's type. [StopGrace] can only be built by [StopGrace.of], which
+        // applies [StopGraceCeiling] — so the property "no `Node` holds a stop open
+        // past the operational ceiling" belongs to every implementation of the
+        // interface rather than to this one remembering. It also cannot be applied
+        // here correctly: the ceiling has a floor derived from the workload's save
+        // timeout, and a node cannot see the other half of that pair.
         val grace =
-            StopGracePeriod.of(effective).getOrElse { rejection ->
+            StopGracePeriod.of(gracePeriod.period).getOrElse { rejection ->
                 // Refused rather than thrown on: [Node] promises callers see
                 // nothing but a [NodeException], and an
                 // `IllegalArgumentException` from here would be the one thing a

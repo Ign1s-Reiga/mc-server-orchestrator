@@ -54,6 +54,17 @@ internal class FakeNode(
     val containerRemovals: MutableList<WorkloadHandle> = mutableListOf()
     val execs: MutableList<List<String>> = mutableListOf()
 
+    /**
+     * The whole request, so a test can assert on the **deadline** an exec was given
+     * and not only on what it ran.
+     *
+     * [execs] is the list nearly every assertion wants and it stays the primary one.
+     * This exists because `ExecRequest.timeout` is a duration a definition supplies
+     * and a `Node` turns into a transport deadline — see `ExecTimeoutCeiling` — so
+     * "what was this call allowed to take" is a side effect like any other.
+     */
+    val execRequests: MutableList<ExecRequest> = mutableListOf()
+
     /** Every control-channel request, so a test can count seals and transfers at the wire. */
     val endpointCalls: MutableList<EndpointRequest> = mutableListOf()
 
@@ -259,6 +270,7 @@ internal class FakeNode(
             throw NodeException.Rejected(name, NodeOperation.EXEC, "the container is not running")
         }
         execs += request.command
+        execRequests += request
         return onExec(request.command)
     }
 
@@ -291,18 +303,26 @@ internal class FakeNode(
 
     override suspend fun stopWorkload(
         handle: WorkloadHandle,
-        gracePeriod: Duration,
+        gracePeriod: StopGrace,
     ) {
         // The same rule the real node applies, asked of the same object, so this
         // fake cannot accept a grace period `LocalNode` would refuse. It used to
         // be a local `isPositive()`, which is the *weaker* half — a caller that
         // reached this fake with an unbounded or overflowing value would have
         // been told it was fine.
-        StopGracePeriod.of(gracePeriod).getOrElse {
+        //
+        // The interface's *own* ceiling is not re-asked here, and could not be:
+        // since the thirtieth audit it is carried by [StopGrace], so a caller
+        // cannot have skipped it. What is left is this node's runtime bound, which
+        // a second implementation is free to differ on — and holding the fake to
+        // the real one's is the point.
+        StopGracePeriod.of(gracePeriod.period).getOrElse {
             throw IllegalArgumentException("the fake node holds the real node to its contract: ${it.message}", it)
         }
         check(NodeOperation.STOP)
-        stops += handle to gracePeriod
+        // Recorded as the duration that reached the runtime, which is what every
+        // assertion about a stop is about. [StopGrace] carries nothing else.
+        stops += handle to gracePeriod.period
         val present = workload as? WorkloadObservation.Present ?: return
         workload = onStop(present)
     }

@@ -1,13 +1,17 @@
 package mcorch.core.node
 
 import io.kotest.assertions.throwables.shouldThrow
+import io.kotest.assertions.withClue
 import io.kotest.matchers.collections.shouldBeEmpty
+import io.kotest.matchers.comparables.shouldBeGreaterThanOrEqualTo
+import io.kotest.matchers.comparables.shouldBeLessThanOrEqualTo
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.string.shouldNotContain
 import mcorch.core.NodeException
 import mcorch.core.NodeOperation
+import mcorch.core.StopGrace
 import mcorch.core.StopGraceCeiling
 import mcorch.core.WorkloadHandle
 import mcorch.core.coreTest
@@ -32,6 +36,7 @@ import mcorch.cri.SandboxStatus
 import mcorch.cri.SandboxSummary
 import mcorch.cri.StopGracePeriod
 import mcorch.schema.NodeName
+import mcorch.schema.PaperServerDefaults
 import mcorch.schema.ResourceName
 import mcorch.schema.SecretRef
 import mcorch.store.SecretStore
@@ -43,11 +48,12 @@ import kotlin.io.path.createDirectories
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.days
 import kotlin.time.Duration.Companion.hours
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 
 /**
  * What [LocalNode.stopWorkload] does with the grace period it is handed, before
- * anything reaches containerd.
+ * anything reaches containerd — and what [StopGraceCeiling] does before that.
  *
  * This guard used to be a local `gracePeriod.isPositive()` check standing in
  * front of a [StopGracePeriod] that enforced strictly more, so the two disagreed
@@ -62,6 +68,17 @@ import kotlin.time.Duration.Companion.seconds
  * immediately and reporting success. Bigger was not safer. So these assertions
  * are as much about **what never reaches the client** as about what the caller
  * sees.
+ *
+ * ## Two bounds, and only one of them is this node's
+ *
+ * Since the thirtieth audit the operational ceiling is carried by [StopGrace], the
+ * type [LocalNode.stopWorkload] takes, so the node applies nothing of its own to it
+ * — the tests below build the value the way the drain controller does and assert on
+ * what reaches the client. **There is no mutation for "the node forgets the
+ * ceiling"**, and the reason belongs here rather than in the harness: the node
+ * cannot express forgetting it. It never sees an unbounded duration. What is left
+ * at this end is containerd's own bound (`StopGracePeriod.of`), which is where a
+ * second `Node` implementation is entitled to differ.
  */
 class StopGraceGuardTest {
     /**
@@ -76,10 +93,13 @@ class StopGraceGuardTest {
      *
      * Why the verdict changed is in [StopGraceCeiling]: the operation being refused
      * was the **stop**, and a stop nobody can issue is a populated, world-holding
-     * server nobody can retire. The cap is safe because nothing reaches
-     * `Node.stopWorkload` except through the zero-player gate and `mayStop`, so a
-     * completed save is already confirmed and the grace period is the last-resort
-     * net.
+     * server nobody can retire. The cap is safe because of where the stop sits in
+     * the protocol — every path to it ends in `mayStop`, so a completed save is
+     * already confirmed and the grace period is the last-resort net. There are
+     * **two** such paths and `DrainWiringTest` is what holds that count; the
+     * sentence this used to carry said "the zero-player gate followed by `mayStop`",
+     * which `DrainController`'s class note has contradicted since the re-issue was
+     * written.
      */
     @Test
     fun `a grace period containerd would invert is capped, not sent`(
@@ -92,7 +112,7 @@ class StopGraceGuardTest {
         val overflowing = (StopGracePeriod.MAX_SECONDS + 1).seconds
         val client = RefusingCriClient()
 
-        node(client, root).stopWorkload(handle(), overflowing)
+        node(client, root).stopWorkload(handle(), StopGrace.of(overflowing, NO_WORLD))
 
         // The whole point, unchanged: containerd was never asked to wait that
         // long. It was asked to wait the ceiling.
@@ -108,16 +128,91 @@ class StopGraceGuardTest {
      */
     @Test
     fun `the ceiling caps a long finite grace period and leaves everything else alone`() {
-        StopGraceCeiling.bound(30.seconds) shouldBe 30.seconds
-        StopGraceCeiling.bound(StopGraceCeiling.MAX) shouldBe StopGraceCeiling.MAX
-        StopGraceCeiling.bound(StopGraceCeiling.MAX + 1.seconds) shouldBe StopGraceCeiling.MAX
-        StopGraceCeiling.bound(StopGracePeriod.MAX_SECONDS.seconds) shouldBe StopGraceCeiling.MAX
+        StopGraceCeiling.bound(30.seconds, NO_WORLD) shouldBe 30.seconds
+        StopGraceCeiling.bound(StopGraceCeiling.MAX, NO_WORLD) shouldBe StopGraceCeiling.MAX
+        StopGraceCeiling.bound(StopGraceCeiling.MAX + 1.seconds, NO_WORLD) shouldBe StopGraceCeiling.MAX
+        StopGraceCeiling.bound(StopGracePeriod.MAX_SECONDS.seconds, NO_WORLD) shouldBe StopGraceCeiling.MAX
         // Not a duration anybody meant. Capping it would turn an argument the code
         // cannot interpret into a plausible-looking stop, so it is handed on
         // untouched to the rule that refuses it and says why.
-        StopGraceCeiling.bound(Duration.INFINITE) shouldBe Duration.INFINITE
-        StopGraceCeiling.bound(Duration.ZERO) shouldBe Duration.ZERO
-        StopGraceCeiling.bound((-30).days) shouldBe (-30).days
+        StopGraceCeiling.bound(Duration.INFINITE, NO_WORLD) shouldBe Duration.INFINITE
+        StopGraceCeiling.bound(Duration.ZERO, NO_WORLD) shouldBe Duration.ZERO
+        StopGraceCeiling.bound((-30).days, NO_WORLD) shouldBe (-30).days
+    }
+
+    /**
+     * **The thirtieth audit's first finding: the ceiling may not invert the pair it
+     * clamps half of.**
+     *
+     * `stopGracePeriod` and `drain.saveTimeout` are validated *together* —
+     * `LifecycleSpec.init` refuses a `PaperServer` whose grace period does not exceed
+     * its save timeout by [PaperServerDefaults.MIN_STOP_GRACE_MARGIN], because a
+     * grace period shorter than the save timeout kills the container part-way
+     * through the save. A row carrying `saveTimeout = 3h` and
+     * `stopGracePeriod = 3h1m` satisfies that, decodes, and used to be stopped with
+     * two hours: SIGKILL into Paper's shutdown save, which is a torn region file.
+     *
+     * The two conditions are correlated rather than independent, which is what makes
+     * this reachable at all: the cap only fires on a definition that bypassed
+     * `PaperServerReader`, and that is the same population that can carry a save
+     * timeout above `PaperServerDefaults.MAX_TIMEOUT`.
+     *
+     * The relation is restated here from the public constant rather than called
+     * through `SpecInvariants.stopGraceProblem`, which is `internal` to `:schema`. If
+     * that rule ever changes shape this assertion has to be re-derived — the
+     * constant is shared, the arithmetic around it is not.
+     */
+    @Test
+    fun `a grace period is never capped below the save timeout it was validated against`() {
+        val margin = PaperServerDefaults.MIN_STOP_GRACE_MARGIN
+        val pairs =
+            listOf(
+                // The reported case, and the one the old ceiling inverted.
+                3.hours to (3.hours + 1.minutes),
+                // The smallest margin the schema accepts, well past the ceiling.
+                5.hours to (5.hours + margin),
+                // A save timeout under the ceiling: the floor is below MAX, so MAX
+                // is what bites and nothing about the pair changes.
+                3.minutes to 10.hours,
+            )
+        for ((saveTimeout, declared) in pairs) {
+            withClue("saveTimeout=$saveTimeout declared=$declared") {
+                // The premise: every pair here is one the schema would accept.
+                declared shouldBeGreaterThanOrEqualTo saveTimeout + margin
+                val effective = StopGraceCeiling.bound(declared, saveTimeout)
+                effective shouldBeLessThanOrEqualTo declared
+                effective shouldBeGreaterThanOrEqualTo saveTimeout + margin
+            }
+        }
+        // …and the cap is still a cap. Without this the assertions above are
+        // satisfied by a ceiling that does nothing at all.
+        StopGraceCeiling.bound(10.hours, 3.minutes) shouldBe StopGraceCeiling.MAX
+    }
+
+    /**
+     * The residual named in [StopGraceCeiling], pinned so it is a decision rather
+     * than a discovery.
+     *
+     * A save timeout large enough that the derived floor passes what *containerd*
+     * accepts leaves the stop refused rather than capped — the cap-versus-refuse
+     * trade pointing the other way, and deliberately so: a refusal is recorded and
+     * loud where a cap that inverts the pair is silent and costs a world. It needs
+     * both halves of the pair to be absurd (292 years), not merely unvalidated.
+     */
+    @Test
+    fun `a save timeout past the runtime's own bound leaves the stop refused, not silently inverted`(
+        @TempDir root: Path,
+    ) = coreTest {
+        val absurd = (StopGracePeriod.MAX_SECONDS + 1).seconds
+        val client = RefusingCriClient()
+
+        // The floor raises the ceiling above what the runtime will take, so nothing
+        // caps it and the runtime's own rule is what answers.
+        StopGraceCeiling.bound(absurd, absurd) shouldBe absurd
+        shouldThrow<NodeException.Rejected> {
+            node(client, root).stopWorkload(handle(), StopGrace.of(absurd, absurd))
+        }
+        client.stops.shouldBeEmpty()
     }
 
     @Test
@@ -130,7 +225,9 @@ class StopGraceGuardTest {
         val client = RefusingCriClient()
 
         val thrown =
-            shouldThrow<NodeException.Rejected> { node(client, root).stopWorkload(handle(), Duration.INFINITE) }
+            shouldThrow<NodeException.Rejected> {
+                node(client, root).stopWorkload(handle(), StopGrace.of(Duration.INFINITE, NO_WORLD))
+            }
 
         thrown.operation shouldBe NodeOperation.STOP
         thrown.message.shouldNotBeNull() shouldContain "finite"
@@ -144,7 +241,8 @@ class StopGraceGuardTest {
     ) = coreTest {
         for (bad in listOf(Duration.ZERO, (-1).seconds, (-30).days)) {
             val client = RefusingCriClient()
-            shouldThrow<NodeException.Rejected> { node(client, root).stopWorkload(handle(), bad) }
+            val node = node(client, root)
+            shouldThrow<NodeException.Rejected> { node.stopWorkload(handle(), StopGrace.of(bad, NO_WORLD)) }
             client.stops.shouldBeEmpty()
         }
     }
@@ -157,7 +255,7 @@ class StopGraceGuardTest {
         // near the runtime's limit — the guard must not be mistaken for a policy
         // on how long a save may take.
         val client = RefusingCriClient()
-        node(client, root).stopWorkload(handle(), 2.hours)
+        node(client, root).stopWorkload(handle(), StopGrace.of(2.hours, 3.minutes))
 
         client.stops shouldBe listOf(ContainerId("c1") to StopGracePeriod.ofSeconds(7200).getOrThrow())
     }
@@ -178,7 +276,7 @@ class StopGraceGuardTest {
         @TempDir root: Path,
     ) = coreTest {
         val client = RefusingCriClient()
-        node(client, root).stopWorkload(handle(), StopGracePeriod.MAX_SECONDS.seconds)
+        node(client, root).stopWorkload(handle(), StopGrace.of(StopGracePeriod.MAX_SECONDS.seconds, NO_WORLD))
 
         client.stops
             .single()
@@ -192,14 +290,16 @@ class StopGraceGuardTest {
         val sandboxOnly = WorkloadHandle(NODE, "s1", containerId = null)
 
         val quiet = RefusingCriClient()
-        node(quiet, root).stopWorkload(sandboxOnly, 30.seconds)
+        node(quiet, root).stopWorkload(sandboxOnly, StopGrace.of(30.seconds, NO_WORLD))
         quiet.stops.shouldBeEmpty()
 
         // A nonsense grace period is refused whether or not there is anything to
         // stop. The argument is wrong either way, and a caller that only learns
         // so once a container exists learns so during a drain.
         val refused = RefusingCriClient()
-        shouldThrow<NodeException.Rejected> { node(refused, root).stopWorkload(sandboxOnly, Duration.INFINITE) }
+        shouldThrow<NodeException.Rejected> {
+            node(refused, root).stopWorkload(sandboxOnly, StopGrace.of(Duration.INFINITE, NO_WORLD))
+        }
         refused.stops.shouldBeEmpty()
     }
 
@@ -222,6 +322,14 @@ class StopGraceGuardTest {
 
     private companion object {
         val NODE: NodeName = NodeName.of("test-node").getOrThrow()
+
+        /**
+         * The save timeout of a workload with no world, which is what
+         * `DrainSubject.saveTimeout` answers for one. It puts no floor under the
+         * ceiling, so every assertion that is about the *cap* uses it rather than
+         * quietly relying on a floor it does not name.
+         */
+        val NO_WORLD: Duration = Duration.ZERO
     }
 }
 

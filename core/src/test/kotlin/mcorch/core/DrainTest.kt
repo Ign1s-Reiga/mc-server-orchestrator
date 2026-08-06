@@ -5,6 +5,7 @@ import io.kotest.matchers.booleans.shouldBeTrue
 import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.comparables.shouldBeGreaterThan
+import io.kotest.matchers.comparables.shouldBeLessThan
 import io.kotest.matchers.ints.shouldBeGreaterThan
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
@@ -22,6 +23,7 @@ import mcorch.schema.DrainStatus
 import mcorch.schema.FailureClass
 import mcorch.schema.FailureReason
 import mcorch.schema.FailureStatus
+import mcorch.schema.PaperServerDefaults
 import mcorch.schema.RconSpec
 import mcorch.schema.ServerPhase
 import mcorch.schema.StorageSpec
@@ -64,6 +66,72 @@ internal class DrainTest {
             harness.store.getServer(name) shouldBe null
             // The world outlives all of it.
             harness.node.volumes shouldHaveSize 1
+        }
+
+    /**
+     * **The thirtieth audit's first and second findings, in the one scenario that
+     * contains both.**
+     *
+     * A definition that never came through `PaperServerReader` — a hand-repaired
+     * store row, a migration — can carry lifecycle durations no YAML could. This one
+     * carries `saveTimeout = 3h` and `stopGracePeriod = 3h1m`: a pair
+     * `LifecycleSpec.init` accepts (the margin is 30s), that `DefinitionCodec`
+     * decodes, and that both operational ceilings used to get wrong in opposite
+     * directions.
+     *
+     * - **The stop grace period must not be capped below the save timeout it was
+     *   validated against.** `StopGraceCeiling` clamped it to two hours, which is
+     *   the schema's own words for what that state does: *"a grace period shorter
+     *   than the save timeout kills the container part-way through the save"*. The
+     *   drain's own flush is confirmed by then, so what SIGKILL lands in is Paper's
+     *   **shutdown** save — a torn region file. The floor closes it, and note what
+     *   the floor is not: the ceiling still shortens this row, down to the smallest
+     *   value the schema would have accepted for the pair rather than down to `MAX`.
+     * - **The save exec must be bounded.** `spec.lifecycle.drain.saveTimeout`
+     *   becomes `execSync`'s gRPC deadline directly, so the same row parked a
+     *   reconcile worker in `save-all flush` for three hours with no effective
+     *   timeout. `ExecTimeoutCeiling` closes it, and the direction is safe: a cap
+     *   can only make a save go unconfirmed sooner, and an unconfirmed save is a
+     *   container this orchestrator does not stop.
+     *
+     * The two are asserted together because they read the **same field** and bound
+     * it differently on purpose — one is how long this process waits for its own
+     * flush, the other how long the container is given to finish its shutdown save
+     * — and a future "make these consistent" edit is exactly what would break one of
+     * them.
+     */
+    @Test
+    fun `a store row past both ceilings keeps its grace above its save timeout, and its save exec bounded`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition(saveTimeout = 3.hours, stopGracePeriod = 3.hours + 1.minutes)
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.store.deleteDefinition(name)
+
+            harness.settle(name, limit = 12)
+
+            harness.node.stops shouldHaveSize 1
+            val (_, grace) = harness.node.stops.single()
+            // The ceiling still bites — this is not "give up on an unvalidated row",
+            // and the worker is held no longer than it has to be — but it stops at
+            // the floor instead of at `MAX`.
+            grace shouldBe 3.hours + PaperServerDefaults.MIN_STOP_GRACE_MARGIN
+            grace shouldBeLessThan definition.spec.lifecycle.stopGracePeriod
+            // The property the floor exists for: the relation the schema validated
+            // the pair against survives whatever the ceiling does to one half of it.
+            grace shouldBeGreaterThan definition.spec.lifecycle.drain.saveTimeout
+            // …and the reason that is not vacuous: this is what it used to be, which
+            // is two hours *below* the save timeout it was validated against.
+            grace shouldNotBe StopGraceCeiling.MAX
+
+            // The other consumer of the same field, bounded the other way.
+            val save =
+                harness.node.execRequests
+                    .single { it.command == PaperCommands.saveAll() }
+            save.timeout.period shouldBe ExecTimeoutCeiling.MAX
+            save.timeout.period shouldBeLessThan definition.spec.lifecycle.drain.saveTimeout
         }
 
     /**

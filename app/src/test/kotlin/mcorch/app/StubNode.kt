@@ -9,6 +9,7 @@ import mcorch.core.Node
 import mcorch.core.NodeException
 import mcorch.core.NodeOperation
 import mcorch.core.NodeStatus
+import mcorch.core.StopGrace
 import mcorch.core.StorageRequest
 import mcorch.core.WorkloadHandle
 import mcorch.core.WorkloadObservation
@@ -192,9 +193,12 @@ internal class StubNode(
 
     override suspend fun stopWorkload(
         handle: WorkloadHandle,
-        gracePeriod: Duration,
+        gracePeriod: StopGrace,
     ) {
-        require(gracePeriod.isPositive()) { "the stub holds the real node to its contract" }
+        // The operational ceiling is not re-checked: [StopGrace] is the only thing
+        // this signature accepts and its factory has applied it. What is left is
+        // the half every implementation owns for itself.
+        require(gracePeriod.period.isPositive()) { "the stub holds the real node to its contract" }
         if (refuseFirstStop && stopsRefused == 0) {
             stopsRefused += 1
             throw NodeException.Unreachable(name, NodeOperation.STOP, "the runtime did not take the stop")

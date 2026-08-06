@@ -2,6 +2,7 @@ package mcorch.core.paper
 
 import mcorch.core.ExecOutcome
 import mcorch.core.ExecRequest
+import mcorch.core.ExecTimeout
 import mcorch.core.Labels
 import mcorch.core.Node
 import mcorch.core.NodeException
@@ -106,7 +107,7 @@ internal class PaperServerAgent(
         val request =
             ExecRequest(
                 command = PaperCommands.serverListPing(spec.network.port),
-                timeout = PROBE_TIMEOUT,
+                timeout = ExecTimeout.of(PROBE_TIMEOUT),
             )
         val result =
             try {
@@ -180,6 +181,16 @@ internal class PaperServerAgent(
      * The timeout is `spec.lifecycle.drain.saveTimeout`, which the schema
      * guarantees sits below the stop grace period. On a timeout the save is
      * **not** confirmed and the container stays running.
+     *
+     * It goes through [ExecTimeout], which bounds it — the thirtieth audit's second
+     * finding. This is the *longer* of the two durations a definition hands the
+     * node, and it becomes `execSync`'s gRPC deadline directly, so a row that never
+     * came through `PaperServerReader` parked a reconcile worker in `save-all flush`
+     * for as long as it liked. The cap can only ever make a save go unconfirmed
+     * earlier, and an unconfirmed save is a container this orchestrator does not
+     * stop — the safe direction, and the reason a cap is right here where a refusal
+     * would abort the drain. See [ExecTimeoutCeiling] for why it is not the same
+     * bound as the stop grace period's, from the same field.
      */
     suspend fun requestSave(
         node: Node,
@@ -192,7 +203,7 @@ internal class PaperServerAgent(
         val request =
             ExecRequest(
                 command = PaperCommands.saveAll(),
-                timeout = spec.lifecycle.drain.saveTimeout,
+                timeout = ExecTimeout.of(spec.lifecycle.drain.saveTimeout),
             )
         val result =
             try {

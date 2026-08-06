@@ -122,7 +122,26 @@
 #            the node stops with. The call is deadlined off that number, so what it
 #            costs is a reconcile worker parked at a container that will not exit,
 #            with no effective timeout — and the runtime's own bound is 292 years
-#            away, so nothing else refuses it.
+#            away, so nothing else refuses it. Re-derived for the thirtieth audit:
+#            the ceiling now lives in the argument's *type*, so the mutation is in
+#            Node.kt, and D39D scores the same edit in the drain scenario.
+#   D40      the *floor* under that ceiling, and the thirtieth audit's first
+#            finding. `stopGracePeriod` and `saveTimeout` are validated as a pair;
+#            a ceiling applied to one half by a consumer that cannot see the other
+#            inverts the relation, and a grace period below the save timeout is
+#            SIGKILL part-way through Paper's shutdown save. D40D is the same edit
+#            scored end to end through a drain.
+#   D41      the sibling ceiling, on the exec that carries `save-all flush`. Same
+#            argument as D39 — the number becomes a gRPC deadline — on the longer
+#            of the two calls, which is where it went unwritten for a round.
+#   D42      a block's blackout sentence appended rather than leading. Nothing is
+#            stopped and no state moves, so only an assertion about the *message*
+#            can see it: `:api` renders "waiting, not stuck — " plus this string,
+#            and a fleet table truncates whatever comes second.
+#   D43      the overdue check reading the *declared* grace period rather than the
+#            derived one, which is a container reported overdue against a number the
+#            runtime was never given. The type bounds the value; only a source scan
+#            can bound who reads the field it came from.
 #   C1..C3   controls: the rule deleted outright, once per assertion arm. If these
 #            do not redden, the harness is not reaching the assertions at all.
 #   S1       the self-test. See below.
@@ -169,6 +188,10 @@ BACKUP_DIR="$(mktemp -d -t drain-wiring-XXXXXX)"
 CONTROLLER=core/src/main/kotlin/mcorch/core/DrainController.kt
 RECONCILER=core/src/main/kotlin/mcorch/core/Reconciler.kt
 LOCAL_NODE=core/src/main/kotlin/mcorch/core/node/LocalNode.kt
+# The seam itself. Since the thirtieth audit the stop's operational ceiling and
+# the exec's live here rather than in an implementation, so the mutations for them
+# moved with them.
+NODE=core/src/main/kotlin/mcorch/core/Node.kt
 PLANNER=core/src/main/kotlin/mcorch/core/proxy/VelocityWorkloadPlanner.kt
 
 WIRING=mcorch.core.DrainWiringTest
@@ -218,9 +241,20 @@ WEDGE_SURVIVES='a permanent save wedge survives a player logging back on'
 # blackout.
 EDIT_NOT_SPENT='an operator edit is not spent on a player who logged on while the drain was frozen'
 FLEET_LOCKED_OUT='an edit made while a proxy is populated does not leave the fleet locked out'
-# Its third: the node's own bound on the grace period it stops with.
+# Its third: the interface's own bound on the grace period it stops with. Both of
+# these moved subject with the thirtieth audit's fix — they now drive a value the
+# argument's *type* bounded, so the mutation for them is in Node.kt.
 GRACE_CAPPED='a grace period containerd would invert is capped, not sent'
 GRACE_STILL_CAPPED='the largest grace period the runtime honours is still capped, because the call is deadlined off it'
+# The thirtieth audit's first finding: the floor under that ceiling, and the
+# residual the floor leaves behind at the runtime's own bound.
+GRACE_FLOORED='a grace period is never capped below the save timeout it was validated against'
+RUNTIME_REFUSES="a save timeout past the runtime's own bound leaves the stop refused, not silently inverted"
+# ...and the scenario that drives both ceilings through a real drain, which is where
+# the two consumers of one field are asserted against each other.
+BOTH_CEILINGS='a store row past both ceilings keeps its grace above its save timeout, and its save exec bounded'
+# The derivation's own enforcement point: the raw field is read in one place.
+ONE_DERIVATION='the declared stop grace period is read only where it is bounded'
 HANDED="the drain is handed the loop's permanence gate rather than deriving one"
 GATED_RELEASE='the seal release is gated on the answer the abort was handed'
 MID_DRAIN='a replacement that becomes unbuildable mid-drain parks before the stop'
@@ -258,12 +292,19 @@ RECONCILER_TAIL='        require(drainAttentionAfter.isPositive()) { "drainAtten
 # A second call site, in the shape the class KDoc used to be blind to: a teardown
 # helper that reaches the runtime directly. Never called, so nothing but the scan
 # can see it — which is the point.
+#
+# Re-derived for the thirtieth audit, and the reason is worth keeping: the stop's
+# grace period became a value type, so `grace: kotlin.time.Duration` stopped
+# compiling and both this and STOP_WRAPPER below reported UNKNOWN. A mutation that
+# no longer compiles proves nothing either way — it is not "the type caught it" —
+# so the parameter follows the interface. The type is a bound, not a gate: a stop
+# decided in the wrong file is exactly as expressible as it was.
 STOP_ELSEWHERE="$RECONCILER_TAIL"'
 
 private suspend fun teardownWithoutDraining(
     node: Node,
     handle: WorkloadHandle,
-    grace: kotlin.time.Duration,
+    grace: StopGrace,
 ) {
     node.stopWorkload(handle, grace)
 }'
@@ -276,7 +317,7 @@ STOP_WRAPPER="$RECONCILER_TAIL"'
 private suspend fun stopWorkload(
     node: Node,
     handle: WorkloadHandle,
-    grace: kotlin.time.Duration,
+    grace: StopGrace,
 ) {
     node.stopWorkload(handle, grace)
 }'
@@ -411,9 +452,43 @@ PROXY_GATE_COPIED='                    previous.drain.parkedOnTheFailure()
 # without it — which is the gate exactly as the sixteenth audit left it.
 PARKED_ON_FAILURE='    this == null || (state == DrainState.DRAIN_FAILED && blocked == null)'
 PARKED_IGNORING_BLOCK='    this == null || state == DrainState.DRAIN_FAILED'
-# The node'"'"'s own bound on the grace period, and the value going out unbounded.
-GRACE_CEILING='        val effective = StopGraceCeiling.bound(gracePeriod)'
-GRACE_UNBOUNDED='        val effective = gracePeriod'
+# The stop grace period's operational ceiling, and the value going out unbounded.
+# Re-derived for the thirtieth audit: this used to sit in `LocalNode.stopWorkload`
+# and is now the only factory for the argument's type, so the mutation follows it
+# into Node.kt. The node has no mutation of its own any more -- it cannot express
+# forgetting a bound it never applies -- and that is written up in
+# StopGraceGuardTest's class note rather than left as a silent gap.
+GRACE_CEILING='        ): StopGrace = StopGrace(StopGraceCeiling.bound(requested, saveTimeout))'
+GRACE_UNBOUNDED='        ): StopGrace = StopGrace(requested)'
+# ...and the floor under that ceiling. Dropping it is the plausible edit -- the
+# ceiling reads perfectly well without a save timeout in it -- and it restores the
+# thirtieth audit's first finding: stopGracePeriod and saveTimeout are a pair the
+# schema validated together, and clamping one half at a consumer that cannot see the
+# other inverts the relation. Two hours of grace under a three-hour save.
+GRACE_FLOOR='        if (saveTimeout.isFinite() && saveTimeout.isPositive()) {
+            maxOf(MAX, saveTimeout + PaperServerDefaults.MIN_STOP_GRACE_MARGIN)
+        } else {
+            MAX
+        }'
+GRACE_NO_FLOOR='        MAX'
+# The sibling ceiling, on the longer of the two calls: saveTimeout becomes
+# execSync's gRPC deadline directly, so an unbounded one parks a reconcile worker in
+# `save-all flush` with no effective timeout at all.
+EXEC_CEILING='        public fun of(requested: Duration): ExecTimeout = ExecTimeout(ExecTimeoutCeiling.bound(requested))'
+EXEC_UNBOUNDED='        public fun of(requested: Duration): ExecTimeout = ExecTimeout(requested)'
+# Which half of a block's message comes first. Appending the blackout like the other
+# two answers is the tidy-looking edit, and it is the thirtieth audit's fourth
+# finding: `:api` renders "waiting, not stuck -- " plus this string, so a truncated
+# fleet table then shows only the half that agrees with "needs nobody".
+# A fourth reader taking the declared grace period instead of the derived one. This
+# is the overdue check, and it is the plausible edit because it reads no node and
+# looks like it only wants a number: it would then report a container overdue against
+# a period the runtime was never given. Behaviourally invisible unless the ceiling
+# bites, which is what the structural pin is for.
+DERIVED_GRACE_READ='            val grace = stopGrace(pass).period'
+DECLARED_GRACE_READ='            val grace = pass.subject.stopGracePeriod'
+BLACKOUT_LEADS='                LoginPath.ShutByThisDrain -> "${path.sentence}. ${message.replaceFirstChar { it.uppercase() }}"'
+BLACKOUT_BURIED='                LoginPath.ShutByThisDrain -> "$message. ${path.sentence}"'
 # Step 2 on the gated resume, and the version without it: the state the twenty-
 # seventh audit'"'"'s second finding is about, where `holdSeal` sits behind
 # `requireEmpty` and is unreachable while anybody is connected.
@@ -655,12 +730,29 @@ MUTATIONS=(
     # mutation.
     "D38@@$CONTROLLER@@$REPLACEMENT@@$EDIT_NOT_SPENT@@$PARKED_ON_FAILURE@@$PARKED_IGNORING_BLOCK"
     "D38P@@$CONTROLLER@@$PROXY_DRAIN@@$FLEET_LOCKED_OUT@@$PARKED_ON_FAILURE@@$PARKED_IGNORING_BLOCK"
-    # The stop grace period leaving the node unbounded. Both node tests redden,
+    # The stop grace period leaving the factory unbounded. Both node tests redden,
     # and that is the pair rather than a duplicate: one is the value containerd's
-    # own arithmetic inverts, the other the largest value it honours — which this
+    # own arithmetic inverts, the other the largest value it honours -- which this
     # node still refuses to hold a worker for, because the call's deadline is
-    # derived from it.
-    "D39@@$LOCAL_NODE@@$STOP_GRACE@@$GRACE_CAPPED;$GRACE_STILL_CAPPED@@$GRACE_CEILING@@$GRACE_UNBOUNDED"
+    # derived from it. The drain-level case is the same mutation scored in a second
+    # class, because the harness runs one class per entry.
+    "D39@@$NODE@@$STOP_GRACE@@$GRACE_CAPPED;$GRACE_STILL_CAPPED@@$GRACE_CEILING@@$GRACE_UNBOUNDED"
+    "D39D@@$NODE@@$DRAIN@@$BOTH_CEILINGS@@$GRACE_CEILING@@$GRACE_UNBOUNDED"
+    # The floor under it: the thirtieth audit's first finding. Two cases in the node
+    # class -- the floor itself, and the residual it leaves at containerd's own bound
+    # -- plus the drain that carries the pair end to end.
+    "D40@@$NODE@@$STOP_GRACE@@$GRACE_FLOORED;$RUNTIME_REFUSES@@$GRACE_FLOOR@@$GRACE_NO_FLOOR"
+    "D40D@@$NODE@@$DRAIN@@$BOTH_CEILINGS@@$GRACE_FLOOR@@$GRACE_NO_FLOOR"
+    # The exec deadline, unbounded. Only the drain scenario sees it: it is the one
+    # test that reads what a save exec was actually allowed to take.
+    "D41@@$NODE@@$DRAIN@@$BOTH_CEILINGS@@$EXEC_CEILING@@$EXEC_UNBOUNDED"
+    # The blackout buried behind the wait. Nothing is stopped by it and no decision
+    # moves -- only the order of one message -- which is exactly why it needs a
+    # mutation: it is invisible to every assertion that reads a state.
+    "D42@@$CONTROLLER@@$PROXY_DRAIN@@$KEEPS_SEAL@@$BLACKOUT_LEADS@@$BLACKOUT_BURIED"
+    # A second reader of the raw grace period. The type bounds the value; nothing
+    # bounds who reads the field it came from, so that half is a source scan.
+    "D43@@$CONTROLLER@@$WIRING@@$ONE_DERIVATION@@$DERIVED_GRACE_READ@@$DECLARED_GRACE_READ"
     "C1@@$CONTROLLER@@$WIRING@@$EXIT@@$RULE@@val recorded = progress"
     "C2@@$CONTROLLER@@$WIRING@@$STEPPED@@$ADOPTION@@val observed = drain"
     "C3@@$CONTROLLER@@$RULES@@$ADOPTS@@$CLAUSE@@is PlayerReading.Occupied -> this"
@@ -673,6 +765,7 @@ restore() {
             DrainController.kt) cp -- "$backup" "$REPO_ROOT/$CONTROLLER" ;;
             Reconciler.kt) cp -- "$backup" "$REPO_ROOT/$RECONCILER" ;;
             LocalNode.kt) cp -- "$backup" "$REPO_ROOT/$LOCAL_NODE" ;;
+            Node.kt) cp -- "$backup" "$REPO_ROOT/$NODE" ;;
             VelocityWorkloadPlanner.kt) cp -- "$backup" "$REPO_ROOT/$PLANNER" ;;
         esac
     done
@@ -699,6 +792,7 @@ trap cleanup EXIT INT TERM
 cp -- "$REPO_ROOT/$CONTROLLER" "$BACKUP_DIR/DrainController.kt"
 cp -- "$REPO_ROOT/$RECONCILER" "$BACKUP_DIR/Reconciler.kt"
 cp -- "$REPO_ROOT/$LOCAL_NODE" "$BACKUP_DIR/LocalNode.kt"
+cp -- "$REPO_ROOT/$NODE" "$BACKUP_DIR/Node.kt"
 cp -- "$REPO_ROOT/$PLANNER" "$BACKUP_DIR/VelocityWorkloadPlanner.kt"
 
 apply() {

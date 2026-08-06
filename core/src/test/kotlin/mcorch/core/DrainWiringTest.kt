@@ -3,6 +3,7 @@ package mcorch.core
 import io.kotest.assertions.withClue
 import io.kotest.matchers.collections.shouldContain
 import io.kotest.matchers.collections.shouldHaveSize
+import io.kotest.matchers.collections.shouldNotBeEmpty
 import io.kotest.matchers.ints.shouldBeGreaterThan
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
@@ -239,6 +240,33 @@ internal class DrainWiringTest {
         // probe has to fall through here — so the count is read inline, and a stop
         // re-issued without reading it is the round-15 shape.
         codeIn(rangeOf("awaitStopped")).any { codeOf(it).contains("readPlayers(") } shouldBe true
+    }
+
+    /**
+     * The declared stop grace period is read in one place, and everything else reads
+     * the derived one.
+     *
+     * The thirtieth audit's first finding is that a ceiling applied to
+     * `stopGracePeriod` without its `saveTimeout` inverts a pair the schema validated
+     * together. `DrainController.stopGrace` is where the two are put back together,
+     * and it has three readers — both stops and the overdue check — none of which
+     * wants the raw field.
+     *
+     * That is a *count of call sites*, which is the shape this codebase has been
+     * caught by three times, so it is asserted rather than written in a KDoc. What
+     * goes red is a fourth reader taking `subject.stopGracePeriod` directly: it would
+     * be reporting, or stopping with, a number the runtime was never given. The
+     * assertion is on the **enclosing function**, not on a count, so a legitimate
+     * fourth reader that goes through the derivation is invisible to it.
+     */
+    @Test
+    fun `the declared stop grace period is read only where it is bounded`() {
+        val reads = LINES.indices.filter { isCode(LINES[it]) && codeOf(LINES[it]).contains("stopGracePeriod") }
+
+        // The control: a scan that finds nothing asserts nothing, and this one is
+        // keyed on a field name that a rename would carry away silently.
+        reads.shouldNotBeEmpty()
+        reads.map { enclosing(it).name }.toSet() shouldBe setOf("stopGrace")
     }
 
     /**
