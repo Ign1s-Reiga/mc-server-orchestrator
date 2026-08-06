@@ -488,13 +488,16 @@ internal class DrainWiringTest {
      * `DrainController.releaseSeal` has no `deregisteredAt` guard where `holdSeal`
      * has one, and what keeps the two consistent is the `router != null` early return
      * — which is total only because of the line asserted here. The twenty-sixth audit
-     * read that as a stop ordering; it is not. `releaseSeal` runs on an abort, which
-     * is a *park*, and putting a backend back in the routing table is exactly what
-     * `restoreRegistration` does there, so the register half of the `PUT` would be
-     * the same compensation rather than a hazard. What the premise buys is the
-     * *record*: a `PUT` from `releaseSeal` would re-register without clearing
-     * `deregisteredAt`, leaving the drain record saying "deregistered" about a
-     * backend that is registered. Worth pinning, not worth alarm.
+     * read that as a stop ordering; it is not, and the twenty-seventh settled why in
+     * a stronger form than "the compensation would be benign": **the body is
+     * unreachable with `deregisteredAt` set.** The field is stamped at exactly two
+     * sites, `letGoAndStop` and `releaseRegistration`, both downstream of a
+     * `DrainRouter` call — and a subject with a router has already returned. So no
+     * subject that can reach `assertAdmission` from there carries a stamp, and
+     * nothing rests on judging whether re-registering would be safe. What the line
+     * asserted here buys is that the early return is *total*: without it a Paper
+     * subject could be given a seal and no router, and then the unreachability
+     * argument has no premise.
      *
      * Follows the name rather than restating `link`: a rename stays green, a
      * substitution reddens.
@@ -521,6 +524,119 @@ internal class DrainWiringTest {
         // that is a name rather than a literal.
         argument("seal") shouldMatch Regex("""\w+""")
         argument("seal") shouldBe argument("router")
+    }
+
+    /**
+     * The loop's permanence gate and the answer the drain acts on are **one
+     * expression**.
+     *
+     * `DrainController.abort` takes compensating edges that are only correct when
+     * *no pass will look at this workload again* — releasing a self-sealing
+     * workload's login seal is the one that exists today. What decides that is
+     * `Reconciler.isBlockedByPermanentFailure`, and the twenty-seventh audit's
+     * critical was the drain keying the edge on one of that predicate's **inputs**
+     * instead: the failure class alone was true of a permanent abort under an
+     * outstanding delete, whose passes carry on, and the release reopened the login
+     * path of a fleet the loop kept reconciling — with the gated resume unable to
+     * shut it again.
+     *
+     * A second derivation of the same fact is what made that possible, so the fact
+     * has one home and this asserts it: the clause is declared once, both kinds'
+     * gates ask it, and both drain entries hand the drain its answer rather than
+     * anything they could compute for themselves. A third kind gets the same wiring
+     * by writing the same call.
+     *
+     * The forwarded *parameter* is followed rather than restated — it has to be one
+     * `DrainController.advance` declares — so a rename stays green and a
+     * substitution reddens.
+     */
+    @Test
+    fun `the drain is handed the loop's permanence gate rather than deriving one`() {
+        val reconciler = Source.of(RECONCILER_PATH)
+
+        fun declarations(name: String) =
+            reconciler.lines.indices.filter {
+                Regex("""${DECLARATION.pattern}(\w+\.)?$name\(""").containsMatchIn(codeOf(reconciler.lines[it]))
+            }
+
+        // One home for the clause, and one gate per kind asking it. Two is the
+        // control: a kind whose gate stops asking would leave this at one.
+        declarations(GATE_CLAUSE) shouldHaveSize 1
+        val gates = declarations("isBlockedByPermanentFailure")
+        gates shouldHaveSize 2
+        gates.forEach { gate ->
+            withClue("a permanence gate at line ${gate + 1} does not ask $GATE_CLAUSE") {
+                reconciler.codeIn(reconciler.bodyOf(gate)).count {
+                    codeOf(it).contains("$GATE_CLAUSE(")
+                } shouldBe 1
+            }
+        }
+
+        // …and every entry into the drain hands that answer down. A literal here —
+        // or anything derived from the cause — is the defect this exists for.
+        val entries =
+            reconciler.lines.indices.filter { mentions(reconciler.lines[it], "drainController.advance") }
+        entries shouldHaveSize 2
+        val declared = parametersOf(rangeOf("advance"))
+        entries.forEach { entry ->
+            val supplied = argumentsOf(reconciler.lines, entry).single { it.contains("$GATE_CLAUSE(") }
+            val name = supplied.substringBefore(" = ")
+            withClue("`advance` is given an argument it does not declare, at line ${entry + 1}") {
+                declared shouldContain name
+            }
+            withClue("the gate's answer is computed at the call site rather than read off the pass") {
+                supplied.removePrefix("$name = ") shouldMatch Regex("""[\w.]+\.$GATE_CLAUSE\(\),""")
+            }
+        }
+    }
+
+    /**
+     * …and inside the controller, the release is gated on that answer and on the
+     * failure class, and on nothing else.
+     *
+     * The behavioural half is in `ProxyDrainTest`: a permanent abort under a delete
+     * keeps the door shut, and one that really does freeze the server opens it. What
+     * no scenario there can see is the *plausible* repair — keying the second half on
+     * `DrainCause.DELETION`, which is available on the pass and agrees with the
+     * reconciler's answer on every path a test can drive. It disagrees where
+     * placement decides a cause first: a terminating definition whose container is on
+     * a node the scheduler no longer chooses drains as a `RELOCATION`, and the door
+     * would be reopened on a delete after all.
+     *
+     * So the guard may read the class and the parameter it was handed. Every other
+     * name in scope — the cause, the state, the subject — reddens this.
+     */
+    @Test
+    fun `the seal release is gated on the answer the abort was handed`() {
+        val call =
+            LINES.indices
+                .filter { mentions(LINES[it], "releaseSeal") }
+                .single { !DECLARATION.containsMatchIn(LINES[it]) }
+        enclosing(call).name shouldBe "abort"
+
+        // The condition alone: the call it guards names the subject, which is a
+        // parameter too and says nothing about what was decided.
+        val guard = codeOf(LINES[call]).replace(Regex("""releaseSeal\([^)]*\)"""), "")
+        val read = parametersOf(rangeOf("abort")).filter { Regex("""\b$it\b""").containsMatchIn(guard) }
+        withClue("the release is guarded by $read") {
+            read.toSet() shouldBe setOf("failureClass", GATE_CLAUSE)
+        }
+
+        // …and what is handed in is the pass's copy at every site, never something
+        // an abort branch worked out for itself.
+        val calls =
+            LINES.indices
+                .filter { mentions(LINES[it], "abort") }
+                .filterNot { DECLARATION.containsMatchIn(LINES[it]) }
+        // A vacuity control rather than a maintained count: this file parks a drain
+        // from many branches, and what must not happen is a scan that found none.
+        calls.size shouldBeGreaterThan 4
+        calls.forEach { site ->
+            val supplied = argumentsOf(LINES, site).single { it.startsWith("$GATE_CLAUSE = ") }
+            withClue("the abort at line ${site + 1} derives its own permanence gate") {
+                supplied shouldMatch Regex("""$GATE_CLAUSE = (pass\.)?$GATE_CLAUSE,""")
+            }
+        }
     }
 
     /**
@@ -653,6 +769,15 @@ internal class DrainWiringTest {
         fun codeIn(range: IntRange): List<String> = lines.slice(range).filter(::isCode)
 
         /**
+         * The lines of the function declared at [declaration].
+         *
+         * The half of [rangeOf] that does not insist on a unique name: two inner
+         * classes may each declare the same member, and a scan that has already
+         * found both needs the body of each.
+         */
+        fun bodyOf(declaration: Int): IntRange = bodyAt(declaration)
+
+        /**
          * The lines of a member function, from its declaration to the brace that
          * closes it at the same indentation.
          */
@@ -752,6 +877,17 @@ internal class DrainWiringTest {
         /** `drainCause(` or `proxyDrainCause(` — a call, never the `DrainCause` type. */
         val DRAIN_CAUSE = Regex("""\w*[Dd]rainCause\(""")
 
+        /**
+         * The one expression that answers *"will a permanent failure recorded here
+         * stop the passes"*, named once because it is the subject of the assertions
+         * that follow it rather than something they forward.
+         *
+         * Renaming it is a source change these tests will fail on, deliberately: the
+         * prose above them names it too, and a claim whose subject has moved has to
+         * be re-read rather than re-pointed.
+         */
+        const val GATE_CLAUSE: String = "permanentFailureStopsPasses"
+
         /** The two calls in `Reconciler` that hand a pass to `DrainController`. */
         val ENTERS_DRAIN = Regex("""\bdrain(Proxy)?\(""")
 
@@ -835,6 +971,31 @@ internal class DrainWiringTest {
                         "expected a `<name>: <Type>,` parameter, found: ${line.trim()}"
                     }.groupValues[1]
                 }
+        }
+
+        /**
+         * The lines of the call opened at [call], to the bracket that closes it.
+         *
+         * By bracket balance rather than by "up to the next line beginning with
+         * `)`". An argument that is itself a constructor call — which is how both
+         * drain entries are written — closes at that indentation too, so the
+         * simpler scan reads a prefix of the argument list and treats it as the
+         * whole: an assertion that a forwarded argument is *absent* would then be
+         * satisfied by a call whose arguments it never reached.
+         */
+        fun argumentsOf(
+            lines: List<String>,
+            call: Int,
+        ): List<String> {
+            var depth = 0
+            val arguments = mutableListOf<String>()
+            for (line in call..lines.lastIndex) {
+                val code = codeOf(lines[line])
+                if (line > call && isCode(lines[line])) arguments += code.trim()
+                depth += code.count { it == '(' } - code.count { it == ')' }
+                if (depth <= 0) break
+            }
+            return arguments
         }
 
         /** The name an expression is applied to, so an assertion can follow it rather than restate it. */

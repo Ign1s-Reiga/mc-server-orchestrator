@@ -1146,6 +1146,9 @@ public class Reconciler(
                 cause = cause,
                 lastProbedAt = pass.previous?.players?.observedAt,
                 hadContainer = pass.previous?.runtime?.containerId != null,
+                // The same answer, from the same expression, on the kind that
+                // seals *itself* — which is the kind the release it gates is for.
+                permanentFailureStopsPasses = pass.stored.permanentFailureStopsPasses(),
             )
         val phase =
             when {
@@ -1393,7 +1396,7 @@ public class Reconciler(
                     // drain that is not parked has been moved past, and treating
                     // it as live freezes the drain one step short of finishing.
                     previous.drain.let { it == null || it.state == DrainState.DRAIN_FAILED }
-            return failed && !stored.definition.terminating
+            return failed && stored.permanentFailureStopsPasses()
         }
 
         fun channel(
@@ -2064,6 +2067,11 @@ public class Reconciler(
                 // is what separates "never created" from "the runtime did not
                 // tell us about it".
                 hadContainer = pass.previous?.runtime?.containerId != null,
+                // The loop's own gate, answered for this pass. A drain that parks
+                // permanently behaves differently depending on whether anything
+                // will look at this server again, and that is not the drain's
+                // question to answer — see [permanentFailureStopsPasses].
+                permanentFailureStopsPasses = pass.stored.permanentFailureStopsPasses(),
             )
         val storage =
             pass.storageStatus(observation).let { base ->
@@ -2635,7 +2643,12 @@ public class Reconciler(
             // costs one observation per resync and issues nothing: a drain that
             // has already recorded a delivered save does not re-send it, and one
             // with no save channel aborts again without touching the server.
-            return failed && !stored.definition.terminating
+            //
+            // The exemption is [permanentFailureStopsPasses] rather than a clause
+            // written here, because the drain has to be able to ask the same
+            // question: what it does on a permanent abort depends on whether these
+            // passes stop, and it used to assume they did.
+            return failed && stored.permanentFailureStopsPasses()
         }
 
         @Suppress("LongParameterList")
@@ -2702,6 +2715,29 @@ public class Reconciler(
         private val LOG = LoggerFactory.getLogger(Reconciler::class.java)
     }
 }
+
+/**
+ * Whether a `PERMANENT` failure recorded on this server stops the loop passing
+ * over it again.
+ *
+ * The trailing clause of both `isBlockedByPermanentFailure` implementations, and
+ * the **one** expression that answers this question for the whole module. A
+ * terminating definition is exempt because a delete that a failure can freeze is a
+ * workload nobody can retire; the passes therefore carry on, and everything that
+ * reasons from *"a permanent abort stops the passes"* has to ask rather than
+ * assume.
+ *
+ * `DrainController.abort` is the caller that made this worth extracting. Its
+ * compensating seal release rests on that sentence, and it was keyed on the
+ * failure class alone — one of this predicate's inputs rather than its answer — so
+ * a permanent abort during a **delete** reopened the login path of a fleet whose
+ * passes were still running, and the gated resume could never shut it again. The
+ * twenty-seventh audit's critical. Handing the answer down costs a parameter and
+ * makes the two sides one expression; copying the clause into the controller would
+ * have been a third derivation of a fact that has already produced this defect
+ * once.
+ */
+private fun StoredServer.permanentFailureStopsPasses(): Boolean = !definition.terminating
 
 /**
  * Timings the loop uses when it has nothing better to go on.

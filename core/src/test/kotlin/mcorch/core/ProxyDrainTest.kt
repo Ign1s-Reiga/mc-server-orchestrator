@@ -14,6 +14,7 @@ import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.string.shouldNotContain
+import io.kotest.matchers.types.shouldBeInstanceOf
 import mcorch.core.proxy.VelocityWorkloadPlanner
 import mcorch.schema.ConditionStatus
 import mcorch.schema.DrainBlockReason
@@ -637,10 +638,19 @@ internal class ProxyDrainTest {
      * "Nothing was stopped" is delivered by `requireEmpty` whatever step 2
      * concluded, so on its own it would pass against a build that waived the seal
      * unconditionally. The discriminator is the **recorded failure on the pass that
-     * aborts**: a waived seal reports `Progressed` and records nothing, and the two
-     * builds are otherwise indistinguishable — both end parked and blocked, because
-     * a proxied wait for zero is what happens either way once the failure has been
-     * settled into a block.
+     * aborts**: a waived seal reports `Progressed` and records nothing.
+     *
+     * ## What the passes after the park now record, and why it changed
+     *
+     * They used to settle into a healthy block, because the gated resume ran
+     * `requireEmpty` and stopped there. That was the twenty-seventh audit's second
+     * finding seen from the reporting side: with step 2 unreachable for ever, the
+     * seal could never land, so the population could never fall and the wait could
+     * never end — and the record said *waiting, needs nobody* about it. Step 2 now
+     * runs on the resume, ahead of the gate, so each pass tries the endpoint again
+     * and records what it got. A drain whose seal cannot be maintained is not a
+     * healthy wait, and the failure is what tells an operator to go and look at the
+     * endpoint.
      */
     @Test
     fun `a proxy with players online still parks when its control endpoint is dead`() =
@@ -671,9 +681,13 @@ internal class ProxyDrainTest {
             val failure = aborted.failure.shouldNotBeNull()
             failure.reason shouldBe FailureReason.PROXY_CONTROL_UNREACHABLE
             failure.failureClass shouldBe FailureClass.RETRYABLE
+            // No seal was ever asserted here, so the message is the one about a
+            // front door that is still taking players.
+            failure.message shouldContain "keeps taking players"
 
-            // It keeps waiting rather than escalating into anything destructive: the
-            // block is the protocol working, so no failure rides with it.
+            // It keeps retrying rather than escalating into anything destructive,
+            // and it keeps saying what is wrong: the endpoint is still down, so
+            // every pass fails step 2 again and the attempt count rises.
             repeat(6) {
                 harness.clock.advance(2.seconds)
                 harness.pass(name)
@@ -685,11 +699,85 @@ internal class ProxyDrainTest {
                     .drain
                     .shouldNotBeNull()
             waiting.state shouldBe DrainState.DRAIN_FAILED
-            waiting.blocked.shouldNotBeNull().reason shouldBe DrainBlockReason.AWAITING_ZERO_PLAYERS
+            waiting.blocked shouldBe null
+            val standing = waiting.failure.shouldNotBeNull()
+            standing.reason shouldBe FailureReason.PROXY_CONTROL_UNREACHABLE
+            standing.failureClass shouldBe FailureClass.RETRYABLE
+            (standing.attempts > failure.attempts) shouldBe true
 
             harness.proxyNode.stops.shouldBeEmpty()
             harness.proxyNode.removals.shouldBeEmpty()
             harness.store.getServer(name).shouldNotBeNull()
+        }
+
+    /**
+     * …and when the endpoint comes back, that drain finishes — which is the half
+     * that could not happen before.
+     *
+     * The mirror of the twenty-seventh audit's critical, and the reason step 2 moved
+     * ahead of the gate on the resume. A proxy whose **first** `holdSeal` fails with
+     * players on parks with the login path never sealed. Every later pass used to
+     * stop at `requireEmpty`, which is behind the six states that seal — so
+     * `holdSeal` was unreachable for ever, the door stayed open, the population it
+     * was waiting on refilled rather than fell, and the drain did not converge *even
+     * after the endpoint recovered*. Nothing about that state lifts on its own; a
+     * delete parked in it is another manual `crictl stop`.
+     *
+     * ## The two halves, and which build passes which
+     *
+     * The old build passes the first half — parked, nothing stopped — and hangs for
+     * ever on the second. The seal landing at the wire after the recovery is the
+     * assertion that separates them: it can only happen on a pass that reached step
+     * 2, and on the old build no pass after the park ever does.
+     *
+     * One backend, so that `assertBackends` finds something admitting at bring-up
+     * and leaves the proxy's own door open. On an empty fleet it seals the proxy for
+     * an unrelated, ruled-on reason and every seal assertion here would read the
+     * same whatever the drain did.
+     */
+    @Test
+    fun `a proxy whose first seal failed still converges once the endpoint comes back`() =
+        coreTest {
+            val harness = ProxyHarness(backends = listOf(backendDefinition("survival-01")))
+            val name = harness.proxyDefinition.metadata.name
+            harness.bringUp()
+            harness.plugin.proxyAdmits.shouldBeTrue()
+
+            // Players on, endpoint down, and a delete asked for. Step 2 never lands.
+            harness.proxyNode.online = 2
+            harness.plugin.unreachable = true
+            harness.store.deleteDefinition(name)
+
+            repeat(6) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+            harness
+                .proxyStatus()
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .sealRequestedAt shouldBe null
+            harness.plugin.proxyAdmits.shouldBeTrue()
+
+            // The plugin comes back — it finished loading, or the operator restarted
+            // it. The next pass has to be able to reach step 2, and on a build where
+            // the resume stops at the zero-player gate it never can.
+            harness.plugin.unreachable = false
+            harness.pass(name)
+            harness.clock.advance(2.seconds)
+            harness.plugin.proxyAdmits.shouldBeFalse()
+
+            // With the door shut the population can fall, and then the delete runs
+            // to completion on its own.
+            harness.proxyNode.online = 0
+            repeat(8) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+            harness.proxyNode.stops shouldHaveSize 1
+            harness.proxyNode.removals.shouldNotBeEmpty()
+            harness.store.getServer(name) shouldBe null
         }
 
     /**
@@ -1636,27 +1724,44 @@ internal class ProxyDrainTest {
         }
 
     /**
-     * A drain that parks permanently gives the login path back.
+     * A drain that parks where **no pass will look again** gives the login path
+     * back.
      *
      * The seal is asserted rather than issued so that an abort needs no compensating
      * edge — but that argument names a *third party*: a backend is un-sealed by the
      * proxy's own pass re-asserting its admission every pass. A proxy sealing
      * **itself** has nobody to do that for it. Its own re-assertion lives in
-     * `assertBackends`, which only a non-draining pass reaches, and a permanent abort
-     * stops its passes altogether — so before this compensation the proxy was left
-     * running, ready, and joinable to nobody, with the loop no longer looking at it.
+     * `assertBackends`, which only a non-draining pass reaches, and a frozen pass
+     * gate stops its passes altogether — so without this compensation the proxy is
+     * left running, ready, and joinable to nobody, with the loop no longer looking
+     * at it.
+     *
+     * ## The cause is a replacement, and that is the point
+     *
+     * It was written as a delete, and a delete is the one cause for which the
+     * premise is false: `Reconciler.isBlockedByPermanentFailure` exempts a
+     * terminating definition, so the passes carry on and the release reopens a door
+     * nothing can shut again. That is the twenty-seventh audit's critical, and the
+     * test for it is the one below. This scenario keeps the compensation honest by
+     * driving the case the argument is actually about — a `REPLACEMENT`, where the
+     * permanent failure really does freeze the server.
+     *
+     * The last assertion is the premise itself: the pass after the park does nothing
+     * at all. Without it this test would still pass on a build where something *did*
+     * look again, and then the release would be the defect rather than the fix.
      *
      * ## Reaching a permanent abort without inventing a failure
      *
-     * The route is the one the audit traced: a container whose `WORLD_DATA` label is
-     * missing — an image or a build older than the label — reads as *holding* world
-     * data, because that is the safe default. The drain then asks a Velocity proxy to
-     * confirm a world save, which it can never do, and that is `PERMANENT` at
-     * `SAVING`. The label is stripped from the observation rather than mocked at the
-     * planner, because what the drain reads is the container.
+     * The route is the one the twenty-sixth audit traced: a container whose
+     * `WORLD_DATA` label is missing — an image or a build older than the label —
+     * reads as *holding* world data, because that is the safe default. The drain
+     * then asks a Velocity proxy to confirm a world save, which it can never do, and
+     * that is `PERMANENT` at `SAVING`. The label is stripped from the observation
+     * rather than mocked at the planner, because what the drain reads is the
+     * container.
      */
     @Test
-    fun `a proxy drain that aborts permanently releases its own login seal`() =
+    fun `a permanent abort that stops the passes releases the proxy login seal`() =
         coreTest {
             val harness = ProxyHarness()
             val name = harness.proxyDefinition.metadata.name
@@ -1666,7 +1771,9 @@ internal class ProxyDrainTest {
             // world, and no proxy can confirm a save.
             val observed = harness.proxyNode.workload as WorkloadObservation.Present
             harness.proxyNode.workload = observed.copy(labels = observed.labels - Labels.WORLD_DATA)
-            harness.store.deleteDefinition(name)
+            // An edit rather than a delete: the definition stays, so the permanent
+            // failure this drain records is one the loop will not pass through.
+            harness.declare(proxyDefinition(maxPlayers = 300))
 
             repeat(6) {
                 harness.pass(name)
@@ -1691,6 +1798,144 @@ internal class ProxyDrainTest {
             harness.plugin.proxyAsserts
                 .last()
                 .shouldBeTrue()
+
+            // The premise, pinned rather than assumed: the gate is shut, so the pass
+            // after the park observes nothing and asserts nothing.
+            val calls = harness.proxyNode.calls.size
+            harness.pass(name).shouldBeInstanceOf<ReconcileOutcome.Failed>()
+            harness.proxyNode.calls shouldHaveSize calls
+        }
+
+    /**
+     * …and a permanent abort under a **delete** keeps the login path shut, because
+     * those passes do not stop.
+     *
+     * The twenty-seventh audit's critical. The release above was keyed on the
+     * failure *class*, which is one input to `isBlockedByPermanentFailure`; its
+     * other input is the terminating flag, and a delete is exempt from the gate so
+     * that a failure can never make a workload undeletable. So a permanent abort
+     * during a delete reopened the front door of a fleet the loop was still
+     * reconciling — and nothing could ever shut it again, because the gated resume
+     * only reaches the states that seal once the server is empty, and the population
+     * refills behind an open door. The delete never completes. The failure does not
+     * even survive to say why: the first block that follows clears it, and a block
+     * does not escalate, so the status settles on *"waiting for the server to
+     * empty… the drain resumes on its own once it is empty"* about a fleet whose
+     * door the orchestrator itself reopened.
+     *
+     * ## The trigger is the audit's own: a stop the node refuses permanently
+     *
+     * `NodeException.Rejected` is not retryable, and `DrainController.stop` turns it
+     * into a permanent abort rather than letting it escape — the drain has already
+     * deregistered by then, and an exception out of the controller would skip the
+     * compensating edges. Nothing about that is exotic: a runtime that refuses a
+     * call against a container in the wrong state produces it.
+     *
+     * ## Why the player count is set by hand
+     *
+     * `FakeNode.online` is the Server List Ping, and the seal the plugin holds does
+     * not feed back into it — no fake can model "this player never got in". So the
+     * count is raised *after* the abort, which is what the old build let happen for
+     * real and what the new one is claiming to prevent. The test then asserts the
+     * two things that are still in `:core`'s gift: the door stays shut across every
+     * pass of the wait, and the delete finishes once the count falls.
+     *
+     * ## The assertion is at the wire, and reading the flag would not do
+     *
+     * `proxyAdmits` is a level, and the resume now asserts step 2 on every pass —
+     * so a build that releases the door and re-seals it a backoff later reads
+     * `false` at every point a test could look. Only the *record of the calls*
+     * shows it: from the pass that seals onwards, no `PUT /v1/proxy` may assert
+     * `true`. The first draft of this test read the flag, and the mutation that
+     * restores the defect passed it.
+     *
+     * One backend, so the proxy's own door is open at bring-up rather than sealed by
+     * `assertBackends` finding nothing admitting — on an empty fleet every assertion
+     * below would be satisfied before the drain ran.
+     */
+    @Test
+    fun `a permanent abort under a delete keeps the proxy login seal on`() =
+        coreTest {
+            val harness = ProxyHarness(backends = listOf(backendDefinition("survival-01")))
+            val name = harness.proxyDefinition.metadata.name
+            harness.bringUp()
+            harness.plugin.proxyAdmits.shouldBeTrue()
+
+            // The runtime will not stop this container, and says so in a way that
+            // asking again cannot change.
+            harness.proxyNode.failAlways(NodeOperation.STOP, harness.proxyNode.rejected(NodeOperation.STOP))
+            harness.store.deleteDefinition(name)
+
+            // Step 1 records the drain; step 2 shuts the door. Taken here rather
+            // than after the abort, because from this point on **no `PUT /v1/proxy`
+            // may ever assert `true`** — and that, not the flag's value at the end,
+            // is the assertion. A release followed by the next pass's re-seal leaves
+            // the flag reading `false` again, so a build that hands the door back
+            // for a whole backoff passes every reading and fails this.
+            harness.pass(name)
+            harness.clock.advance(2.seconds)
+            harness.pass(name)
+            harness.clock.advance(2.seconds)
+            harness.plugin.proxyAdmits.shouldBeFalse()
+            val sealed = harness.plugin.proxyAsserts.size
+
+            // Empty, so the drain gets as far as the stop: save, deregister, stop —
+            // and the stop is refused, permanently.
+            repeat(6) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+            val parked =
+                harness
+                    .proxyStatus()
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            // The recorded failure rather than the recorded state: with the passes
+            // still running, this drain alternates between the refused stop and the
+            // re-derivation above it, so which state a given pass ends in is a
+            // parity of the loop and not the property under test.
+            parked.failure.shouldNotBeNull().failureClass shouldBe FailureClass.PERMANENT
+            // The stop reached the node and was refused there: `calls` records the
+            // attempt, `stops` only the ones that took.
+            harness.proxyNode.calls shouldContain NodeOperation.STOP
+            harness.proxyNode.stops.shouldBeEmpty()
+            harness.proxyNode.removals.shouldBeEmpty()
+
+            // The assertion. The old build released here, on the class alone.
+            harness.plugin.proxyAdmits.shouldBeFalse()
+            harness.plugin.proxyAsserts.drop(sealed) shouldNotContain true
+
+            // Somebody is connected — through the port, or from before the seal —
+            // and the drain waits for them rather than disconnecting anybody. The
+            // door stays shut throughout, which is what makes the wait end.
+            harness.proxyNode.online = 4
+            repeat(6) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+            harness
+                .proxyStatus()
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .state shouldBe DrainState.DRAIN_FAILED
+            harness.plugin.proxyAdmits.shouldBeFalse()
+            harness.plugin.proxyAsserts.drop(sealed) shouldNotContain true
+            harness.store.getServer(name).shouldNotBeNull()
+
+            // The operator restarts the wedged runtime and the last player logs off.
+            // The delete completes on its own, which is the whole point of exempting
+            // a terminating definition from the permanent gate.
+            harness.proxyNode.clearFailures(NodeOperation.STOP)
+            harness.proxyNode.online = 0
+            repeat(8) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+            harness.proxyNode.stops shouldHaveSize 1
+            harness.proxyNode.removals.shouldNotBeEmpty()
+            harness.store.getServer(name) shouldBe null
         }
 
     /**
@@ -1742,15 +1987,22 @@ internal class ProxyDrainTest {
      * one is the opposite: the loop keeps coming back, so the drain is still trying
      * to reach zero, and the seal is what lets it get there.
      *
-     * ## Why releasing it there does not lapse, and does not come back
+     * ## Why releasing it there is a door handed back, whatever the next pass does
      *
-     * `DRAIN_FAILED` resumes through `requireEmpty` for a subject with no router,
-     * and with anybody online that lands in `blocked` — which does not seal, and
-     * never reaches the six forward states that do. So the release is permanent in
-     * the only sense that matters: the front door is open, the population it was
-     * waiting to drain refills, and no later pass can shut it again. A delete or a
-     * replacement parked there never completes, which is the state that ends in a
-     * manual `crictl stop`.
+     * When the audit found it, nothing could take the door back at all: the gated
+     * resume ran `requireEmpty` first, so with anybody online it landed in `blocked`
+     * — which does not seal — and the six forward states that do were unreachable.
+     * The population refilled behind the open door and the wait was for a zero that
+     * could no longer arrive.
+     *
+     * Since the twenty-seventh audit the resume asserts step 2 ahead of that gate,
+     * so a release would be re-sealed on the next pass rather than never. That makes
+     * it a **flap**, not a repair: the door is open for a whole backoff — five
+     * minutes on a grown one — once per cycle, which on a busy fleet is enough to
+     * refill it, and each refill lengthens the wait it is supposed to be ending. The
+     * two changes are complements and this test is what keeps them apart: releasing
+     * on a retryable park is still wrong, and the resume asserting a seal is not a
+     * licence for it.
      *
      * ## The scenario needs no exotic fault
      *

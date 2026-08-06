@@ -195,6 +195,11 @@ internal class DrainController(
      * @param hadContainer whether a container has ever been observed for this
      *   server. A sandbox that reports no containers means something different
      *   depending on the answer.
+     * @param permanentFailureStopsPasses whether a `PERMANENT` failure recorded by
+     *   this pass will stop the loop passing over this server again — the
+     *   reconciler's own gate, answered rather than re-derived here. [abort] is
+     *   what reads it: the compensating edges that belong to *"nothing will ever
+     *   look at this workload again"* must not be taken while something will.
      */
     @Suppress("LongParameterList")
     suspend fun advance(
@@ -205,6 +210,7 @@ internal class DrainController(
         cause: DrainCause,
         lastProbedAt: Instant?,
         hadContainer: Boolean,
+        permanentFailureStopsPasses: Boolean,
     ): DrainProgress {
         val progress =
             advanceOnce(
@@ -215,6 +221,7 @@ internal class DrainController(
                 cause = cause,
                 lastProbedAt = lastProbedAt,
                 hadContainer = hadContainer,
+                permanentFailureStopsPasses = permanentFailureStopsPasses,
             )
         val recorded = progress.dropSaveContradictedByPlayers()
         if (recorded !== progress) {
@@ -242,6 +249,7 @@ internal class DrainController(
         cause: DrainCause,
         lastProbedAt: Instant?,
         hadContainer: Boolean,
+        permanentFailureStopsPasses: Boolean,
     ): DrainProgress {
         val now = clock.instant()
         val recorded = current ?: started(now)
@@ -344,7 +352,7 @@ internal class DrainController(
         if (observation.state == WorkloadState.SANDBOX_ONLY) {
             return abort(
                 subject = subject,
-                node = node,
+                permanentFailureStopsPasses = permanentFailureStopsPasses,
                 // The *confirmation* goes, because nothing was observed this
                 // pass and the world may have moved on. The record of a
                 // delivered-but-unconfirmed save request stays: it is the only
@@ -448,6 +456,7 @@ internal class DrainController(
                 contract = subject.contractOf(observation),
                 cause = cause,
                 now = now,
+                permanentFailureStopsPasses = permanentFailureStopsPasses,
             )
         // Whether this pass began parked is decided here, before anything moves the
         // recorded state, and it is one of the two inputs [settleRecords] needs. A
@@ -648,14 +657,20 @@ internal class DrainController(
             // then it goes back and saves again rather than jumping to the stop
             // on a confirmation from the last session.
             DrainState.DRAIN_FAILED -> {
-                // No seal is asserted here, and that is what restores joins. A
-                // drain that has stopped advancing is a drain that is not going to
-                // move those players, so holding the backend out of routing buys
-                // nothing and costs a running server no player can reach — for
-                // ever, if the abort was permanent, because then this pass never
-                // happens again either. The proxy's own reconcile sweep is what
-                // makes the restoration land in that case; this branch simply
-                // declines to re-assert.
+                // No seal is asserted here **for a backend**, and that is what
+                // restores its joins. A drain that has stopped advancing is a drain
+                // that is not going to move those players, so holding it out of the
+                // proxy's routing buys nothing and costs a running server no player
+                // can reach — for ever, if the abort was permanent, because then
+                // this pass never happens again either. The proxy's own reconcile
+                // sweep is what makes the restoration land in that case; this
+                // branch simply declines to re-assert.
+                //
+                // A subject that seals *itself* is the opposite case and [resume]
+                // is where it is handled: there is no third party to re-assert for
+                // it, and the seal is what lets its wait for zero end. See that
+                // function for why step 2 runs before the gate rather than after
+                // it.
                 //
                 // The zero-player wrapper is only for a workload with no router.
                 // With one, players are the thing the resumed states exist to move,
@@ -676,12 +691,51 @@ internal class DrainController(
      * [gated] is false exactly when there is a router. Players are then the thing
      * the resumed states exist to move, so refusing to resume while anybody is
      * connected would park a proxied drain for as long as people were playing.
+     *
+     * ## Step 2 runs first on the gated path, and it is the only place it can
+     *
+     * The twenty-seventh audit's second finding, and it is the mirror of the one
+     * that made [releaseSeal] permanent-only. A subject with no router seals
+     * *itself*, and the six forward states that assert that seal all sit behind
+     * [requireEmpty] on this path — so a drain whose **first** [holdSeal] failed
+     * with players on parks with the door open, and every pass after it stops at
+     * [requireEmpty] with anybody connected. [holdSeal] is then unreachable for
+     * ever: the population never falls to zero, the drain never converges, and it
+     * does not converge after the endpoint recovers either, because nothing brings
+     * it back to a state that would seal. A delete or a replacement in that state
+     * is another `crictl stop`.
+     *
+     * Asserting it here is level-triggering the seal on the one state that had none
+     * of it, and it repairs the neighbouring case for free: a proxy restarted
+     * underneath a long, healthy block loses its admission state, and nothing else
+     * on this path would ever put it back — `assertBackends` is reached only by a
+     * pass that is *not* draining.
+     *
+     * ## What it costs, which is a report rather than a door
+     *
+     * It hands nothing back: there is no unseal here, only an assertion, and
+     * [abort] no longer releases on a retryable park. What changes is that a pass
+     * which cannot reach the control endpoint while somebody is on now records a
+     * `RETRYABLE` failure where it used to record a healthy [blocked]. That is the
+     * honest report — a wait whose seal cannot be maintained is not the protocol
+     * working, it is a wait that cannot end — and it is what an operator needs to
+     * be told, since [blocked] is rendered as *do not act*.
+     *
+     * The alternative was rejected under the old rule for a reason that has since
+     * expired: paired with an *unconditional* release it handed the door back for a
+     * whole backoff on every cycle. With the release gated there is nothing to pair
+     * it with, so only the reporting change is left, and it is weighed against a
+     * delete that can never complete.
      */
     private suspend fun resume(
         pass: DrainPass,
         drain: DrainStatus,
         gated: Boolean,
-    ): DrainProgress = if (gated) requireEmpty(pass, drain) { resumeInto(pass, drain) } else resumeInto(pass, drain)
+    ): DrainProgress {
+        if (!gated) return resumeInto(pass, drain)
+        holdSeal(pass, drain).abortOrNull?.let { return it }
+        return requireEmpty(pass, drain) { resumeInto(pass, drain) }
+    }
 
     private suspend fun resumeInto(
         pass: DrainPass,
@@ -919,6 +973,19 @@ internal class DrainController(
          */
         val cause: DrainCause,
         val now: Instant,
+        /**
+         * `Reconciler.permanentFailureStopsPasses`, carried so that every [abort]
+         * reached from a step is handed the same answer this pass was given.
+         *
+         * A step may not derive it, and [cause] is the derivation that looks as
+         * though it would do. It is not: placement decides a cause before
+         * `drainCause` is consulted, so a terminating definition whose container is
+         * on a node the scheduler no longer chooses drains as a `RELOCATION`. A
+         * gate keyed on the cause would then take the delete's branch for a
+         * replacement's, or the reverse, which is the shape this field exists to
+         * stop being written a third time.
+         */
+        val permanentFailureStopsPasses: Boolean,
     ) {
         val server: ResourceName get() = subject.server
     }
@@ -972,6 +1039,14 @@ internal class DrainController(
      * The one place a failed step 2 decides between parking the drain and letting it
      * through, so that the waiver has a single enforcement point rather than one per
      * abort branch.
+     *
+     * The message's second half is [loginPathAfterAPark] rather than a sentence,
+     * because what a failed assertion leaves behind is not one state. It used to say
+     * *"the server keeps running and keeps taking players"* unconditionally, which
+     * is true of a backend and of a proxy that never got sealed — and false of the
+     * state this controller now deliberately produces, a proxy sealed on an earlier
+     * pass whose endpoint has since gone quiet. Over-stating availability errs safe
+     * and hides the only symptom there is: nobody can log in.
      */
     private suspend fun abortSeal(
         pass: DrainPass,
@@ -992,7 +1067,7 @@ internal class DrainController(
         return SealHold.Aborted(
             abort(
                 subject = pass.subject,
-                node = pass.node,
+                permanentFailureStopsPasses = pass.permanentFailureStopsPasses,
                 drain = drain,
                 occupancy = pass.occupancy,
                 now = pass.now,
@@ -1000,10 +1075,52 @@ internal class DrainController(
                 failureClass = if (retryable) FailureClass.RETRYABLE else FailureClass.PERMANENT,
                 message =
                     "new joins could not be stopped at the proxy, so the drain is not going further: $detail. " +
-                        "The server keeps running and keeps taking players",
+                        loginPathAfterAPark(pass.subject, drain),
             ),
         )
     }
+
+    /**
+     * What a park leaves the workload's login path in — the half of a step-2 failure
+     * an operator acts on.
+     *
+     * Three states, and the record distinguishes them:
+     *
+     * - **A backend.** Its admission is stated by the *proxy's* pass, every pass,
+     *   from `DrainState.sealsBackend()` — false in `DRAIN_FAILED` — so a park hands
+     *   its joins back whatever this drain could or could not assert.
+     * - **A workload that seals itself and has a seal in place.** `sealRequestedAt`
+     *   is stamped only by a `PUT` the proxy confirmed and nothing clears it
+     *   afterwards, so a park with it set is a front door that is still shut. Since
+     *   the twenty-sixth audit that is deliberate — the seal is what lets the wait
+     *   for zero end — and it means the symptom is a blackout, which no other
+     *   surface reports.
+     * - **A workload that seals itself and never got one.** The one case the old
+     *   unconditional sentence described.
+     *
+     * The remedy named for the blackout is the one that exists: removing the cause
+     * of the drain returns the workload to a converging pass, and `assertBackends`
+     * re-asserts admission there. There is no unseal operation to offer instead.
+     */
+    private fun loginPathAfterAPark(
+        subject: DrainSubject,
+        drain: DrainStatus,
+    ): String =
+        when {
+            subject.router != null -> {
+                "The server keeps running, and the proxy admits players to it again while the drain is parked"
+            }
+
+            drain.sealRequestedAt != null -> {
+                "It keeps running with the login seal this drain put on still in place, so nobody can join it " +
+                    "until the endpoint answers again — or until whatever asked for this drain is withdrawn, " +
+                    "which puts it back on a converging pass that re-admits players"
+            }
+
+            else -> {
+                "The server keeps running and keeps taking players"
+            }
+        }
 
     /**
      * Step 3: somewhere for the players to go.
@@ -1092,7 +1209,7 @@ internal class DrainController(
                 // is blocked on is not a property of this server.
                 abort(
                     subject = pass.subject,
-                    node = pass.node,
+                    permanentFailureStopsPasses = pass.permanentFailureStopsPasses,
                     drain = drain,
                     occupancy = occupancy,
                     now = now,
@@ -1108,7 +1225,7 @@ internal class DrainController(
             is DestinationChoice.Unavailable -> {
                 abort(
                     subject = pass.subject,
-                    node = pass.node,
+                    permanentFailureStopsPasses = pass.permanentFailureStopsPasses,
                     drain = drain,
                     occupancy = occupancy,
                     now = now,
@@ -1307,7 +1424,7 @@ internal class DrainController(
             // `DRAIN_FAILED` branch.
             return abort(
                 subject = pass.subject,
-                node = pass.node,
+                permanentFailureStopsPasses = pass.permanentFailureStopsPasses,
                 drain = anchored,
                 occupancy = occupancy,
                 now = now,
@@ -1387,7 +1504,7 @@ internal class DrainController(
                 )
                 abort(
                     subject = pass.subject,
-                    node = pass.node,
+                    permanentFailureStopsPasses = pass.permanentFailureStopsPasses,
                     drain = anchored.copy(destination = null, transferAttempts = anchored.transferAttempts + 1),
                     occupancy = occupancy,
                     now = now,
@@ -1403,7 +1520,7 @@ internal class DrainController(
             is TransferReport.Refused -> {
                 abort(
                     subject = pass.subject,
-                    node = pass.node,
+                    permanentFailureStopsPasses = pass.permanentFailureStopsPasses,
                     drain = anchored.copy(transferAttempts = anchored.transferAttempts + 1),
                     occupancy = occupancy,
                     now = now,
@@ -1416,7 +1533,7 @@ internal class DrainController(
             is TransferReport.Unavailable -> {
                 abort(
                     subject = pass.subject,
-                    node = pass.node,
+                    permanentFailureStopsPasses = pass.permanentFailureStopsPasses,
                     drain = anchored,
                     occupancy = occupancy,
                     now = now,
@@ -1568,7 +1685,7 @@ internal class DrainController(
             is SealOutcome.Refused -> {
                 abort(
                     subject = pass.subject,
-                    node = pass.node,
+                    permanentFailureStopsPasses = pass.permanentFailureStopsPasses,
                     drain = drain,
                     occupancy = pass.occupancy,
                     now = now,
@@ -1583,7 +1700,7 @@ internal class DrainController(
             is SealOutcome.Unavailable -> {
                 abort(
                     subject = pass.subject,
-                    node = pass.node,
+                    permanentFailureStopsPasses = pass.permanentFailureStopsPasses,
                     drain = drain,
                     occupancy = pass.occupancy,
                     now = now,
@@ -1612,8 +1729,15 @@ internal class DrainController(
      * refuses permanently. For a proxy that is the fleet's front door, gone, with a
      * failure the remedy cannot lift.
      *
-     * So it is asked again here, where nothing has been taken away yet and a refusal
-     * costs a park rather than an outage.
+     * So it is asked again here, where a refusal costs a park rather than an outage.
+     * *Nothing has been taken away yet* is true of the first pass through
+     * `DEREGISTERED` and not of a re-entry: the pass after a confirmed
+     * deregistration comes back through here, and so does a resume that lands on
+     * `DEREGISTERED` with a stop already issued. Both park safely — [abort]'s
+     * [restoreRegistration] is the compensation for the first, and a stop inside its
+     * grace period is a container the drain will observe down — but the *message*
+     * has to say which, or it tells an operator nothing has moved about a backend
+     * that has left the routing table.
      *
      * ## Scope and class, both deliberate
      *
@@ -1649,7 +1773,7 @@ internal class DrainController(
             // controller would skip the compensating edges [abort] carries.
             return abort(
                 subject = pass.subject,
-                node = pass.node,
+                permanentFailureStopsPasses = pass.permanentFailureStopsPasses,
                 drain = drain,
                 occupancy = pass.occupancy,
                 now = pass.now,
@@ -1657,9 +1781,10 @@ internal class DrainController(
                 failureClass = FailureClass.RETRYABLE,
                 message =
                     "node `${pass.node.name}` cannot build the replacement this drain is for: " +
-                        "${refused.message}. Nothing has been stopped, removed or deregistered on that — the " +
-                        "workload that is running stays where the drain left it — and the drain finishes on " +
-                        "its own once the node can build what would take its place",
+                        "${refused.message}. Nothing has been stopped or removed on that, and the workload " +
+                        "that is running stays where the drain left it — which on a re-entry after step 6 may " +
+                        "be out of the proxy's routing, or inside the grace period of a stop already issued. " +
+                        "The drain finishes on its own once the node can build what would take its place",
             )
         }
         return null
@@ -1810,7 +1935,7 @@ internal class DrainController(
         if (circling > evidenceGap + pass.subject.saveTimeout) {
             return abort(
                 subject = pass.subject,
-                node = pass.node,
+                permanentFailureStopsPasses = pass.permanentFailureStopsPasses,
                 drain = anchored,
                 occupancy = pass.occupancy,
                 now = now,
@@ -1969,7 +2094,7 @@ internal class DrainController(
     ): DrainProgress =
         abort(
             subject = pass.subject,
-            node = pass.node,
+            permanentFailureStopsPasses = pass.permanentFailureStopsPasses,
             drain = drain.forgetSaveConfirmation(),
             occupancy = pass.occupancy,
             now = pass.now,
@@ -2030,7 +2155,7 @@ internal class DrainController(
             // disk, and only a human can supply that.
             return abort(
                 subject = pass.subject,
-                node = pass.node,
+                permanentFailureStopsPasses = pass.permanentFailureStopsPasses,
                 drain = drain,
                 occupancy = occupancy,
                 now = now,
@@ -2235,7 +2360,7 @@ internal class DrainController(
                 // stop the container (`failure-modes.md` item 1).
                 abort(
                     subject = pass.subject,
-                    node = pass.node,
+                    permanentFailureStopsPasses = pass.permanentFailureStopsPasses,
                     drain = drain.copy(saveRequestedAt = now),
                     occupancy = occupancy,
                     now = now,
@@ -2251,7 +2376,7 @@ internal class DrainController(
                 // `saveRequestedAt` stays null.
                 abort(
                     subject = pass.subject,
-                    node = pass.node,
+                    permanentFailureStopsPasses = pass.permanentFailureStopsPasses,
                     drain = drain,
                     occupancy = occupancy,
                     now = now,
@@ -2265,7 +2390,7 @@ internal class DrainController(
             is SaveOutcome.Unconfirmable -> {
                 abort(
                     subject = pass.subject,
-                    node = pass.node,
+                    permanentFailureStopsPasses = pass.permanentFailureStopsPasses,
                     drain = drain,
                     occupancy = occupancy,
                     now = now,
@@ -2314,7 +2439,7 @@ internal class DrainController(
             // world.
             return abort(
                 subject = pass.subject,
-                node = pass.node,
+                permanentFailureStopsPasses = pass.permanentFailureStopsPasses,
                 drain = drain,
                 occupancy = occupancy,
                 now = now,
@@ -2351,7 +2476,7 @@ internal class DrainController(
             // a drain that could not finish, not a pass that could not be completed.
             return abort(
                 subject = pass.subject,
-                node = pass.node,
+                permanentFailureStopsPasses = pass.permanentFailureStopsPasses,
                 drain = drain,
                 occupancy = occupancy,
                 now = now,
@@ -2453,7 +2578,7 @@ internal class DrainController(
             } catch (failure: NodeException) {
                 return abort(
                     subject = pass.subject,
-                    node = pass.node,
+                    permanentFailureStopsPasses = pass.permanentFailureStopsPasses,
                     drain = drain,
                     occupancy = occupancy,
                     now = now,
@@ -2668,29 +2793,29 @@ internal class DrainController(
      * seals itself gets this for free, which is the point of asking the question in
      * the type rather than about the kind.
      *
-     * ## Permanent only, which is what the argument above actually says
+     * ## Only where no pass will look again, which is what the argument above says
      *
-     * The twenty-sixth audit's critical. The sentence this edge rests on — *this
-     * drain has stopped advancing, so the seal buys nothing* — is true of a
-     * permanent abort and false of a retryable one, because
-     * `Reconciler.isBlockedByPermanentFailure` is what stops the passes. A
-     * retryable abort is a drain that is **still being attempted**: the loop comes
-     * back after a backoff, and for a subject with no router that resume runs
-     * through [requireEmpty], which with anybody online lands in [blocked]. [blocked]
-     * does not seal, and none of the six forward states that do can be reached
-     * while a player is on. So releasing it there is not a flap that the next pass
-     * repairs — it is permanent in the only sense that matters, and it deletes the
-     * mechanism it was compensating around: the population refills behind the open
-     * door and the drain waits for a zero that can no longer arrive. A delete or a
+     * The twenty-sixth and twenty-seventh audits' criticals, and they are one
+     * sentence read twice. The sentence this edge rests on is *nothing will ever
+     * re-assert this workload's admission, because no pass will look at it again* —
+     * and what decides that is `Reconciler.isBlockedByPermanentFailure`, in full.
+     *
+     * - A **retryable** abort is a drain that is still being attempted: the loop
+     *   comes back after a backoff, so the seal is the mechanism of the wait rather
+     *   than a leftover of a dead one.
+     * - A **permanent** abort under an outstanding delete is the same thing wearing
+     *   the other class. `isBlockedByPermanentFailure` exempts a terminating
+     *   definition — a delete a failure can freeze is a workload nobody can retire
+     *   — so those passes carry on too.
+     *
+     * Either release is unrecoverable for the same reason: for a subject with no
+     * router the `DRAIN_FAILED` resume runs [holdSeal] and then [requireEmpty],
+     * and while the door is open the population refills, so [requireEmpty] blocks
+     * for ever and the wait is for a zero that can no longer arrive. A delete or a
      * replacement parked like that never completes, which is the state that ends in
-     * a manual `crictl stop`.
-     *
-     * The other way round was considered and is worse. Pairing an unconditional
-     * release with a re-assertion on the gated resume ([holdSeal] before
-     * [requireEmpty] in the `DRAIN_FAILED` branch) hands the door back for a whole
-     * backoff — five minutes on a grown one — once per cycle, which on a busy fleet
-     * is enough to refill it; and it turns a healthy [blocked] into an abort
-     * whenever the control endpoint is the thing that is down.
+     * a manual `crictl stop`. So the gate is [abort]'s
+     * `permanentFailureStopsPasses` argument — the reconciler's own answer, handed
+     * down — rather than the failure class, which is one of its inputs.
      *
      * ## Why [blocked] deliberately does not do this either
      *
@@ -2704,25 +2829,32 @@ internal class DrainController(
      *
      * [holdSeal] skips itself after step 6 because `PUT /v1/backends/{name}`
      * registers *and* admits, so asserting a seal there would put a backend back in
-     * the routing table moments before its container stops. This edge runs only on
-     * an abort — a **park** — where putting it back is precisely what
-     * [restoreRegistration] does for the routed shape, so the register half of the
-     * `PUT` would be the same compensation rather than a hazard. It does not arise
-     * today in any case: `deregisteredAt` is stamped only by [letGoAndStop], which
-     * needs a [DrainRouter], and a subject with a router returns above. That
-     * premise is `Reconciler.drain` passing one link object as both counterparties,
-     * which `DrainWiringTest` pins.
+     * the routing table moments before its container stops. This edge cannot reach
+     * that state at all: `deregisteredAt` is *stamped* at exactly two sites
+     * ([letGoAndStop] and [releaseRegistration]) — [restoreRegistration] is the
+     * only other writer and it clears — and both stamps are downstream of a
+     * [DrainRouter] call, while a subject with a router returns above. So no subject that
+     * can reach [DrainSeal.assertAdmission] from here carries a stamp — an
+     * unreachability argument rather than a judgement about whether re-registering
+     * would be safe. Its premise is `Reconciler.drain` passing one link object as
+     * both counterparties, which `DrainWiringTest` pins.
      *
      * Best effort, and it says so. A seal that could not be asserted usually cannot
      * be released either — the endpoint is not answering — and there is nothing
-     * useful to do about that but say which state the proxy has been left in. Two
-     * residuals, both accepted: a player may connect between this and a resumed
-     * drain re-sealing, and `requireEmpty` re-reads on the pass that stops; and a
-     * permanent abort out of `STOPPING` releases the seal of a workload whose
-     * container has already been told to go away, so whoever joins is dropped when
-     * it exits — a proxy holds no world, a backend saves on quit, and the
-     * alternative is a running front door nobody can reach and no pass will look at
-     * again.
+     * useful to do about that but say which state the proxy has been left in. One
+     * residual, accepted: a player may connect between this and the pass that
+     * stops, and [requireEmpty] re-reading on that pass is the guarantee — the same
+     * exposure a standalone server has had since [sealIsPrecondition].
+     *
+     * The paragraph that used to stand here claimed a second residual — that a
+     * permanent abort out of `STOPPING` releases the seal of a container that has
+     * already been told to go away, so *"no pass will look at it again"*. That was
+     * false on the clause this section is now about: under a delete the passes
+     * carry on, and the workload whose door had just been reopened was one the loop
+     * would keep reconciling for ever. It is recorded rather than deleted because
+     * the residual was the *justification* for the over-wide gate, and a wrong
+     * reason left beside a corrected decision is what the next reader takes for a
+     * general licence.
      */
     private suspend fun releaseSeal(subject: DrainSubject) {
         val seal = subject.seal ?: return
@@ -2776,11 +2908,19 @@ internal class DrainController(
      * happens to the *container* at a limit — a drain that has been stuck for
      * twenty minutes still must not be stopped — and this changes only what a
      * human is told, which is the thing the system was missing.
+     *
+     * @param permanentFailureStopsPasses `Reconciler.permanentFailureStopsPasses`
+     *   for this pass: whether the record this abort is about to write will stop
+     *   the loop passing over the server. Not a class, not a [DrainCause], and not
+     *   the terminating flag — the *answer* the loop's own gate gives, so that the
+     *   compensating edges belonging to "nothing will look at this again" cannot be
+     *   taken while something will. It replaced a `node` parameter that had been
+     *   unread since the compensating edges moved in here.
      */
     @Suppress("LongParameterList")
     private suspend fun abort(
         subject: DrainSubject,
-        node: Node,
+        permanentFailureStopsPasses: Boolean,
         drain: DrainStatus,
         occupancy: PlayerOccupancy?,
         now: Instant,
@@ -2797,13 +2937,15 @@ internal class DrainController(
         // …and "lapses on its own" is a sentence about a *third party* asserting it.
         // For a subject that seals itself there is none, so the seal needs the same
         // treatment as a deregistration — but only where the sentence that justifies
-        // it is true. A **permanent** abort stops this server's passes, so nothing
-        // will ever re-assert anything; a retryable one is a drain that is still
-        // being attempted, and for a subject with no router the resume is gated on
-        // zero players, so a seal released here could never be put back while
-        // anybody is on. See [releaseSeal], which also says why the block path must
-        // not do this.
-        if (failureClass == FailureClass.PERMANENT) releaseSeal(subject)
+        // it is true, and that sentence is *"no pass will look at this server
+        // again"*. It is one predicate, `Reconciler.permanentFailureStopsPasses`,
+        // and this is its answer rather than one of its inputs: the class alone was
+        // true of a permanent abort under an outstanding **delete**, whose passes
+        // carry on, and the release then reopened a fleet's login path that the
+        // gated resume could never shut again. A retryable park keeps the seal for
+        // the neighbouring reason — the loop is still coming back. See [releaseSeal],
+        // which also says why the block path must not do this.
+        if (failureClass == FailureClass.PERMANENT && permanentFailureStopsPasses) releaseSeal(subject)
         val failure =
             noteFailure(
                 server = server,
