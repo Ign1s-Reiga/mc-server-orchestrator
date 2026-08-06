@@ -1682,3 +1682,52 @@ Related: [[standalone-paper-drain-shape]]
      both are preceded by `mayStop`; `Reconciler.kt`'s `letGo = deregisteredAt != null`
      closes danger pattern 55, so *not* restoring a registration keeps a backend out of
      routing without a second mechanism, and `converge`'s `drain = null` is the recovery.
+
+## Round 33: the record that governs a compensation, and the path that deletes it
+
+139. **A "was this side effect issued" record is only as durable as the *whole* record
+     it lives in, and the reconcile loop deletes that record whenever the drain's
+     cause is withdrawn.** `DrainStatus.stopDispatchedAt` (round 33) correctly closes
+     `restoreRegistration` — but `restoreRegistration` is not the only way a backend
+     gets back into the routing table. `drainCause` returns null the moment the
+     container's `specHash` label matches the desired spec again (an operator
+     reverting the edit that started the `REPLACEMENT`), `Reconciler` then routes to
+     `converge` instead of `drain`, `drainController.advance` is never called, and
+     `awaitJoinable`'s local `status(...)` writes `drain = null` on **every** branch —
+     `Joinable`, `NotJoinable`, `Unavailable` alike, before any evidence is gathered.
+     `stopDispatchedAt` and `deregisteredAt` go with it, `ProxyPass.backends` computes
+     `letGo = false` and `sealed = false`, and `assertBackends` re-admits players to a
+     container inside its stop grace period whose shutdown save already ran. Round 32
+     recorded `converge`'s `drain = null` as *the recovery* for a stranded backend;
+     round 33 made the same line the destroyer of the only guard. The general rule:
+     when a field is added so a compensation can test a fact instead of inheriting a
+     paragraph, enumerate every writer of the field's **container**, not of the field.
+     A `copy(x = null)` you never wrote is still a clear.
+140. **"The drain is no longer wanted" and "the stop has already been dispatched" are
+     different questions, and only one of them is the operator's to answer.** A
+     `REPLACEMENT` is withdrawable by reverting the edit (danger pattern 124 relies on
+     this) — right up to the instant `stopWorkload` returns. After that the container
+     is going away whatever the store says, and honouring the withdrawal converts a
+     drain into a *cancelled* drain that nothing cancelled. Any "this drain can be
+     abandoned" branch needs the irreversibility test, not the desire test: once a
+     stop is dispatched the pass must keep draining to `containerDown` and let the
+     teardown-then-create apply the reverted definition.
+141. **A cost declined as "that population is already clamped" has to be checked
+     against what the clamp actually clamps.** Round 33 declined a
+     "this node refused before issuing" property on `NodeException` because a stop
+     refused on a bad `stopGracePeriod` is a population `SpecBounds` covers.
+     `SpecBounds` applies **ceilings only** and says so in a section header — flooring
+     would invert the validated pair. `DrainSpec` has no `init`, and
+     `LifecycleSpec.init` checks only the *relation*, which a negative pair satisfies
+     (`saveTimeout = -10m, stopGracePeriod = -5m`). That row decodes, passes
+     `SpecBounds` and `StopGraceCeiling` untouched, and is refused by
+     `StopGracePeriod.of` inside `LocalNode.stopWorkload` — after the pre-RPC stamp.
+     Same shape as item 136: a reachability/coverage claim about another module's
+     bound, taken without re-running its arithmetic.
+142. **A pre-RPC stamp records "a call was attempted", not "a request left this
+     process", and the node has a success path that issues nothing.**
+     `LocalNode.stopWorkload` returns early and *successfully* when
+     `handle.containerId == null`. Unreachable through `advance` today, and it errs
+     safe (the backend stays out of routing), but the field's KDoc makes the ordering
+     its entire content, so the one node path that breaks the equivalence belongs in
+     it.
