@@ -57,6 +57,10 @@ a park**: if a fact is stated by one kind of park it belongs to both.
 
 ## An operational ceiling caps; it does not refuse
 
+> **Round 30 revised this.** The ruling below still holds — a stop refused is
+> worse than a stop shortened — but the ceiling was applied at the wrong layer and
+> without a floor, and both were defects. See [[deadline-ceilings]].
+
 `GrpcCriClient.stopContainer` deadlines the call at `gracePeriod + slack`, so the
 grace period is also how long a worker is parked at a container that will not
 exit. `StopGracePeriod` bounds it 292 years out, and no *type* enforces the
@@ -104,13 +108,14 @@ re-propose it.
 
 ## What is still open
 
-- `:api`'s `detail()` leads a blocked drain with *"waiting, not stuck — "* and
-  the blackout sentence now arrives in the tail. Honest, but the lead is the part
-  a fleet table truncates to.
+- ~~`:api`'s `detail()` leads a blocked drain with *"waiting, not stuck — "* and
+  the blackout sentence now arrives in the tail.~~ Closed in round 30 by
+  `LoginPath`; see [[deadline-ceilings]].
 - The integration suites did **not** run this round: `scripts/dev/containerd-up.sh`
   needs an interactive `sudo` and there was no TTY. Nothing here changes a CRI
   call's shape, but `LocalNode.stopWorkload`'s capped value has only unit
-  coverage.
+  coverage. **Still true in round 30**, and now the capped value is built one
+  layer further out.
 
 See [[level-triggered-seal]] for the seal rules this rests on and
 [[blocked-is-not-failed]] for the three states a consumer must tell apart.

@@ -237,6 +237,24 @@ true dependency both times this has happened. **After adding a test to a class a
 mutation names, re-run the whole harness before trusting it**; a MISCAUGHT there
 is the instrument working.
 
+**A type change silently turns mutations into UNKNOWNs, and an UNKNOWN is not a
+catch.** Round 30 changed `Node.stopWorkload`'s parameter to a value type, and the
+two mutations that add a *stop somewhere it does not belong* both declared
+`grace: kotlin.time.Duration`. They stopped compiling, the harness left no report,
+and the run reported them UNKNOWN — which is the honest answer and reads, at a
+glance, like the type having caught them. It has not: the type is a **bound**, not
+a gate, and a stop decided in the wrong file is exactly as expressible as before.
+Re-derive the mutation's parameter types after any signature change and confirm it
+goes red again. The general form: after changing a signature, every mutation that
+*writes new code* against it needs re-deriving, not only the ones whose literal you
+edited.
+
+**Do not pipe a mutation harness through `tail`.** I ran one as
+`./harness.sh 2>&1 | tail -70`, saw "2 mutations were not caught", and had thrown
+away every `MISCAUGHT`/`GREEN`/`UNKNOWN` line — those go to stderr *interleaved*,
+so the tail kept the successes and dropped the findings. It also masks the exit
+status behind `tail`'s. Redirect the whole run to a file and grep it.
+
 **A test that first demonstrates the defect inherits every rule the defect rests
 on.** Round 25's pin-exit test asserts the login path is *shut* while the
 replacement drain waits, before asserting the operator's lever reopens it — so a

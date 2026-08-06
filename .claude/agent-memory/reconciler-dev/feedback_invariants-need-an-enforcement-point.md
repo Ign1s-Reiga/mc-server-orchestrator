@@ -359,6 +359,42 @@ follow-ons worth keeping:
   beside it*. An entry whose claimed set is stale is the harness lying about its
   own subject.
 
-See [[localnode-test-gap]] for the sibling rule about decisions, and
+## A rule about a pair cannot be enforced where only one half is visible
+
+Round 30, and it is the sharpest form of this file's rule so far. `LifecycleSpec`
+validates `stopGracePeriod` **against** `saveTimeout`; a ceiling on the first was
+applied inside `LocalNode.stopWorkload`, which is handed the first and not the
+second — so it could reduce one half below the other and break a relation the
+schema had already checked. Nothing was wrong with the ceiling; it was in a place
+that could not be right.
+
+- **Before clamping, normalising or defaulting a field, ask what it was validated
+  *against*, and whether this layer can see that.** If it cannot, the layer is
+  wrong however sound the rule is. The tell is the same one as round 24's: a value
+  with a second arrival route, plus a cross-field `init` that route does not re-run.
+- **The fix that holds is a parameter type whose factory takes both.**
+  `Node.stopWorkload(handle, StopGrace)` where `StopGrace.of(requested,
+  saveTimeout)` is the only constructor — the pair cannot be split by a caller,
+  and the derivation lands where both fields already sit side by side.
+- **At a seam, prefer the type over the implementation, and say which bound is
+  whose.** The policy ceiling belongs to the interface and travels in the type; the
+  runtime bound stays with the implementation, because where containerd's
+  arithmetic wraps is not a fact about `Node`. A test that pins the first inside
+  one implementation is a test *a second implementation is not required to pass*,
+  which is the seam quietly assuming there is one node.
+- **Then pin who may read the raw field.** The type bounds the value; nothing
+  bounds who reads the field it came from. A source scan asserting the declared
+  field is read only inside the derivation is what stops a fourth reader quoting a
+  number the runtime was never given — and it replaces the "there are three
+  callers" sentence this file bans.
+
+**A fix derived from a general property belongs at every value with that
+property.** The ceiling's argument was "this becomes a transport deadline"; a
+sibling field became one on a longer call and went unbounded for a round. When
+writing the justification for a bound, read it back as a predicate and grep for
+everything it is true of.
+
+See [[localnode-test-gap]] for the sibling rule about decisions,
+[[deadline-ceilings]] for the round this came from, and
 [[prove-the-test-can-fail]] for why the unit test of the function was the one
 that mattered.
