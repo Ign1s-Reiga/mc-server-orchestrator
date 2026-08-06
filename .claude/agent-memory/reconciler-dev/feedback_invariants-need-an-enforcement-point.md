@@ -328,6 +328,37 @@ differ between the two callers — the pre-flight records `RETRYABLE` because
 freezing a running proxy stops the routing sweep — and that is a caller's
 decision, not a second enforcement point.
 
+## A record is an invariant too, and it needs the same enforcement point
+
+Round 28. `sealRequestedAt` was written by one of the **seven** sites that shut a
+workload's login path, and the six that did not were invisible: nothing *decides*
+on the field, so no scenario can see a missing stamp except by reading a status in
+exactly the right state. The pattern to recognise: *"X happens at seven places and
+the note that X happened is written at one."* Same answer as the rules above —
+put the record on the value the work returns (`SealHold.recordedOn`), so a caller
+cannot carry on without it — plus a structural pin, because the behavioural half
+can only ever cover the site a scenario drives.
+
+**Assert the record together with the thing it is a record of.** `sealRequestedAt`
+alone is green against a build that stamps without sealing; the wire flag alone
+says nothing about what the operator is told. The pair is the assertion.
+
+## Re-derive a mutation harness's anchors, and read what its misses mean
+
+The same round changed five of `drain-wiring-mutations.sh`'s literals out from
+under it, and the script said so rather than passing: *"the source contains 0
+occurrences of … re-derive this mutation before trusting a green run"*. Two
+follow-ons worth keeping:
+
+- **Shape the source so the anchor can be one contiguous block.** A comment landing
+  in the middle of the block a mutation replaces makes its literal carry prose;
+  moving the comment above the block is free and keeps the harness honest.
+- **A MISCAUGHT that names your new test is a finding, not noise.** Three existing
+  mutations reddened one extra case each — the new scenarios are genuinely
+  sensitive to those defects — so the claim is widened *and the reason written
+  beside it*. An entry whose claimed set is stale is the harness lying about its
+  own subject.
+
 See [[localnode-test-gap]] for the sibling rule about decisions, and
 [[prove-the-test-can-fail]] for why the unit test of the function was the one
 that mattered.

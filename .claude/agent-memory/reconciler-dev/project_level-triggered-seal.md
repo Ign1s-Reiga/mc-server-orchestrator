@@ -1,6 +1,6 @@
 ---
 name: level-triggered-seal
-description: Why the proxy seal is asserted rather than issued, the two rules that look alike and are not (sealsBackend vs drainInitiated), the anchor rules a bounded drain step needs, why a resume never clears a failure, and the two rounds that narrowed the seal release to the gate's answer while making the gated resume assert step 2
+description: Why the proxy seal is asserted rather than issued, the two rules that look alike and are not (sealsBackend vs drainInitiated), the anchor rules a bounded drain step needs, why a resume never clears a failure, the rounds that narrowed the seal release to the gate's answer and made the gated resume assert step 2, and why the seal's record is written at every asserting site while the release's outcome decides the failure class
 metadata:
   type: project
 ---
@@ -336,6 +336,56 @@ population the drain is waiting to drain and a delete on a busy fleet could neve
 complete. The general test — does this effect exist to *cause* the condition the
 step is waiting for? Then a "consistency" compensation on the waiting path
 removes the reason the wait can end.
+
+### …and the seal's *record* was written at one of the seven sites that shut the door
+
+Round 28's first critical, and it is the reporting mirror of the round-27 fix. The
+stamp lived in the `DRAIN_REQUESTED` arm while `holdSeal` runs on six other states
+**and on the gated resume** — which, since round 27, is where a self-sealing
+workload's door is first shut whenever the opening attempt failed with players on.
+`loginPathAfterAPark` keys on that record, so the next pass to lose the endpoint
+said *"the server keeps running and keeps taking players"* about a fleet this
+controller had blacked out one pass earlier: **danger pattern 119 reintroduced
+through a call site rather than a stale comment**, with both neighbouring tests
+green because each ends with the field null for a *different* reason.
+
+- `SealHold.recordedOn(drain, now)` is the fix — the hold carries the stamp, every
+  site records it, `?: now` so a re-assertion does not restamp. `Waived` stamps
+  nothing.
+- **A record has to be written where the work happens, at every site that does the
+  work.** The scenario suite can only cover the site it drives, so the other six
+  are pinned structurally: every `holdSeal(` result is bound, consulted for its
+  abort, and recorded (`DrainWiringTest`, harness D34/D35).
+- Reading the field *with* the wire flag is what makes the assertion mean anything:
+  the record alone passes against a build that stamps without sealing.
+
+### The compensation decides the class it is recorded under
+
+Round 28's second. `releaseSeal` was best-effort inside the one gate that
+guarantees nobody retries it — one timed-out control call left the fleet's front
+door shut, the `PERMANENT` class froze `reconcileProxy`, and a definition edit did
+not repair it because the generation bump resumes straight into `holdSeal`. The
+contrast that shows the shape is wrong rather than an accepted residual:
+`restoreRegistration` is best-effort *and safe*, because `assertBackends`
+re-registers a parked backend every pass. **The seal has no third party — that is
+the whole argument for the edge existing.**
+
+`releaseSeal` now returns whether the login path was left shut, and `abort` records
+`RETRYABLE` when it was: *a permanence whose own compensation is unrecoverable is
+not a permanence anyone can act on*. It settles as `PERMANENT` on the pass where
+the release lands, which is the end state the edge was always for. Both ends need a
+test — a build that only ever retried is the other way to get this wrong.
+
+### An operator-facing remedy has to exist under every cause
+
+Round 28's fourth. *"Until whatever asked for this drain is withdrawn"* is true of a
+`REPLACEMENT` and false of a `DELETION` (`deletedAt` is one-way, `:api` has no
+un-delete), and it was the only sentence about a fleet-wide blackout. The fix is
+**wording that names both exits**, not a branch: the discriminator would have to be
+the terminating flag, `cause` is the plausible substitute and is wrong (placement
+decides a cause first, so a terminating definition can drain as a `RELOCATION`), and
+`permanentFailureStopsPasses` is `!terminating` today but is the answer to a
+different question. A sentence true under every cause needs no plumbing at all.
 
 ## Rulings I made that a human may overrule
 

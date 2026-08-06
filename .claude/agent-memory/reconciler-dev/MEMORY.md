@@ -6,7 +6,7 @@
 - [Assert on side effects](feedback_assert-on-side-effects.md) — how tests here go green while proving nothing, and the habits that prevent it.
 - [Drain against the container](feedback_drain-against-the-container.md) — save evidence expires, and a drain reads the workload's labels rather than the edited definition.
 - [Escalation ruling](project_escalation-ruling.md) — item 7's reach, and why NEEDS_ATTENTION stopped being a drain flag; the anchor that decides alarm fatigue.
-- [Blocked is not failed](project_blocked-is-not-failed.md) — a drain waiting on players records no failure; the three states, and what deliberately stayed put.
+- [Blocked is not failed](project_blocked-is-not-failed.md) — a block clears a retryable failure and keeps a permanent one; the three states, the flapping anchor still open.
 - [Integration freeze that never was](project_integration-freeze.md) — runBlocking parented the loop, so only *passing* tests hung. Resolved; keep for the diagnosis method.
 - [LocalNode test gap](project_localnode-test-gap.md) — collapse a decision into the module that owns it; a raw value plus a flag about it means the seam is wrong.
 - [Classify narrowly, contain broadly](feedback_classify-narrowly-and-contain-broadly.md) — keep the never-retry bucket small; let no exception escape a worker.
@@ -15,7 +15,7 @@
 - [Cancellation exposure](project_cancellation-exposure.md) — what the save-record shield covers, the two windows left open on purpose, and why write-ahead was rejected on its merits.
 - [Derive from the consumer](feedback_derive-from-the-consumer.md) — a status field is judged by what reads it; two of my defects passed every `:core` test and needed a real dashboard.
 - [Unreadable state posture](project_unreadable-state-posture.md) — a bad definition row cost the fleet; a bad observation was already safe via `getServer`, and the loop's skip only buys reporting.
-- [Level-triggered seal](project_level-triggered-seal.md) — assert, never issue; anchor rules; why the release is keyed on the gate's answer, and why the gated resume now seals.
+- [Level-triggered seal](project_level-triggered-seal.md) — assert, never issue; anchor rules; the release keyed on the gate's answer and classed by whether it landed; every asserting site records the seal.
 - [Record where no work happens](project_record-where-no-work-happens.md) — the third critical from "did work ⇒ recovered", and why the fix was placement rather than a narrower rule.
 - [Invariants need an enforcement point](feedback_invariants-need-an-enforcement-point.md) — pin wiring by shape and every premise of an unreachability argument; two gates need a side-effect assertion.
 - [Replacement needs an exit](project_replacement-exit.md) — a hash input no operator can edit closes the fleet's login path; the lever, the pre-flight asked at both ends, the wait still unbounded.
