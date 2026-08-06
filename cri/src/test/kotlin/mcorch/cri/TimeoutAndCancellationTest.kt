@@ -75,7 +75,7 @@ class TimeoutAndCancellationTest {
                     }
                     shouldThrow<CriException.Timeout> { client.startContainer(ContainerId("c")) }
                     shouldThrow<CriException.Timeout> {
-                        client.stopContainer(ContainerId("c"), StopGracePeriod.ofSeconds(1))
+                        client.stopContainer(ContainerId("c"), StopGracePeriod.ofSeconds(1).getOrThrow())
                     }
                     shouldThrow<CriException.Timeout> { client.removeContainer(ContainerId("c")) }
                     shouldThrow<CriException.Timeout> { client.containerStatus(ContainerId("c")) }
