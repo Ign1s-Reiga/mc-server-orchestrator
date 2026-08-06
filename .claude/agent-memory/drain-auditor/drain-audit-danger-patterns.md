@@ -1529,3 +1529,63 @@ Related: [[standalone-paper-drain-shape]]
      `init` `require`: `Reconciler.rejectDefinition` records `PERMANENT` and does not
      exempt `terminating` (danger pattern 104), so that trade makes a populated server
      undeletable. Close it at the decode (tolerant, one server) or at the node.
+
+## Round 30: the ceiling that inverts the relation, and the sentence that came back
+
+128. **A bound applied at one end of a cross-field invariant inverts it, and it
+     inverts it on exactly the population it fires for.**
+     `StopGraceCeiling.bound` caps `stopGracePeriod` at 2h in `LocalNode.stopWorkload`.
+     The one cross-field rule the schema calls a data-loss rule —
+     `SpecInvariants.stopGraceProblem`, *"a grace period shorter than the save
+     timeout kills the container part-way through the save"* — is enforced in
+     `LifecycleSpec.init`, i.e. on the *uncapped* pair, and the node cannot see
+     `saveTimeout` at all (`Node.stopWorkload` takes a handle and a duration). So
+     `saveTimeout = 3h, stopGracePeriod = 3h1m` decodes, passes the `init`, and
+     reaches containerd as 2h — below the save timeout. `DrainSpec` has **no**
+     `init` bounding `saveTimeout`; only `PaperServerReader` does. And the cap only
+     ever fires on a definition that did not come through a reader, which is the
+     same population that can carry an oversized `saveTimeout`: the trigger
+     condition selects for the rows where the inversion is possible. Whenever a
+     clamp is added to one field of a validated pair, apply it as
+     `max(ceiling, whatever the pair's rule requires)` or apply it where both
+     fields are visible (the decode), never at the consumer that sees one of them.
+129. **The same unvalidated row supplies a second transport deadline, and only one
+     of the two got a ceiling.** The ceiling's own argument is that
+     `GrpcCriClient.stopContainer` derives its gRPC deadline as
+     `gracePeriod + deadlineSlack`, so an absurd grace period is a worker parked
+     with no effective timeout. `GrpcCriClient.execSync` does the identical thing —
+     `commandSeconds.seconds + deadlineSlack` — and its input is
+     `spec.lifecycle.drain.saveTimeout` (`PaperServerAgent.requestSave`), from the
+     same row, with the same absent type-level bound, on the *longer* of the two
+     calls. A fix derived from "this number becomes a deadline" has to be applied to
+     every number that becomes one; grep the `:cri` deadline derivations, not the
+     one the finding was written against.
+130. **A retired safety sentence comes back in the KDoc of the next thing that needs
+     it.** `DrainController`'s class note says, in as many words, that *"no path
+     reaches `Node.stopWorkload` except through `requireEmpty` followed by
+     `mayStop`"* was false from the day `awaitStopped`'s re-issue was written, and
+     that the count is held by `DrainWiringTest` rather than by prose. Round 30's
+     `StopGraceCeiling` KDoc — where it is the *whole* argument for capping rather
+     than refusing — states it again as "nothing reaches `Node.stopWorkload` except
+     through the zero-player gate followed by `mayStop`". The substance survives
+     (both gates end in `mayStop`), so it is a warning and not a critical, but the
+     new site does not carry the qualification the old one was corrected into, and
+     the second gate lets an *unanswered* probe through. When a safety argument is
+     borrowed into a new file, borrow the correction with it or link to the
+     paragraph that holds it.
+131. **Verifying a narrowing needs both directions, and the second one is "what does
+     the newly-reachable pass do".** `parkedOnTheFailure()` is provably a subset of
+     the clause it replaced (`null || state == DRAIN_FAILED` vs
+     `null || (state == DRAIN_FAILED && blocked == null)`), so
+     `isBlockedByPermanentFailure` can only un-freeze. What makes that *safe* is
+     three separate facts, none of them in the gate: `blocked` is written only by
+     `DrainController.blocked`, which always parks in `DRAIN_FAILED`, and
+     `settleRecords` clears a stale block on every non-parked pass, so the new
+     clause cannot bite outside `DRAIN_FAILED`; `abort` does
+     `copy(failure = …, blocked = null)`, so a genuine permanent abort still arms
+     the gate and there is no wedge; and every block runs through
+     `readPlayers`' `Occupied` arm → `forgetSaveEvidence`, which clears
+     `worldSavedAt` **and** `playersEvacuated`, so the resume ladder after a block
+     can only land on `SEALED`/`TARGET_RESOLVED` and a fresh confirmed save is
+     always taken before the stop. Re-check all three before accepting any future
+     widening of what `blocked` records.
