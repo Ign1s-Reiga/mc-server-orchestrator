@@ -166,6 +166,24 @@
 #            means the bad row never reaches a request. D51 routes the refusal into
 #            the bucket that is never retried, which would leave a repaired
 #            definition unable to save at all.
+#   D52..D53 the thirty-third audit's critical, at the rule: a dispatched stop's
+#            record deleted the moment the drain stops being *wanted*. D52 is the
+#            half that makes the remedy itself a defect — a record that survives a
+#            create describes a container that no longer exists, and the pass after a
+#            replacement is built drains the replacement. D53 turns the retention off
+#            and is scored twice, once as the rule and once as the paths.
+#   D54..D55 the routing half, one per kind: a withdrawn cause converging over the
+#            top of a stop it cannot recall. Reverting an edit is the documented way
+#            to call off a replacement and it is the only lever an operator has, so
+#            this is the pass an operator *causes*.
+#   D56..D57 one clear back to `drain = null`, and the same clear asking the rule
+#            about nothing. Neither reddens a scenario, and that is the finding:
+#            behind D54's guard these sites are unreachable, so the shape is the only
+#            instrument that can see them.
+#   D58      the site the audit's prescription did not name. Refusing an edit is not
+#            withdrawing a drain, so `forbiddenTransition` has no routing guard in
+#            front of it and its clear is live — a `storage.mode` edit landing inside
+#            the grace period of a stop some earlier edit asked for.
 #   C1..C3   controls: the rule deleted outright, once per assertion arm. If these
 #            do not redden, the harness is not reaching the assertions at all.
 #   S1       the self-test. See below.
@@ -227,6 +245,7 @@ PROXY_AGENT=core/src/main/kotlin/mcorch/core/proxy/VelocityProxyAgent.kt
 FLEET=core/src/main/kotlin/mcorch/core/ProxyFleet.kt
 
 WIRING=mcorch.core.DrainWiringTest
+LIFETIME=mcorch.core.DrainRecordLifetimeTest
 RULES=mcorch.core.SaveEvidenceTest
 DRAIN=mcorch.core.DrainTest
 PROXY_DRAIN=mcorch.core.ProxyDrainTest
@@ -314,6 +333,15 @@ ISSUES_NOTHING='a second pass against the same bad row issues nothing and lands 
 SAVE_REFUSED='a zero save timeout is recorded as a permanent drain failure with no exec sent'
 CLASSIFIED='every request built from a definition is built where its refusal is classified'
 CHANNEL_TIMEOUT='every control channel is given the seal timeout its message names'
+# The thirty-third audit's critical: not what the dispatched-stop record says, but
+# how long it lives. Two unit cases for the rule, one shape for the sites that ask
+# it, and three scenarios for the paths that reach them.
+RECORD_SURVIVES='a dispatched stop survives while the runtime still reports the container'
+RECORD_RETIRED='a dispatched stop does not outlive the container it was aimed at'
+RETIRED_BY_RULE='every drain record this loop retires is retired through the one rule'
+BACKEND_REVERT='reverting the edit does not undo a stop that has already been dispatched'
+PROXY_REVERT="reverting a proxy's edit does not undo a stop that has already been dispatched"
+REFUSED_MID_STOP='an edit refused mid-stop does not delete the record of the stop'
 
 # Single-quoted throughout: these are literals, and one of them contains the
 # quoting characters of two languages.
@@ -637,6 +665,33 @@ PROBE_UNGUARDED='            ExecRequest(
 # another spec — which is what "make these consistent" reaches for.
 CHANNEL_FIELD='timeout = spec.backends.drain.sealTimeout,'
 CHANNEL_OTHER_FIELD='timeout = spec.lifecycle.drain.sealTimeout,'
+# The two arms of the dispatched-stop record'"'"'s lifetime rule, D52 and D53.
+FRESH_CONTAINER='        WorkloadState.CREATED, WorkloadState.SANDBOX_ONLY -> false'
+SIGNALLED_CONTAINER='        WorkloadState.RUNNING, WorkloadState.EXITED, WorkloadState.UNKNOWN -> true'
+# Three sites that retire a drain record, each identified by the comment above it —
+# the call itself is the same expression at eleven places, which is the point of it
+# having one spelling.
+JOINABLE_CLEAR='            // the moment it stops, so the record of that survives this. See
+            // [clearedDrainRecord].
+            drain = clearedDrainRecord(pass.previous?.drain, observation),'
+REFUSAL_CLEAR='                // the refusal either way.
+                drain = clearedDrainRecord(pass.previous?.drain, observation),'
+JOINABLE_DELETES='            // the moment it stops, so the record of that survives this. See
+            // [clearedDrainRecord].
+            drain = null,'
+JOINABLE_ASKS_NOTHING='            // the moment it stops, so the record of that survives this. See
+            // [clearedDrainRecord].
+            drain = clearedDrainRecord(null, observation),'
+REFUSAL_DELETES='                // the refusal either way.
+                drain = null,'
+# The two routing lines that keep a withdrawn cause draining while its stop is out,
+# one per kind. Each is anchored on the line under it, since the call is identical.
+WITHDRAWN_BACKEND='                            ?: outstandingStopCause(pass.previous?.drain, observation)
+                    // Before the drain, never after'
+WITHDRAWN_PROXY='                            ?: outstandingStopCause(pass.previous?.drain, observation)
+                    val blocker = replacementBlocker(pass, placement.node, cause)'
+CONVERGES_INSTEAD='                    // Before the drain, never after'
+CONVERGES_INSTEAD_PROXY='                    val blocker = replacementBlocker(pass, placement.node, cause)'
 
 # name @@ file @@ class @@ testcases that must redden (";"-separated) @@ literal @@ replacement
 #
@@ -892,6 +947,36 @@ MUTATIONS=(
     # dispatched, so arming the wedge would leave a repaired definition unable to
     # save at all — the failure `SaveOutcome`'s three cases exist to keep apart.
     "D51@@$PAPER_AGENT@@$UNBUILDABLE@@$SAVE_REFUSED@@$SAVE_CLASSIFIES@@                return SaveOutcome.Unconfirmed(unbuildableSave(rejected).detail)"
+    # A record that survives a create, which is how the rule's own remedy becomes a
+    # defect: the pass after a replacement is built then drains the replacement, for
+    # ever. Nothing behavioural covers this clause — `convergeProxy`'s create clears
+    # the record on an `Absent` observation one step earlier — and the scenario that
+    # first exposed it counted *creates* rather than reading a record, which is luck.
+    "D52@@$CONTROLLER@@$LIFETIME@@$RECORD_RETIRED@@$FRESH_CONTAINER@@        WorkloadState.CREATED, WorkloadState.SANDBOX_ONLY -> true"
+    # The retention off altogether: every site that concludes no drain is wanted
+    # deletes the record of a `SIGTERM` that is still inside the container. Scored
+    # twice, as the rule and as the three paths that reach it.
+    "D53@@$CONTROLLER@@$LIFETIME@@$RECORD_SURVIVES@@$SIGNALLED_CONTAINER@@        WorkloadState.RUNNING, WorkloadState.EXITED, WorkloadState.UNKNOWN -> false"
+    "D53D@@$CONTROLLER@@$PROXY_DRAIN@@$BACKEND_REVERT;$PROXY_REVERT;$REFUSED_MID_STOP@@$SIGNALLED_CONTAINER@@        WorkloadState.RUNNING, WorkloadState.EXITED, WorkloadState.UNKNOWN -> false"
+    # The withdrawn cause routed back to converging, one entry per kind. This is the
+    # critical itself: reverting the edit is the documented way to call off a
+    # replacement, and taken mid-stop it used to put the workload back on a pass that
+    # re-admits players to a container inside its grace period.
+    "D54@@$RECONCILER@@$PROXY_DRAIN@@$BACKEND_REVERT@@$WITHDRAWN_BACKEND@@$CONVERGES_INSTEAD"
+    "D55@@$RECONCILER@@$PROXY_DRAIN@@$PROXY_REVERT@@$WITHDRAWN_PROXY@@$CONVERGES_INSTEAD_PROXY"
+    # A single site back to deleting the record outright, and the same site asking
+    # the rule about nothing — `clearedDrainRecord(null, …)` is `drain = null` with
+    # more letters, and it satisfies a scan for the call alone. Both redden the shape
+    # and neither reddens a scenario: `awaitJoinable` is not reachable with a stop in
+    # flight while D54's guard stands, which is what makes these clears defence in
+    # depth and the shape the only thing that can see them.
+    "D56@@$RECONCILER@@$WIRING@@$RETIRED_BY_RULE@@$JOINABLE_CLEAR@@$JOINABLE_DELETES"
+    "D57@@$RECONCILER@@$WIRING@@$RETIRED_BY_RULE@@$JOINABLE_CLEAR@@$JOINABLE_ASKS_NOTHING"
+    # The site that *is* reachable, and the one the audit's prescription did not
+    # name: refusing an edit is not withdrawing a drain, so no routing guard stands
+    # in front of `forbiddenTransition`. Scored as a shape and as a scenario.
+    "D58@@$RECONCILER@@$WIRING@@$RETIRED_BY_RULE@@$REFUSAL_CLEAR@@$REFUSAL_DELETES"
+    "D58D@@$RECONCILER@@$PROXY_DRAIN@@$REFUSED_MID_STOP@@$REFUSAL_CLEAR@@$REFUSAL_DELETES"
     "C1@@$CONTROLLER@@$WIRING@@$EXIT@@$RULE@@val recorded = progress"
     "C2@@$CONTROLLER@@$WIRING@@$STEPPED@@$ADOPTION@@val observed = drain"
     "C3@@$CONTROLLER@@$RULES@@$ADOPTS@@$CLAUSE@@is PlayerReading.Occupied -> this"
@@ -920,8 +1005,8 @@ restore() {
 # the same trap that restores the source: this script's own printed verdict is the
 # record of the run, and it names the tests it reddened.
 discard_reports() {
-    for class in "$WIRING" "$RULES" "$DRAIN" "$PROXY_DRAIN" "$PROXY_RECONCILE" "$REPLACEMENT" "$PLANNING" \
-        "$STOP_GRACE" "$UNBUILDABLE"; do
+    for class in "$WIRING" "$LIFETIME" "$RULES" "$DRAIN" "$PROXY_DRAIN" "$PROXY_RECONCILE" "$REPLACEMENT" \
+        "$PLANNING" "$STOP_GRACE" "$UNBUILDABLE"; do
         rm -f -- "$RESULTS/TEST-$class.xml"
     done
 }
