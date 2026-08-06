@@ -19,3 +19,4 @@
 - [Record where no work happens](project_record-where-no-work-happens.md) — the third critical from "did work ⇒ recovered", and why the fix was placement rather than a narrower rule.
 - [Invariants need an enforcement point](feedback_invariants-need-an-enforcement-point.md) — pin wiring by shape and every premise of an unreachability argument; two gates need a side-effect assertion.
 - [Replacement needs an exit](project_replacement-exit.md) — a hash input no operator can edit closes the fleet's login path; the lever, the pre-flight asked at both ends, the wait still unbounded.
+- [Gate and ceiling](project_gate-and-ceiling.md) — a block must not arm the permanent gate; a park is a park; the node caps a grace period rather than refusing it; why troubleSince was declined.

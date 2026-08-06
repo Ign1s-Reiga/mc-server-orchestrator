@@ -197,6 +197,15 @@ opposite direction from the vacuity trap: total noise rather than total green.
 Strip a trailing parenthesised list, and read one MISCAUGHT's two lists side by
 side before believing a run that reddened everything.
 
+**And the stripper has to be fixed in *every* harness, not the one that found it.**
+`control-plugin-mutations.sh` learned `sub(/\([^()]*\)$/, "", name)` when the
+`(Path)` trap was first found; `drain-wiring-mutations.sh` was left stripping `()`
+alone, and it went unnoticed for rounds because no entry there named a `@TempDir`
+test until one did. The moment it did, the entry read MISCAUGHT however the
+mutation had gone. **When a harness bug is fixed, grep the sibling harnesses for
+the same expression before closing it** — a fix applied to the instrument that
+happened to expose the bug is half a fix.
+
 **A delimiter that can occur in the payload is a harness lying about its subject.**
 The mutation table was `name|file|class|literal|replacement`, and the first literal
 containing `||` split into the wrong fields, applied a replacement nobody wrote,
