@@ -55,6 +55,14 @@ scripts/dev/containerd-down.sh
 ./gradlew :cri:integrationTest     # CRI-boundary tests against a real containerd (same prerequisite)
 ```
 
+## Operator-facing behaviour
+
+`docs/operating.md` holds the behaviours that are deliberate, correct and
+surprising — the undeletable RCON-less server, the revert window, the two-hour
+constant chain, and two invariants the types do not enforce. When a change makes
+one of those sentences false, that file is the third place to fix, and it is the
+one a non-contributor reads.
+
 ## Non-negotiable invariants
 
 Breaking the ordering below loses player data. Check these first when implementing or reviewing.
