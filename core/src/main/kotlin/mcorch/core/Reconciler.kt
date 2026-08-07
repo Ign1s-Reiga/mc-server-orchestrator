@@ -716,6 +716,13 @@ public class Reconciler(
         observation: WorkloadObservation,
     ): ImageStatus {
         val recorded = pass.previous?.image
+        // `hadContainer` is not asked, and this is a classification of
+        // `SANDBOX_ONLY` where its two worlds genuinely do not differ: what is
+        // being decided is whether to skip an *image* round trip, and an image
+        // belongs to the node rather than to a container. An emptied sandbox and
+        // one the runtime is under-reporting both answer "ask again", which costs
+        // one call and is what a create would need anyway. Nothing here can stop,
+        // remove or converge over anything.
         val settled =
             observation is WorkloadObservation.Present && observation.state != WorkloadState.SANDBOX_ONLY
         if (settled && recorded != null && recorded.available && recorded.requested == pass.definition.spec.image) {
@@ -2068,6 +2075,11 @@ public class Reconciler(
         observation: WorkloadObservation,
     ): ImageStatus {
         val recorded = pass.previous?.image
+        // The backend half of the proxy's [ensureProxyImage], and `hadContainer`
+        // is not asked for the same reason: this decides whether to skip an image
+        // round trip, not what to do with a container. Both of `SANDBOX_ONLY`'s
+        // worlds answer "ask the image service again", which is what the create
+        // that may follow needs in hand either way.
         val settled =
             observation is WorkloadObservation.Present &&
                 observation.state != WorkloadState.SANDBOX_ONLY
@@ -2431,10 +2443,17 @@ public class Reconciler(
                 // which `StatusDrafting.worldSavedMessage` renders as "ephemeral
                 // storage: there is no world to save" for a server the loop is
                 // refusing to make ephemeral, on exactly the population where the
-                // volume name is recorded nowhere else. Absence stays absence;
-                // [draft] defaults this argument to the same `previous?.storage`,
-                // so a null here carries the row forward unchanged rather than
-                // inventing an answer for it.
+                // volume name is recorded nowhere else. Absence stays absence:
+                // this expression is null exactly on the rows that carry no
+                // storage block, and null is the honest record for a row that has
+                // none.
+                //
+                // **Not** because the argument falls back to [draft]'s default. An
+                // explicitly passed null takes no default in Kotlin; it writes
+                // null. That the default here is the same `previous?.storage` is a
+                // coincidence of this one call — the two agree on every row — and
+                // reasoning from it would be wrong the moment either side changed,
+                // which is what the next person to edit this line would act on.
                 storage = pass.previous?.storage?.copy(bound = true),
                 // Refusing the *edit* is not withdrawing a drain that is already
                 // stopping this container, and this is the third site that would

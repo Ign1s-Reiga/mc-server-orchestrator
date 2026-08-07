@@ -219,6 +219,21 @@
 #            alphabet entirely; and D64 moves a converge out of the `when` that
 #            weighs it against the drain, which is the premise both `converge` arms
 #            argue from.
+#   D65..D67 the thirty-sixth audit on that instrument, and all three were **green**
+#            against it — the two counts it balances fell together in each case, so
+#            the alphabet control said nothing. D65 wraps a live arm's pattern the way
+#            the formatter does, which takes the state off the `->` line and out of a
+#            scan that read that line alone; D66 imports the entries and writes them
+#            without their type, which the scan did not see at all — the audit gave
+#            context-sensitive resolution as the way in and this compiler refuses it,
+#            so the import is what makes the shape real; D67 classifies
+#            with an `==` instead of an arm, which is what `:core/main` already did in
+#            three places while the docstring claimed "every classification".
+#   D68      the premise the drain's `SANDBOX_ONLY` abort argues from: it does not
+#            read the fact at its own line, and is right only because
+#            `containerIsDown(hadContainer)` has already returned for the other world.
+#            The mutation answers that call with a literal, which leaves every token
+#            the note names in place.
 #   C1..C3   controls: the rule deleted outright, once per assertion arm. If these
 #            do not redden, the harness is not reaching the assertions at all.
 #   S1       the self-test. See below.
@@ -398,6 +413,12 @@ PREDATING_ROW='a status row that predates the storage field is not given a false
 WORKLOAD_STATE_CLASSIFIED='every workload-state classification either takes the fact or argues at the SANDBOX_ONLY arm'
 NO_ELSE_ARM='no workload-state classification hides a state in an else arm'
 CONVERGE_ROUTED='every converge is an arm of the routing that asks the rule'
+# The thirty-sixth audit, on the same instrument: two shapes that left its alphabet
+# without moving either of its counts — a pattern the formatter wrapped, and an entry
+# written without its type — and one classification syntax the docstring claimed and
+# the scan never read.
+BARE_ENTRY='no workload-state classification writes a bare enum entry'
+SANDBOX_ABORT_ROUTED='the drain'"'"'s sandbox abort is reached only past the rule that separates the two sandboxes'
 
 # Single-quoted throughout: these are literals, and one of them contains the
 # quoting characters of two languages.
@@ -814,6 +835,74 @@ private fun couldStillBeServing(state: WorkloadState): Boolean =
 # together, so the classification check stays green and only this one bites.
 PHASE_ARMS='                        WorkloadState.CREATED, WorkloadState.SANDBOX_ONLY -> ServerPhase.UNKNOWN'
 PHASE_ELSE='                        else -> ServerPhase.UNKNOWN'
+# Three arms merged into one wrapped pattern, with the note rewritten to explain the
+# merge. Behaviourally identical — all three already answered `ServerPhase.UNKNOWN` —
+# and it is what a tidy-minded person writes after reading the arms. The whole point
+# is where the two states end up: on *continuation* lines, so an arm scan that reads
+# the `->` line alone loses `SANDBOX_ONLY` and `CREATED` together, the alphabet
+# control balances, and the classification check stays green over a state it can no
+# longer see. That is the thirty-sixth audit's first hole, and it was one edit away
+# from the live arm in `couldBeTheContainerTheEditIsAbout`.
+PHASE_STATES='                        WorkloadState.UNKNOWN -> ServerPhase.UNKNOWN
+
+                        // Refused by `couldBeTheContainerTheEditIsAbout` above, so
+                        // unreachable here — enumerated rather than folded into an
+                        // `else` because an `else` is how a classification of this
+                        // state stops being visible to anything that goes looking
+                        // for one. `hadContainer` is not asked for the reason that
+                        // arm gives; this is a badge either way, not a decision
+                        // about a container.
+                        WorkloadState.CREATED, WorkloadState.SANDBOX_ONLY -> ServerPhase.UNKNOWN'
+PHASE_STATES_WRAPPED='                        // Three states, one badge. Nothing here decides anything
+                        // about a container, so they are merged rather than
+                        // repeated three times over.
+                        WorkloadState.CREATED,
+                        WorkloadState.SANDBOX_ONLY,
+                        WorkloadState.UNKNOWN -> ServerPhase.UNKNOWN'
+# The same sixth classification as D62, written with the type left off the entries —
+# and a scan keyed on the qualified name sees neither the state nor the `CREATED` that
+# controls it. Both vanish together, which is why the check that scores this refuses
+# the *shape* rather than counting arms that would have balanced.
+#
+# **The import is the mutation**, and it took a compile to find that out. The
+# thirty-sixth audit gave the bare form as `SANDBOX_ONLY -> true` compiling under
+# Kotlin 2.4.10's context-sensitive resolution; against this build's compiler it does
+# not — every entry reads "Unresolved reference". Importing the entries is the shape
+# that *does* compile, in every Kotlin version, so it is the one written here. The
+# finding was right and the mechanism given for it was not; if a later Kotlin turns
+# the other form on by default, this entry is where the second one goes.
+#
+# Anchored on the last import rather than the file's tail because both halves have to
+# land in one replacement, and a top-level function may follow the imports directly.
+LAST_IMPORT='import java.time.Duration as JavaDuration'
+NEW_CLASSIFICATION_UNQUALIFIED="$LAST_IMPORT"'
+import mcorch.core.WorkloadState.CREATED
+import mcorch.core.WorkloadState.EXITED
+import mcorch.core.WorkloadState.RUNNING
+import mcorch.core.WorkloadState.SANDBOX_ONLY
+import mcorch.core.WorkloadState.UNKNOWN
+
+private fun couldStillBeServing(state: WorkloadState): Boolean =
+    when (state) {
+        RUNNING, EXITED, UNKNOWN -> true
+        SANDBOX_ONLY -> false
+        CREATED -> false
+    }'
+# A classification that is not a `when` arm at all. `:core/main` already held three
+# of these when the scan claimed "every classification" and read arms alone — one of
+# them the drain's own abort — so this is the shape the docstring was writing cheques
+# for. Dead code, so nothing but the scan can see it.
+NEW_COMPARISON="$RECONCILER_TAIL"'
+
+private fun isAnEmptySandbox(observation: WorkloadObservation.Present): Boolean =
+    observation.state == WorkloadState.SANDBOX_ONLY'
+# The one fact that separates a sandbox this loop emptied from one whose container the
+# runtime has stopped reporting, answered with a constant. Every token the abort's note
+# names survives — the call, the binding, the guard, the return — and the note is
+# false. This is the thirty-fourth audit's critical written at the address its own fix
+# created, which is the general rule for a fact that has become a parameter.
+ASKS_SANDBOX_RULE='        val down = observation.containerIsDown(hadContainer)'
+ASKS_WITH_A_LITERAL='        val down = observation.containerIsDown(false)'
 # The converge decided above the `when` rather than in it: behaviourally identical,
 # and it takes the choice out of the one place both answers are weighed together.
 ROUTING_WHEN='                    when {
@@ -1160,6 +1249,26 @@ MUTATIONS=(
     # drain. The arms' notes would then be quietly false, which is the state rounds 18
     # and 19 both ended in.
     "D64@@$RECONCILER@@$WIRING@@$CONVERGE_ROUTED@@$ROUTING_WHEN@@$ROUTING_EARLY_RETURN"
+    # The thirty-sixth audit's two ways out of that scan's alphabet, and the syntax it
+    # never read. D65 wraps an existing arm rather than adding one, because adding one
+    # is the case D62 already covers and the hole was in how an *edit* to a live arm
+    # gets formatted. D66 writes the entries without their type. Both were green before
+    # the scan learned to fold continuation lines and to refuse a bare entry, and both
+    # were green *including the alphabet control*, which is the part worth keeping: a
+    # control that falls with the thing it controls is not one.
+    "D65@@$RECONCILER@@$WIRING@@$WORKLOAD_STATE_CLASSIFIED@@$PHASE_STATES@@$PHASE_STATES_WRAPPED"
+    "D66@@$RECONCILER@@$WIRING@@$BARE_ENTRY@@$LAST_IMPORT@@$NEW_CLASSIFICATION_UNQUALIFIED"
+    # A classification written as a comparison instead of an arm. The docstring said
+    # "every classification"; the scan read arms, and three comparisons were already in
+    # `:core/main` — `DrainController`'s `SANDBOX_ONLY` abort among them.
+    "D67@@$RECONCILER@@$WIRING@@$WORKLOAD_STATE_CLASSIFIED@@$RECONCILER_TAIL@@$NEW_COMPARISON"
+    # The premises of that abort's argument, which is a constructive one and so goes in
+    # a test rather than in the note beside it: the rule is asked above the
+    # classification, once, with this pass's own fact, and its answer is bound and
+    # returned on. D68 answers it with a literal — the thirty-fourth audit's critical at
+    # the one address the fix left for it, and the shape a `false` at a call site always
+    # has: every token the note names is still there and the fact is gone.
+    "D68@@$CONTROLLER@@$WIRING@@$SANDBOX_ABORT_ROUTED@@$ASKS_SANDBOX_RULE@@$ASKS_WITH_A_LITERAL"
     "C1@@$CONTROLLER@@$WIRING@@$EXIT@@$RULE@@val recorded = progress"
     "C2@@$CONTROLLER@@$WIRING@@$STEPPED@@$ADOPTION@@val observed = drain"
     "C3@@$CONTROLLER@@$RULES@@$ADOPTS@@$CLAUSE@@is PlayerReading.Occupied -> this"

@@ -353,6 +353,14 @@ public class LocalNode internal constructor(
                 if (existing != null) {
                     val status = client.sandboxStatus(existing)
                     val adopted = observationOf(spec.server, status)
+                    // `hadContainer` is the reconcile loop's fact and there is
+                    // none of it at this layer: it is a container id *the loop*
+                    // recorded, and a node is the thing being asked rather than
+                    // the thing that remembers. What this reads is the sandbox
+                    // status fetched on the line above, in this same call, so
+                    // "no container in it" is this call's own observation rather
+                    // than a claim about history — and both answers build the
+                    // container the caller asked for. Nothing here ends one.
                     if (adopted.state != WorkloadState.SANDBOX_ONLY) {
                         // Already built. Adopting it is the whole reason a
                         // second pass is not a second container.
@@ -394,6 +402,13 @@ public class LocalNode internal constructor(
                 } catch (collision: CriException) {
                     if (!collision.isNameCollision()) throw collision
                     val adopted = observationOf(spec.server, client.sandboxStatus(sandboxId))
+                    // The same reading as the adoption above, and `hadContainer`
+                    // is as absent here for the same reason. This asks only
+                    // whether the collision left something to adopt: the sandbox
+                    // was just re-read, a container that is there is the one the
+                    // create raced with, and one that is not means the object
+                    // exists under a name this build cannot see. Refusing is the
+                    // whole of the answer — nothing is stopped or removed on it.
                     if (adopted.state == WorkloadState.SANDBOX_ONLY) {
                         throw unadoptable(NodeOperation.CREATE, "container for `${spec.server}`", collision)
                     }
