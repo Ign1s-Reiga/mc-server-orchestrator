@@ -5,14 +5,22 @@ import io.kotest.matchers.collections.shouldContain
 import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.collections.shouldNotBeEmpty
 import io.kotest.matchers.ints.shouldBeGreaterThan
+import io.kotest.matchers.ints.shouldBeLessThan
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.string.shouldMatch
 import io.kotest.matchers.string.shouldStartWith
+import mcorch.schema.DrainState
+import mcorch.schema.DrainStatus
+import mcorch.schema.PaperServerStatus
+import mcorch.schema.ServerPhase
+import mcorch.schema.ServerStatus
+import mcorch.schema.StatusReconstruction
 import org.junit.jupiter.api.Test
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
+import java.time.Instant
 import kotlin.io.path.readText
 
 /**
@@ -1390,6 +1398,279 @@ internal class DrainWiringTest {
     }
 
     /**
+     * Every producer of a drain state that a **decode rule** keys on says, at the
+     * producer, what it does about the record that rule reconstructs.
+     *
+     * ## The defect this exists for
+     *
+     * `mcorch.schema.StatusReconstruction` reads a stored observation and, for a
+     * document in [DrainState.STOPPING] with no `stopDispatchedAt`, supplies one —
+     * justified by *"a drain reaches `STOPPING` only after a stop request returned
+     * cleanly"*. That sentence has an antecedent with **two** producers in this
+     * module and its author surveyed one. The other is the already-down branch in
+     * [DrainController.advanceOnce], reached whenever the runtime says the container
+     * is gone, dispatching nothing — so the current build routinely writes exactly
+     * the document the rule says cannot exist.
+     *
+     * Nothing could have caught it. 921 unit tests, two mutation harnesses and an
+     * integration run were all honestly green: there is no expression to flip in a
+     * rule whose premise is a survey, and a survey is not a shape any scan was
+     * looking for. It is the thirty-fourth audit's finding one level up — a fact
+     * modelled in one place and approximated by a consumer that asked a narrower
+     * question — and the answer is the same one: an instrument whose unit is the
+     * thing the survey enumerates.
+     *
+     * ## How the scan learns which states are keyed on
+     *
+     * Not from a list here. A hardcoded `STOPPING` would be a maintained list wearing
+     * a test's clothes, which is the failure this suite exists to retire.
+     *
+     * The rule is a pure, public function of a status, so it can simply be **asked**:
+     * build one observation per [DrainState] with no side-effect records at all, run
+     * it through [StatusReconstruction.reconstruct], and the states that come back
+     * reconstructed are the states the rule keys on. The alphabet is `DrainState`'s
+     * own entries, so a ninth state joins the probe on the day it is declared, and the
+     * *record* each rule restores is read off the report it returns rather than named
+     * here — [mcorch.schema.ReconstructedRecord.field] is the rule's own word for what
+     * it wrote.
+     *
+     * That is why this lives in `:core` and not beside the rule in `:schema`. The rule
+     * is discoverable from anywhere; the **producers** are not. They are drain
+     * transitions, they exist only in this module, and `:schema` cannot see one — it
+     * is the module `:core` depends on, not the other way round.
+     *
+     * The limit of the discovery, stated rather than papered over: it finds decode
+     * rules keyed on a `DrainState`. A rule keyed on some other field of a status is
+     * invisible to this probe, and widening it means giving the probe an axis per
+     * field. `DrainState` is the axis that had the defect.
+     *
+     * ## What "named by the justification" means mechanically
+     *
+     * Not a KDoc in `:schema` listing `DrainController.kt:302`. A line number rots on
+     * the next edit; a function name rots on the next rename; and both point the wrong
+     * way across a module boundary, since the justification lives in the module that
+     * cannot name a producer.
+     *
+     * So the obligation is discharged **at the producer**, and the two ends meet at
+     * the name of the record: the rule reports which field it reconstructs, and every
+     * producer of a keyed state has to name that field — in its own statement, or in
+     * the contiguous `//` block above it. Nothing on either side names a location, and
+     * whoever writes the third producer of `STOPPING` is the person who has to think
+     * about the stamp, which is where the thinking was missing.
+     *
+     * A note is prose and prose can be pasted; that is accepted here for the reason
+     * the classification scan above accepts it, and it is scored the same way — one
+     * mutation adds a producer with no note, another gives it a note that argues the
+     * branch without naming the record.
+     */
+    @Test
+    fun `every producer of a state a decode rule keys on names the record it reconstructs`() {
+        // The read/write classifier, on the shapes it has to tell apart — three of
+        // which are in this module and one of which (a write folded across lines with
+        // its note above the whole statement) is the shape both live producers have.
+        val shapes =
+            Source(
+                "<the four shapes>",
+                listOf(
+                    "        return when (drain.state) {",
+                    "            DrainState.SEALED,",
+                    "            DrainState.STOPPING,",
+                    "            -> awaitStopped(pass, drain)",
+                    "            else -> drain.state == DrainState.STOPPING",
+                    "        }",
+                    "        val moved = drain.moveTo(DrainState.STOPPING, now)",
+                ),
+            ).writesOf(DRAIN_STATE_TYPE, "STOPPING")
+        withClue("a wrapped pattern or a comparison reads as a producer, so the scan flags what it should not") {
+            shapes.map { it.where } shouldBe listOf("<the four shapes>:7")
+        }
+        val wrapped =
+            Source(
+                "<a wrapped write>",
+                listOf(
+                    "        // the stopDispatchedAt stamp travels with the state",
+                    "        drain =",
+                    "            dispatching",
+                    "                .moveTo(DrainState.STOPPING, now),",
+                ),
+            ).writesOf(DRAIN_STATE_TYPE, "STOPPING").single()
+        wrapped.answer shouldBe "drain = dispatching .moveTo(DrainState.STOPPING, now),"
+        wrapped.note shouldContain "stopDispatchedAt"
+
+        // The name-resolution hole, refused rather than read. The scan is keyed on the
+        // qualified spelling, and the thirty-sixth audit's second hole was the same
+        // scan one level up going blind to `import mcorch.core.WorkloadState.SANDBOX_ONLY`
+        // — one IDE quick-fix, and the producer looks identical. Teaching the scan to
+        // read bare entries is not the answer here: `ServerPhase` declares `STOPPING`
+        // too, so a bare `STOPPING` cannot be attributed to a type at all. An alias is
+        // the same hole spelled differently and is refused with it.
+        val detector = "import mcorch.schema.$DRAIN_STATE_TYPE.STOPPING"
+        IMPORTS_A_STATE.containsMatchIn(detector) shouldBe true
+        IMPORTS_A_STATE.containsMatchIn("import mcorch.schema.$DRAIN_STATE_TYPE") shouldBe false
+        val unqualified =
+            mainSources().flatMap { source ->
+                source.lines.filter { IMPORTS_A_STATE.containsMatchIn(it) }.map { "${source.path}: ${it.trim()}" }
+            }
+        withClue(
+            "a drain state can be written without its type here, where the producer scan cannot see it: $unqualified",
+        ) {
+            unqualified shouldBe emptyList<String>()
+        }
+
+        val rules = decodeRules()
+        withClue(
+            "no decode rule keys on a $DRAIN_STATE_TYPE any more. Either the rule whose producers this " +
+                "enumerates was retired — delete this test and say why — or it now keys on something the probe " +
+                "cannot discover, and the discovery has to be widened rather than left reading green",
+        ) {
+            rules.shouldNotBeEmpty()
+        }
+        // Two controls on the discovery itself, because a probe that answers the same
+        // thing for every state has discovered nothing. The first is that it
+        // discriminates between states at all; the second is that what it detects is
+        // the record being **absent** rather than the state being what it is —
+        // reconstructing a reconstruction has to find nothing left to do.
+        rules.size shouldBeLessThan DrainState.entries.size
+        rules.forEach { rule ->
+            rule.records.shouldNotBeEmpty()
+            val once = StatusReconstruction.reconstruct(statusInDrainState(rule.state))
+            withClue("the rule for ${rule.state} fires on a status it has already reconstructed") {
+                StatusReconstruction.reconstruct(once.status).wasReconstructed shouldBe false
+            }
+        }
+
+        rules.forEach { rule ->
+            val producers = mainSources().flatMap { it.writesOf(DRAIN_STATE_TYPE, rule.state.name) }
+            withClue(
+                "a decode rule keys on ${rule.state} and nothing in this module writes it. Either the scan has " +
+                    "stopped recognising this module's transitions, or the rule keys on a state the drain " +
+                    "cannot reach",
+            ) {
+                producers.shouldNotBeEmpty()
+            }
+            rule.records.forEach { record ->
+                val silent = producers.filterNot { it.answer.contains(record) || it.note.contains(record) }
+                withClue(
+                    "a drain reaches ${rule.state} at a site that says nothing about `$record`, which a decode " +
+                        "rule reconstructs from that state alone. Either this producer writes the record, or " +
+                        "the note above it says why it does not and the rule's premise is wrong: " +
+                        "${silent.map { it.where }}",
+                ) {
+                    silent.map { it.where } shouldBe emptyList<String>()
+                }
+            }
+        }
+    }
+
+    /**
+     * The premise both `STOPPING` producers' notes rest on: the already-down branch is
+     * above the state dispatch, so **every** drain state passes it.
+     *
+     * A constructive argument, so its premises go in a test rather than in the note
+     * beside them — this file's rule, and the note added at that branch makes a claim
+     * that needs it: *"in whatever state the drain was in, including one that never
+     * got near step 7"*. The same fact falsified the exclusion `:schema`'s rule was
+     * written with, so it is load-bearing in two places and pinned in neither until
+     * now.
+     *
+     * Four premises, each a way the claim goes quietly false:
+     *
+     * - the states are dispatched in **one** function, so there is no second router a
+     *   state could be worked from;
+     * - that function is `private`, which is what makes the call sites in this file
+     *   all of its call sites;
+     * - the branch that answers the container being down **returns**, above the call
+     *   that dispatches; and
+     * - every other call to the dispatch is inside a function that is itself only ever
+     *   reached from the dispatch, so it is downstream of the same return.
+     *
+     * The last premise is walked backwards from each callee at any depth — the chain
+     * is `step` → `resume` → `resumeInto` → `step`, and a check that resolved a fixed
+     * number of hops would have been wrong about it either way. What it cannot see is
+     * a call written as something other than `name(`: a function *reference* passed as
+     * a value would be missed, and no member of this chain is one.
+     *
+     * Scoped to this file on purpose. `Reconciler` matches on a drain state too and
+     * `DrainSubject.sealsBackend` is a `when` over the whole enum, but neither runs a
+     * drain step: they badge a phase and answer a pure question about a state. What is
+     * claimed here is about the function that *does the work*.
+     */
+    @Test
+    fun `every drain state's work is dispatched below the branch that answers the container being down`() {
+        val dispatchingArms = CONTROLLER.arms().filter { it.pattern.contains("$DRAIN_STATE_TYPE.") }
+        withClue("no arm in this file matches on a $DRAIN_STATE_TYPE, so the dispatch was not found at all") {
+            dispatchingArms.size shouldBeGreaterThan 2
+        }
+        val owners = dispatchingArms.map { enclosing(it.line).name }.distinct()
+        withClue("drain states are dispatched from more than one function, so no single ordering covers them") {
+            owners shouldHaveSize 1
+        }
+        val dispatch = enclosing(dispatchingArms.first().line)
+        withClue("the dispatch is not private, so the calls in this file are not all of its calls") {
+            dispatch.declaration shouldContain "private"
+        }
+
+        // The guard, re-derived here rather than shared with the sandbox-abort test: a
+        // premise asserted through another test's local is a premise held by that
+        // test's continued existence.
+        val asked =
+            LINES.indices
+                .filter { mentions(LINES[it], "containerIsDown") }
+                .filterNot { DECLARATION.containsMatchIn(LINES[it]) }
+        withClue("the container-down rule is asked ${asked.size} times in this file, not once") {
+            asked shouldHaveSize 1
+        }
+        val rule = asked.single()
+        val down = binding(LINES[rule])
+        val guardOwner = enclosing(rule)
+        val opens = "if (${down.name} != null)"
+        val guard = guardOwner.body.first { it > rule && codeOf(LINES[it]).trim().startsWith(opens) }
+        val guarded = CONTROLLER.bodyOf(guard)
+        withClue("the container-down branch does not return, so a state below it is not past a decision") {
+            codeIn(guarded).any { RETURN.containsMatchIn(it) } shouldBe true
+        }
+
+        fun callSitesOf(name: String): List<Int> =
+            LINES.indices
+                .filter { mentions(LINES[it], name) }
+                .filterNot { DECLARATION.containsMatchIn(LINES[it]) }
+
+        // Walked backwards from the callee, at any depth: `step` → `resume` →
+        // `resumeInto` → `step` is the chain today, and a scan that resolved a fixed
+        // number of hops would have said the wrong thing about it. A function is
+        // downstream of the dispatch when **every** call site of it is inside the
+        // dispatch or inside something already known to be downstream. Backwards
+        // rather than forwards on purpose: reachability computed from the dispatch
+        // outwards would have to over-approximate, and an over-approximation here
+        // *admits* a route rather than refusing one. A cycle answers false, which is
+        // the same safe direction.
+        fun onlyReachedFromTheDispatch(
+            name: String,
+            seen: Set<String>,
+        ): Boolean {
+            val sites = callSitesOf(name)
+            return sites.isNotEmpty() &&
+                sites.all { site ->
+                    val owner = enclosing(site).name
+                    site in dispatch.body || (owner !in seen && onlyReachedFromTheDispatch(owner, seen + name))
+                }
+        }
+
+        val calls = callSitesOf(dispatch.name)
+        calls.shouldNotBeEmpty()
+        calls.forEach { call ->
+            val within = enclosing(call)
+            val belowTheGuard = within.name == guardOwner.name && call > guarded.last
+            withClue(
+                "`${dispatch.name}` is called at ${CONTROLLER.path}:${call + 1}, in `${within.name}`, by a route " +
+                    "that has not been through the container-down branch",
+            ) {
+                (belowTheGuard || onlyReachedFromTheDispatch(within.name, setOf(dispatch.name))) shouldBe true
+            }
+        }
+    }
+
+    /**
      * One `when` arm, split into the parts a claim about it is made of.
      *
      * [answer] is the arm's own line only — see the scan's docstring for why the
@@ -1447,6 +1728,20 @@ internal class DrainWiringTest {
          */
         val answer: String,
         val note: String,
+    )
+
+    /**
+     * One decode rule, as discovered by asking it rather than by listing it.
+     *
+     * [state] is the drain state the rule keys on; [records] are the fields it
+     * restores, named in the rule's own vocabulary — the leaf of
+     * [mcorch.schema.ReconstructedRecord.field], which is the identifier a producer
+     * would write. A rule that restored two fields would carry two, and each is
+     * demanded of every producer independently.
+     */
+    private data class DecodeRule(
+        val state: DrainState,
+        val records: List<String>,
     )
 
     private data class Binding(
@@ -1603,6 +1898,87 @@ internal class DrainWiringTest {
                         note = noteAbove(start),
                     )
                 }
+
+        /**
+         * Every place in this file that **writes** [entry] of the enum [type] into a
+         * value, rather than reading one.
+         *
+         * ## Why the unit is an occurrence and not a call site
+         *
+         * The producers of a drain state are not all call sites of one function.
+         * `moveTo(DrainState.STOPPING, now)` is one shape; `state =
+         * DrainState.DRAIN_REQUESTED` in a constructor is another; and the shape that
+         * defeats a call-site scan outright is `moveTo(resume, now)`, where the state
+         * is a local bound by a `when` whose arms answer with literals. A scan keyed on
+         * the call would have to resolve that variable. A scan keyed on the **literal**
+         * does not: the arms that bind it are themselves occurrences in a writing
+         * position, so the indirect producer is caught where its state is chosen.
+         *
+         * ## What counts as reading
+         *
+         * Two positions, and they are exempt because neither puts the state anywhere:
+         *
+         * - a `when` **pattern** — the text left of the arm's `->`, plus any lines the
+         *   formatter has wrapped the pattern onto, which is where
+         *   [DrainSubject.sealsBackend] writes six states on six lines; and
+         * - an operand of `==` or `!=`, which is how `Reconciler` badges a phase and
+         *   how this file asks whether a drain has parked.
+         *
+         * Everything else is treated as a write, and the direction of that error is
+         * chosen: a set expression such as `DrainState.entries.toSet() -
+         * DrainState.DRAIN_FAILED` in `ReconcileLoop` reads as a write and would be
+         * asked for a note if `DRAIN_FAILED` were ever keyed on. A note there costs a
+         * line and says something true; the other direction loses a producer.
+         *
+         * Counting occurrences rather than matching positions is what lets one line
+         * hold both — `state == DrainState.X -> …` is a read, and a line that compares
+         * one state and assigns another is still a write.
+         */
+        fun writesOf(
+            type: String,
+            entry: String,
+        ): List<Decision> {
+            val names = Regex("""(?<![\w.])$type\.$entry\b""")
+            val compares = Regex("""[=!]=\s*$type\.$entry\b|(?<![\w.])$type\.$entry\s*[=!]=""")
+            val continuations = wrappedPatternLines()
+            return lines.indices
+                .filter { isCode(lines[it]) && it !in continuations }
+                .filter { line ->
+                    val code = codeOf(lines[line])
+                    // An arm's answer, or the whole line when it is not an arm. The
+                    // pattern half of an arm line is a read by construction.
+                    val written = if (armPattern(code) != null) code.substringAfter("->") else code
+                    names.findAll(written).count() > compares.findAll(written).count()
+                }.map { line ->
+                    val start = statementStart(line)
+                    Decision(
+                        where = "$path:${line + 1}",
+                        // Folded **upward** only, to the start of the expression. A
+                        // record set on a line *below* the transition — a sibling
+                        // argument of the same constructor call — is deliberately
+                        // outside it: folding a whole call in would let any argument of
+                        // it satisfy the rule, which is the same mistake as scanning an
+                        // arm's block instead of the arm.
+                        answer = (start..line).joinToString(" ") { codeOf(lines[it]).trim() },
+                        note = noteAbove(start),
+                    )
+                }
+        }
+
+        /**
+         * The lines the formatter has wrapped a `when` pattern onto, arm lines
+         * themselves excluded.
+         *
+         * The same fold [arms] uses, so the two scans cannot disagree about what a
+         * pattern is: the thirty-sixth audit's first hole was a pattern wrapped out of
+         * one scan's alphabet, and a second scan with its own idea of wrapping is that
+         * hole waiting to be re-cut.
+         */
+        private fun wrappedPatternLines(): Set<Int> =
+            lines.indices
+                .filter { isCode(lines[it]) && armPattern(codeOf(lines[it])) != null }
+                .flatMap { arrow -> armStart(arrow) until arrow }
+                .toSet()
 
         /**
          * The entries of the enum [type] declared in this file, in declaration order.
@@ -1844,6 +2220,67 @@ internal class DrainWiringTest {
         const val UNCLASSIFIED: String = "SANDBOX_ONLY"
 
         const val THE_FACT: String = "hadContainer"
+
+        /**
+         * The enum whose producers the decode-rule scan enumerates, named once so the
+         * scan and the prose about it cannot drift apart.
+         */
+        const val DRAIN_STATE_TYPE: String = "DrainState"
+
+        /**
+         * An import that would let a drain state be written without its type: an
+         * entry imported directly, or the type imported under another name.
+         *
+         * Both are ways a producer leaves [writesOf]'s alphabet without looking any
+         * different, which is the class of hole the thirty-sixth audit found in the
+         * classification scan. Refusing them is cheaper than reading them, and here it
+         * is also the only sound option: [ServerPhase] declares `STOPPING` as well, so
+         * a bare entry cannot be attributed to a type by a source scan at all.
+         */
+        val IMPORTS_A_STATE = Regex("""^\s*import\s+[\w.]*\b$DRAIN_STATE_TYPE(?:\.[A-Z]|\s+as\s)""")
+
+        /** Any instant. Nothing in a decode rule reads one; they only get copied. */
+        val PROBE_AT: Instant = Instant.parse("2026-08-07T00:00:00Z")
+
+        /**
+         * An observation whose drain is in [state] and which carries **no** side-effect
+         * record at all.
+         *
+         * Every optional field left at its default on purpose: what is being discovered
+         * is which states a decode rule fills a gap for, and a probe that arrived with
+         * the record already present would discover nothing. That the absence is what
+         * the rule keys on — rather than the state — is asserted separately, by feeding
+         * a reconstruction back through it.
+         */
+        fun statusInDrainState(state: DrainState): ServerStatus =
+            PaperServerStatus(
+                name = resourceName("probe"),
+                observedGeneration = 1,
+                phase = ServerPhase.DRAINING,
+                observedAt = PROBE_AT,
+                lastTransitionAt = PROBE_AT,
+                drain = DrainStatus(state = state, startedAt = PROBE_AT, enteredStateAt = PROBE_AT),
+            )
+
+        /**
+         * The decode rules `:schema` applies on the read, discovered by running each
+         * drain state through them.
+         *
+         * The alphabet is [DrainState.entries] — the declaration itself, so a ninth
+         * state is probed on the day it is written — and the records are read off the
+         * report the rule returns. Nothing about either is written down here, which is
+         * the whole point: a list of keyed states in this file would be the maintained
+         * list this suite exists to replace.
+         */
+        fun decodeRules(): List<DecodeRule> =
+            DrainState.entries.mapNotNull { state ->
+                val reconstructed = StatusReconstruction.reconstruct(statusInDrainState(state))
+                if (!reconstructed.wasReconstructed) {
+                    null
+                } else {
+                    DecodeRule(state, reconstructed.reconstructed.map { it.field.substringAfterLast('.') })
+                }
+            }
 
         /**
          * `x == WorkloadState.SANDBOX_ONLY`, in either order, qualified or not.

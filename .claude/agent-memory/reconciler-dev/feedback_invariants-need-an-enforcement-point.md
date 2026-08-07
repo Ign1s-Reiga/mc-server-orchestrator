@@ -494,3 +494,42 @@ read a balanced count as coverage.
 continuation lines back into the pattern, so that the *silent* check — the one
 that carries the rule — is what refuses it. Tightening the count instead would
 have produced a second thing that goes red for reasons nobody can read.
+
+## A premise can be a survey, and the survey can be in another module
+
+Round 37, and it is this file's opening rule with the comment moved across a
+module boundary. A decode rule in `:schema` keyed on `DrainState.STOPPING`,
+justified by *"a drain reaches `STOPPING` only after a stop request returned
+cleanly"* — an antecedent with **two** producers in `:core`, one of them
+surveyed. Nothing could go red: a premise that is a survey has no expression to
+flip, and no scan was keyed on the thing being surveyed.
+
+- **When a rule keys on a value another module produces, the enumeration belongs
+  with the producers.** The rule is discoverable from anywhere; the producers are
+  not. Putting the check beside the rule would need a list of call sites in a
+  module that cannot see one.
+- **Discover the rule's subject by asking the rule, never by listing it.** It was
+  a pure public function of a status, so the keyed states are what comes back
+  reconstructed when every entry of the enum is fed through it, and the record's
+  name is read off the report it returns. A hardcoded state would have been the
+  maintained list this whole file bans. Two controls make the discovery honest:
+  it must not answer the same for every entry, and feeding its own output back in
+  must find nothing left to do — which is what proves it keys on the record being
+  *absent* rather than on the state.
+- **Invert the direction of the naming.** "The justification names the sites" rots
+  at the next edit and points the wrong way across a dependency. "Every producer
+  names the record" does not, and it puts the thinking on whoever writes the third
+  producer. The two ends meet at an identifier neither side hardcodes.
+- **The unit of a producer scan is the state literal in a writing position, not
+  the call site.** `moveTo(resume, now)` binds its state from a `when` whose arms
+  answer with literals, so a call-site scan would have to resolve the variable —
+  and the occurrence scan catches the indirect producer *where its state is
+  chosen*, for free. Reads to exempt: a `when` pattern (share the other scan's
+  fold, or the two disagree about what a pattern is) and an `==`/`!=` operand.
+- **Compute a "reached only from here" property backwards, not forwards.**
+  Reachability computed outwards from the entry point has to over-approximate,
+  and an over-approximation *admits* a route. Walking back from each callee —
+  every call site of `f` is inside the entry point or inside something already
+  known to be downstream — is sound, needs no depth limit, and answers false on a
+  cycle. The chain here was three hops (`step` → `resume` → `resumeInto` →
+  `step`) and any fixed number of hops would have been wrong about it.

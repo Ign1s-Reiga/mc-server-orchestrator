@@ -36,6 +36,14 @@ claim a later round relies on has to be the claim that is enforced.
 - **The alphabet is read from the enum declaration**, so a sixth `WorkloadState`
   enters the scan on the day it is written rather than the day somebody remembers
   the test.
+- **Round 37 added a second scan beside it** over `DrainState` producers — see
+  [[producer-scan-scope]]. They share `Source`'s wrapped-pattern fold on purpose:
+  a second scan with its own idea of what a `when` pattern is re-cuts the hole the
+  thirty-sixth audit found. The bare-entry hole is closed differently in each,
+  and the difference is the reason: `WorkloadState` arms are *required to qualify*
+  (the scan then reads them), while a bare `DrainState` entry is refused **at the
+  import**, because `ServerPhase` also declares `STOPPING` and a source scan
+  cannot attribute a bare one to a type at all.
 
 ## The review rule I was asked to weigh and did not invent
 

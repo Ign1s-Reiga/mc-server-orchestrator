@@ -297,6 +297,19 @@ internal class DrainController(
                 // and the next pass purges the whole record; the eighth audit ruled
                 // that cosmetic, and the sixteenth's harm through it (re-arming the
                 // permanent gate on the replacement path) is closed at the gate.
+                //
+                // **This producer of `STOPPING` dispatches nothing**, and that is the
+                // fact a reader downstream needs. The state is reached from the
+                // *observation* — the runtime says the container is gone, in whatever
+                // state the drain was in, including one that never got near step 7 —
+                // so no stop request left this process and `stopDispatchedAt` is
+                // carried, never written: null for a drain that never reached step 7,
+                // and step 7's own stamp for one whose container this branch has now
+                // seen go. `STOPPING` therefore does not imply a dispatch; the stamp
+                // is the only thing that does, which is why [stopIsInFlight] answers
+                // on the stamp and not on the state. Safe here for a second reason: this
+                // branch is reached only from [WorkloadObservation.containerIsDown],
+                // so there is no live container to withhold from a routing table.
                 drain =
                     letGo
                         .moveTo(DrainState.STOPPING, now)
@@ -2665,6 +2678,12 @@ internal class DrainController(
                 sideEffectIssued = true,
             )
         }
+        // The state and the record move in one expression: `dispatching` is `drain`
+        // with `stopDispatchedAt` already stamped, and this is the transition into
+        // `STOPPING` that a stop request actually reached the runtime for. The pairing
+        // is what a reader may rely on and the state alone is not — a producer of this
+        // state that dispatched nothing writes no stamp, so `STOPPING` is not evidence
+        // of a request having gone out and the stamp is.
         return DrainProgress(
             drain = dispatching.moveTo(DrainState.STOPPING, now),
             occupancy = occupancy,
