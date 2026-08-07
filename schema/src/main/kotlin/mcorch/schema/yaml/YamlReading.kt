@@ -101,9 +101,12 @@ internal fun isNullScalar(node: Node): Boolean =
  * documentation:
  *
  * - forwards, [MappingReader.secretRef] refuses to run at a path this list does
- *   not name. A fourth secret-bearing field added without listing it fails on
- *   the first parse that reaches it — including the parse of every valid example
- *   — instead of quietly getting the generic treatment;
+ *   not name. The check fires when the *enclosing block* is read, not when the
+ *   field is written, so an unlisted field fails on every document that opens
+ *   its block — but a block no document opens is never read, and two of the
+ *   three here are optional. "Unlisted fails immediately" is therefore true
+ *   because `SecretEchoTest` requires every [containers] entry to be written by
+ *   a `valid/` example, not because it follows from the check alone;
  * - backwards, `SecretEchoTest` walks the list and requires each entry to answer
  *   a scalar with [MappingReader.INLINE_SECRET_PROBLEM] and to quote nothing.
  *
@@ -115,7 +118,14 @@ internal fun isNullScalar(node: Node): Boolean =
  * this list only decides which message is the *helpful* one.
  */
 internal object SecretBearingPaths {
-    /** The fields that take a reference. */
+    /**
+     * The fields that take a reference.
+     *
+     * A field under a list is written with an empty index — `spec.backends[]
+     * .tokenSecret` — because [normalised] is what these are compared against.
+     * There is no such field today; the spelling is fixed here so that the day
+     * one lands, listing it works instead of throwing on every document.
+     */
     val refs: Set<String> =
         setOf(
             "spec.network.rcon.passwordSecret",
@@ -123,10 +133,47 @@ internal object SecretBearingPaths {
             "spec.control.tokenSecret",
         )
 
-    /** The blocks that hold one — the shorthand a hurried operator collapses to a scalar. */
-    val containers: Set<String> = refs.mapTo(mutableSetOf()) { it.substringBeforeLast('.') }
+    /**
+     * The blocks that hold one — the shorthand a hurried operator collapses to a
+     * scalar.
+     *
+     * Derived rather than listed so the two cannot drift, which makes the shape
+     * of a [refs] entry load-bearing: a reference written directly under `spec`
+     * would derive the container `spec`, and then `spec: <anything>`, on every
+     * kind, would answer with the secret-store message — the outcome this
+     * object's own reasoning calls worse than the generic one. A reference
+     * belongs in a block that is about it.
+     */
+    val containers: Set<String> =
+        refs.mapTo(mutableSetOf()) { ref ->
+            val container = ref.substringBeforeLast('.')
+            require(container.contains('.')) {
+                "$ref would make `$container` a secret-bearing block, and a block that shallow is read " +
+                    "for every document of its kind: a scalar written there would be answered with the " +
+                    "secret store rather than with its shape. Put the reference inside a block of its own."
+            }
+            container
+        }
 
-    fun holds(path: String): Boolean = path in refs || path in containers
+    fun isRef(path: String): Boolean = normalised(path) in refs
+
+    fun holds(path: String): Boolean = normalised(path).let { it in refs || it in containers }
+
+    /**
+     * A field path with its list positions flattened: `spec.backends[2].token`
+     * becomes `spec.backends[].token`.
+     *
+     * [MappingReader.pathOf] composes literals, but [MappingReader.valueList]
+     * puts a document *position* in the path, so a path is not always something
+     * a `Set<String>` of literals can hold. Without this, a secret-bearing field
+     * under a list would make [MappingReader.secretRef]'s check throw on every
+     * well-formed document rather than on the developer error it is aimed at —
+     * a guard that fires on valid input is worse than no guard. Violations keep
+     * the real index; only the membership test sees this form.
+     */
+    fun normalised(path: String): String = if ('[' in path) path.replace(LIST_INDEX, "[]") else path
+
+    private val LIST_INDEX = Regex("""\[\d+]""")
 }
 
 /**
@@ -442,7 +489,7 @@ internal class MappingReader private constructor(
         required: Boolean = false,
     ): SecretRef? {
         val at = pathOf(name)
-        check(at in SecretBearingPaths.refs) {
+        check(SecretBearingPaths.isRef(at)) {
             "$at takes a secret reference but SecretBearingPaths.refs does not name it, so a scalar written " +
                 "there would be reported as a plain shape mismatch instead of being sent to the secret store. " +
                 "Add the path to that list."
@@ -460,9 +507,12 @@ internal class MappingReader private constructor(
         val reader = of(at, node, sink, inherited = true) ?: return null
         val secretName =
             reader.string("name", required = true)?.let { raw ->
-                ResourceName.of(raw).getOrElse {
-                    reader.violation("name", SecretRef.NAME_PROBLEM)
+                val problem = SecretRef.nameProblem(raw)
+                if (problem != null) {
+                    reader.violation("name", problem)
                     null
+                } else {
+                    ResourceName.of(raw).getOrNull()
                 }
             }
         val key = reader.string("key", required = true)

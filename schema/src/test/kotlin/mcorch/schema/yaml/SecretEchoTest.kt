@@ -11,6 +11,10 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestFactory
 import org.snakeyaml.engine.v2.api.LoadSettings
 import org.snakeyaml.engine.v2.api.lowlevel.Compose
+import org.snakeyaml.engine.v2.nodes.MappingNode
+import org.snakeyaml.engine.v2.nodes.Node
+import org.snakeyaml.engine.v2.nodes.ScalarNode
+import org.snakeyaml.engine.v2.nodes.SequenceNode
 
 /**
  * Nothing an operator writes on a path that can hold a secret comes back out in
@@ -62,12 +66,89 @@ class SecretEchoTest {
             (SecretBearingPaths.refs + SecretBearingPaths.containers).toList()
     }
 
+    /**
+     * The condition the guard actually depends on.
+     *
+     * [MappingReader.secretRef]'s check fires when the block *around* the field
+     * is read, and two of the three blocks are optional — so "an unlisted field
+     * fails on the first parse" is only true while every block is opened by some
+     * valid example. It is today, by coincidence: `proxy-full.yaml` writes
+     * `control:` and `full.yaml` writes `rcon:`, while `proxy-minimal.yaml`
+     * reaches neither. This turns the coincidence into a checked fact, so that a
+     * fourth secret-bearing field under a new optional block cannot arrive with
+     * no example that opens it.
+     */
+    @Test
+    fun `every block that can hold a secret reference is written by a valid example`() {
+        val documents = Fixtures.names("valid").flatMap { compose(Fixtures.load("valid/$it")) }
+
+        SecretBearingPaths.containers.forEach { container ->
+            val written = documents.any { hasPath(it, container.split('.')) }
+            if (!written) {
+                throw AssertionError(
+                    "no example under valid/ writes `$container`, so no parse opens that block and the " +
+                        "check in MappingReader.secretRef would never run for a field added inside it",
+                )
+            }
+        }
+    }
+
+    /**
+     * The two shape rules the list itself has to keep, both of which decide
+     * whether the guard fires on a developer error or on an operator's file.
+     *
+     * A path is not always a literal: [MappingReader.valueList] puts a document
+     * position in one, so membership is tested against the flattened form. And a
+     * reference one level too shallow would derive `spec` as a secret-bearing
+     * block, which would answer `spec: <anything>` on every kind with the
+     * secret-store message; that one is enforced by a `require` at
+     * initialisation, and asserted here as the property it protects.
+     *
+     * Nothing is listed under a list yet, so the flattening cannot be shown
+     * end-to-end — only that membership routes through it and leaves ordinary
+     * paths alone.
+     */
+    @Test
+    fun `the path list is in the shape the guard needs`() {
+        SecretBearingPaths.normalised("spec.backends[2].tokenSecret") shouldBe "spec.backends[].tokenSecret"
+        SecretBearingPaths.normalised("spec.forwarding.secret") shouldBe "spec.forwarding.secret"
+
+        SecretBearingPaths.refs.forEach { SecretBearingPaths.isRef(it) shouldBe true }
+        SecretBearingPaths.containers.forEach { container ->
+            SecretBearingPaths.holds(container) shouldBe true
+            if (!container.contains('.')) {
+                throw AssertionError("`$container` is a top-level block: every document of its kind opens it")
+            }
+        }
+    }
+
+    /**
+     * The coordinates lose the value, not the diagnostic.
+     *
+     * An empty `name` said "must not be empty" before this change and has to go
+     * on saying it: replacing every rejection with the syntax rule would be a
+     * quieter message wearing the same clothes as a safety fix.
+     */
+    @Test
+    fun `a rejected coordinate still says which rule it broke`() {
+        val yaml =
+            proxy(
+                "  forwarding:",
+                "    secret:",
+                "      name: \"\"",
+                "      key: ${"k".repeat(300)}",
+            )
+
+        val violations = ServerDefinitionParser.parse(yaml, "coordinates.yaml").violations()
+
+        violations.single { it.field == "spec.forwarding.secret.name" }.problem shouldBe "must not be empty"
+        violations.single { it.field == "spec.forwarding.secret.key" }.problem shouldBe
+            "must be at most 253 characters, found 300"
+    }
+
     @Test
     fun `a secret reference read at an undeclared path fails loudly rather than quietly`() {
-        val node =
-            Compose(LoadSettings.builder().build())
-                .composeAllFromString("token:\n  name: fleet-forwarding\n  key: modern-forwarding\n")
-                .first()
+        val node = compose("token:\n  name: fleet-forwarding\n  key: modern-forwarding\n").first()
         val reader = MappingReader.of("spec.invented", node, ViolationSink("guard.yaml"))
         requireNotNull(reader)
 
@@ -131,6 +212,30 @@ class SecretEchoTest {
 
         text.single { it.field == "spec.resources" }.problem shouldBe "expected a mapping, found a string"
         number.single { it.field == "spec.resources" }.problem shouldBe "expected a mapping, found a number"
+    }
+
+    private fun compose(yaml: String): List<Node> =
+        Compose(LoadSettings.builder().build()).composeAllFromString(yaml).toList()
+
+    /**
+     * Whether a document writes a dotted path. A segment ending `[]` — the
+     * spelling [SecretBearingPaths] uses for a field under a list — matches if
+     * any element of that list continues the path.
+     */
+    private fun hasPath(
+        node: Node,
+        segments: List<String>,
+    ): Boolean {
+        val segment = segments.firstOrNull() ?: return true
+        val rest = segments.drop(1)
+        if (node !is MappingNode) return false
+        val value =
+            node.value
+                .firstOrNull { (it.keyNode as? ScalarNode)?.value == segment.removeSuffix("[]") }
+                ?.valueNode
+                ?: return false
+        if (!segment.endsWith("[]")) return hasPath(value, rest)
+        return value is SequenceNode && value.value.any { hasPath(it, rest) }
     }
 
     private infix fun String.shouldNotQuote(written: String) {

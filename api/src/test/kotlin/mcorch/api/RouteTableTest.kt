@@ -2,6 +2,7 @@ package mcorch.api
 
 import io.kotest.matchers.collections.shouldContainAll
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.string.shouldContain
 import mcorch.api.auth.OperatorAuth
 import mcorch.api.auth.SessionRegistry
 import mcorch.api.http.Access
@@ -136,5 +137,38 @@ class RouteTableTest {
         val again = api.call("GET", "/api/v1/secrets/real-secret/password")
         again.status shouldBe 405
         again.body shouldBe reply.body
+    }
+
+    /**
+     * A bad coordinate in the path is refused in this route's own words.
+     *
+     * `:schema` rejects the same two coordinates for a definition file, and its
+     * message explains that a coordinate is where material lands "when someone
+     * abbreviates the reference away" — a YAML mistake, and one that cannot be
+     * made over a URL where there is no reference to abbreviate. Relaying it
+     * would answer a client with advice about a file it never wrote. The rule is
+     * shared (`ResourceName.SYNTAX`, `SecretRef.KEY_SYNTAX`); the framing is not.
+     *
+     * Neither segment is repeated back, on the same rule as every other message
+     * about a secret coordinate in this system.
+     */
+    @Test
+    fun `a malformed secret coordinate is refused in this route's own words`() {
+        val badName = api.call("PUT", "/api/v1/secrets/My_Secret/password", "material", contentType = "text/plain")
+        badName.status shouldBe 400
+        badName.body shouldContain "the `name` segment of the path"
+        badName.body shouldContain "lowercase letters"
+
+        // `!` rather than a space: still outside the key syntax, but a legal URI
+        // path character, so the request reaches the route it is aimed at.
+        val badKey = api.call("PUT", "/api/v1/secrets/survival-01-rcon/pass!word", "m", contentType = "text/plain")
+        badKey.status shouldBe 400
+        badKey.body shouldContain "the `key` segment of the path"
+
+        listOf(badName, badKey).forEach { reply ->
+            reply.body.contains("abbreviates the reference away") shouldBe false
+            reply.body.contains("My_Secret") shouldBe false
+            reply.body.contains("pass!word") shouldBe false
+        }
     }
 }

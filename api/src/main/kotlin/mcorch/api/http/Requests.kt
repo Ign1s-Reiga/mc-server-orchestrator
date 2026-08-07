@@ -58,11 +58,34 @@ internal object Requests {
         }
     }
 
+    /**
+     * The two path segments of `/api/v1/secrets/{name}/{key}`, as coordinates.
+     *
+     * The rule is `:schema`'s and the wording is this route's. `SecretRef.of`
+     * explains a rejection in terms of a definition file — it tells the reader
+     * that a coordinate is where material lands "when someone abbreviates the
+     * reference away" — and that mistake is not reachable over a URL, where
+     * there is no reference to abbreviate. Relaying it would answer a client
+     * with advice about a file it never wrote.
+     *
+     * Neither segment is quoted back, matching every other message about a
+     * secret coordinate in this system.
+     */
     fun secretRef(request: Request): SecretRef {
         val name = request.pathParams["name"].orEmpty()
         val key = request.pathParams["key"].orEmpty()
+        if (ResourceName.of(name).isFailure) {
+            throw ApiException(
+                ErrorCode.BAD_REQUEST,
+                "the `name` segment of the path is not a usable secret name: it must be ${ResourceName.SYNTAX}",
+            )
+        }
+        // Only the key can be left: the name was just accepted by the same rule.
         return SecretRef.of(name, key).getOrElse {
-            throw ApiException(ErrorCode.BAD_REQUEST, "the secret reference is not usable: ${it.message}")
+            throw ApiException(
+                ErrorCode.BAD_REQUEST,
+                "the `key` segment of the path is not a usable secret key: it must be ${SecretRef.KEY_SYNTAX}",
+            )
         }
     }
 
