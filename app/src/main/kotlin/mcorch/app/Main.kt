@@ -81,7 +81,22 @@ public fun main() {
             exitProcess(EXIT_MISCONFIGURED)
         }
 
-    Orchestrator.open(config).use { orchestrator ->
+    // Inside the misconfiguration channel, and not only for symmetry. `open` wires
+    // the node, and `LocalNode.open`'s stop-deadline pre-flight throws
+    // `IllegalArgumentException` with a message naming which constant to move.
+    // Outside this catch that message reached an operator as an uncaught stack trace
+    // on the default exit code — the one presentation guaranteed to be read as a
+    // crash rather than as a thing to go and fix. Nothing has been reconciled at this
+    // point, so the exit is as clean as the two config reads above.
+    val orchestrator =
+        try {
+            Orchestrator.open(config)
+        } catch (invalid: IllegalArgumentException) {
+            LOG.error("cannot start: {}", invalid.message)
+            exitProcess(EXIT_MISCONFIGURED)
+        }
+
+    orchestrator.use { orchestrator ->
         // The API is opened *inside* the orchestrator's `use` and closed before
         // it, so no request can be in a store call when the store is closed. It
         // is deliberately not part of `Orchestrator.open`: the composition root

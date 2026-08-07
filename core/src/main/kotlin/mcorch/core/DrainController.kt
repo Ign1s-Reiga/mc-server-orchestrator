@@ -2814,13 +2814,21 @@ internal class DrainController(
             try {
                 pass.node.stopWorkload(observation.handle, stopGrace(pass))
             } catch (failure: NodeException) {
-                // Whatever this exception says, a stop has already been dispatched —
-                // reaching `STOPPING` is what a *successful* first stop does — so the
-                // abort must not put the registration back. That is the half a
-                // discriminator keyed on the exception class gets wrong, and it is the
-                // mirror of the half a discriminator keyed on the state gets wrong in
-                // [stop]. Neither is asked now: the record decides. See
-                // [restoreRegistration].
+                // Whatever this exception says, the abort must not put the
+                // registration back on the strength of *this* call having failed.
+                // That is the half a discriminator keyed on the exception class gets
+                // wrong, and it is the mirror of the half a discriminator keyed on the
+                // state gets wrong in [stop]. Neither is asked: the record decides.
+                //
+                // Note what is deliberately *not* claimed here. This used to read
+                // "reaching `STOPPING` is what a successful first stop does", which is
+                // false — the already-down branch reaches `STOPPING` from the
+                // observation without dispatching anything, so arriving in this catch
+                // does not by itself mean a `SIGTERM` was ever sent. It does not need
+                // to: `dispatching` is stamped before the call above, so the record is
+                // true either way, and it is the record [restoreRegistration] reads.
+                // Getting here with no earlier dispatch means the stamp this pass just
+                // wrote is the first one, which is exactly right.
                 return abort(
                     subject = pass.subject,
                     permanentFailureStopsPasses = pass.permanentFailureStopsPasses,

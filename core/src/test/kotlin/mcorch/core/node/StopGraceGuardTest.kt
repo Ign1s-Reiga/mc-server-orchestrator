@@ -271,10 +271,15 @@ class StopGraceGuardTest {
      * timeout sends one), so all it supplies is a fresh grace period on a fresh
      * transport deadline, and it reaches `SIGKILL` only when its own grace period
      * expires before its own deadline. `GrpcCriClient` sets that deadline to
-     * `min(gracePeriod, CriTimeouts.stopDeadlineCap) + deadlineSlack`. Above the cap
-     * the two are ordered the wrong way **by construction**, so every re-issue ends
-     * exactly as the first did, on every pass, for ever. No retry count reaches that
-     * — it is the inequality. It is not confined to the re-issue either:
+     * `min(gracePeriod, CriTimeouts.stopDeadlineCap) + deadlineSlack`. Past
+     * **`stopDeadlineCap + deadlineSlack`** the two are ordered the wrong way by
+     * construction, so every re-issue ends exactly as the first did, on every pass,
+     * for ever. No retry count reaches that — it is the inequality. Note the
+     * threshold is the cap *plus the slack*: inside that band the grace period is
+     * still what expires and the kill is still reached, which is `:cri`'s own
+     * wording. The assertions below are stated at the bare cap, one slack short,
+     * deliberately — the slack is a margin `:cri` may retune and this relation
+     * should not be spending it. It is not confined to the re-issue either:
      * `DrainController.stop` calls with the same value, times out on the same
      * inequality and aborts as *retryable*, so the next pass comes back into the same
      * call. Both stop sites spin, and each is behaving correctly in isolation.
@@ -308,17 +313,24 @@ class StopGraceGuardTest {
      * unbounded grace period is refused by the rule that owns it, not by the
      * catch-all`, above.
      *
-     * ## Why a test and not a `require`
+     * ## Why this is a test, given that a `require` also exists
      *
-     * It would have gone in [StopGraceCeiling]'s `init`, next to the reason, the way
+     * The check would naturally have gone in [StopGraceCeiling]'s `init`, the way
      * `SpecBounds.init` binds its own two borrowed constants. The far side is a
      * `:cri` type and [StopGraceCeiling] lives in `Node.kt`, which is the
      * distribution seam: `:cri` is an `implementation` dependency precisely so that
      * `LocalNode` is the only class in `:core` naming a CRI type, and putting one in
      * the interface's own file would make the seam's policy ceiling a statement about
-     * one runtime's transport configuration. A test sees both modules, runs on every
-     * build, and carries the reason. The day the cap becomes something `:core` owns,
-     * move it.
+     * one runtime's transport configuration.
+     *
+     * So the relation is held in two places and **this is not the only one**.
+     * `LocalNode.open` carries a `require` against the cap its own client is built
+     * with, which is the deployment half; see
+     * `opening a node runs the stop deadline pre-flight…` below. This is the constant
+     * half: it runs on every build with no node constructed, and it names which of
+     * the four constants moved. A `require` cannot do that job — it only fires where
+     * a node is opened — and a test cannot do the other one, because it cannot see a
+     * config a future `LocalNodeConfig` might supply.
      *
      * This says nothing about what containerd then does, which is `:cri`'s to measure
      * and is measured — `StopDeadlineCapIT`. What is asserted here is arithmetic on
@@ -437,12 +449,20 @@ class StopGraceGuardTest {
      * is itself a hit, so this cannot be a ban any more and is a **classification**:
      * a file that names either token is either one that builds a [CriClientConfig],
      * which is a `Node` implementation wiring its own transport and is entitled to an
-     * opinion about its own deadline, or it is a finding. That is deliberately
-     * coarser than the call-site unit this repo prefers, and the reason is worth
-     * writing rather than tightening: a wrapper file could buy it off, and the
-     * `require` is the enforcement point standing behind it. A list of permitted
-     * *paths* was the alternative and is worse — the next `Node` implementation would
-     * have to be edited past it, which is the seam this project protects.
+     * opinion about its own deadline, or it is a finding. A list of permitted *paths*
+     * was the alternative and is worse — the next `Node` implementation would have to
+     * be edited past it, which is the seam this project protects.
+     *
+     * **`LocalNode.kt` is therefore permanently exempt, and what covers it is not
+     * this test.** It names the field in code, so it is in the wiring class for good,
+     * and a `copy(timeouts = …)` *there* is invisible here. Nor is it covered merely
+     * because a `require` sits in the file: the property is an **identity** — the
+     * `require` reads `criConfig.timeouts.stopDeadlineCap` and `CriClient.connect` is
+     * handed that same `criConfig` value, so the number checked is the number
+     * connected. `connect(criConfig.copy(timeouts = …))` would satisfy the `require`
+     * and run on a different cap, and nothing mechanical would notice. That identity
+     * is stated at the `require` itself, which is where somebody editing those two
+     * lines will be looking.
      *
      * Prose is exempt: `Node.kt` names the constant in several KDoc paragraphs on
      * purpose. That is what the code/comment split in [mainSources] is for, and it is
@@ -652,6 +672,11 @@ class StopGraceGuardTest {
      * as code, so a paragraph wrapped by hand or by a future formatter setting could
      * turn this red for a token that is prose — a scan going spuriously red is how a
      * scan gets deleted.
+     *
+     * Tracking depth introduces the opposite failure, which is why [codeLinesOf]
+     * hands the depth back and this asserts on it: red for prose is a nuisance,
+     * **green for a blanked file is a defect**, and only one of the two announces
+     * itself.
      */
     private fun mainSources(): List<Pair<String, List<String>>> =
         Path
@@ -659,8 +684,22 @@ class StopGraceGuardTest {
             .toFile()
             .walkTopDown()
             .filter { it.isFile && it.extension == "kt" }
-            .map { file -> file.invariantSeparatorsPath to codeLinesOf(file.readLines()) }
-            .sortedBy { it.first }
+            .map { file ->
+                val (code, depth) = codeLinesOf(file.readLines())
+                // **The stripper fails open and this is what closes it.** An unmatched
+                // terminator in prose is a compile error, loud and immediate. An
+                // unmatched *opener* — a KDoc line mentioning one, or a multi-line raw
+                // string containing one — silently blanks every line after it, so the
+                // scans below would find nothing in the rest of the file and report
+                // green. A scan that can be switched off by a comment is worse than no
+                // scan, so the depth has to come back to zero.
+                check(depth == 0) {
+                    "${file.invariantSeparatorsPath} ends inside a block comment (depth $depth). The stripper " +
+                        "has blanked the rest of the file, so every scan over it is silently vacuous — find the " +
+                        "unmatched opener, in prose or in a raw string, before trusting a green run"
+                }
+                file.invariantSeparatorsPath to code
+            }.sortedBy { it.first }
             .toList()
 
     /**
@@ -678,45 +717,47 @@ class StopGraceGuardTest {
      * Kotlin — which is the same class of hazard the function exists to handle, met
      * while documenting it.)
      */
-    private fun codeLinesOf(lines: List<String>): List<String> {
+    private fun codeLinesOf(lines: List<String>): Pair<List<String>, Int> {
         var depth = 0
-        return lines.map { raw ->
-            val line = raw.replace(STRING_LITERAL, "\"\"")
-            val kept = StringBuilder()
-            var i = 0
-            while (i < line.length) {
-                when {
-                    depth == 0 && line.startsWith("/*", i) -> {
-                        depth++
-                        i += 2
-                    }
+        val stripped =
+            lines.map { raw ->
+                val line = raw.replace(STRING_LITERAL, "\"\"")
+                val kept = StringBuilder()
+                var i = 0
+                while (i < line.length) {
+                    when {
+                        depth == 0 && line.startsWith("/*", i) -> {
+                            depth++
+                            i += 2
+                        }
 
-                    depth > 0 && line.startsWith("/*", i) -> {
-                        depth++
-                        i += 2
-                    }
+                        depth > 0 && line.startsWith("/*", i) -> {
+                            depth++
+                            i += 2
+                        }
 
-                    depth > 0 && line.startsWith("*/", i) -> {
-                        depth--
-                        i += 2
-                    }
+                        depth > 0 && line.startsWith("*/", i) -> {
+                            depth--
+                            i += 2
+                        }
 
-                    depth > 0 -> {
-                        i++
-                    }
+                        depth > 0 -> {
+                            i++
+                        }
 
-                    line.startsWith("//", i) -> {
-                        i = line.length
-                    }
+                        line.startsWith("//", i) -> {
+                            i = line.length
+                        }
 
-                    else -> {
-                        kept.append(line[i])
-                        i++
+                        else -> {
+                            kept.append(line[i])
+                            i++
+                        }
                     }
                 }
+                kept.toString()
             }
-            kept.toString()
-        }
+        return stripped to depth
     }
 
     private companion object {

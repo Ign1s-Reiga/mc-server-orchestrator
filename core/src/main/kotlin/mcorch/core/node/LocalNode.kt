@@ -1105,17 +1105,32 @@ public class LocalNode internal constructor(
          * `Node.kt` is the distribution seam, and a `:cri` type named there would
          * make the interface's policy ceiling a statement about one runtime's
          * transport configuration. **This** class is the one `:core` already permits
-         * to name CRI types, and it is the one holding the [CriClientConfig] — so it
-         * is the only place the relation can be checked against the value the process
-         * will really run on rather than against `CriTimeouts()`. The arithmetic on
-         * the constants is pinned separately, in `StopGraceGuardTest`; this binds the
-         * deployment, and neither subsumes the other.
+         * to name CRI types, and it is the one holding the [CriClientConfig]. The
+         * arithmetic on the constants is pinned separately, in `StopGraceGuardTest`;
+         * this binds the config, and neither subsumes the other.
+         *
+         * **What makes it bind the config is an identity, not the check's presence.**
+         * The `require` reads `criConfig.timeouts.stopDeadlineCap` and
+         * `CriClient.connect` is handed **the same `criConfig` value** — that is the
+         * whole of the guarantee. `connect(criConfig.copy(timeouts = …))` would
+         * satisfy the check and then run on a different cap, and no scan can see that,
+         * because this file is entitled to name these types. Keep the two naming one
+         * value; if a future edit has to transform the config, do it *above* the
+         * `require` so the check reads what is connected.
+         *
+         * Today the config is built two lines up with default timeouts, so this is
+         * asking about the same numbers `StopGraceGuardTest` asks about. The
+         * difference becomes real the moment [LocalNodeConfig] gains a timeouts input
+         * — which is precisely the change that would silently invalidate the test —
+         * and it is written this way now so that change needs no new thinking.
          *
          * It throws at wiring time, which is the right blast radius: nothing has been
          * reconciled yet, no container exists to be stranded, and the repair is a
          * code or configuration change. That is the split round 24 drew — a `require`
          * may enforce what a *planner* gets wrong, never what an operator supplies on
          * a definition, because the latter freezes a server nobody can then retire.
+         * Both operands here are compile-time constants: nothing an operator writes,
+         * in YAML or the environment, reaches this predicate.
          */
         public fun open(
             config: LocalNodeConfig,
@@ -1124,12 +1139,17 @@ public class LocalNode internal constructor(
             val criConfig = CriClientConfig(endpoint = CriEndpoint.parse(config.runtimeEndpoint))
             val ceiling = StopGraceCeiling.ceilingFor(SpecBounds.MAX_SAVE_TIMEOUT)
             require(ceiling <= criConfig.timeouts.stopDeadlineCap) {
-                "a stop this node issues may carry a grace period of up to $ceiling, but its CRI client gives up " +
-                    "on a stop after ${criConfig.timeouts.stopDeadlineCap}. A grace period past that deadline " +
-                    "never reaches the runtime's kill, and the drain re-issues it on every pass for ever — a " +
-                    "container that can only be retired with crictl. Raise CriTimeouts.stopDeadlineCap, or lower " +
-                    "PaperServerDefaults.MAX_STOP_GRACE_PERIOD and MAX_TIMEOUT, which is where the ceiling comes " +
-                    "from"
+                "a stop this node issues may carry a grace period of up to $ceiling, but its CRI client stops " +
+                    "waiting for a stop after ${criConfig.timeouts.stopDeadlineCap} plus " +
+                    "${criConfig.timeouts.deadlineSlack} of slack. A grace period past that total never reaches " +
+                    "the runtime's kill, and the drain re-issues it on every pass for ever — a container that can " +
+                    "only be retired with crictl. This refuses at the cap alone, one slack short of where the " +
+                    "behaviour changes, so that it does not depend on a margin :cri may retune. The fix is to " +
+                    "raise CriTimeouts.stopDeadlineCap: it bounds only how long one call waits, never the grace " +
+                    "period the container is given. Lowering the ceiling instead means lowering " +
+                    "PaperServerDefaults.MAX_TIMEOUT, which is the cap PaperServerReader applies to several spec " +
+                    "timeouts and not just the save timeout — and MAX_STOP_GRACE_PERIOD cannot come down on its " +
+                    "own, because SpecBounds.init requires it to stay a margin above MAX_TIMEOUT"
             }
             return LocalNode(
                 name = config.name,

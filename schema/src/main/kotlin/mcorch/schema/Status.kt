@@ -461,11 +461,19 @@ public data class DrainStatus(
      * `SIGTERM` may already have been delivered to the process a compensation is
      * about to send players back to. [state] `== STOPPING` is not that fact — a stop
      * whose deadline elapsed is caught with the drain still `DEREGISTERED` — and
-     * neither is the exception class, because a *first* stop that returned cleanly is
-     * the only thing that puts a drain in `STOPPING`, so a plain refusal of the
-     * re-issue after it still follows a dispatch. Both were proposed as discriminators
-     * and each is wrong at a different call site; this is the fact they were proxies
-     * for.
+     * neither is the exception class, because a refusal of a *re-issue* usually
+     * follows a first stop that returned cleanly and therefore a dispatch. Both were
+     * proposed as discriminators and each is wrong at a different call site; this is
+     * the fact they were proxies for.
+     *
+     * **`STOPPING` has two producers and only one of them dispatches anything.** This
+     * KDoc used to say a first stop returning cleanly was "the only thing that puts a
+     * drain in `STOPPING`". It is not: a drain whose container the runtime already
+     * reports as gone is moved to `STOPPING` from the *observation*, with no request
+     * issued and this field left as it was. That is the strongest reason to keep the
+     * discriminator on this field rather than on [state] — the state is reachable
+     * without a dispatch, and a stamp is not — so the correction strengthens the
+     * design it was written to justify rather than qualifying it.
      *
      * **Stamped before the request is issued, which is deliberately the opposite of
      * [saveRequestedAt].** The two records have opposite purposes. A save record

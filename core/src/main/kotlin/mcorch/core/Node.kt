@@ -434,9 +434,12 @@ public interface Node {
  *   deadline, never on what is sent, so a capped stop can only leave a container
  *   running *longer* than an uncapped one — containerd does not escalate to
  *   `SIGKILL` once the request context has expired. It is finished by the drain
- *   re-issuing the stop **while the grace period is inside the cap**, which is why
- *   that timeout is retryable; past the cap the re-issue ends exactly as the first
- *   call did and finishes nothing, which is what the section below is about.
+ *   re-issuing the stop **while the grace period is inside `stopDeadlineCap +
+ *   deadlineSlack`**, which is why that timeout is retryable; past that the re-issue
+ *   ends exactly as the first call did and finishes nothing, which is what the
+ *   section below is about. The guard this object applies sits at the bare cap, one
+ *   `deadlineSlack` short of where the behaviour actually changes, deliberately —
+ *   see that section.
  * - **Nothing here should be re-tightened on the strength of it.** "The call is
  *   deadlined anyway" is not an argument for capping the grace period below the save
  *   timeout: the deadline bounds the wait, and the grace period is the last-resort
@@ -514,16 +517,25 @@ public interface Node {
  * makes it live; one second spends the guard's own margin, which is why the guard is
  * where the alarm goes off rather than the container.
  *
- * **It is a test and not a `require`, and that is the seam's doing.** The check
- * would have gone in this object's `init`, the way `SpecBounds.init` binds its own
- * two borrowed constants — but the value on the far side is a `:cri` type, and this
- * file is the distribution seam. `:cri` is an `implementation` dependency precisely
- * so that `LocalNode` is the only class in `:core` naming a CRI type; putting one in
+ * **It is checked in two places, and neither is this object's `init`.** The check
+ * would naturally have gone there, the way `SpecBounds.init` binds its own two
+ * borrowed constants — but the value on the far side is a `:cri` type, and this file
+ * is the distribution seam. `:cri` is an `implementation` dependency precisely so
+ * that `LocalNode` is the only class in `:core` naming a CRI type; putting one in
  * [Node]'s own file would make the interface's policy ceiling a statement about one
  * runtime's transport configuration, which is the second `Node` implementation's
- * problem and not this type's. A `:core` test sees both modules, runs on every
- * build, and fails with the reason attached. Write the `require` here the day the
- * cap becomes something `:core` owns.
+ * problem and not this type's. So:
+ *
+ * - `StopGraceGuardTest.the ceiling a stop may carry stays inside the deadline that
+ *   finishes it` pins **the constants**. It sees both modules, runs on every build,
+ *   and fails with the reason attached.
+ * - `LocalNode.open`'s `require` pins **the deployment**. That class is the one
+ *   `:core` already permits to name CRI types and the one holding the client config,
+ *   so it can ask the question of the value its own client is built with. It throws
+ *   at wiring time, before any node exists.
+ *
+ * Neither subsumes the other, and a second `Node` implementation owes the same
+ * pre-flight about its own transport rather than inheriting one from here.
  *
  * **What is left uncovered, stated as a ruling.** [StopGrace.of] is total, so
  * `StopGrace.of(31.days, 30.days)` is constructible today and is above the cap. No
@@ -546,11 +558,15 @@ public object StopGraceCeiling {
      *
      * **It also has to stay at or under `CriTimeouts.stopDeadlineCap`**, or a stop
      * carrying it can never reach the runtime's kill however many times the drain
-     * re-issues it — *The relation a re-issued stop terminates on*, above. Nothing
-     * in this module can check that without naming a `:cri` type in the seam's own
-     * file, so it is a test rather than the `require` that would otherwise go here:
-     * `StopGraceGuardTest.the ceiling a stop may carry stays inside the deadline
-     * that finishes it`.
+     * re-issues it — *The relation a re-issued stop terminates on*, above. The
+     * behaviour actually changes one `deadlineSlack` further out, at
+     * `stopDeadlineCap + deadlineSlack`; the bound is stated at the bare cap so it
+     * does not rest on a margin `:cri` is free to change.
+     *
+     * Checked in two places, neither of them here, because a `:cri` type may not be
+     * named in the seam's own file: `StopGraceGuardTest.the ceiling a stop may carry
+     * stays inside the deadline that finishes it` for the constants, and
+     * `LocalNode.open`'s `require` for the config a node is really built with.
      */
     public val MAX: Duration = PaperServerDefaults.MAX_STOP_GRACE_PERIOD
 
