@@ -235,10 +235,20 @@ public interface CriClient : AutoCloseable {
      * The cap shortens the deadline and never the grace period, so this call can
      * only ever leave a container running longer, never kill it sooner.
      *
-     * A timeout therefore does not mean the stop failed: containerd has the stop
-     * signal and goes on with it. It does mean the kill at the end of the grace
-     * period will not happen for *this* call — re-issue the stop, which is
-     * idempotent, or read the container's state.
+     * A timeout therefore does not mean the stop failed: the container has the
+     * stop signal, and containerd will not escalate to a kill for a call that has
+     * already given up. It does mean the kill at the end of the grace period will
+     * not happen for *this* call — re-issue the stop, which is idempotent, or read
+     * the container's state.
+     *
+     * **A re-issue does not deliver the stop signal a second time**, so one
+     * carrying the same grace period ends exactly as this one did, however many
+     * times it is made. What a re-issue supplies is a fresh grace period on a
+     * fresh context, and the kill is reached only when that grace period is what
+     * expires first — which is why a re-issue inside the cap does finish the
+     * container: its own deadline then outlasts it. The runtime behaviour this
+     * rests on, and the measurements behind it, are on
+     * [CriTimeouts.stopDeadlineCap].
      *
      * @throws CriException on any failure.
      */

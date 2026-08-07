@@ -71,8 +71,13 @@ public data class CriTimeouts(
      * with `if ctx.Err() != nil { return ctx.Err() }` when the request context
      * went first (read against containerd 2.3.3, the release
      * `scripts/dev/containerd-env.sh` pins, and measured in
-     * `cri/src/integrationTest`). So when this cap fires, the container has the
-     * stop signal and will *not* be killed by that call.
+     * `cri/src/integrationTest`). So when a stop does give up at this cap, the
+     * container has the stop signal and will *not* be killed by that call. Note
+     * the condition is that the deadline expired first, and not merely that the
+     * grace period was over the cap: between the two lies a [deadlineSlack]-wide
+     * band where the deadline still outlasts the grace period and the kill is
+     * still reached, which is why `GrpcCriClient` tests the elapsed time rather
+     * than the cap.
      *
      * Re-issuing the stop is what finishes it, and not by re-delivering the
      * signal: containerd compare-and-swaps a per-container flag the first time a
@@ -81,8 +86,8 @@ public data class CriTimeouts(
      * request already sent the signal"*, in its own log on 2.3.3. What a re-issue
      * supplies is a fresh grace period on a fresh context, and the `SIGKILL` is
      * reached only when that grace period is what expires. A re-issue carrying
-     * the same over-cap grace period therefore ends exactly as the first one did,
-     * however many times it is made.
+     * the same grace period therefore ends exactly as the first one did, however
+     * many times it is made.
      *
      * Measured against that runtime: a 12s grace period on a container that
      * ignores `SIGTERM`, deadlined at 4s by a 2s cap, gave up at 4.04s and left
@@ -102,6 +107,15 @@ public data class CriTimeouts(
      * module cannot see `:schema`'s cap and deliberately does not depend on it;
      * if that cap ever rises above this, the consequence is a retryable timeout
      * on a stop that is still proceeding, not a shortened grace period.
+     *
+     * That independence runs one way, and the asymmetry is the part to be careful
+     * with. This module reads nobody else's cap, but `:core` reads *this* one —
+     * its argument that the capped path never fires for the population it
+     * reconciles rests on this default. **Raising it is a local decision; lowering
+     * it is not.** Nothing here shortens a grace period in either direction, but a
+     * lowered cap moves the point at which a healthy stop starts returning a
+     * retryable timeout, and that point is something a consumer has already
+     * reasoned about. Lower it in the same breath as the consumer resting on it.
      */
     val stopDeadlineCap: Duration = 2.hours,
 ) {
