@@ -2710,6 +2710,22 @@ internal class DrainController(
      * necessary, and a shorter grace period cannot make a stuck container stop
      * any faster than the runtime's own kill already will.
      *
+     * **What a re-issue is actually worth, because it is not unconditional.** It
+     * does not re-deliver the stop signal — containerd records that a stop with a
+     * timeout already sent one and skips it — so all it supplies is a fresh grace
+     * period on a fresh transport deadline, and it reaches the kill only when that
+     * grace period expires before that deadline. `GrpcCriClient` deadlines the call
+     * at `min(gracePeriod, CriTimeouts.stopDeadlineCap) + slack`, so a grace period
+     * **above** the cap has the two ordered the wrong way by construction and every
+     * re-issue from here ends exactly as the first one did. The sentence above then
+     * stops being true in the direction it matters: there is no runtime kill coming,
+     * and a shorter grace period *would* reach one. It is still not shortened —
+     * `failure-modes.md` item 7, and a save this drain has already confirmed makes
+     * the loop a report rather than a data-loss risk. What keeps the case empty is
+     * the constant relation in [StopGraceCeiling] (*The relation a re-issued stop
+     * terminates on*), which is where a reader looking at this branch should go
+     * next.
+     *
      * The probe is read here too, and it is the one state that treats it
      * asymmetrically. A *positive* player count blocks the re-issue and voids
      * the save, like everywhere else. A probe that merely fails does not: a
@@ -3095,7 +3111,13 @@ internal class DrainController(
      * stop and neither clause true. containerd does not escalate to `SIGKILL` once the
      * request context has expired, so a stop this loop stopped waiting for leaves the
      * container running for longer rather than dying sooner — the window is real and
-     * it is the re-issue that ends it.
+     * it is the re-issue that ends it, on every grace period the loop can present.
+     * (Only on those: a re-issue reaches the kill when its own grace period expires
+     * before its own deadline, so one carrying a grace period above
+     * `CriTimeouts.stopDeadlineCap` ends nothing. That widens this window without
+     * limit and does not narrow it, so it changes nothing about the discriminator
+     * below — see [StopGraceCeiling], *The relation a re-issued stop terminates on*,
+     * for why the case is empty.)
      *
      * **What not restoring costs, and why that is the direction to take.** The backend
      * stays out of the proxy's routing table for as long as the drain does: nothing
@@ -3104,7 +3126,9 @@ internal class DrainController(
      * makes this compensation the only mechanism. So the cost of the strand is
      * **availability**, and it lasts exactly as long as the drain does: the park is
      * retried, the stop is re-issued, the container goes, and `Reconciler.teardown`
-     * retires the whole record. No operator has to do anything for that, and the
+     * retires the whole record. No operator has to do anything for that — on the
+     * over-cap grace period the parenthesis above rules out, and only there, one
+     * would — and the
      * thirty-third audit is why it is not described as *"a converging pass writes
      * `drain = null` once the drain is no longer wanted"* any more — that recovery was
      * real and it was also this defect: the withdrawal of a cause deleted the record

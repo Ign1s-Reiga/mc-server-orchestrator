@@ -434,7 +434,9 @@ public interface Node {
  *   deadline, never on what is sent, so a capped stop can only leave a container
  *   running *longer* than an uncapped one — containerd does not escalate to
  *   `SIGKILL` once the request context has expired. It is finished by the drain
- *   re-issuing the stop, which is why that timeout is retryable.
+ *   re-issuing the stop **while the grace period is inside the cap**, which is why
+ *   that timeout is retryable; past the cap the re-issue ends exactly as the first
+ *   call did and finishes nothing, which is what the section below is about.
  * - **Nothing here should be re-tightened on the strength of it.** "The call is
  *   deadlined anyway" is not an argument for capping the grace period below the save
  *   timeout: the deadline bounds the wait, and the grace period is the last-resort
@@ -450,9 +452,82 @@ public interface Node {
  * needs both halves of the pair absurd rather than merely unvalidated. A refusal
  * there is recorded and loud where a cap that inverts the pair is silent and costs a
  * world, and it is the same answer `Duration.INFINITE` already gets.
+ *
+ * ## The relation a re-issued stop terminates on
+ *
+ * Everything above says the deadline cap costs a *report* and never a container.
+ * That is true in one direction only, and the condition is a relation between this
+ * object's constants and `:cri`'s — stated here because it is the thing a reader
+ * moving either of them has to know, and pinned in
+ * `StopGraceGuardTest.the ceiling a stop may carry stays inside the deadline that
+ * finishes it`.
+ *
+ * `DrainController.awaitStopped` re-issues a stop that did not take, with the
+ * **same** grace period. Escalating to a zero-grace kill is `failure-modes.md`
+ * item 7 and is deliberately not done. What makes a re-issue finish anything was
+ * measured against containerd 2.3.3 and is written up in
+ * `CriTimeouts.stopDeadlineCap`: a re-issue does *not* re-deliver the signal — the
+ * runtime compare-and-swaps a per-container flag the first time a stop with a
+ * timeout sends one — so all a re-issue supplies is a fresh grace period on a fresh
+ * context, and it reaches `SIGKILL` only when **its own grace period expires before
+ * its own deadline**.
+ *
+ * `GrpcCriClient` sets that deadline to `min(gracePeriod, stopDeadlineCap) + slack`.
+ * So while the grace period is at or under the cap the grace period expires first
+ * and the kill fires; above the cap the two are ordered the other way **by
+ * construction**, and every re-issue ends exactly as the first one did, on every
+ * pass, for ever. That is not a race and no retry count reaches it — it is the
+ * inequality.
+ *
+ * The relation to keep true is therefore *"nothing a [Node] can be handed exceeds
+ * the deadline `:cri` will wait for it"*, and it currently rests on four constants
+ * in three modules meeting **at equality against a strict `>`**:
+ * [MAX] here (two hours), `PaperServerDefaults.MAX_STOP_GRACE_PERIOD` it is borrowed
+ * from, `SpecBounds.MAX_SAVE_TIMEOUT` (one hour — because [ceilingFor]'s floor
+ * raises this ceiling above [MAX] once a save timeout passes `MAX - margin`), and
+ * `CriTimeouts.stopDeadlineCap` (two hours), whose own KDoc says in as many words
+ * that `:cri` cannot see `:schema`'s cap and deliberately does not depend on it. One
+ * second of movement in either of the outer two makes the loop above live.
+ *
+ * **It is a test and not a `require`, and that is the seam's doing.** The check
+ * would have gone in this object's `init`, the way `SpecBounds.init` binds its own
+ * two borrowed constants — but the value on the far side is a `:cri` type, and this
+ * file is the distribution seam. `:cri` is an `implementation` dependency precisely
+ * so that `LocalNode` is the only class in `:core` naming a CRI type; putting one in
+ * [Node]'s own file would make the interface's policy ceiling a statement about one
+ * runtime's transport configuration, which is the second `Node` implementation's
+ * problem and not this type's. A `:core` test sees both modules, runs on every
+ * build, and fails with the reason attached. Write the `require` here the day the
+ * cap becomes something `:core` owns.
+ *
+ * **What is left uncovered, stated as a ruling.** [StopGrace.of] is total, so
+ * `StopGrace.of(31.days, 30.days)` is constructible today and is above the cap. No
+ * definition the loop acts on produces one — `SpecBounds` bounds both halves at the
+ * decode and `Reconciler` acts on nothing else — so the population is empty, and the
+ * assertions named above are what keeps it empty rather than a survey saying so. If
+ * one is ever built anyway the cost is bounded and is *not* a world: the save is
+ * confirmed before step 7, `DrainStatus.stopDispatchedAt` keeps the backend out of
+ * routing, the abort is retryable and `NEEDS_ATTENTION` raises. It is a container
+ * nobody can retire without `crictl`. Shortening the re-issue's grace period is
+ * still not the answer to that — see `DrainController.awaitStopped` and
+ * `failure-modes.md` item 7 — and neither is capping this ceiling at `:cri`'s
+ * number, which would clamp
+ * one half of a validated pair by a rule that cannot see the other half. That is the
+ * thirtieth audit's finding, two sections up.
  */
 public object StopGraceCeiling {
-    /** See the note above. Two hours, borrowed from the widest cap any reader applies. */
+    /**
+     * See the note above. Two hours, borrowed from the widest cap any reader
+     * applies.
+     *
+     * **It also has to stay at or under `CriTimeouts.stopDeadlineCap`**, or a stop
+     * carrying it can never reach the runtime's kill however many times the drain
+     * re-issues it — *The relation a re-issued stop terminates on*, above. Nothing
+     * in this module can check that without naming a `:cri` type in the seam's own
+     * file, so it is a test rather than the `require` that would otherwise go here:
+     * `StopGraceGuardTest.the ceiling a stop may carry stays inside the deadline
+     * that finishes it`.
+     */
     public val MAX: Duration = PaperServerDefaults.MAX_STOP_GRACE_PERIOD
 
     /**

@@ -3,6 +3,7 @@ package mcorch.core.node
 import io.kotest.assertions.throwables.shouldThrow
 import io.kotest.assertions.withClue
 import io.kotest.matchers.collections.shouldBeEmpty
+import io.kotest.matchers.collections.shouldNotBeEmpty
 import io.kotest.matchers.comparables.shouldBeGreaterThanOrEqualTo
 import io.kotest.matchers.comparables.shouldBeLessThanOrEqualTo
 import io.kotest.matchers.nulls.shouldNotBeNull
@@ -21,6 +22,7 @@ import mcorch.cri.ContainerSpec
 import mcorch.cri.ContainerStatus
 import mcorch.cri.ContainerSummary
 import mcorch.cri.CriClient
+import mcorch.cri.CriTimeouts
 import mcorch.cri.ExecResult
 import mcorch.cri.ExecStreams
 import mcorch.cri.ImageId
@@ -39,6 +41,7 @@ import mcorch.schema.NodeName
 import mcorch.schema.PaperServerDefaults
 import mcorch.schema.ResourceName
 import mcorch.schema.SecretRef
+import mcorch.schema.SpecBounds
 import mcorch.store.SecretStore
 import mcorch.store.SecretValue
 import org.junit.jupiter.api.Test
@@ -216,6 +219,16 @@ class StopGraceGuardTest {
      * that deadline on purpose: it is measured in `:cri`, against a real containerd,
      * and asserting it here from a fake would be this module claiming a property it
      * cannot observe.
+     *
+     * **What it does have to point at, since the thirty-eighth audit.** The month
+     * built below is *above* that cap, and a stop above the cap is one whose re-issue
+     * can never reach the runtime's kill — so this is the shape of the value that
+     * would park a drain for ever, constructed here in a green test. It is legal to
+     * construct and no definition the loop acts on produces one; what keeps that true
+     * is a relation between three modules' constants, and it is asserted rather than
+     * surveyed in `the ceiling a stop may carry stays inside the deadline that
+     * finishes it`, below. Read the two together: this one says what the arithmetic
+     * does with an out-of-population pair, that one says why no pass presents one.
      */
     @Test
     fun `above a two-hour save timeout the ceiling is the save timeout, and a month-long stop goes out`(
@@ -243,6 +256,146 @@ class StopGraceGuardTest {
         client.stops
             .single()
             .second.seconds shouldBe (30.days + margin).inWholeSeconds
+    }
+
+    /**
+     * **The thirty-eighth audit's first follow-up: the loop above this one
+     * terminates on a relation between four constants in three modules, and nothing
+     * was looking at it.**
+     *
+     * `DrainController.awaitStopped` re-issues a stop that did not take, with the
+     * *same* grace period — `failure-modes.md` item 7, and deliberate. What makes a
+     * re-issue finish anything was measured against containerd 2.3.3 in
+     * `cri/src/integrationTest`: it does **not** re-deliver the stop signal (the
+     * runtime compare-and-swaps a per-container flag the first time a stop with a
+     * timeout sends one), so all it supplies is a fresh grace period on a fresh
+     * transport deadline, and it reaches `SIGKILL` only when its own grace period
+     * expires before its own deadline. `GrpcCriClient` sets that deadline to
+     * `min(gracePeriod, CriTimeouts.stopDeadlineCap) + deadlineSlack`. Above the cap
+     * the two are ordered the wrong way **by construction**, so every re-issue ends
+     * exactly as the first did, on every pass, for ever. No retry count reaches that
+     * — it is the inequality.
+     *
+     * So the property is *"nothing a `Node` can be handed exceeds the deadline `:cri`
+     * will wait for it"*, and it currently holds at **equality against a strict
+     * `>`**: one second of movement in either outer constant makes it live. `:cri`'s
+     * own KDoc says in as many words that it cannot see `:schema`'s cap and
+     * deliberately does not depend on it, which is exactly the borrowed-constant
+     * drift `SpecBounds.init` was written for one module down. `:core` depends on
+     * both and is the only place the two are visible together.
+     *
+     * ## Why the assertions are these three
+     *
+     * The first is the relation as stated. The second is the one it is not enough on
+     * its own: [StopGraceCeiling.ceilingFor] has a **floor**, so past a save timeout
+     * of `MAX - margin` the effective ceiling is the save timeout and rises with it —
+     * which puts a fourth constant, `SpecBounds.MAX_SAVE_TIMEOUT`, inside the
+     * relation. The third runs the real factory over the extreme pair the loop can
+     * present, and it stands for the whole population rather than one point:
+     * `StopGraceCeiling.bound` is `min(requested, ceilingFor(saveTimeout))` for a
+     * finite request and `ceilingFor` is non-decreasing, so a pair inside both of
+     * `SpecBounds`' ceilings lands at or under what this asserts.
+     *
+     * The one value that escapes that argument is a non-finite request, which
+     * `SpecBounds.capStop` and [StopGraceCeiling.bound] both pass through untouched —
+     * and it is covered rather than an exception: `StopGracePeriod.of` refuses it
+     * before any stop leaves this process, so it never reaches `stopContainer` and
+     * can never be what a deadline is capped below. That is the subject of `an
+     * unbounded grace period is refused by the rule that owns it, not by the
+     * catch-all`, above.
+     *
+     * ## Why a test and not a `require`
+     *
+     * It would have gone in [StopGraceCeiling]'s `init`, next to the reason, the way
+     * `SpecBounds.init` binds its own two borrowed constants. The far side is a
+     * `:cri` type and [StopGraceCeiling] lives in `Node.kt`, which is the
+     * distribution seam: `:cri` is an `implementation` dependency precisely so that
+     * `LocalNode` is the only class in `:core` naming a CRI type, and putting one in
+     * the interface's own file would make the seam's policy ceiling a statement about
+     * one runtime's transport configuration. A test sees both modules, runs on every
+     * build, and carries the reason. The day the cap becomes something `:core` owns,
+     * move it.
+     *
+     * This says nothing about what containerd then does, which is `:cri`'s to measure
+     * and is measured — `StopDeadlineCapIT`. What is asserted here is arithmetic on
+     * constants, which is the whole of what was missing.
+     */
+    @Test
+    fun `the ceiling a stop may carry stays inside the deadline that finishes it`() {
+        // The shipped configuration. `the shipped node runs on the default CRI
+        // timeouts` is what makes reading the default honest.
+        val cap = CriTimeouts().stopDeadlineCap
+
+        withClue(
+            "StopGraceCeiling.MAX is above the deadline :cri will wait for a stop, so a stop carrying it can " +
+                "never reach the runtime's kill and DrainController.awaitStopped re-issues it for ever. Raise " +
+                "CriTimeouts.stopDeadlineCap with it, or lower PaperServerDefaults.MAX_STOP_GRACE_PERIOD, which " +
+                "is where this is borrowed from",
+        ) {
+            StopGraceCeiling.MAX shouldBeLessThanOrEqualTo cap
+        }
+
+        withClue(
+            "the ceiling's floor raises it above the deadline for the widest save timeout a stored definition " +
+                "can carry, so the relation above is not enough on its own: SpecBounds.MAX_SAVE_TIMEOUT plus " +
+                "PaperServerDefaults.MIN_STOP_GRACE_MARGIN has to stay inside CriTimeouts.stopDeadlineCap too",
+        ) {
+            StopGraceCeiling.ceilingFor(SpecBounds.MAX_SAVE_TIMEOUT) shouldBeLessThanOrEqualTo cap
+        }
+
+        withClue(
+            "the extreme pair SpecBounds admits builds a StopGrace above the deadline, so some definition the " +
+                "reconcile loop acts on can park a drain in STOPPING with no exit but crictl",
+        ) {
+            StopGrace
+                .of(SpecBounds.MAX_STOP_GRACE_PERIOD, SpecBounds.MAX_SAVE_TIMEOUT)
+                .period shouldBeLessThanOrEqualTo cap
+        }
+    }
+
+    /**
+     * The premise the test above rests on, asserted rather than surveyed.
+     *
+     * It reads `CriTimeouts()`, the default. That stands for the value the shipped
+     * orchestrator runs on only while nothing in this module configures the type —
+     * `LocalNode.open` builds its `CriClientConfig` with the endpoint alone. A
+     * `LocalNodeConfig` field plumbed through to `stopDeadlineCap` would be an
+     * entirely reasonable thing to add and would make the relation above assert
+     * something nobody runs, silently, because a `CriClient` does not hand its
+     * timeouts back.
+     *
+     * The claim is deliberately the whole type rather than the one field: `:core`
+     * naming `CriTimeouts` at all is the event that has to be re-read here, and it is
+     * the same line `core/build.gradle.kts` draws for the seam — `LocalNode` is the
+     * only class in this module that may name a CRI type. Prose is exempt because
+     * three KDoc paragraphs in `Node.kt` name the constant on purpose; that is what
+     * the code/comment split below is for, and it is what makes the scan need a
+     * vacuity control.
+     */
+    @Test
+    fun `the shipped node runs on the default CRI timeouts`() {
+        val sources = mainSources()
+
+        withClue("expected to run with the :core module directory as the working directory") {
+            sources.shouldNotBeEmpty()
+        }
+
+        // The control. A scan for "this token is absent" is worth nothing unless
+        // something findable is found, and the *right* something: the call that would
+        // carry the override has to be in scope and has to survive the comment strip.
+        withClue("no CriClientConfig( in :core's code — this scan is not reading the file the claim is about") {
+            sources.filter { (_, code) -> code.any { "CriClientConfig(" in it } }.shouldNotBeEmpty()
+        }
+
+        val naming = sources.filter { (_, code) -> code.any { "CriTimeouts" in it } }.map { it.first }
+
+        withClue(
+            "these files configure the CRI timeouts, so CriTimeouts() is no longer the cap the shipped node " +
+                "runs on. Re-derive `the ceiling a stop may carry stays inside the deadline that finishes it` " +
+                "against the value actually configured before changing this assertion: $naming",
+        ) {
+            naming.shouldBeEmpty()
+        }
     }
 
     /**
@@ -383,8 +536,42 @@ class StopGraceGuardTest {
 
     private fun handle(): WorkloadHandle = WorkloadHandle(NODE, "s1", "c1")
 
+    /**
+     * Every `.kt` under this module's main sources as `path to its code lines`.
+     *
+     * Comments are dropped and string literals blanked before anything is looked
+     * for, because the token this scans for is written on purpose in three KDoc
+     * paragraphs of `Node.kt` — a scan that could not tell those from an import
+     * would be red on the day it was written and would stay red by being weakened.
+     * Line-prefix stripping is enough here and is the same fold `DrainWiringTest`
+     * uses: this repo writes block comments as `/** … */` with continuation lines
+     * starting `*`, and spotless enforces it.
+     */
+    private fun mainSources(): List<Pair<String, List<String>>> =
+        Path
+            .of("src/main/kotlin")
+            .toFile()
+            .walkTopDown()
+            .filter { it.isFile && it.extension == "kt" }
+            .map { file ->
+                val code =
+                    file.readLines().map { line ->
+                        val trimmed = line.trimStart()
+                        if (trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("/*")) {
+                            ""
+                        } else {
+                            line.replace(STRING_LITERAL, "\"\"").substringBefore("//")
+                        }
+                    }
+                file.invariantSeparatorsPath to code
+            }.sortedBy { it.first }
+            .toList()
+
     private companion object {
         val NODE: NodeName = NodeName.of("test-node").getOrThrow()
+
+        /** A string literal, so a scan for a token cannot be fooled by prose inside one. */
+        val STRING_LITERAL = Regex(""""([^"\\]|\\.)*"""")
 
         /**
          * The save timeout of a workload with no world, which is what
