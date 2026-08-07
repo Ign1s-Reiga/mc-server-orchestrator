@@ -2094,3 +2094,42 @@ Related: [[standalone-paper-drain-shape]]
      this reason. A KDoc mentioning either token shifts a count: the refusing side
      reddens spuriously, the catching side inflates and can hide a startup step that
      is genuinely outside the channel.
+
+175. **A threshold derived "in passes" is compared against a threshold measured in
+     wall-clock, and the ordering between them only holds at the backoff cap.**
+     `ReconcilerConfig.drainAttentionLedger = 6` is justified by "at the 5-minute
+     cap, `drainAttentionAfter` is three faulting passes, so six always trips the
+     time arm first, at every cadence". The second clause does not follow: the time
+     arm fires on elapsed seconds, the ledger arm on pass count, and `Backoff` starts
+     a fault streak at 1s with factor 2. Six consecutive `Retry` passes elapse in
+     1+2+4+8+16 ≈ 31s, so the count arm pre-empts the 15-minute arm by ~30x on a
+     *continuously* failing drain — the alarm fatigue `drainAttentionAfter` exists to
+     prevent. Whenever a new escalation arm is added beside an existing one, convert
+     both to the same unit at the **fastest** cadence the loop can run, not the
+     slowest. The test that "isolates the two arms" by advancing a fake clock 8
+     minutes per pass cannot see this, because the harness sets the cadence by hand
+     and the real loop sets it from `queue.failed`.
+
+176. **A funnel inserted into `advanceOnce`'s tail sees only the passes that reach
+     `step()`, and `SANDBOX_ONLY` is the early return that is *not* neutral.**
+     `advanceOnce` returns before the funnel five times: no current drain,
+     `containerIsDown`, non-`Present`, `UNKNOWN`, and `WorkloadState.SANDBOX_ONLY`.
+     The first four establish nothing and are neutral by construction. The fifth
+     `return abort(...)`s with a recorded `DRAIN_STALLED` — a genuine fault that the
+     ledger never counts, while the block that follows on the next good pass still
+     scores its −1. An intermittently-under-reporting runtime therefore drifts the
+     ledger *down*, which is the one direction the neutral-vs-health distinction was
+     written to prevent. When auditing "every pass goes through this one funnel",
+     enumerate the `return`s above it and ask of each whether it *records* anything,
+     not whether it *steps*.
+
+177. **A single scalar ledger lets one subsystem's health pay down another's
+     faults.** `settleLedger` credits −1 for `workDone` or for a block, and a block
+     only means "the probe answered and players are on". `awaitStopped`'s block
+     (players reappeared after a stop was issued) exercises neither the proxy control
+     endpoint nor the save path, yet erases one endpoint fault per pass. Likewise a
+     block that finds a `PERMANENT` failure standing scores −1 while nothing
+     recovered. Both are inside the stated rule and neither loses data — arm 1 covers
+     the permanent case — but the rule "a block is health" is only true of the
+     subsystem the pass actually touched. Any future narrowing of the flapping arm
+     has to say which fault a recovery is a recovery *of*.
