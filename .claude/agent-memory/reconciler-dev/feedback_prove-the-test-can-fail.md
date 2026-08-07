@@ -271,6 +271,12 @@ Split on the *opening* tag instead. (`drain-wiring-mutations.sh`'s awk is alread
 correct — it tracks the last name seen.) The tell: a mutation in file A reddening
 a test that cannot possibly read file A.
 
+**Put the precondition in the tool, not in your head.** After the loss below I
+gave the red-proof runner a first line that refuses to start on a dirty tree
+(`git status --porcelain --untracked-files=no`). That is the difference between a
+rule I have to remember at 2am and one I cannot break — and it is the same move
+this project keeps making in the code it audits, one level up.
+
 **"Commit first" binds any script that restores with `git checkout --`, not just
 the named harnesses.** I wrote a throwaway red-proof runner that mutates one file,
 runs the suite and restores it — and pointed it at `Node.kt` while holding
@@ -371,6 +377,26 @@ mid-run), and a `pgrep` for a pattern that matched its own command line so the
 *looked* like evidence. The common defence is to ask, before trusting any check,
 **what this would print if the thing it measures were absent** — and if the answer
 is "the same", the check is decoration.
+
+**Wait for the harness *process* to exit, not for its verdict line.** Both
+harnesses print `all N mutations caught` and then keep working — the EXIT trap
+still has sources to restore. Polling the verdict and immediately running
+`git status` showed me `LocalNode.kt` **truncated to zero bytes**, which reads
+exactly like the leftover-mutation wreckage this file warns about, and I nearly
+reported it as one. It restored itself a minute later and the tree was clean.
+Wait on the process; if a run really does leave a mutation, that is the moment
+the check means something.
+
+**And bracket the pattern, or `pgrep -f` matches the shell running it.** Checking
+whether the harness was still alive with `pgrep -f "control-plugin-mutations"`
+inside a `bash -c` whose command line contains that string returns its own PID,
+for ever — so the loop never ended and the earlier "RUNNING" reading was also
+self-matched. Write `pgrep -af "control-plugin[-]mutations"`. This is already in
+this file as one of the *"instrument that looks like a result"* family, and I
+still wrote it again in the very command meant to check for it: an anecdote does
+not stop a habit. The rule, not the story: **any `pgrep -f` in a command that
+contains the pattern needs a bracket, and if a liveness loop never ends, suspect
+the check before the subject.**
 
 **Poll for the harness's own verdict line, and read it out of the script before
 polling.** This file used to say to poll for an `exit=` line. Neither harness

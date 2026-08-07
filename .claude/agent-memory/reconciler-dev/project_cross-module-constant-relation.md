@@ -81,6 +81,21 @@ are visible together.
   because a one-line string-literal regex does not blank it. *When a red-proof of a
   fail-open fails to compile, the mutation is wrong, not the finding — go and find
   the spelling the language actually accepts.*
+- **Sweep the tests beside the file, not just the production copies.** The `git log -S`
+  sweep found three live copies of the retired `STOPPING` premise and missed
+  `StatusReconstructionTest`, which restated it as the *justification for the rule*
+  the corrected file spends sixty lines on. A retired premise migrates into test
+  prose because that is where people re-explain the rule in their own words. Run the
+  sweep over `src/test` explicitly.
+- **A shared scanner beats a copied one when its bugs are the interesting part.**
+  `:app`'s startup-channel scan counted over raw text while `:core`'s stripped
+  comments; a comment holding the counted literal inflates one side and hides a real
+  defect, while the other direction is only noise — *check which way a scan's
+  false reading points before calling it safe.* Fixed by lifting the stripper to
+  `mcorch.core.testing.KotlinSource`, a `:core` test fixture (`java-test-fixtures`
+  was already the repo's idiom via `:schema`). The argument that decided
+  lift-over-copy: the helper **fails open**, and a copy would not have inherited the
+  depth check that closes it.
 - **A remedy the operator never sees is not a remedy.** The `require`'s message
   names which of four constants to move, and `Orchestrator.open` sat outside
   `Main.kt`'s `catch (invalid: IllegalArgumentException)` — so it surfaced as an
