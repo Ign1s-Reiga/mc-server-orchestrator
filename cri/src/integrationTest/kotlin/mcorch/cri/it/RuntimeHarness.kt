@@ -42,10 +42,28 @@ internal class RuntimeHarness(
      */
     timeouts: CriTimeouts = CriTimeouts(),
 ) : AutoCloseable {
-    val client: CriClient =
-        CriClient.connect(CriClientConfig(endpoint = CriEndpoint.parse(endpoint()), timeouts = timeouts))
+    private val clients = mutableListOf<CriClient>()
+
+    val client: CriClient = clientWith(timeouts)
 
     private val sandboxes = mutableListOf<SandboxId>()
+
+    /**
+     * A second client over the same runtime, on different deadlines.
+     *
+     * For the steps of a suite that are not the thing being measured. A suite
+     * that shrinks a deadline to make it observable otherwise judges *every*
+     * call it makes by that shrunken value, including the ones that simply have
+     * to succeed — and a control step starved by the experiment's own budget
+     * fails in the shape of the defect the experiment was looking for. That has
+     * happened here once already: `StopDeadlineCapIT`'s re-issued stop, given
+     * `deadlineSlack` of 2s, timed out on a stop containerd had completed
+     * successfully in 1.73s.
+     */
+    fun clientWith(timeouts: CriTimeouts): CriClient =
+        CriClient
+            .connect(CriClientConfig(endpoint = CriEndpoint.parse(endpoint()), timeouts = timeouts))
+            .also { clients += it }
 
     /**
      * Brings up a sandbox and a running container that will not stop when asked
@@ -131,7 +149,7 @@ internal class RuntimeHarness(
                     }
             }
         }
-        client.close()
+        clients.forEach { it.close() }
     }
 
     internal companion object {

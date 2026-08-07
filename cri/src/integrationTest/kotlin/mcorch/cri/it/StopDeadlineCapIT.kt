@@ -89,10 +89,24 @@ internal class StopDeadlineCapIT {
                 }
 
                 // The re-issue is what finishes it, and it is finished by a stop
-                // whose grace period fits inside the cap: deadline outlasts the
-                // grace period, the inner wait expires first, the kill happens.
+                // whose deadline outlasts its grace period: the inner wait is
+                // then the one that expires, and the kill happens.
+                //
+                // On the shipped deadlines rather than this suite's. SLACK is 2s
+                // so that the capped stop above gives up well inside GRACE, and
+                // that same 2s is the entire budget any other stop here has for
+                // everything that is not its grace period. Measured against this
+                // runtime that tail is not small: 1s of grace, the kill, the task
+                // dead 19ms later, then 0.71s more for the exit event to reach
+                // containerd's event monitor — 1.73s of a 3s deadline, with the
+                // rest of the round trip to come. On a loaded host it has not
+                // fitted, and the re-issue then failed on a deadline this
+                // experiment picked, having done exactly what is asserted below.
+                // The measurement is the capped stop; this is the control, and it
+                // runs on what production would give it.
+                val shipped = harness.clientWith(CriTimeouts())
                 val reissuedAt = System.nanoTime()
-                harness.client.stopContainer(container, StopGracePeriod.ofSeconds(1).getOrThrow())
+                shipped.stopContainer(container, StopGracePeriod.ofSeconds(1).getOrThrow())
                 val reissueElapsed = (System.nanoTime() - reissuedAt).toDouble() / 1_000_000_000.0
                 println("re-issued with a 1s grace period: returned after ${"%.2f".format(reissueElapsed)}s")
                 harness.state(container) shouldBe ContainerState.EXITED
