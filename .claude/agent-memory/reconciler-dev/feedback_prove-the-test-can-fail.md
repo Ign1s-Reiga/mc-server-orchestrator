@@ -302,6 +302,26 @@ foreground. Having committed first is what made recovery a one-line
 once, detached, when nothing is left to change. It is slow in a way worth planning
 around: round 38's full drain run took about 80 minutes for 89 mutations.
 
+**A mutation must use a value the constructors accept, or it measures the
+constructor.** A red-proof of mine configured a CRI timeout to `Duration.ZERO`;
+`CriTimeouts.init` rejects that, so the `:core` object holding the constant failed
+class-init and **76** tests went red — the one under test among them. The run was
+indistinguishable from a real catch and attributed nothing, which is the
+per-test-case vacuity trap above arriving through the *value* rather than through
+the report parser. Re-run with a legal value (`1.hours`) and it reddened exactly
+one. **Before believing a red set, ask whether the mutation could have broken
+something every test shares**; a red count far above the claim is the tell, not a
+bonus.
+
+**The family this belongs to: an instrument that looks like a result.** Three in
+two rounds — the vacuous mutation above, a waiter polling for a sentinel the
+harness never prints (reaped, and it reads exactly like the harness dying
+mid-run), and a `pgrep` for a pattern that matched its own command line so the
+"stray process" check could never come back clean. Each produced output that
+*looked* like evidence. The common defence is to ask, before trusting any check,
+**what this would print if the thing it measures were absent** — and if the answer
+is "the same", the check is decoration.
+
 **Poll for the harness's own verdict line, and read it out of the script before
 polling.** This file used to say to poll for an `exit=` line. Neither harness
 prints one — both end with `all $ran mutations caught, each by the test case it
@@ -374,6 +394,15 @@ construction** — an identity test would have reported a record correctly retir
 in exactly the scenario where it outlived its container. Ask of any fixture: *does
 the value I am handing this exist in the field, and does anything about it differ
 between the two cases I am claiming to tell apart?*
+
+**A KDoc that spells out a block-comment terminator ends the KDoc there.** Writing
+the delimiters out while documenting a comment stripper closed the doc four lines
+early and the rest of the prose compiled as Kotlin — twenty unresolved-reference
+errors pointing at symbols nowhere near the edit, which is what the failure looks
+like from the outside. If a paragraph must discuss block comments, name them in
+words. The generalisation: **when compile errors name symbols you did not touch,
+suspect that something you wrote changed where the parser thinks code begins**
+rather than reading the errors at face value.
 
 ## When the check cannot exist, move it to the compiler
 
