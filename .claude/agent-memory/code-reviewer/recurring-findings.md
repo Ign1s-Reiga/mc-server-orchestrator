@@ -5,7 +5,7 @@ metadata:
   type: feedback
 ---
 
-Across audits of this repo the same five shapes keep coming back. Check them before
+Across audits of this repo the same shapes keep coming back. Check them before
 reading anything else in a new or changed module.
 
 1. **A control/desired-state operation with no deadline can wedge permanently.**
@@ -37,6 +37,33 @@ reading anything else in a new or changed module.
    `toIntOrNull(radix)` accepts a leading `+`/`-`. Modules that document their parser as
    "deliberately strict" have all three.
 
+6. **A prose "quote" of an error message reproduces a *neighbouring* derived value, not
+   the one the format string interpolates.** The near-miss is always a value that is
+   correct somewhere else in the same paragraph. Instance: `docs/schema.md` quoted the heap
+   violation as "the largest heap is 3276Mi"; the message interpolates
+   `JvmHeapPolicy.maxAllowedHeap(...).render()`, and 3276Mi is `defaultMaxHeap` — the same
+   quantity *after* a round-down to a whole MiB. `MemoryQuantity.render()` only uses a
+   binary suffix when it divides evenly, so the un-rounded value prints as a bare byte
+   count. Never trust a quoted message: find the format string, then evaluate every
+   interpolation for the exact input the doc names, including how the value renders.
+
+7. **"Rejected at parse time, so it can never happen" is stated more absolutely than the
+   loop supports.** `:schema` validation is genuinely total for what it can see, and the
+   prose generalises that into "an invalid definition never reaches the reconcile loop".
+   The loop has its own permanent-refusal paths for things a parse cannot check — workload
+   derivation invariants, `spec.placement.node` naming an unknown node, two proxy selectors
+   matching one backend, a selector matching nothing. Whenever a doc claims a class of
+   error is impossible, grep `:core` for a refusal that records `PERMANENT`.
+
+8. **A right rule carries a stale or wrong *reason*.** The reason is usually the historical
+   incident that motivated the rule, restated in the present tense after validation closed
+   the hole (proxy `network.port`: the wedged-drain account is what accepting another value
+   *cost*, before the reader rejected it). Or it names a mechanism that does not exist on
+   this path (`minecraftVersion` "quote it or YAML reads it as a number" — the reader takes
+   `ScalarNode.value`, the raw text, and never consults the resolved tag). Weigh these as
+   heavily as wrong numbers: the user says so explicitly, and a wrong reason survives
+   longer because the rule it defends is correct.
+
 **Why:** These are the findings that survived to the "fix before merge" bucket in more
 than one review. The user writes very high-quality prose around the code, which makes
 lapses harder to spot by reading — the prose describes the intended invariant even where
@@ -44,6 +71,7 @@ the code misses it.
 
 **How to apply:** Read the code against the doc comment rather than with it. When a
 comment enumerates a list (libraries excluded, versions supported, fields redacted),
-check the enumeration item by item against what executes.
+check the enumeration item by item against what executes. When it quotes a message or a
+number, re-derive it from the source for the exact input named.
 
 See [[review-output-style]] and [[user-profile]].
