@@ -271,6 +271,25 @@ Split on the *opening* tag instead. (`drain-wiring-mutations.sh`'s awk is alread
 correct — it tracks the last name seen.) The tell: a mutation in file A reddening
 a test that cannot possibly read file A.
 
+**"Commit first" binds any script that restores with `git checkout --`, not just
+the named harnesses.** I wrote a throwaway red-proof runner that mutates one file,
+runs the suite and restores it — and pointed it at `Node.kt` while holding
+uncommitted edits to `Node.kt`. The restore reverted my work, silently, and the
+tell was almost invisible: the file simply **stopped appearing in `git status`**,
+which reads like nothing happened rather than like something was lost. I only
+caught it because the next thing I did happened to grep for text I had written.
+Two habits: commit before pointing any restoring tool at a file, and after a
+restore, check that the files you edited are *still listed as modified* rather
+than checking that the tree is clean — "clean" is the failure here, not the
+success.
+
+**Two more from the same script.** `git add -A` after a red-proof swept the
+harness and its 660-line log into the commit; stage explicitly or clean up before
+committing, and read `git show --stat` before moving on. And a habitual
+`--no-gpg-sign` went onto a commit in a repo that signs everything — check
+`git log --format=%G?` rather than assuming the flag you always pass is still the
+right one.
+
 **Never run a mutation harness in the background while you are still editing.** It
 backs the sources up at start and restores them at exit, so every edit made during
 the run is either silently reverted at the end or mutated underneath the run — and

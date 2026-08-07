@@ -69,8 +69,28 @@ are visible together.
   [[invariants-need-an-enforcement-point]]'s "a source scan's holes".
 - **A comment-strip keyed on the line prefix reads a wrapped block-comment line as
   code**, so the scan can go spuriously red on prose — and a scan that cries wolf is
-  a scan somebody deletes. Track `/* … */` depth instead, and blank string literals
-  first so neither a `//` nor a `/*` inside one can open a comment.
+  a scan somebody deletes. Track block-comment depth instead, and blank string
+  literals first so neither a `//` nor an opener inside one can open a comment.
+- **Depth tracking then fails the other way, and only one of the two announces
+  itself.** An unmatched *opener* blanks the rest of the file, so every scan over it
+  reads green — the fail-open. So `codeLinesOf` returns its depth and the caller
+  requires zero per file. Worth knowing when red-proving it: an opener in **prose**
+  does not compile (Kotlin nests block comments, so the KDoc's terminator closes the
+  inner one and the file runs on), which makes it loud and not the hazard. The case
+  that compiles and is silent is a **multi-line raw string** containing an opener,
+  because a one-line string-literal regex does not blank it. *When a red-proof of a
+  fail-open fails to compile, the mutation is wrong, not the finding — go and find
+  the spelling the language actually accepts.*
+- **A remedy the operator never sees is not a remedy.** The `require`'s message
+  names which of four constants to move, and `Orchestrator.open` sat outside
+  `Main.kt`'s `catch (invalid: IllegalArgumentException)` — so it surfaced as an
+  uncaught stack trace on the default exit code, the one presentation guaranteed to
+  read as a crash. **After adding a `require` anywhere in a startup path, follow the
+  exception all the way to what the operator sees.** Pinned in `:app` by *counting*
+  refusing steps against catching arms rather than matching one, so a third step
+  added outside the channel is caught; and the arm catches `IllegalArgumentException`
+  precisely because `require` throws that, so turning the pre-flight into a
+  `NodeException` would slip past it.
 - **The finding the trace turned up, which the audit had not.** `DrainController.stop`
   reaches the same inequality **first**: its call times out, its catch aborts as
   retryable, the next pass comes back into the same call. Both spin, and each is
