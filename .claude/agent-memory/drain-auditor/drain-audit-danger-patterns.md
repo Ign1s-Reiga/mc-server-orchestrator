@@ -1869,11 +1869,17 @@ Related: [[standalone-paper-drain-shape]]
      `->` sits on a third state's line hides the arm completely, and if `CREATED` is
      wrapped with it the classifying/`CREATED` counts fall *together* so the alphabet
      control still balances — widening the existing `couldBeTheContainerTheEditIsAbout`
-     arm by one state does exactly this; (b) unqualified enum entries, legal under
-     Kotlin 2.4's context-sensitive resolution, drop out of the alphabet with no count
-     mismatch; (c) `if (state == WorkloadState.SANDBOX_ONLY)` is not a `when` arm at
-     all, and `:core/main` already has three of them (`DrainController` ~352,
-     `Reconciler` ~720 and ~2073). The `else` test closes a fourth shape. A scan built
+     arm by one state does exactly this; (b) unqualified enum entries drop out of the alphabet with no
+     count mismatch. **The stated mechanism was wrong and the hole was real:**
+     `SANDBOX_ONLY -> true` in a `when` does *not* compile on Kotlin 2.4.10 (no
+     context-sensitive resolution by default, no flag enables it); what compiles in
+     every version is `import mcorch.core.WorkloadState.SANDBOX_ONLY`, one IDE
+     quick-fix away. Name a mechanism only after compiling it, or the catch is an
+     UNKNOWN dressed as a finding; (c) `if (state == WorkloadState.SANDBOX_ONLY)` is not a `when` arm at
+     all, and `:core/main` has **five** of them, not three
+     (`DrainController` ~363, `Reconciler` ~720 and ~2073, and `LocalNode.ensureWorkload`
+     twice, ~361 and ~410 — one function classifying the state at both its adoption
+     and its collision path). The `else` test closes a fourth shape. A scan built
      to find omissions should be mutated with the shapes a *formatter* produces, not
      only the shapes an author types.
 156. **Verified this round, so do not re-derive:** `mainSources()` walks the whole
@@ -1886,3 +1892,49 @@ Related: [[standalone-paper-drain-shape]]
      so a null storage record claims nothing and gates nothing;
      `bound = observation is Present` is the project's own definition of bound, so
      `copy(bound = true)` on an `EXITED` container is consistent rather than a lie.
+
+157. **A read-side reconstruction keyed on a drain state must survey every producer
+     of that state, not only the one the field was designed around.**
+     `StatusReconstruction.reconstruct` stamps `stopDispatchedAt` from
+     `enteredStateAt` whenever `state == STOPPING && stopDispatchedAt == null`, on the
+     stated premise that *"a drain reaches `STOPPING` only after a stop request
+     returned cleanly"*. There are **two** producers of `STOPPING`:
+     `DrainController.stop` (~2669, always stamped) and the already-down branch
+     (~302, `letGo.moveTo(STOPPING, now)`), which is reached whenever
+     `containerIsDown` answers — `Absent`, `EXITED`, `CREATED`, or `SANDBOX_ONLY`
+     with `hadContainer == false` — and which never dispatched anything. That record
+     is drafted into the status (`Reconciler` ~2206 / ~1229) and persisted by the
+     teardown (~2516, ~2522, ~1250, ~1253), so a **current** build routinely writes
+     the exact document the reconstruction claims only an older build could. The
+     stamp is harmless today only because `stopIsInFlight`'s observation gate
+     independently answers false for every state that branch can have been reached
+     from — i.e. the safety comes from a different argument than the documented one.
+     **Ask of any decode-time inference: which code paths write the antecedent, and
+     did the author enumerate them or assume them?**
+
+158. **A log line that asserts provenance ("the build that wrote this row") is a
+     claim the code cannot check.** `SqliteStore.decodeStatus` (~634) warns that a
+     field *"was not recorded by the build that wrote this observation"*, and its
+     KDoc leans on the line being rare — a repeat is documented as meaning the row is
+     not being written back, "a different fault and one worth seeing". Because the
+     current build produces the same document shape (see 157), the line fires in
+     ordinary operation on every replacement drain of an already-down container, and
+     the one diagnostic that would reveal a genuine write-back failure is buried in
+     routine noise. Word such a line as what was observed (*"this row carries no
+     dispatch record; reading it as X"*), never as who wrote it.
+
+159. **The `DRAIN_FAILED` exclusion is right, but the reason given for it is not, and
+     the wrong reason invites a widening.** `StatusReconstruction` excludes
+     `DRAIN_FAILED` on the ground that *"a failed drain has no edge to a stop... the
+     container is never driven down, the record is never retired"*. False for the
+     population that would need reconstructing: `advanceOnce` asks
+     `containerIsDown(hadContainer)` at ~268, **before** any state dispatch and for
+     every state including `DRAIN_FAILED`, so a genuinely-signalled container that
+     exits does drive the drain to `STOPPING`/`containerDown` and does retire the
+     record. The exclusion's real justification is the same one given for
+     `DEREGISTERED` — the false-positive rate, since most `DRAIN_FAILED` rows never
+     dispatched a stop, and a stamp there suppresses `restoreRegistration` for the
+     ordinary case. The residual is that a pre-field row which *did* dispatch and then
+     aborted is never reconstructed, so a converging pass can still delete the record
+     and re-admit. Keep the exclusion; fix the stated reason, or the next reader will
+     widen it the moment they find a retirement edge.
