@@ -1834,3 +1834,55 @@ Related: [[standalone-paper-drain-shape]]
      `forbiddenTransition`'s `couldBeTheContainerTheEditIsAbout`, and `converge` /
      `convergeProxy` (whose `SANDBOX_ONLY` arms are protected by the routing above
      them, and whose argument lives at the routing site rather than at the arm).
+
+
+## Round 36: the instrument's own alphabet, and a residual priced in a sibling's currency
+
+153. **A field whose absence "costs a player's session" was given the residual
+     paragraph of the fields whose absence costs a cycle.**
+     `DrainStatus.stopDispatchedAt` (Status.kt) argues at length that losing it
+     "errs towards re-admitting players to a container that is shutting down — the
+     direction to design against", and then closes with *"a row written before this
+     field existed reads null, so a drain caught mid-stop by an upgrade can
+     re-admit once — the same one-cycle cost every anchor here pays"*. It is not the
+     same cost: `resaveForcedAt` and `transferStartedAt` pay a cycle, this one pays
+     the thing the field exists to prevent, and it is not "once" — the record is
+     *deleted* by `clearedDrainRecord` on that pass and nothing restores it, so the
+     backend stays admitting for the rest of the grace period. `StatusCodec` writes
+     the field into a *document*, not a column, so no migration version changed when
+     it was added and no `Migration` backfills it. Whenever a residual for a new
+     optional field is written by analogy to the fields above it in the same class,
+     check that the analogy carries the *direction* of the error and not just the
+     shape of the sentence.
+154. **The rejected-discriminator argument is direction-sensitive, and reusing it at
+     the decode reverses it.** `state == STOPPING` was correctly refused as the
+     call-site discriminator because it *under*-reports a dispatch (a stop whose
+     deadline elapsed leaves the drain `DEREGISTERED`). Using it at the *decode*,
+     only for a document that has no `stopDispatchedAt` key at all, *over*-reports —
+     which withholds a re-admission and keeps the drain running to `containerDown`.
+     "That proxy was rejected" is not an argument against the safe-direction use of
+     the same proxy in a different position.
+155. **A structural scan has an alphabet, and three writable shapes are outside this
+     one.** `DrainWiringTest`'s state-arm instrument reads *the arm's own line* and
+     requires the literal `WorkloadState.` in the pattern. Verified by replicating
+     the scan and mutating: (a) a formatter-wrapped multi-state pattern where the
+     `->` sits on a third state's line hides the arm completely, and if `CREATED` is
+     wrapped with it the classifying/`CREATED` counts fall *together* so the alphabet
+     control still balances — widening the existing `couldBeTheContainerTheEditIsAbout`
+     arm by one state does exactly this; (b) unqualified enum entries, legal under
+     Kotlin 2.4's context-sensitive resolution, drop out of the alphabet with no count
+     mismatch; (c) `if (state == WorkloadState.SANDBOX_ONLY)` is not a `when` arm at
+     all, and `:core/main` already has three of them (`DrainController` ~352,
+     `Reconciler` ~720 and ~2073). The `else` test closes a fourth shape. A scan built
+     to find omissions should be mutated with the shapes a *formatter* produces, not
+     only the shapes an author types.
+156. **Verified this round, so do not re-derive:** `mainSources()` walks the whole
+     module, so file coverage is not the hole; `replacementBlocker` returns null
+     whenever `pass.previous?.drain != null`, so `blocker != null` really does imply
+     no drain record and both `converge` arms' routing arguments hold; no path removes
+     a persistent volume (`LocalNode` never deletes the volume directory), so
+     invariant 5 is structural rather than conditional; `storage?.persistent == false`
+     and `storage?.bound` are the only readers of `StorageStatus` outside rendering,
+     so a null storage record claims nothing and gates nothing;
+     `bound = observation is Present` is the project's own definition of bound, so
+     `copy(bound = true)` on an `EXITED` container is consistent rather than a lie.
