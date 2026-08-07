@@ -62,10 +62,17 @@ independently:
 The relation that matters is `StopGraceCeiling.MAX <= stopDeadlineCap`, and it
 currently holds **at equality between two independent literals.**
 
-If a grace period ever exceeds `stopDeadlineCap`, the client stops waiting
-before the runtime reaches its kill — and containerd does not re-deliver the
-stop signal on a re-issue, so re-issuing with the same grace period can never
-finish it. The drain retries for ever, reports itself, and stops nothing.
+The deadline a stop call runs under is `min(grace, cap) + slack`, so a grace
+period above the cap does **not** by itself mean the call gives up first —
+there is a `deadlineSlack`-wide band above the cap (30s on the shipped default)
+where the grace still expires first and containerd does reach the kill. The
+condition that matters is **which of the two expires first**, not whether the
+grace is over the cap.
+
+Past that band the client stops waiting before the runtime reaches its kill —
+and containerd does not re-deliver the stop signal on a re-issue, so re-issuing
+with the same grace period can never finish it. The drain retries for ever,
+reports itself, and stops nothing.
 
 Nothing is lost if that happens. But it is the one place where three modules
 that each declare independence from the others have to agree for a loop to
