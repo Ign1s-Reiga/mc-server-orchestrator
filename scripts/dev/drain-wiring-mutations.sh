@@ -1010,7 +1010,12 @@ MUTATIONS=(
     # critical itself: reverting the edit is the documented way to call off a
     # replacement, and taken mid-stop it used to put the workload back on a pass that
     # re-admits players to a container inside its grace period.
-    "D54@@$RECONCILER@@$PROXY_DRAIN@@$BACKEND_REVERT@@$WITHDRAWN_BACKEND@@$CONVERGES_INSTEAD"
+    # Two reds since the thirty-fourth audit, and it is a true dependency rather than
+    # noise: the new scenario reverts an edit mid-stop as well, so a routing line that
+    # is not there at all converges in both of them. D60 is the entry that isolates
+    # the *fact* — the line present and answering with a constant — and only the new
+    # scenario can see that one.
+    "D54@@$RECONCILER@@$PROXY_DRAIN@@$BACKEND_REVERT;$UNREPORTED_MID_STOP@@$WITHDRAWN_BACKEND@@$CONVERGES_INSTEAD"
     "D55@@$RECONCILER@@$PROXY_DRAIN@@$PROXY_REVERT@@$WITHDRAWN_PROXY@@$CONVERGES_INSTEAD_PROXY"
     # A single site back to deleting the record outright, and the same site asking
     # the rule about nothing — `clearedDrainRecord(null, …)` is `drain = null` with
