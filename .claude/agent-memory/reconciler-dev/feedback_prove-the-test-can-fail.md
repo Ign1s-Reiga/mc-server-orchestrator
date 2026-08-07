@@ -295,11 +295,24 @@ recovery.
 
 **And the full drain harness outruns a ten-minute tool timeout**, which kills it
 mid-mutation and leaves that mutation in the working tree — the same wreckage as a
-`pkill`, from a completely ordinary invocation. Run it detached and poll for its
-own `exit=` line rather than in the foreground. Having committed first is what made
-recovery a one-line `git checkout --` of a file I knew held no work of mine; run a
-subset first (`./scripts/dev/drain-wiring-mutations.sh D62 D63`) to iterate, and the
-whole set once, detached, when nothing is left to change.
+`pkill`, from a completely ordinary invocation. Run it detached rather than in the
+foreground. Having committed first is what made recovery a one-line
+`git checkout --` of a file I knew held no work of mine; run a subset first
+(`./scripts/dev/drain-wiring-mutations.sh D62 D63`) to iterate, and the whole set
+once, detached, when nothing is left to change. It is slow in a way worth planning
+around: round 38's full drain run took about 80 minutes for 89 mutations.
+
+**Poll for the harness's own verdict line, and read it out of the script before
+polling.** This file used to say to poll for an `exit=` line. Neither harness
+prints one — both end with `all $ran mutations caught, each by the test case it
+names` on stdout, or `$failures mutations were not caught as claimed` on *stderr*.
+Polling for the wrong sentinel does not fail loudly; the waiter simply never
+returns and is eventually reaped, which arrives looking like the harness died
+mid-run when it had in fact finished cleanly. Three of mine were killed that way
+in one round. Two rules: `grep` the script for its final `echo` before writing a
+waiter, and make the waiter's condition match **either** outcome — a condition
+keyed only on the success line hangs for the whole run precisely when the run
+found something.
 
 **A green `./gradlew build` did not mean the integration sources compiled.**
 Neither `:app`'s nor `:cri`'s `check` depended on `compileIntegrationTestKotlin`,
