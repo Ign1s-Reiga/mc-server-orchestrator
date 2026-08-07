@@ -434,7 +434,12 @@ public interface Node {
  *   deadline, never on what is sent, so a capped stop can only leave a container
  *   running *longer* than an uncapped one — containerd does not escalate to
  *   `SIGKILL` once the request context has expired. It is finished by the drain
- *   re-issuing the stop, which is why that timeout is retryable.
+ *   re-issuing the stop **while the grace period is inside `stopDeadlineCap +
+ *   deadlineSlack`**, which is why that timeout is retryable; past that the re-issue
+ *   ends exactly as the first call did and finishes nothing, which is what the
+ *   section below is about. The guard this object applies sits at the bare cap, one
+ *   `deadlineSlack` short of where the behaviour actually changes, deliberately —
+ *   see that section.
  * - **Nothing here should be re-tightened on the strength of it.** "The call is
  *   deadlined anyway" is not an argument for capping the grace period below the save
  *   timeout: the deadline bounds the wait, and the grace period is the last-resort
@@ -450,9 +455,119 @@ public interface Node {
  * needs both halves of the pair absurd rather than merely unvalidated. A refusal
  * there is recorded and loud where a cap that inverts the pair is silent and costs a
  * world, and it is the same answer `Duration.INFINITE` already gets.
+ *
+ * ## The relation a re-issued stop terminates on
+ *
+ * Everything above says the deadline cap costs a *report* and never a container.
+ * That is true in one direction only, and the condition is a relation between this
+ * object's constants and `:cri`'s — stated here because it is the thing a reader
+ * moving either of them has to know, and pinned in
+ * `StopGraceGuardTest.the ceiling a stop may carry stays inside the deadline that
+ * finishes it`.
+ *
+ * `DrainController.awaitStopped` re-issues a stop that did not take, with the
+ * **same** grace period. Escalating to a zero-grace kill is `failure-modes.md`
+ * item 7 and is deliberately not done. What makes a re-issue finish anything was
+ * measured against containerd 2.3.3 and is written up in
+ * `CriTimeouts.stopDeadlineCap`: a re-issue does *not* re-deliver the signal — the
+ * runtime compare-and-swaps a per-container flag the first time a stop with a
+ * timeout sends one — so all a re-issue supplies is a fresh grace period on a fresh
+ * context, and it reaches `SIGKILL` only when **its own grace period expires before
+ * its own deadline**.
+ *
+ * `GrpcCriClient` sets that deadline to `min(gracePeriod, stopDeadlineCap) + slack`.
+ * So the ordering flips at `stopDeadlineCap + deadlineSlack` and **not at the cap**,
+ * which is worth doing the arithmetic on rather than reading off the name: for a
+ * grace period between the cap and the cap plus the slack the deadline is
+ * `cap + slack`, the runtime's own wait still expires first, and the kill still
+ * fires. Past that the two are ordered the other way and every attempt ends exactly
+ * as the first one did, on every pass, for ever. That is not a race and no retry
+ * count reaches it — it is the inequality.
+ *
+ * **The guard below is nevertheless written against the bare cap, deliberately.**
+ * `deadlineSlack` is `:cri`'s to change and is a margin rather than a bound, so a
+ * relation that spent it would be one this module could lose without touching
+ * anything of its own. Thirty seconds of headroom is not worth a dependency on
+ * somebody else's margin.
+ *
+ * **It decides both stop sites and not only the re-issue**, which is worth knowing
+ * before reading either. `DrainController.stop` calls this with the same value: the
+ * capped deadline elapses, its `NodeException` catch aborts the drain as
+ * *retryable*, and the next pass comes back down the resume ladder into the same
+ * call — so on the ordinary path the first stop is already the loop and the re-issue
+ * is reached where that one returned cleanly. It is *not* reached only that way:
+ * `STOPPING` has a second producer, `DrainController`'s already-down branch, which
+ * moves a drain there from the **observation** and dispatches nothing, so a drain
+ * that arrived that way and then observes `RUNNING` lands in `awaitStopped` with the
+ * re-issue as the first stop ever sent. Nothing is lost by it — that path gates on
+ * its own `mayStop` and stamps `stopDispatchedAt` before its own call — and the
+ * outcome under an over-cap grace period is the same retryable abort. Both spin on
+ * the same inequality, and neither gives up, which is the correct behaviour of each
+ * in isolation.
+ *
+ * The relation to keep true is therefore *"nothing a [Node] can be handed exceeds
+ * the deadline `:cri` will wait for it"*, and it currently rests on four constants
+ * in three modules meeting **at equality against a strict `>`**:
+ * [MAX] here (two hours), `PaperServerDefaults.MAX_STOP_GRACE_PERIOD` it is borrowed
+ * from, `SpecBounds.MAX_SAVE_TIMEOUT` (one hour — because [ceilingFor]'s floor
+ * raises this ceiling above [MAX] once a save timeout passes `MAX - margin`), and
+ * `CriTimeouts.stopDeadlineCap` (two hours), whose own KDoc says in as many words
+ * that `:cri` cannot see `:schema`'s cap and deliberately does not depend on it.
+ * Thirty-one seconds of movement — [MAX] up, or the cap down — spends the slack and
+ * makes it live; one second spends the guard's own margin, which is why the guard is
+ * where the alarm goes off rather than the container.
+ *
+ * **It is checked in two places, and neither is this object's `init`.** The check
+ * would naturally have gone there, the way `SpecBounds.init` binds its own two
+ * borrowed constants — but the value on the far side is a `:cri` type, and this file
+ * is the distribution seam. `:cri` is an `implementation` dependency precisely so
+ * that `LocalNode` is the only class in `:core` naming a CRI type; putting one in
+ * [Node]'s own file would make the interface's policy ceiling a statement about one
+ * runtime's transport configuration, which is the second `Node` implementation's
+ * problem and not this type's. So:
+ *
+ * - `StopGraceGuardTest.the ceiling a stop may carry stays inside the deadline that
+ *   finishes it` pins **the constants**. It sees both modules, runs on every build,
+ *   and fails with the reason attached.
+ * - `LocalNode.open`'s `require` pins **the deployment**. That class is the one
+ *   `:core` already permits to name CRI types and the one holding the client config,
+ *   so it can ask the question of the value its own client is built with. It throws
+ *   at wiring time, before any node exists.
+ *
+ * Neither subsumes the other, and a second `Node` implementation owes the same
+ * pre-flight about its own transport rather than inheriting one from here.
+ *
+ * **What is left uncovered, stated as a ruling.** [StopGrace.of] is total, so
+ * `StopGrace.of(31.days, 30.days)` is constructible today and is above the cap. No
+ * definition the loop acts on produces one — `SpecBounds` bounds both halves at the
+ * decode and `Reconciler` acts on nothing else — so the population is empty, and the
+ * assertions named above are what keeps it empty rather than a survey saying so. If
+ * one is ever built anyway the cost is bounded and is *not* a world: the save is
+ * confirmed before step 7, `DrainStatus.stopDispatchedAt` keeps the backend out of
+ * routing, the abort is retryable and `NEEDS_ATTENTION` raises. It is a container
+ * nobody can retire without `crictl`. Shortening the re-issue's grace period is
+ * still not the answer to that — see `DrainController.awaitStopped` and
+ * `failure-modes.md` item 7 — and neither is capping this ceiling at `:cri`'s
+ * number, which would clamp one half of a validated pair by a rule that cannot see
+ * the other half. That is the thirtieth audit's finding, two sections up.
  */
 public object StopGraceCeiling {
-    /** See the note above. Two hours, borrowed from the widest cap any reader applies. */
+    /**
+     * See the note above. Two hours, borrowed from the widest cap any reader
+     * applies.
+     *
+     * **It also has to stay at or under `CriTimeouts.stopDeadlineCap`**, or a stop
+     * carrying it can never reach the runtime's kill however many times the drain
+     * re-issues it — *The relation a re-issued stop terminates on*, above. The
+     * behaviour actually changes one `deadlineSlack` further out, at
+     * `stopDeadlineCap + deadlineSlack`; the bound is stated at the bare cap so it
+     * does not rest on a margin `:cri` is free to change.
+     *
+     * Checked in two places, neither of them here, because a `:cri` type may not be
+     * named in the seam's own file: `StopGraceGuardTest.the ceiling a stop may carry
+     * stays inside the deadline that finishes it` for the constants, and
+     * `LocalNode.open`'s `require` for the config a node is really built with.
+     */
     public val MAX: Duration = PaperServerDefaults.MAX_STOP_GRACE_PERIOD
 
     /**

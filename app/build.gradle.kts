@@ -32,6 +32,11 @@ dependencies {
     // substrings in a response body — an assertion that passes because the key
     // moved is exactly the kind this test exists to stop.
     testImplementation(libs.snakeyaml.engine)
+
+    // `mcorch.core.testing.KotlinSource`, for the wiring test that reads Main.kt.
+    // Declared rather than copied: the helper's fail-open on an unmatched comment
+    // opener is closed in one place, and a copy here would not have inherited it.
+    testImplementation(testFixtures(project(":core")))
 }
 
 application {

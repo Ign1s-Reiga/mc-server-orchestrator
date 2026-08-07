@@ -619,16 +619,25 @@ internal class ProxyDrainTest {
      * The mirror, and the half an exception-class discriminator gets wrong: a stop
      * that could not be **re-issued** still follows one that was dispatched.
      *
-     * `awaitStopped` only runs because a *first* stop returned successfully — that is
-     * the only thing that puts a drain in `STOPPING` — so a plain `Rejected` on the
-     * re-issue is a permanent park at a container that has had its `SIGTERM`. Keying
-     * the compensation on `failure is NodeException.Timeout` would restore the
-     * registration here; keying it on `state == STOPPING` would restore it in the
-     * scenario above. The record is neither, which is why it is a record.
+     * In *this* scenario `awaitStopped` runs because a first stop returned
+     * successfully, so a plain `Rejected` on the re-issue is a permanent park at a
+     * container that has had its `SIGTERM`. Keying the compensation on
+     * `failure is NodeException.Timeout` would restore the registration here; keying
+     * it on `state == STOPPING` would restore it in the scenario above. The record is
+     * neither, which is why it is a record.
+     *
+     * **That is a fact about this fixture and not about the state.** `STOPPING` has a
+     * second producer — the already-down branch, which reaches it from the
+     * observation and dispatches nothing — so "a first stop returned successfully" is
+     * not something a reader may infer from the state, and this test does not ask
+     * them to: it drives the dispatch itself. The scenario is unchanged; only the
+     * claim above it is, because the old wording ("the only thing that puts a drain
+     * in `STOPPING`") was the premise `Status.stopDispatchedAt` has now been
+     * corrected for.
      *
      * The container is made not to exit (`onStop` returns the workload unchanged),
-     * which is the state `awaitStopped` exists for and the only way to reach the
-     * re-issue at all.
+     * which is the state `awaitStopped` exists for and how this test reaches the
+     * re-issue.
      */
     @Test
     fun `a stop that could not be re-issued does not hand the backend back either`() =

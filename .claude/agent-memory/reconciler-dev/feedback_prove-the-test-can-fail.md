@@ -1,6 +1,6 @@
 ---
 name: prove-the-test-can-fail
-description: Before trusting a green run, prove the check could have gone red — Gradle skips up-to-date tasks, virtual time hides races, a level something else re-asserts must be pinned at the wire, a mutation set beats one sabotage, a precondition the compiler refuses is written as a reason where its mutation would go, a rename must sweep the retired claim and not just the identifier, and some checks belong in the type system instead
+description: Before trusting a green run, prove the check could have gone red — Gradle skips up-to-date tasks, virtual time hides races, a level something else re-asserts must be pinned at the wire, a mutation set beats one sabotage, a mutation carrying a value a constructor rejects measures the constructor, a precondition the compiler refuses is written as a reason where its mutation would go, a rename must sweep the retired claim and not just the identifier, a grep only proves what is in your own tree so check the base before disputing a quotation, and some checks belong in the type system instead
 metadata:
   type: feedback
 ---
@@ -228,6 +228,18 @@ retired version, in the header, which is the string read first. The identifiers
 are what the tooling sees; the sentences are what a human uses to decide whether
 a green run means anything.
 
+**And a retired premise usually has no identifier to grep at all.** Round 38's
+was *"the re-issue is what finishes it"*, corrected in `:cri`'s KDoc and operator
+message in the same round it was measured — and left standing in **three**
+`:core` sentences that share no token with it: *"it is the re-issue that ends
+it"*, *"a shorter grace period cannot make a stuck container stop any faster than
+the runtime's own kill already will"*, and *"the stop is re-issued, the container
+goes"*. The audit named one of the three. What found the other two was grepping
+the **verb of the mechanism** (`re-issu`) across every module and reading each
+hit for what it *asserts* rather than what it mentions. Do that before closing a
+correction, and expect the count to be more than one: this project has now had
+"the correction landed in one file of N" twice in consecutive rounds.
+
 **Adding a test can grow an existing mutation's red set, and that is a result to
 read rather than a nuisance to suppress.** Round 26's new retryable-abort test
 spends six passes in `blocked` proving the seal is never handed back, so D23 —
@@ -259,6 +271,31 @@ Split on the *opening* tag instead. (`drain-wiring-mutations.sh`'s awk is alread
 correct — it tracks the last name seen.) The tell: a mutation in file A reddening
 a test that cannot possibly read file A.
 
+**Put the precondition in the tool, not in your head.** After the loss below I
+gave the red-proof runner a first line that refuses to start on a dirty tree
+(`git status --porcelain --untracked-files=no`). That is the difference between a
+rule I have to remember at 2am and one I cannot break — and it is the same move
+this project keeps making in the code it audits, one level up.
+
+**"Commit first" binds any script that restores with `git checkout --`, not just
+the named harnesses.** I wrote a throwaway red-proof runner that mutates one file,
+runs the suite and restores it — and pointed it at `Node.kt` while holding
+uncommitted edits to `Node.kt`. The restore reverted my work, silently, and the
+tell was almost invisible: the file simply **stopped appearing in `git status`**,
+which reads like nothing happened rather than like something was lost. I only
+caught it because the next thing I did happened to grep for text I had written.
+Two habits: commit before pointing any restoring tool at a file, and after a
+restore, check that the files you edited are *still listed as modified* rather
+than checking that the tree is clean — "clean" is the failure here, not the
+success.
+
+**Two more from the same script.** `git add -A` after a red-proof swept the
+harness and its 660-line log into the commit; stage explicitly or clean up before
+committing, and read `git show --stat` before moving on. And a habitual
+`--no-gpg-sign` went onto a commit in a repo that signs everything — check
+`git log --format=%G?` rather than assuming the flag you always pass is still the
+right one.
+
 **Never run a mutation harness in the background while you are still editing.** It
 backs the sources up at start and restores them at exit, so every edit made during
 the run is either silently reverted at the end or mutated underneath the run — and
@@ -283,11 +320,95 @@ recovery.
 
 **And the full drain harness outruns a ten-minute tool timeout**, which kills it
 mid-mutation and leaves that mutation in the working tree — the same wreckage as a
-`pkill`, from a completely ordinary invocation. Run it detached and poll for its
-own `exit=` line rather than in the foreground. Having committed first is what made
-recovery a one-line `git checkout --` of a file I knew held no work of mine; run a
-subset first (`./scripts/dev/drain-wiring-mutations.sh D62 D63`) to iterate, and the
-whole set once, detached, when nothing is left to change.
+`pkill`, from a completely ordinary invocation. Run it detached rather than in the
+foreground. Having committed first is what made recovery a one-line
+`git checkout --` of a file I knew held no work of mine; run a subset first
+(`./scripts/dev/drain-wiring-mutations.sh D62 D63`) to iterate, and the whole set
+once, detached, when nothing is left to change. It is slow in a way worth planning
+around: round 38's full drain run took about 80 minutes for 89 mutations.
+
+**A mutation must use a value the constructors accept, or it measures the
+constructor.** A red-proof of mine configured a CRI timeout to `Duration.ZERO`;
+`CriTimeouts.init` rejects that, so the `:core` object holding the constant failed
+class-init and **76** tests went red — the one under test among them. The run was
+indistinguishable from a real catch and attributed nothing, which is the
+per-test-case vacuity trap above arriving through the *value* rather than through
+the report parser. Re-run with a legal value (`1.hours`) and it reddened exactly
+one. **Before believing a red set, ask whether the mutation could have broken
+something every test shares**; a red count far above the claim is the tell, not a
+bonus.
+
+**A grep proves what is in *your* tree, and a worktree agent's tree is not the one
+the dispatcher is quoting.** I was quoted a sentence from `CriClientConfig.kt`,
+could not find it, checked `git log -- <path>` and saw the file had not moved since
+a commit my base contained, and reported the citation as unfindable — twice, the
+second time with the greps laid out as evidence. Every one of those checks was
+honest and the conclusion was wrong: `main` was **five commits ahead** of my base,
+and the sentence arrived in one of them. `git log -- <path>` answers "when did this
+move *in my history*", which is silent about commits I do not have, so it reads as
+confirmation when it is nothing of the kind.
+
+Before disputing a quotation, establish which tree it came from:
+
+- `git rev-list --count <base>..main` — is the branch behind at all? This is the
+  one question I did not ask, and it is the cheapest.
+- `git merge-base --is-ancestor <commit> HEAD` — do I actually have the commit the
+  claim rests on?
+- `git show main:<path> | grep …` — read the file *on the branch being quoted from*,
+  not the one checked out.
+
+`git merge-base HEAD main` returning the base is **not** evidence the branch is
+current; it returns the same value whether `main` has moved or not, and I read it
+as reassurance. The failure is symmetrical and worth naming for that reason: every
+symptom of reading a stale base is identical to the dispatcher having invented a
+quote. Being confidently wrong in *that* direction is expensive — it impugns a
+correct correction — so the base check comes before the accusation, not after.
+
+What did survive: recording the disagreement in a form that stayed **cheap to
+settle** — exact lines, exact command — is what let one `git show` end it instead
+of another round of assertions. And [[audit-remedies-are-hypotheses]]' rule held in
+both directions, including against my own rebuttal.
+
+**The family this belongs to: an instrument that looks like a result.** Three in
+two rounds — the vacuous mutation above, a waiter polling for a sentinel the
+harness never prints (reaped, and it reads exactly like the harness dying
+mid-run), and a `pgrep` for a pattern that matched its own command line so the
+"stray process" check could never come back clean. Each produced output that
+*looked* like evidence. The common defence is to ask, before trusting any check,
+**what this would print if the thing it measures were absent** — and if the answer
+is "the same", the check is decoration.
+
+**Wait for the harness *process* to exit, not for its verdict line.** Both
+harnesses print `all N mutations caught` and then keep working — the EXIT trap
+still has sources to restore. Polling the verdict and immediately running
+`git status` showed me `LocalNode.kt` **truncated to zero bytes**, which reads
+exactly like the leftover-mutation wreckage this file warns about, and I nearly
+reported it as one. It restored itself a minute later and the tree was clean.
+Wait on the process; if a run really does leave a mutation, that is the moment
+the check means something.
+
+**And bracket the pattern, or `pgrep -f` matches the shell running it.** Checking
+whether the harness was still alive with `pgrep -f "control-plugin-mutations"`
+inside a `bash -c` whose command line contains that string returns its own PID,
+for ever — so the loop never ended and the earlier "RUNNING" reading was also
+self-matched. Write `pgrep -af "control-plugin[-]mutations"`. This is already in
+this file as one of the *"instrument that looks like a result"* family, and I
+still wrote it again in the very command meant to check for it: an anecdote does
+not stop a habit. The rule, not the story: **any `pgrep -f` in a command that
+contains the pattern needs a bracket, and if a liveness loop never ends, suspect
+the check before the subject.**
+
+**Poll for the harness's own verdict line, and read it out of the script before
+polling.** This file used to say to poll for an `exit=` line. Neither harness
+prints one — both end with `all $ran mutations caught, each by the test case it
+names` on stdout, or `$failures mutations were not caught as claimed` on *stderr*.
+Polling for the wrong sentinel does not fail loudly; the waiter simply never
+returns and is eventually reaped, which arrives looking like the harness died
+mid-run when it had in fact finished cleanly. Three of mine were killed that way
+in one round. Two rules: `grep` the script for its final `echo` before writing a
+waiter, and make the waiter's condition match **either** outcome — a condition
+keyed only on the success line hangs for the whole run precisely when the run
+found something.
 
 **A green `./gradlew build` did not mean the integration sources compiled.**
 Neither `:app`'s nor `:cri`'s `check` depended on `compileIntegrationTestKotlin`,
@@ -349,6 +470,15 @@ construction** — an identity test would have reported a record correctly retir
 in exactly the scenario where it outlived its container. Ask of any fixture: *does
 the value I am handing this exist in the field, and does anything about it differ
 between the two cases I am claiming to tell apart?*
+
+**A KDoc that spells out a block-comment terminator ends the KDoc there.** Writing
+the delimiters out while documenting a comment stripper closed the doc four lines
+early and the rest of the prose compiled as Kotlin — twenty unresolved-reference
+errors pointing at symbols nowhere near the edit, which is what the failure looks
+like from the outside. If a paragraph must discuss block comments, name them in
+words. The generalisation: **when compile errors name symbols you did not touch,
+suspect that something you wrote changed where the parser thinks code begins**
+rather than reading the errors at face value.
 
 ## When the check cannot exist, move it to the compiler
 

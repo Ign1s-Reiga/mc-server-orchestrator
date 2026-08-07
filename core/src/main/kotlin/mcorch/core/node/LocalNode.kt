@@ -14,6 +14,7 @@ import mcorch.core.NodeException
 import mcorch.core.NodeOperation
 import mcorch.core.NodeStatus
 import mcorch.core.StopGrace
+import mcorch.core.StopGraceCeiling
 import mcorch.core.StorageRequest
 import mcorch.core.WorkloadHandle
 import mcorch.core.WorkloadObservation
@@ -45,6 +46,7 @@ import mcorch.schema.ImageRef
 import mcorch.schema.NodeName
 import mcorch.schema.ResourceName
 import mcorch.schema.SecretRef
+import mcorch.schema.SpecBounds
 import mcorch.store.SecretStore
 import mcorch.store.StoreException
 import org.slf4j.LoggerFactory
@@ -1088,14 +1090,72 @@ public class LocalNode internal constructor(
          * Does not connect eagerly: the first call is what discovers containerd
          * is down, and it fails with a retryable
          * [NodeException.Unreachable].
+         *
+         * ## The one pre-flight, and why it is here rather than at the ceiling
+         *
+         * A stop this node issues is deadlined by `:cri` at
+         * `min(gracePeriod, stopDeadlineCap) + deadlineSlack`, and a grace period
+         * past that deadline can never reach the runtime's kill however many times
+         * the drain re-issues it — [StopGraceCeiling], *The relation a re-issued stop
+         * terminates on*, has the mechanism and the measurement. So the largest grace
+         * period [StopGrace] will hand this node has to stay inside the cap the
+         * client is actually built with.
+         *
+         * `StopGraceCeiling`'s own `init` was the obvious place and it cannot be:
+         * `Node.kt` is the distribution seam, and a `:cri` type named there would
+         * make the interface's policy ceiling a statement about one runtime's
+         * transport configuration. **This** class is the one `:core` already permits
+         * to name CRI types, and it is the one holding the [CriClientConfig]. The
+         * arithmetic on the constants is pinned separately, in `StopGraceGuardTest`;
+         * this binds the config, and neither subsumes the other.
+         *
+         * **What makes it bind the config is an identity, not the check's presence.**
+         * The `require` reads `criConfig.timeouts.stopDeadlineCap` and
+         * `CriClient.connect` is handed **the same `criConfig` value** — that is the
+         * whole of the guarantee. `connect(criConfig.copy(timeouts = …))` would
+         * satisfy the check and then run on a different cap, and no scan can see that,
+         * because this file is entitled to name these types. Keep the two naming one
+         * value; if a future edit has to transform the config, do it *above* the
+         * `require` so the check reads what is connected.
+         *
+         * Today the config is built two lines up with default timeouts, so this is
+         * asking about the same numbers `StopGraceGuardTest` asks about. The
+         * difference becomes real the moment [LocalNodeConfig] gains a timeouts input
+         * — which is precisely the change that would silently invalidate the test —
+         * and it is written this way now so that change needs no new thinking.
+         *
+         * It throws at wiring time, which is the right blast radius: nothing has been
+         * reconciled yet, no container exists to be stranded, and the repair is a
+         * code or configuration change. That is the split round 24 drew — a `require`
+         * may enforce what a *planner* gets wrong, never what an operator supplies on
+         * a definition, because the latter freezes a server nobody can then retire.
+         * Both operands here are compile-time constants: nothing an operator writes,
+         * in YAML or the environment, reaches this predicate.
          */
         public fun open(
             config: LocalNodeConfig,
             secrets: SecretStore,
-        ): LocalNode =
-            LocalNode(
+        ): LocalNode {
+            val criConfig = CriClientConfig(endpoint = CriEndpoint.parse(config.runtimeEndpoint))
+            val ceiling = StopGraceCeiling.ceilingFor(SpecBounds.MAX_SAVE_TIMEOUT)
+            require(ceiling <= criConfig.timeouts.stopDeadlineCap) {
+                "a stop this node issues may carry a grace period of up to $ceiling, but its CRI client stops " +
+                    "waiting for a stop after ${criConfig.timeouts.stopDeadlineCap} plus " +
+                    "${criConfig.timeouts.deadlineSlack} of slack. A grace period past that total never reaches " +
+                    "the runtime's kill, and the drain re-issues it on every pass for ever — a container that can " +
+                    "only be retired with crictl. This refuses at the cap alone, one slack short of where the " +
+                    "behaviour changes, so that it does not depend on a margin :cri may retune. The fix is to " +
+                    "raise CriTimeouts.stopDeadlineCap: it bounds only how long one call waits, never the grace " +
+                    "period the container is given. Lowering the ceiling instead is possible but narrower than " +
+                    "it looks: PaperServerDefaults.MAX_STOP_GRACE_PERIOD can only fall as far as " +
+                    "MAX_TIMEOUT + MIN_STOP_GRACE_MARGIN before SpecBounds.init refuses it, so on the shipped " +
+                    "constants that is 1h30s and it helps only for a cap somewhere in (1h30s, 2h). Going below " +
+                    "that means lowering MAX_TIMEOUT too, which is the ceiling PaperServerReader applies to " +
+                    "several spec timeouts and not only the save timeout"
+            }
+            return LocalNode(
                 name = config.name,
-                client = CriClient.connect(CriClientConfig(endpoint = CriEndpoint.parse(config.runtimeEndpoint))),
+                client = CriClient.connect(criConfig),
                 secrets = secrets,
                 volumeRoot = config.volumeRoot,
                 logRoot = config.logRoot,
@@ -1103,6 +1163,7 @@ public class LocalNode internal constructor(
                 sandboxNamespace = config.sandboxNamespace,
                 cgroupParent = config.cgroupParent,
             )
+        }
     }
 }
 

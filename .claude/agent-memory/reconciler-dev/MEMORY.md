@@ -26,3 +26,4 @@
 - [Guard lifetime](project_guard-lifetime.md) — a refusal conditioned on a state the drain itself ends; its two outcomes, only one of which churns; the `?:` that put the erasure back.
 - [Classification scan scope](project_classification-scan-scope.md) — the two syntaxes it reads, the five exempt comparisons, the `!= RUNNING` gap left open, and the review rule I declined to fake.
 - [Producer scan scope](project_producer-scan-scope.md) — a rule in another module keyed on a state this one produces; discovery by asking the rule, the obligation moved to the producer, the guard that fires on store-dev.
+- [Cross-module constant relation](project_cross-module-constant-relation.md) — four constants at equality decide a loop's termination; why a test, not the `require`, and which mutation is informative.

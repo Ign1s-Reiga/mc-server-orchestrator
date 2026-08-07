@@ -1,5 +1,22 @@
 plugins {
     id("mcorch.kotlin-conventions")
+
+    // `mcorch.core.testing.KotlinSource` is shared: two modules pin wiring by
+    // scanning their own sources, and both need the comments gone first, because a
+    // scan a comment can move is not a scan. :app's copy was written without that
+    // and the asymmetry was a real hole — a comment holding the literal it counts
+    // inflates one side of the count.
+    //
+    // Shared as a fixture rather than copied because the interesting part of that
+    // helper is its *bugs*: it fails open on an unmatched comment opener, and the
+    // depth check that closes it would not have been inherited by a copy. Same
+    // reasoning and same mechanism as :schema's example definitions.
+    //
+    // This does not widen :core's API. The plugin adds source sets and two
+    // variants; nothing lands on the main compile classpath, and the fixture
+    // variant is only selected by `testFixtures(project(":core"))`. A plain
+    // `project(":core")` dependency — what :api and :app have — resolves as before.
+    id("java-test-fixtures")
 }
 
 // Reconcile loop, scheduler, and the node abstraction — the distribution seam.

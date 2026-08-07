@@ -31,10 +31,20 @@ class StatusReconstructionTest {
                 .shouldBeInstanceOfPaper()
                 .drain
                 .shouldNotBeNull()
-        // `enteredStateAt`, because a drain reaches STOPPING exactly when a stop
-        // request returned cleanly. Not `observedAt`, which belongs to the pass that
-        // looked rather than to the stop, and not a clock read here, which would
-        // re-date the dispatch on every read.
+        // `enteredStateAt`, because on the rows this rule exists for — the ones
+        // `letGoAndStop` produced, where a stop request did return cleanly — that is
+        // when the dispatch happened, so the reconstruction is exact. Not
+        // `observedAt`, which belongs to the pass that looked rather than to the
+        // stop, and not a clock read here, which would re-date the dispatch on every
+        // read.
+        //
+        // Deliberately *not* justified as "a drain reaches STOPPING exactly when a
+        // stop request returned cleanly", which this comment used to say and which is
+        // false: the already-down branch reaches STOPPING from the observation having
+        // dispatched nothing, so this rule has false positives by construction. What
+        // makes them harmless is the observation gate in `stopIsInFlight`, not any
+        // property of the state — see [StatusReconstruction]'s own KDoc, which spends
+        // its longest section on exactly this.
         served.stopDispatchedAt shouldBe drain.enteredStateAt
         // Nothing else moved. A reconstruction that also re-dated a save request or
         // dropped a block would be repairing what it was not asked to.
