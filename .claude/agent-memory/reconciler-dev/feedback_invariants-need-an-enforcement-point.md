@@ -1,6 +1,6 @@
 ---
 name: invariants-need-an-enforcement-point
-description: An invariant held by every call site doing the right thing is not enforced — collapse it into one function whose return type carries it, distrust any comment counting call sites, and pin wiring that no input can exercise by asserting on the source (shapes only: unconditional application, exits, gates, classification rather than lists, and the call site rather than the file as the unit; prefer a constructive unreachability argument to a survey of inputs, pin every premise of it including which object reaches the callee, and cover two gates in series with an assertion about the side effect rather than the refusal)
+description: An invariant held by every call site doing the right thing is not enforced — collapse it into one function whose return type carries it, distrust any comment counting call sites, and pin wiring that no input can exercise by asserting on the source (shapes only: unconditional application, exits, gates, classification rather than lists, and the call site rather than the file as the unit; prefer a constructive unreachability argument to a survey of inputs, pin every premise of it including which object reaches the callee, and cover two gates in series with an assertion about the side effect rather than the refusal; a source scan's holes are the meaning-preserving edits — the formatter's wrapping, the resolver's spellings, the syntax of the decision — and a control keyed on a sibling count is not one if the failure moves both)
 metadata:
   type: feedback
 ---

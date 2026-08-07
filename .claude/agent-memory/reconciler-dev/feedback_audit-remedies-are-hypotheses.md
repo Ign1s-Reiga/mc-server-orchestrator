@@ -1,6 +1,6 @@
 ---
 name: audit-remedies-are-hypotheses
-description: An audit's finding and its prescribed remedy carry different weight — the named helper may be wrong, and a remedy for "the same root" may reach only one of the defects it was filed against
+description: An audit's finding and its prescribed remedy carry different weight — the named helper may be wrong, a remedy for "the same root" may reach only one of the defects it was filed against, and even a demonstrated hole can be given a mechanism that does not compile here
 metadata:
   type: feedback
 ---
