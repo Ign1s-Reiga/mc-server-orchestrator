@@ -1,5 +1,6 @@
 package mcorch.core
 
+import io.kotest.assertions.withClue
 import io.kotest.matchers.booleans.shouldBeFalse
 import io.kotest.matchers.booleans.shouldBeTrue
 import io.kotest.matchers.collections.shouldBeEmpty
@@ -93,7 +94,7 @@ internal class FlappingEscalationTest {
             // is on the record is younger than the threshold, and on the passes where
             // there is none it is false for want of a subject.
             drain.failingTooLong(harness.clock.instant(), 15.minutes).shouldBeFalse()
-            drain.failingTooOften(LEDGER).shouldBeTrue()
+            drain.failingTooOften(harness.clock.instant(), 15.minutes, LEDGER).shouldBeTrue()
 
             // The operator-facing half. A message that said "failing since" would be
             // quoting an anchor this case does not have.
@@ -186,7 +187,7 @@ internal class FlappingEscalationTest {
 
             // The isolation, asserted rather than assumed.
             drain.faultLedger shouldBeLessThanOrEqualTo LEDGER - 1
-            drain.failingTooOften(LEDGER).shouldBeFalse()
+            drain.failingTooOften(harness.clock.instant(), 15.minutes, LEDGER).shouldBeFalse()
 
             drain.failingTooLong(harness.clock.instant(), 15.minutes).shouldBeTrue()
             status.attention().status shouldBe ConditionStatus.TRUE
@@ -289,6 +290,150 @@ internal class FlappingEscalationTest {
             carried.attempts shouldBe standing.attempts
             carried.occurredAt shouldBe standing.occurredAt
         }
+
+    /**
+     * **The forty-second audit's finding: a count is not a duration.**
+     *
+     * Six consecutive aborts each return `Retry`, so the real loop requeues them one,
+     * two, four, eight and sixteen seconds apart — the sixth lands around half a
+     * minute in. With the count as the only test, one containerd blip or one proxy
+     * restart raised the operator's single alert flag, and did not clear it for six
+     * healthy passes. That is the alarm fatigue this whole arm exists to avoid,
+     * produced by the arm.
+     *
+     * The gate is the same fifteen minutes the age arm uses, measured from
+     * `faultLedgerSince`. So the count is reached here and the flag stays down.
+     *
+     * **The cadence is the scenario, not a detail.** These are the intervals
+     * `Backoff` actually schedules for consecutive `Retry` outcomes; the other tests
+     * in this file advance minutes per pass and cannot see this at all, which is why
+     * the defect survived them. The last two assertions are what stop the test
+     * passing for the wrong reason: the count really did reach the threshold, and it
+     * is the age half that is holding the flag down.
+     */
+    @Test
+    fun `a burst of faults inside the backoff's first seconds reaches the count and is not flagged`() =
+        coreTest {
+            val harness = Harness()
+            val name = drainingServer(harness)
+            harness.node.failAlways(NodeOperation.EXEC, harness.node.unreachable(NodeOperation.EXEC))
+
+            // 1s, 2s, 4s, 8s, 16s — `Backoff`'s first five delays, jitter aside.
+            listOf(1, 2, 4, 8, 16).forEach { seconds ->
+                step(harness, name, seconds.seconds)
+            }
+            step(harness, name, 1.seconds)
+
+            val status = harness.status(name).shouldNotBeNull()
+            val drain = status.drain.shouldNotBeNull()
+
+            // Half a minute of wall clock, and the whole budget spent.
+            drain.faultLedger shouldBeGreaterThanOrEqualTo LEDGER
+            status.attention().status shouldBe ConditionStatus.FALSE
+
+            // Neither arm, and for different reasons: the count is there and the age
+            // is not; the failure is younger than the age arm's threshold.
+            drain.failingTooOften(harness.clock.instant(), 15.minutes, LEDGER).shouldBeFalse()
+            drain.failingTooLong(harness.clock.instant(), 15.minutes).shouldBeFalse()
+            harness.node.stops.shouldBeEmpty()
+        }
+
+    /**
+     * **A runtime that stops reporting a container is a fault, and it is counted.**
+     *
+     * `advance` answers a `SANDBOX_ONLY` observation with an abort before any step
+     * runs — the one early return that records a fault rather than establishing
+     * nothing. Left outside the funnel it scored zero while the healthy pass after it
+     * still scored −1, so the single class of fault this arm most needs to see could
+     * never reach the threshold, and mixed with a genuine endpoint fault it paid the
+     * endpoint's evidence down.
+     *
+     * The control is the second half: the same drain, the same passes, with the
+     * runtime reporting normally. Without it this asserts only that *something*
+     * moved the ledger.
+     */
+    @Test
+    fun `a runtime that stops reporting a container is counted like any other fault`() =
+        coreTest {
+            val harness = Harness()
+            val name = drainingServer(harness)
+
+            val reported = harness.node.workload.shouldBeInstanceOf<WorkloadObservation.Present>()
+            harness.node.workload = reported.copy(state = WorkloadState.SANDBOX_ONLY)
+            repeat(3) { step(harness, name, 1.minutes) }
+
+            val unreported =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            unreported.faultLedger shouldBe 3
+            unreported.faultLedgerSince.shouldNotBeNull()
+
+            // The control: put the container back and the same three passes pay it
+            // down again, so the number above is this abort and not the scenario.
+            harness.node.workload = reported
+            repeat(3) { step(harness, name, 1.minutes) }
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .faultLedger shouldBe 0
+        }
+
+    /**
+     * The pair's invariant, over a whole scenario rather than at one instant.
+     *
+     * `faultLedgerSince` is non-null exactly while `faultLedger` is positive. It is
+     * maintained in one expression at one funnel precisely so that no writer has to
+     * remember it — and this is what says the funnel really is the only writer. A
+     * `since` left behind after the count returns to zero would date a later,
+     * unrelated run of faults from an instant that has nothing to do with them, and
+     * the arm would fire on its first pass.
+     */
+    @Test
+    fun `the ledger and its instant are non-null together at every step of a flapping drain`() =
+        coreTest {
+            val harness = Harness()
+            val name = drainingServer(harness)
+
+            repeat(6) {
+                harness.node.failAlways(NodeOperation.EXEC, harness.node.unreachable(NodeOperation.EXEC))
+                step(harness, name, 30.seconds)
+                assertPaired(harness, name)
+                harness.node.clearFailures(NodeOperation.EXEC)
+                repeat(2) {
+                    step(harness, name, 30.seconds)
+                    assertPaired(harness, name)
+                }
+            }
+
+            // The scenario has to have exercised both sides of the invariant, or it
+            // is asserting one branch twelve times.
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .faultLedger shouldBe 0
+        }
+
+    private suspend fun assertPaired(
+        harness: Harness,
+        name: ResourceName,
+    ) {
+        val drain =
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+        withClue("ledger=${drain.faultLedger} since=${drain.faultLedgerSince}") {
+            (drain.faultLedgerSince != null) shouldBe (drain.faultLedger > 0)
+        }
+    }
 
     /** A deleted, populated server: the drain that cannot finish while people play. */
     private suspend fun drainingServer(harness: Harness): ResourceName {

@@ -487,6 +487,10 @@ internal object StatusCodec {
         // restart. Written unconditionally, including the zero, so a row's silence
         // means "written before this field" and nothing else.
         scope.put("faultLedger", drain.faultLedger)
+        // Written beside the count it dates, and null exactly when the count is
+        // zero. A drain that came back with the count and not the instant would be
+        // re-dated from the pass that noticed — one threshold later, never earlier.
+        scope.put("faultLedgerSince", drain.faultLedgerSince)
     }
 
     private fun readDrain(
@@ -510,20 +514,27 @@ internal object StatusCodec {
             destination = reader.value("$prefix.destination", ResourceName::of),
             blocked = readBlock(reader, "$prefix.blocked"),
             failure = readFailure(reader, "$prefix.failure"),
-            // Optional and clamped, where `transferAttempts` beside it is
-            // `requireInt`. Two deliberate differences from its neighbour:
+            // Read as text and parsed here rather than through `int`, which is the
+            // only way the tolerance below is actually total.
             //
-            // A missing key reads zero rather than failing the row. V6 stamps every
-            // existing document, so absence should not happen — but a decode-time
-            // refusal on this type is not charged to one server, it aborts
-            // `listServers` and with it the loop's whole view of the fleet, and this
-            // field is worth nothing beside that. Zero is also the answer that
-            // cannot escalate, so the tolerant read errs quiet rather than loud.
+            // The argument is that no hand edit of *this* field should be able to
+            // abort a fleet read: a decode-time refusal here is not charged to one
+            // server, it takes `listServers` down and with it the loop's whole view
+            // of the fleet, and a fault counter is worth nothing beside that. `int`
+            // delivers two thirds of that — absent and negative — and throws
+            // `StoreException.Corrupt` on `faultLedger=x`, which is exactly the
+            // shape a hand edit produces. `toIntOrNull` closes the third.
             //
-            // A negative is clamped for the same reason rather than refused. Nothing
-            // that writes these rows can produce one; a hand edit can, and the value
-            // it should take is not in doubt.
-            faultLedger = (reader.int("$prefix.faultLedger") ?: 0).coerceAtLeast(0),
+            // Every unreadable value lands on zero, which is the answer that cannot
+            // escalate, so the tolerance errs quiet rather than loud.
+            faultLedger = (reader.string("$prefix.faultLedger")?.toIntOrNull() ?: 0).coerceAtLeast(0),
+            // Deliberately *not* given the same treatment. An unparsable instant is
+            // read by `instant` as a refusal, and that is right here: this field's
+            // absence is meaningful — it means the count is zero — so a value that
+            // cannot be read is not the same as one that is not there, and silently
+            // answering null would date a live ledger from the pass that noticed
+            // while telling nobody. The count above has no such second reading.
+            faultLedgerSince = reader.instant("$prefix.faultLedgerSince"),
         )
     }
 

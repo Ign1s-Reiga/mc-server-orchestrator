@@ -136,6 +136,11 @@ class LegacyDrainRowTest {
             // all — and the value being one that *escalates* is what makes the
             // stripped reading a visible loss rather than a cosmetic one.
             faultLedger = 7,
+            // Paired with the count above: the invariant `DrainController` maintains
+            // is that this is non-null exactly while the count is positive, so a
+            // probe carrying a positive count and no instant would be a document the
+            // loop cannot produce.
+            faultLedgerSince = AT.minusSeconds(3600),
         )
 
     private val status =
@@ -268,6 +273,19 @@ class LegacyDrainRowTest {
                                 "is. It loses the record telling an operator the world may not have been " +
                                 "flushed, which is why the loop carries it forward rather than re-deriving",
                         expected = { it.copy(failure = null) },
+                    ),
+                "DrainStatus.faultLedgerSince" to
+                    Reads(
+                        why =
+                            "null means the ledger's age is not established, and the escalation's second arm " +
+                                "stays quiet without it — so a row that predates the field under-reports " +
+                                "rather than firing on evidence whose age nothing knows. The next pass " +
+                                "re-dates it from itself, which delays a report by one threshold and can " +
+                                "never advance one. It is read strictly, unlike the count beside it: an " +
+                                "unparsable instant is a refusal, because absence here is a *meaningful* " +
+                                "value and answering null for a corrupt one would silently re-date a live " +
+                                "ledger",
+                        expected = { it.copy(faultLedgerSince = null) },
                     ),
                 "DrainStatus.faultLedger" to
                     Reads(

@@ -220,7 +220,8 @@ private fun deriveConditions(
     // sentence ends in `drain.failure.message` — and an escalation whose text is a
     // full stop is one an operator cannot act on.
     val drainAttentionByLedger =
-        drain?.failingTooOften(attentionLedger) == true && drain.failingTooLong(now, attentionAfter).not()
+        drain?.failingTooOften(now, attentionAfter, attentionLedger) == true &&
+            drain.failingTooLong(now, attentionAfter).not()
     // The second arm, and the reason this flag is no longer a drain flag.
     //
     // A drain is not the only way the loop stops being able to move a server.

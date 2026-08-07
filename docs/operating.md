@@ -137,19 +137,27 @@ cannot see a fault that keeps clearing: a control endpoint that fails on one
 pass and behaves on the next never leaves a failure standing anywhere, and every
 recovery deletes the record and its clock. So a running total is kept instead —
 a fault adds one, a pass that finds the server healthy takes one away, floored
-at zero — and the flag fires when it reaches six. The message says *"keeps
-failing and recovering"* and quotes a count rather than a duration.
+at zero — and the flag fires when it reaches six **and** the total has been above
+zero for the same fifteen minutes. The message says *"keeps failing and
+recovering"* and quotes a count rather than a duration.
+
+Both halves matter. Six consecutive failures retry a second apart at first, so
+the count alone would reach six inside half a minute and turn one containerd
+blip into an alert. The fifteen minutes is what keeps this arm to the faults the
+first one cannot see, rather than to the ones it has not got to yet.
 
 The arithmetic is the whole rule and it is meant to be checkable in your head:
 **the total only grows while the drain is failing more often than it is
 working.**
 
-The surprise worth stating: **a fault that is present on exactly half the passes
-sits at the crossover and is not reported.** That is deliberate. Buying it would
-mean the decrement being smaller than the increment, and then no sentence
-describes where the threshold is. In practice an intermittent fault is not a
-metronome, so a genuine one-in-two fault does wander over the line eventually;
-an exactly alternating one never does.
+The surprise worth stating: **how fast the flag arrives depends on the fault
+rate, and below about half it can take most of a day.** That is the crossover
+doing its job, not a bug — the total drifts upward only above half. It is not a
+promise of silence: below half the total still wanders up to six eventually
+(hours at 40%, most of a day at 30%), and at exactly half it takes about forty
+passes. The one case that never arrives is a perfect metronome, which nothing
+real is. If you need a faster signal for a specific fault, alert on the logs for
+it rather than on this flag.
 
 Neither case stops anything. The container keeps running and the loop keeps
 retrying in both, which is what makes the flag safe to alert on.

@@ -581,11 +581,34 @@ public data class DrainStatus(
      *
      * The arithmetic is the specification and it is meant to be checkable in a
      * sentence: **the ledger grows only while a drain is failing more often than
-     * it recovers.** A fault rate below half trends to the floor and never
-     * escalates; above half it grows without bound and always does; at exactly
-     * half it is driftless, so a perfectly alternating fault does not escalate and
-     * a real one — which is never perfectly alternating — eventually does, because
-     * the floor at zero reflects the walk upward.
+     * it recovers.**
+     *
+     * That is a statement about the *drift*, not about what is reachable, and the
+     * difference is worth being exact about because the loose version has been
+     * written here before. Above half the drift is upward and the threshold is
+     * reached quickly. At or below half there is no upward drift — but the walk is
+     * not absorbed at zero either, it is reflected there, so it still reaches any
+     * threshold almost surely, just slowly: on the order of `(q/p)^N` passes below
+     * half, and `N(N+1)` passes at exactly half. **Nothing here is a guarantee of
+     * silence.** What the rate buys is how long it takes, over a range wide enough
+     * that a healthy-ish drain finishes or is torn down long first. The one case
+     * that genuinely never arrives is a perfect metronome, which nothing real is.
+     *
+     * ## One scalar, and the question it has nowhere to put
+     *
+     * A recovery pays down whatever fault came before it, whether or not the two
+     * are about the same thing. A drain waiting in `STOPPING` scores a recovery
+     * without exercising the control endpoint or the save path at all, so it can
+     * pay down a control-endpoint fault it says nothing about. Harmless while the
+     * arm is a single fleet-wide *"this drain is not converging"* signal, which is
+     * all it claims to be.
+     *
+     * It stops being harmless the moment somebody narrows the arm — per subsystem,
+     * per failure reason, per step — because the first question that change has to
+     * answer is **which fault a recovery is a recovery of**, and one integer offers
+     * nowhere to write the answer. That is a re-shaping of this field and its
+     * companion, not an extra branch at the escalation, and it is worth knowing
+     * before rather than after.
      *
      * ## Why an `Int` here rather than a derived thing
      *
@@ -607,6 +630,47 @@ public data class DrainStatus(
      * accumulating on its next fault.
      */
     val faultLedger: Int = 0,
+    /**
+     * When [faultLedger] last left zero, and null whenever it is zero.
+     *
+     * The count alone says *how much* has gone wrong and nothing about *over how
+     * long*. Six consecutive aborts requeue on a backoff of one, two, four, eight
+     * and sixteen seconds, so a single containerd blip or a proxy restart reaches
+     * six inside half a minute — and raising the operator's one alert flag on a
+     * thirty-second hiccup is the alarm fatigue this whole arm was built to avoid.
+     * This is what lets the escalation ask for a count **and** a duration, so the
+     * arm can only ever report something the age arm has already had its chance at.
+     *
+     * ## Not the set-once anchor this codebase has withdrawn twice
+     *
+     * `troubleSince` was declined and `enteredStateAt`-as-a-step-anchor was
+     * removed, both for lifetime reasons: one was never cleared by anything on the
+     * healthy path, the other was restamped by every park. The difference here is
+     * that this field has **no lifetime of its own**. It is stamped and cleared by
+     * the same arithmetic, in the same expression, at the same single funnel that
+     * moves [faultLedger] — non-null exactly while the count is positive:
+     *
+     * ```
+     * since = if (ledger == 0) null else (previous.faultLedgerSince ?: now)
+     * ```
+     *
+     * So it cannot go stale while the thing it dates has gone, and it cannot be
+     * restamped while that thing persists. The invariant
+     * `(faultLedger > 0) == (faultLedgerSince != null)` is therefore maintained by
+     * construction rather than by every writer remembering it, and there is exactly
+     * one writer.
+     *
+     * The `?: now` is a self-repair rather than a fallback of the kind
+     * [transferStartedAt] warns about, and the distinction is which way it errs. A
+     * row carrying a positive count and no instant — an intermediate build, a hand
+     * edit — is dated from the pass that noticed, which delays the report by one
+     * threshold and never advances it. The alternative, treating the pair as
+     * escalated, would report on evidence whose age nothing established.
+     *
+     * Needs no migration: absent is a legitimate value, it means null, and every
+     * row V6 wrote carries a zero count beside it.
+     */
+    val faultLedgerSince: Instant? = null,
 ) {
     /**
      * Whether a completed save has been confirmed for this drain.

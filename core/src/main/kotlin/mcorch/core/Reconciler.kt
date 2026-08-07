@@ -3059,36 +3059,35 @@ public data class ReconcilerConfig(
      *
      * ## Where six comes from
      *
-     * Derived from [drainAttentionAfter], not chosen. The two arms have to be
-     * ordered so that a drain which is failing *continuously* is still reported by
-     * the arm calibrated for it — otherwise this number quietly becomes the
-     * escalation rule and the fifteen minutes above stop meaning anything.
+     * **It is not a time equivalence, and an earlier version of this paragraph
+     * tried to make it one.** That draft argued six was safe because
+     * [drainAttentionAfter] is three consecutive faulting passes at the backoff
+     * cap, so six consecutive faults "cannot happen before three". The two halves
+     * are in different units: a count is only comparable to a wall clock at one
+     * cadence, and a fault streak does not reach the cap for about eight and a half
+     * minutes. Six consecutive aborts requeue at one, two, four, eight and sixteen
+     * seconds, so the sixth lands **around half a minute in** — and one containerd
+     * blip raised the operator's single alert flag.
      *
-     * The comparison has to be made in passes, and the loop's cadence is a backoff
-     * rather than an interval, so it has two ends. Both a fault (`Retry`) and a
-     * healthy block (`Retry`) leave `WorkQueue`'s attempt counter alone, so a drain
-     * in this state climbs `Backoff`'s 1s → 5min curve and settles at the **cap**:
-     * one pass per five minutes. At that cadence [drainAttentionAfter] is **three
-     * consecutive faulting passes**. Six is double that, so:
+     * The ordering is not this number's job at all. It belongs to the age gate on
+     * [mcorch.schema.DrainStatus.faultLedgerSince]: the arm requires the ledger to
+     * have been non-zero for [drainAttentionAfter] as well as to have reached this
+     * count, so it cannot fire until the age arm has had its whole window and
+     * declined. That is one rule in one unit, and it holds at every cadence rather
+     * than at one.
      *
-     * - a continuously failing drain always trips the time arm first, at every
-     *   cadence — six consecutive faults cannot happen before three;
-     * - an intermittent fault, which the time arm cannot report at all, is reported
-     *   here once the evidence is twice what the time arm settles for.
+     * What is left for this number to decide is **how much evidence of intermittency
+     * is a pattern**. Six is a net excess: six faults with nothing between them, or
+     * twelve passes at three faults in four, or eighteen at two in three. Fewer than
+     * about four and an ordinary flap — a proxy restart, a node blip and its retry —
+     * would qualify. It also keeps the arithmetic the operator is told in
+     * `docs/operating.md` legible: the count is the thing that has to be *earned*,
+     * and the fifteen minutes is the thing that has to have *elapsed*.
      *
-     * What six costs in wall-clock depends on how intermittent the fault is,
-     * because the ledger moves by the *net* of faults over recoveries. At the cap:
-     * a fault on three passes in four reaches six in twelve passes, about an hour;
-     * two in three, in eighteen passes, about ninety minutes; anything at or below
-     * one in two never reaches it, which is the policy. Early in a drain, before
-     * the backoff has climbed, the same counts take seconds to minutes — and that
-     * is a floor rather than a schedule: a saturated loop is slower, and nothing
-     * here assumes otherwise.
-     *
-     * Raising it makes an intermittent fault take proportionally longer to report
-     * and never makes anything quieter that is loud today. Lowering it below three
-     * is the one change that would be wrong for a reason arithmetic rather than
-     * taste: this arm would start pre-empting the time arm on continuous faults.
+     * Raising it delays an intermittent report and can never make anything quieter
+     * that is loud today, because the age gate already bounds this arm from below.
+     * Lowering it trades evidence for latency and nothing else — the blip case is
+     * held by the gate, not by the number.
      */
     val drainAttentionLedger: Int = 6,
     /**
