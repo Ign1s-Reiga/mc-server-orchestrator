@@ -1938,3 +1938,159 @@ Related: [[standalone-paper-drain-shape]]
      aborted is never reconstructed, so a converging pass can still delete the record
      and re-admit. Keep the exclusion; fix the stated reason, or the next reader will
      widen it the moment they find a retirement edge.
+
+160. **A documentation-only diff can reinstate a premise a previous round retired,
+     and it arrives with no executable line to review.** Round 39
+     (`fix/bind-stop-grace-ceiling`) added the sentence *"`awaitStopped`'s re-issue is
+     reached only on the paths where the first stop returned cleanly"* to
+     `Node.kt` (`StopGraceCeiling`, *The relation a re-issued stop terminates on*), to
+     `DrainController.awaitStopped`'s KDoc, and to `reconciler-dev`'s project memory —
+     three copies of the premise item **157** had already falsified, and it now stands
+     as the justification for a cross-module constant relation. The second producer of
+     `STOPPING` (`advanceOnce`'s already-down branch, `letGo.moveTo(STOPPING, now)`)
+     dispatches nothing, and `DrainController`'s own comment two lines above it says so
+     in bold. **Diff prose against the retired-premise list, not only against the
+     code.** A `git diff` that touches no executable line still changes what the next
+     author is allowed to assume.
+161. **A source-text scan for a *type name* does not catch configuration through
+     `copy()`.** `StopGraceGuardTest.the shipped node runs on the default CRI timeouts`
+     asserts no `:core` main source names the token `CriTimeouts`, so that reading
+     `CriTimeouts()` in the sibling test stands for what ships. Verified: the scan is
+     green, the vacuity control (`CriClientConfig(` present) really fires on
+     `LocalNode.open`, the strip survives the fully-qualified spelling, and `:core` is
+     the only module with a `:cri` dependency — so the module scope is right. The hole
+     is that both `CriClientConfig` and `CriTimeouts` are `data class`es, so
+     `cfg.copy(timeouts = cfg.timeouts.copy(stopDeadlineCap = 1.hours))` configures the
+     cap while naming no `CriTimeouts` token. **Score a token scan against the
+     *shapes that reach the field*, not the shapes that name the type.**
+162. **"The far side is a `:cri` type, so it cannot be a `require`" is only true of the
+     seam's own file.** `LocalNode.open` builds the `CriClientConfig` and is the one
+     class in `:core` the seam already permits to name CRI types, so a `require`
+     comparing `StopGraceCeiling.ceilingFor(SpecBounds.MAX_SAVE_TIMEOUT)` against
+     `config.timeouts.stopDeadlineCap` would bind the value the process actually runs
+     on — closing 161's hole and making the default-reading test unnecessary. When a
+     check is declined on the seam, ask which *other* class the seam already sanctions
+     before accepting a test as the enforcement point.
+163. **The re-issue's dead band starts at `stopDeadlineCap + deadlineSlack`, not at the
+     cap.** The deadline is `min(grace, cap) + slack`, so for `cap < grace <= cap+slack`
+     the runtime's kill still fires before the call gives up and the stop completes.
+     `Node.kt`'s *"One second of movement — MAX up, or the cap down — makes it live"*
+     and `:cri`'s matching sentence are both overstated by one `deadlineSlack` (30s
+     shipped). Direction is safe — the guard asserts `MAX <= cap`, which is exactly
+     right at `slack == 0` and conservative otherwise — but an operator diagnosing a
+     stuck drain from these sentences will look for the wrong boundary.
+
+## Round 40: the require that is a build assertion, and the sweep that missed its siblings
+
+164. **A `require` whose operands are *both* compile-time constants is a build
+     assertion wearing a runtime type, and that is what puts it on the planner side.**
+     `LocalNode.open`'s pre-flight compares
+     `StopGraceCeiling.ceilingFor(SpecBounds.MAX_SAVE_TIMEOUT)` against
+     `CriClientConfig(endpoint = …).timeouts.stopDeadlineCap` — `LocalNodeConfig`
+     carries no timeouts, so nothing an operator writes, and no stored row, can reach
+     the predicate. It can only be falsified by editing a constant, which reddens the
+     suite first. Score every new `require` this way before applying the round-24
+     objection: ask which operands are reachable from a definition or the environment,
+     and if the answer is none, the "freezes a server nobody can retire" argument does
+     not apply. Blast radius when it fires: `Orchestrator.open` throws before any node
+     exists, the store is closed by its own catch, containers keep running unmanaged
+     and nothing stops — the loud, safe direction. The residual is diagnosability:
+     `main` catches `IllegalArgumentException` around `OrchestratorConfig`/`ApiConfig`
+     and logs `cannot start: {}` with `EXIT_MISCONFIGURED`, but `Orchestrator.open` is
+     *not* wrapped, so a wiring `require`'s message — which is the whole remedy —
+     surfaces as an uncaught stack trace on the default exit code.
+165. **A correction sweeps the copies a grep for the *new* wording finds, not the
+     copies the *old* claim has.** The retired premise "a first stop returning cleanly
+     is the only thing that puts a drain in `STOPPING`" entered at `7f43649` in four
+     places at once. Round 40 corrected one of them plus its own two new copies and
+     left three standing: `DrainStatus.stopDispatchedAt`'s KDoc in `:schema` (the
+     field's canonical justification, and the field is the discriminator), the inline
+     comment inside `awaitStopped`'s own `catch` twelve lines from the decision, and
+     `ProxyDrainTest`'s KDoc. When correcting a premise, `git log -S` the *old*
+     sentence and fix every site that commit created — a sweep that starts from the
+     file being edited finds one.
+166. **The restatement of the boundary a round exists to correct is usually in the
+     same diff.** `Node.kt:437` (added) says the re-issue "finishes nothing" past the
+     cap and forwards the reader to the section below; `Node.kt:476` (added) says the
+     flip is at `cap + slack` and "**not at the cap**". Both new, forty lines apart.
+     Re-read the diff for the *old* claim before accepting that a boundary correction
+     landed; authors write the habitual sentence in the same commit as the fix. (Also
+     still at the bare cap and unhedged: `StopGraceCeiling.MAX`'s KDoc, the pre-flight
+     `require`'s message, and `StopGraceGuardTest`'s "above the cap … by construction".)
+167. **Widening a token scan from the type name to the field name exempts the one
+     file that legitimately reads the field — which is the only file that can
+     introduce the hole the widening was for.** Item 161's `copy` shape is now
+     invisible in `LocalNode.kt`, because naming `stopDeadlineCap` in the `require`
+     puts that file permanently in the "wiring" class. The compensating control is the
+     `require`, and a `require` enforces only while it reads the **same expression**
+     that is passed on: `require(… criConfig.timeouts.stopDeadlineCap)` beside
+     `CriClient.connect(criConfig)` is sound; `connect(criConfig.copy(timeouts = …))`
+     would pass the check and run on another cap. Check the identity of the value, not
+     the presence of the check.
+168. **A comment stripper fails open, and only one of its two failures is loud.** The
+     `codeLinesOf` depth tracker is correct on the cases it was written for (verified
+     by replica: `/* */` on one line, nesting, `*/` and `/*` inside blanked string
+     literals, `/*` after a `//`). An unmatched `*/` in prose is a compile error and
+     stops the build; an unmatched `/*` in prose silently blanks the **rest of the
+     file**, so a scan over it goes green for code it never read. Nothing asserts the
+     depth is zero at end of file (it currently is, across all 27 `:core` main
+     sources), and a multi-line raw string containing `/*` reaches the same state.
+     Whenever a structural scan gains a stripper, ask which stripper failure is silent
+     and assert against it.
+
+## Round 41: the correction that lands everywhere but the test beside it
+
+169. **Kotlin nests block comments, so the only *silent* way a comment stripper can
+     blank a file is a multi-line raw string.** `/*` unmatched in prose raises the
+     nesting depth, the file's own `*/` brings it back to 1 rather than 0, and the
+     file ends inside a comment — a compile error, not a silent green. `*/` unmatched
+     in prose closes a KDoc early and compiles the rest of the sentence — also a
+     compile error. The case that compiles *and* fools a per-line
+     `"([^"\\]|\\.)*"` blanker is `/*` inside a `"""…"""` body. Correct item 168 with
+     this: the depth-at-EOF assertion is still the right control, but a comment that
+     tells a reader "a KDoc line mentioning one" is a silent hazard is teaching the
+     wrong failure. Check `codeLinesOf`-style depth counters cannot go negative
+     (`*/` at depth 0 must fall through to code), or `depth == 0` stops being a test
+     for an unmatched opener.
+170. **A red-proof record is a dated measurement, and a later commit in the same
+     branch can falsify it without touching the sentence.** `StopGraceGuardTest`
+     records "lowering `stopDeadlineCap` to an hour reddened **this test and nothing
+     else** in 954" — written at `ba0335b`, before `88999c1` added the `LocalNode.open`
+     `require` and a second test that the same mutation now reddens. Forty lines
+     further down the same file the later test says so in as many words. When a branch
+     adds an enforcement point, re-read every red-proof paragraph that names a
+     mutation on the same constant: the suite total in the sentence (954 vs 955) is
+     the tell that two paragraphs were measured at different times.
+171. **The premise sweep reaches production KDoc and stops at the test beside it.**
+     Round 41 retired "a first stop returning cleanly is the only thing that puts a
+     drain in `STOPPING`" from `Status.kt`, `DrainController`'s catch and
+     `ProxyDrainTest` — and left `StatusReconstructionTest.kt:34` restating it as the
+     justification for the very rule (`enteredStateAt` as the reconstructed dispatch
+     instant) whose production KDoc, six files away, spends sixty lines explaining
+     that the premise is false. Grep test sources for the *old* claim specifically:
+     a sweep keyed on the files a change touches will not reach an assertion's
+     comment.
+172. **A new enforcement point is operator-facing behaviour and owes `docs/operating.md`
+     a sentence.** `LocalNode.open`'s pre-flight turns "three modules must agree or the
+     drain loops for ever" into "the process refuses to start with exit 78". §3 of
+     `operating.md` still describes only the for-ever loop, which the shipped
+     single-host path can no longer reach. Whenever a round converts a latent
+     for-ever-loop into a startup refusal, check whether the file a non-contributor
+     reads still describes the old outcome as reachable.
+173. **`exitProcess` in a `catch` is a stop path worth auditing, and this one is
+     clean.** `main` now wraps `Orchestrator.open` in the misconfiguration channel.
+     What made it safe was not the catch but `Orchestrator.open`'s own two
+     `catch (Throwable)` arms — `embedded.close()` after a failed `LocalNode.open`,
+     `node.close()` + `embedded.close()` after a failed wiring — so the store is shut
+     before the process leaves. Audit the *callee's* cleanup before accepting a
+     `catch → exitProcess` at the call site; the catch itself closes nothing, and a
+     store left open on a fatal path is a locked database rather than a lost world
+     only because nothing has reconciled yet.
+174. **A source-scanning test that counts occurrences must strip comments, or it can
+     be reddened and silenced by prose.** `VelocityPinWiringTest` counts
+     `Orchestrator.open(` / `fromEnvironment(` against
+     `catch (invalid: IllegalArgumentException)` over the raw file text, while
+     `StopGraceGuardTest.mainSources` in the same branch strips comments for exactly
+     this reason. A KDoc mentioning either token shifts a count: the refusing side
+     reddens spuriously, the catching side inflates and can hide a startup step that
+     is genuinely outside the channel.
