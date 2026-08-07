@@ -84,12 +84,42 @@ public data class ReconstructedStatus(
  * persisted by the first pass that acts on it. A migration would be doing, at the
  * cost of a version number, work that happens anyway one pass later.
  *
- * ## Why [DrainState.STOPPING] exactly
+ * ## Why [DrainState.STOPPING] exactly, and what the state does *not* prove
  *
- * A drain reaches `STOPPING` only after a stop request returned cleanly, so for a
- * document in that state the dispatch is not a guess: it is a fact the document
- * already implies, and [DrainStatus.enteredStateAt] is when it happened. This is
- * reconstruction rather than a conservative assumption.
+ * `STOPPING` has **two producers in the reconcile loop, and only one of them
+ * dispatches anything.**
+ *
+ * `DrainController.letGoAndStop` reaches it after a container stop request returned
+ * cleanly, and stamps the field on the way through `dispatchingStop`. Those are the
+ * rows this object exists for: on one of them a null is a build that had no key to
+ * write, [DrainStatus.enteredStateAt] is when the dispatch happened, and the
+ * reconstruction is exact.
+ *
+ * The second is `DrainController.advanceOnce`'s container-is-already-down branch. It
+ * is taken *before* the state machine runs, for any drain whose workload the runtime
+ * reports absent, exited, merely created, or sandbox-only having never had a
+ * container — and it moves the record to `STOPPING` having **dispatched nothing**.
+ * The teardown persists that record. So the current build writes `state == STOPPING`
+ * with no stamp on the ordinary path of every drain of a container that was already
+ * down, this rule fires on those rows, and the stamp it synthesises for them is for
+ * a dispatch that never happened. They are false positives, and nothing in a
+ * document tells them from the rows above.
+ *
+ * **What makes them harmless is the observation gate, not the paragraph above it.**
+ * The stamp has one reader, `stopIsInFlight`, and it answers `true` only for a stamp
+ * *together with* an observation. Every observation the second producer can be
+ * reached from either fails that test outright — an absent workload is not a
+ * `Present` one, and `CREATED` and never-had-a-container `SANDBOX_ONLY` answer
+ * false — or is `EXITED`, which is a container genuinely gone and so the evidence
+ * that *retires* the record, not a running process a fabricated stamp could withhold
+ * players from. Runtime states do not run backwards, so none of those workloads
+ * comes back up underneath the stamp.
+ *
+ * That makes `stopIsInFlight`'s observation half load-bearing **for this rule** and
+ * not only for its own. Reading the stamp alone as authoritative — dropping the
+ * observation half for `EXITED`, say, on the grounds that a document in `STOPPING`
+ * has already proved a dispatch — would not be a local simplification of that
+ * function. It would remove the only thing neutralising this rule's false positives.
  *
  * `state == STOPPING` was rejected as the *call-site* discriminator because it
  * **under**-reports — a stop whose deadline elapsed leaves the drain
@@ -106,16 +136,41 @@ public data class ReconstructedStatus(
  * backend back into routing, for the ordinary case rather than the exceptional
  * one.
  *
- * **[DrainState.DRAIN_FAILED] is excluded, and it is the exclusion that matters
- * most.** It is declared after `STOPPING` but it is not past it: a failed drain
- * has no edge to a stop and leaves the server running. So a stamp reconstructed
- * there can never be retired — nothing drives that container down, the workload is
- * never observed absent, and the record that would be cleared when it is stays for
- * ever. The safe direction the rest of this argument rests on is that
- * over-reporting a dispatch withholds a re-admission *and lets the drain run to a
- * stopped container*; in `DRAIN_FAILED` there is no such end, so the cost stops
- * being bounded. An ordinal comparison (`state >= STOPPING`) would include it by
- * accident of declaration order, which is why the test here names the state.
+ * **[DrainState.DRAIN_FAILED] is excluded on the same ground, and the ground is
+ * *not* that it has no way out.** It has one, and a reader who goes looking will
+ * find it: `advanceOnce` asks the container-is-already-down question above on every
+ * pass for every state, `DRAIN_FAILED` included and before the state machine gets a
+ * say. A drain that really did signal its container and then aborted is carried to
+ * `STOPPING` by that branch when the container reaches the end of its grace period
+ * and exits, and the teardown retires the record. There is no state here in which a
+ * stamp is structurally immortal.
+ *
+ * What excludes it is its **false-positive rate**, which is the argument
+ * `DEREGISTERED` already rests on and is sufficient on its own. `DRAIN_FAILED` is
+ * where a drain parks after aborting, and a drain can abort at any step, so the
+ * overwhelming majority of records sitting there never dispatched anything.
+ * Reconstructing there stamps the common case and disables `restoreRegistration`
+ * for it. It is worse than `DEREGISTERED` on this measure rather than better,
+ * because a current build already stamps every `DRAIN_FAILED` record that *did*
+ * dispatch — `dispatchingStop` runs before the stop call, so the abort that follows
+ * a refused stop carries the field — which leaves reconstruction there with almost
+ * nothing true to do.
+ *
+ * The unbounded cost is real but it is a property of those false positives rather
+ * than of the state: a record that never dispatched has no container being driven
+ * down, so nothing observes the workload absent and nothing retires the invented
+ * stamp. That is what the rest of this argument's "it errs the safe way and then
+ * ends" depends on, and it is the false positives that do not end.
+ *
+ * An ordinal comparison (`state >= STOPPING`) would include the state by accident of
+ * declaration order, which is why the test here names it.
+ *
+ * One residual is knowingly left open: a row written *before* the field existed,
+ * which dispatched and then aborted, sits in `DRAIN_FAILED` with no stamp and is not
+ * reconstructed. Any build old enough to have written it also predates
+ * `restoreRegistration`'s guard and `clearedDrainRecord`, so it had already lost the
+ * record by other means; widening the rule to catch it would buy that row at the
+ * price of every false positive above.
  *
  * ## The direction of the error
  *
@@ -161,8 +216,9 @@ public object StatusReconstruction {
      *
      * The state test is spelled as an equality against one member rather than as a
      * comparison, for the reason the class note gives about `DRAIN_FAILED`: an
-     * ordering here would take in whatever is declared after `STOPPING`, and what
-     * is declared after it today is the one state where this must not fire.
+     * ordering here would take in whatever is declared after `STOPPING`, and what is
+     * declared after it today is a state this must not fire in — the only such state
+     * an ordering would reach, the others all being declared earlier.
      */
     private fun missingStopDispatch(drain: DrainStatus): Instant? =
         if (drain.state == DrainState.STOPPING && drain.stopDispatchedAt == null) drain.enteredStateAt else null

@@ -494,10 +494,12 @@ abstract class StoreConformanceSuite {
      *
      * `DRAIN_FAILED` is the one a *narrower* rule still gets wrong. It is declared
      * after `STOPPING`, so `state >= STOPPING` sweeps it in by accident of
-     * declaration order — and it is the single state where a reconstructed stamp can
-     * never be retired, because a failed drain has no edge to a stop, so the
-     * container is never driven down and the workload is stranded out of routing for
-     * ever. That is why the rule names one state instead of comparing.
+     * declaration order. It is excluded for `DEREGISTERED`'s reason rather than a
+     * structural one: a failed drain does have a way to a stop, because the
+     * reconciler asks whether the container is already down on every pass whatever
+     * the state, but it is where a drain parks after aborting at any step, so its
+     * records overwhelmingly never dispatched and a stamp invented there reports the
+     * common case. That is why the rule names one state instead of comparing.
      */
     @Test
     fun `a drain short of the stop keeps its absent dispatch record`() =

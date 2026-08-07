@@ -16,7 +16,7 @@ import java.time.Instant
  * change to it would have to keep. The one that is easiest to break by accident is
  * the state test: written as a comparison rather than an equality it would take in
  * [DrainState.DRAIN_FAILED], which is declared after [DrainState.STOPPING] and is
- * the one state where a reconstructed stamp can never be retired.
+ * the state whose records overwhelmingly never dispatched anything.
  */
 class StatusReconstructionTest {
     @Test
@@ -77,10 +77,12 @@ class StatusReconstructionTest {
      * [DrainState.DEREGISTERED] is where a drain ordinarily waits *before* any stop,
      * so a stamp invented there reports a dispatch for the common case and suppresses
      * the re-registration that puts a parked drain's backend back into routing.
-     * [DrainState.DRAIN_FAILED] is the one that must never be reconstructed at all:
-     * a failed drain has no edge to a stop, so the container is never driven down,
-     * the record is never retired, and the workload is out of routing for ever. It
-     * is also declared *after* `STOPPING`, so an ordinal test would sweep it in.
+     * [DrainState.DRAIN_FAILED] is excluded on that same ground and not on a
+     * structural one — a failed drain *does* have a way to a stop, since the
+     * reconciler asks whether the container is already down on every pass whatever
+     * the state — but it is where a drain parks after aborting at any step, so its
+     * records overwhelmingly never dispatched. It is also declared *after*
+     * `STOPPING`, so an ordinal test would sweep it in.
      */
     @Test
     fun `no other drain state is given a dispatch record`() {
