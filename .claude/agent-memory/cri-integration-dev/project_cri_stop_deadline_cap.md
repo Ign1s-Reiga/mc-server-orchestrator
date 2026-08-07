@@ -1,6 +1,6 @@
 ---
 name: cri-stop-deadline-cap
-description: The stop deadline is capped independently of the grace period it sends, and containerd does not escalate to SIGKILL once the request context has expired
+description: The stop deadline is capped independently of the grace period it sends, "over the cap" is not the same condition as "the deadline expired first", and containerd does not escalate to SIGKILL once the request context has expired
 metadata:
   type: project
 ---
@@ -47,6 +47,18 @@ the opposite until 2026-08-07.
 event to reach the CRI event monitor and settle the container's status. That
 last tail is invisible from the client and is why `deadlineSlack` is 30s and not
 2s; a budget of "grace + a second or two" does not hold on a loaded host.
+
+**`capped` is not "the deadline expired first", and the gap is a whole
+`deadlineSlack` wide.** The deadline is `min(grace, cap) + slack`, so for
+`cap < grace < cap + slack` the grace period is over the cap *and* still expires
+before the deadline — containerd reaches the kill and the call returns
+successfully. Any sentence of the form "over the cap ⇒ no kill from that call"
+is therefore false in a 30s band on the shipped defaults. This has now produced
+an inaccurate doc sentence twice; before writing one, evaluate
+`grace < min(grace, cap) + slack` for a grace period just past the cap. It is
+also why `attributeCappedStop` tests the *elapsed time* against the deadline
+rather than testing `capped`, and that test is load-bearing rather than
+belt-and-braces.
 
 **Not a second guard on the grace period** — it bounds a different quantity
 (wall-clock time the caller is parked), which is why it does not fall foul of

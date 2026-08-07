@@ -35,6 +35,13 @@ into the last line printed. Three cheap checks that settle it in minutes:
 - JUnit's `@Timeout` in `SAME_THREAD` mode reports `TimeoutException` on a test
   whose assertions all passed. Do not read that as "the assertion never got
   there".
+- A wait-loop built on `pgrep -f "gradlew build"` never exits: `-f` matches the
+  whole command line, and the monitor shell's own command line contains that
+  string, so the loop finds *itself* and waits for ever. This looks exactly like
+  a long build and burned several 600s timeouts on 2026-08-07. Match on the PID
+  (`until ! kill -0 <pid>`) or on a `BUILD (SUCCESSFUL|FAILED)` line in the log.
+  Also note `cmd | tail -n` writes nothing to the output file until the pipeline
+  ends, so an empty log is not evidence of a stalled build.
 
 See [[cri-exec-timeout-attribution]] for the real (and much smaller) `:cri`
 defect the same run exposed.
