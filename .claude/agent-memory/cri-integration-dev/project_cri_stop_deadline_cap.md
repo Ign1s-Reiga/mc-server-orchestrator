@@ -32,9 +32,25 @@ stopping it". It keeps the signal it already delivered; it does not escalate. Th
 re-issue is what finishes a container that ignores `SIGTERM`, which is why the
 `DEADLINE_EXCEEDED` must stay retryable.
 
+**A re-issued stop does not re-deliver the signal.** `container_stop.go`
+compare-and-swaps a per-container `IsStopSignaledWithTimeout` the first time a
+stop with `timeout>0` sends one and skips it after — *"Skipping the sending of
+signal terminated ... because a prior stop with timeout>0 request already sent
+the signal"* in containerd's journal on 2.3.3. What a re-issue supplies is a
+fresh grace period on a fresh context, and the `SIGKILL` is reached only when
+*that* grace period expires. So a re-issue carrying the same over-cap grace
+period can never reach the kill, however many times it is made. Two KDocs said
+the opposite until 2026-08-07.
+
+**What a stop that does reach the kill costs**: 1.73s for a 1s grace period —
+1.00s of grace, the kill, the task dead 19ms later, then **0.71s** for the exit
+event to reach the CRI event monitor and settle the container's status. That
+last tail is invisible from the client and is why `deadlineSlack` is 30s and not
+2s; a budget of "grace + a second or two" does not hold on a loaded host.
+
 **Not a second guard on the grace period** — it bounds a different quantity
 (wall-clock time the caller is parked), which is why it does not fall foul of
 [[cri-guard-symmetry-rule]]. A reader will ask; the KDoc answers it.
 
 See [[cri-stop-timeout-overflow]], [[cri-exec-timeout-attribution]],
-[[cri-integration-sourceset]].
+[[cri-integration-sourceset]], [[cri-deadline-evidence]].

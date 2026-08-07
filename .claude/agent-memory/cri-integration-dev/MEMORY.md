@@ -10,3 +10,4 @@
 - [The capped stop deadline](project_cri_stop_deadline_cap.md) — the deadline is not the grace; containerd never escalates to SIGKILL once our context expired.
 - [Guard symmetry rule](feedback_guard_symmetry.md) — an outer layer asks the type that owns a rule; it never restates a weaker version of it.
 - [The :cri integration source set](project_cri_integration_sourceset.md) — what belongs there, and the shared-containerd hazard when other agents' worktrees are running.
+- [Reading a deadline experiment](project_cri_deadline_evidence.md) — grpc's "deadline exceeded after Xs" is not the elapsed time, and a shrunken deadline must not judge the control step.
