@@ -948,11 +948,12 @@ DOWN_BRANCH_NOTED='                //
                 // fact a reader downstream needs. The state is reached from the
                 // *observation* — the runtime says the container is gone, in whatever
                 // state the drain was in, including one that never got near step 7 —
-                // so no stop request left this process and `stopDispatchedAt` stays
-                // whatever it was, which for every such drain is null. `STOPPING`
-                // therefore does not imply a dispatch; the stamp is the only thing
-                // that does, which is why [stopIsInFlight] answers on the stamp and
-                // not on the state. Safe here for a second reason as well: this
+                // so no stop request left this process and `stopDispatchedAt` is
+                // carried, never written: null for a drain that never reached step 7,
+                // and step 7'"'"'s own stamp for one whose container this branch has now
+                // seen go. `STOPPING` therefore does not imply a dispatch; the stamp
+                // is the only thing that does, which is why [stopIsInFlight] answers
+                // on the stamp and not on the state. Safe here for a second reason: this
                 // branch is reached only from [WorkloadObservation.containerIsDown],
                 // so there is no live container to withhold from a routing table.
                 drain ='
