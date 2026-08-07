@@ -22,4 +22,5 @@
 - [Gate and ceiling](project_gate-and-ceiling.md) — a block must not arm the permanent gate; a park is a park; the node caps a grace period rather than refusing it; why troubleSince was declined.
 - [Deadline ceilings](project_deadline-ceilings.md) — clamping half a validated pair inverts it; `max(K, f(other))` bounds the relation, not the wait; `:cri` owns the wait; one refusal, two classes.
 - [Dispatch record](project_dispatch-record.md) — two proxies wrong at two call sites mean a fact nobody records; the stamp that inverts the save rule; the `Rejected` ruling still open.
-- [Record lifetime](project_record-lifetime.md) — the value was right and the lifetime was inherited; the fix's own defect; which sites are unreachable; the workload-owned record still open.
+- [Record lifetime](project_record-lifetime.md) — the value was right and the lifetime was inherited; the fix's own defect; the rule that was one argument short; the workload-owned record, ruled.
+- [Guard lifetime](project_guard-lifetime.md) — a refusal conditioned on a state the drain itself ends; the churn that replaced the freeze; the volume name the loop erased.

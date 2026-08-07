@@ -304,6 +304,31 @@ say why, and keep a second entry that isolates the rule on its own — weakening
 the demonstration half to make one mutation tidy would delete the evidence that
 the defect is real.
 
+**A board scores flips, and the defect can be a *missing argument*.** Round 34's
+critical was `stopIsInFlight` classifying an observation without the fact that
+decides it. No entry in a 67-mutation suite could go red for a discriminator
+nobody had written — there is no expression to flip — and the suite was, honestly,
+green. What found it was a **hand comparison of two rules that read the same
+observation**: `containerIsDown` splits the case on `hadContainer` and says in its
+own comment why getting it wrong kills a live server. Two rules for one question
+is the smell; when you see it, diff the rules rather than adding a mutant. And
+after the fix, mutate the defect at its *new* address: a fact that is now a
+parameter can be answered with a constant at one call site, which is invisible to
+every other assertion and is exactly how the original defect would come back.
+
+**A fixture can be shaped so the missing discriminator is invisible.** The unit
+test for that rule built every observation with a container id — `SANDBOX_ONLY`
+included, which a real node never produces (`WorkloadView.observe` takes that
+branch precisely when there is no container). So the case the rule got wrong could
+not be expressed, and an exhaustiveness control read as complete while one of five
+states was classified from data that does not occur. The same trap one level up:
+`FakeNode` named every container after the server, so ids were identical across
+recreations and "is this the container the drain signalled" was **true by
+construction** — an identity test would have reported a record correctly retired
+in exactly the scenario where it outlived its container. Ask of any fixture: *does
+the value I am handing this exist in the field, and does anything about it differ
+between the two cases I am claiming to tell apart?*
+
 ## When the check cannot exist, move it to the compiler
 
 Structured-logging argument order is untyped and untested anywhere in this repo —
