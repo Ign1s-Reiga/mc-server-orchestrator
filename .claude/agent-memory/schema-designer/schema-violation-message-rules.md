@@ -27,13 +27,21 @@ three rules below before writing the message text.
 - **`SecretBearingPaths` (in `YamlReading.kt`) is the single list of fields taking a `SecretRef`**,
   plus the block each one sits in. A scalar at one of those paths gets `INLINE_SECRET_PROBLEM`
   instead of "expected a mapping" — that is a *message-quality* choice, not the safety mechanism.
-  `MappingReader.secretRef` throws if called at a path the list does not name, so a fourth
-  secret-bearing field either gets listed or fails every parse that reaches it; `SecretEchoTest`
-  walks the list from the other side. This pair is why the list is a guard and not a comment.
+  `MappingReader.secretRef` throws if called at a path the list does not name; `SecretEchoTest`
+  walks the list from the other side. Three properties keep that pair a guard rather than a
+  comment, and each was a review finding: the check fires when the *enclosing block* is read, so
+  it only means "fails immediately" while every container is written by some `valid/` example (now
+  asserted); membership is tested on the path with list indices flattened, because `valueList`
+  puts a document position in a path and a guard that throws on valid input is worse than none;
+  and a reference must not sit directly under `spec`, or the derived container would make
+  `spec: <anything>` answer with the secret store on every kind (a `require` refuses it).
 - **Inside a `SecretRef`, the `name` and `key` coordinates are described, not quoted** — that is
-  where material lands when someone abbreviates the reference away. `SecretRef.NAME_PROBLEM` and
-  `keyProblem` carry the syntax rule and no value; `ResourceName.SYNTAX` exists so that wording has
-  one home. This also de-echoed `SecretRef.of`, which `:api` renders into a 400 body.
+  where material lands when someone abbreviates the reference away. `nameProblem`/`keyProblem` keep
+  the empty and over-length answers (a length is a fact *about* a value, not the value) and fall
+  back to the syntax rule instead of quoting; `ResourceName.SYNTAX` and `SecretRef.KEY_SYNTAX` are
+  public so that wording has one home. `:api` states the same rule in its own words on
+  `/api/v1/secrets/{name}/{key}` rather than relaying `SecretRef.of`, whose text is written for a
+  definition file and describes a mistake unreachable over a URL.
 
 Residual echo paths, probed and accepted rather than missed:
 
