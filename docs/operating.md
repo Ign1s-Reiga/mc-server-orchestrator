@@ -50,17 +50,25 @@ orchestrator records the dispatch precisely so it cannot do that.
 
 ## 3. Three modules must agree on two hours
 
-A stop's grace period is capped in three places that each derive it
+A stop's grace period is capped in several places that each derive it
 independently:
 
 | Module | Constant | Value |
 |---|---|---|
 | `:schema` | `PaperServerDefaults.MAX_STOP_GRACE_PERIOD` | 2h |
-| `:core` | `StopGraceCeiling.MAX` | borrowed from the above |
+| `:schema` | `SpecBounds.MAX_SAVE_TIMEOUT` | 1h |
+| `:core` | `StopGraceCeiling.MAX` | borrowed from the first |
 | `:cri` | `CriTimeouts.stopDeadlineCap` | 2h, declared independently |
 
-The relation that matters is `StopGraceCeiling.MAX <= stopDeadlineCap`, and it
-currently holds **at equality between two independent literals.**
+The relation that matters is that **nothing a node can be handed exceeds the
+deadline `:cri` will wait for it**, and it holds **at equality between
+independent literals.**
+
+The save timeout is in the relation and it is easy to miss. `StopGraceCeiling`
+puts a *floor* under its own ceiling — it will not cap a grace period below the
+save it has to cover — so once a save timeout passes `MAX - margin` the
+effective ceiling stops being two hours and rises with the save timeout. That
+is why the bound to check is `ceilingFor(MAX_SAVE_TIMEOUT)` and not `MAX`.
 
 The deadline a stop call runs under is `min(grace, cap) + slack`, so a grace
 period above the cap does **not** by itself mean the call gives up first —
@@ -71,12 +79,21 @@ grace is over the cap.
 
 Past that band the client stops waiting before the runtime reaches its kill —
 and containerd does not re-deliver the stop signal on a re-issue, so re-issuing
-with the same grace period can never finish it. The drain retries for ever,
-reports itself, and stops nothing.
+with the same grace period can never finish it. The drain would retry for ever,
+report itself, and stop nothing.
 
-Nothing is lost if that happens. But it is the one place where three modules
-that each declare independence from the others have to agree for a loop to
-terminate. Move any of the three deliberately.
+**You should never see that, because the orchestrator refuses to start
+instead.** Wiring a node checks the relation against the cap its own CRI client
+was built with, and a mismatch fails startup with `cannot start:` and a message
+naming which constant to move. Nothing has been reconciled at that point, so
+nothing is half-done: containers already running keep running, unmanaged, until
+you fix the constant and start again.
+
+So this is no longer a trap, but it is still the one place where modules that
+each declare independence from the others have to agree for a loop to
+terminate. Move any of them deliberately. Raising `stopDeadlineCap` is the safe
+direction; lowering the others is constrained, because `SpecBounds` will not let
+the grace ceiling fall below the save timeout plus its margin.
 
 ## 4. A backend has a seal and a router, or neither
 
