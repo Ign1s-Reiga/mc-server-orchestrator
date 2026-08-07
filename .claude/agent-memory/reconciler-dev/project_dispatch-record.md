@@ -45,6 +45,32 @@ it while the `SIGTERM` was still inside the container. It has a lifetime of its
 own now (`stopIsInFlight` / `clearedDrainRecord`); see [[record-lifetime]] before
 reading anything below as current.
 
+## The taxonomy landed, 2026-08-07, and the ruling below is now repairable
+
+`NodeDispatch` is on `NodeException` (`NOTHING_SENT` / `UNKNOWN`, no `SENT`,
+required parameter on the base so the five subclass defaults are the whole rule).
+`LocalNode` and `HostPaths` claim `NOTHING_SENT` only where it is provable by
+construction: the stop-grace refusal, `requireContainer`, both endpoint refusals,
+and `HostPaths.prepare` — whose one call site is the line above `runSandbox`.
+`HostPaths`' *mount* refusals deliberately keep the default, because
+`containerSpecFor` runs after the sandbox exists. **A per-file rule would have
+been wrong; the difference is which line of one method throws.**
+
+Nothing branches on it yet, on purpose — both consumers are drain guards. What it
+makes possible, in the order it should be taken:
+
+- `stop`'s catch can drop the `stopDispatchedAt` it just wrote when the node says
+  nothing was sent, which retires the availability cost below.
+- `PaperServerAgent.requestSave`'s `else -> NotDelivered` would move its `UNKNOWN`
+  cases into `Unconfirmed`. That is the bigger call: it decides what one RCON
+  hiccup costs a server, and it is danger pattern 3 pointing the other way.
+
+The measured lesson from building it: **a default on a base-class constructor
+parameter that every subclass passes through is unreachable, and a mutation of it
+reddens nothing.** My first draft had one, the red-proof reported MISCAUGHT with
+an empty red set, and the fix was to make the base parameter required. A safe
+default that cannot be observed to change is not a safe default.
+
 ## The ruling I took past the brief, and it is open to overruling
 
 **A `Rejected` from the stop no longer restores the registration.** The auditor's

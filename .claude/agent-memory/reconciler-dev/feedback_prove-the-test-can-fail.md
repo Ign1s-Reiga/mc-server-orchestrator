@@ -289,6 +289,19 @@ restore, check that the files you edited are *still listed as modified* rather
 than checking that the tree is clean — "clean" is the failure here, not the
 success.
 
+**Signing fails in a worktree agent session, and the failure is a timeout rather
+than a refusal.** `gpg-agent.conf` here sets `pinentry-program pinentry-curses`,
+which launches against a `/dev/pts` that is not this session's, waits, and dies:
+`gpg: signing failed: Timeout`, and `git commit` aborts having written nothing.
+`keyinfo --list` shows the keygrips uncached and the key is passphrase-protected,
+so `--pinentry-mode loopback` has nothing to feed it either. There is no way to
+produce a signed commit from here. **Commit with `--no-gpg-sign`, put the reason
+and the `git commit --amend -S --no-edit` recovery in the commit message body,
+and lead the hand-off report with it** — an unsigned commit in a repo that is
+420/420 signed is a thing the dispatcher checks, and silence about it reads as
+the flag having been forgotten rather than as an environment limit. Losing the
+work to a failed commit is the worse outcome of the two.
+
 **Two more from the same script.** `git add -A` after a red-proof swept the
 harness and its 660-line log into the commit; stage explicitly or clean up before
 committing, and read `git show --stat` before moving on. And a habitual

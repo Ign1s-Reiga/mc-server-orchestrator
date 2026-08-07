@@ -214,6 +214,32 @@ would make it true later: a Kotlin release enabling that resolution is exactly w
 somebody needs the second entry. See [[prove-the-test-can-fail]] for the sibling rule
 about signature changes turning mutations into UNKNOWNs.
 
+## A defect *description* can be the declined remedy's counter-scenario, inverted
+
+The strongest instance yet, and it cost nothing only because I measured before
+building. A brief described the flapping-escalation item as *over*-reporting: an
+anchor surviving healthy waiting so a recovered endpoint escalates as though it
+had been failing throughout. The code does the **opposite** — `blocked()` deletes
+a retryable failure, so an endpoint failing every other pass never escalates at
+all. Four hours of simulated alternation, twenty-five observations, `attention`
+FALSE at every one ([[flapping-escalation]]).
+
+Where the inverted description came from is worth knowing, because it will happen
+again: it is almost word for word the counter-scenario I wrote when I *declined*
+a proposed fix a few rounds earlier. **A declined remedy's cost and a live defect
+read identically once they are one hop from the source** — both are a paragraph
+saying "and then it escalates on a fault one second old".
+
+**How to apply:** when a brief hands you a defect in prose, reproduce it before
+designing against it — a scratch test in the existing harness that prints the
+status every pass, thrown away afterwards, is twenty minutes. Two things make it
+worth it beyond catching an inversion: the run tells you the *reachable* scenario
+(mine needed players online, which the prose never mentioned), and the control —
+the same scenario with the one condition removed — is what proves the machinery
+is sound where it applies rather than broken everywhere. Report the measurement,
+not the correction: "here is what twenty-five passes did" ends the disagreement
+in one round, and it is not an accusation.
+
 ## Arguing to leave something open
 
 When escalating a known hole rather than fixing it, **argue from what is at
