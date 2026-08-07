@@ -184,6 +184,21 @@
 #            withdrawing a drain, so `forbiddenTransition` has no routing guard in
 #            front of it and its clear is live — a `storage.mode` edit landing inside
 #            the grace period of a stop some earlier edit asked for.
+#   D59..D61 the thirty-fourth audit's two criticals, both consequences of the round
+#            above. **Read the finding that came with the first before reading these
+#            as coverage:** a board scores *flips of an expression*, and that critical
+#            was a **missing argument** — `stopIsInFlight` classified `SANDBOX_ONLY`
+#            without the fact that separates a sandbox this loop emptied from one
+#            whose container the runtime has stopped enumerating. No entry here could
+#            have gone red for a discriminator nobody had written, and the check that
+#            found it was a hand comparison with `containerIsDown`, which reads the
+#            identical observation and answers it the other way. What D59 and D60
+#            score is the defect at the address the fix *created* for it: an arm that
+#            can now be flipped, and a call site that can now answer the fact with a
+#            constant. D61 is the second critical, where a refusal was conditioned on
+#            `RUNNING` — a state the drain itself takes away — so the container exits
+#            and the create applies the very definition the loop spent passes
+#            refusing.
 #   C1..C3   controls: the rule deleted outright, once per assertion arm. If these
 #            do not redden, the harness is not reaching the assertions at all.
 #   S1       the self-test. See below.
@@ -342,6 +357,16 @@ RETIRED_BY_RULE='every drain record this loop retires is retired through the one
 BACKEND_REVERT='reverting the edit does not undo a stop that has already been dispatched'
 PROXY_REVERT="reverting a proxy's edit does not undo a stop that has already been dispatched"
 REFUSED_MID_STOP='an edit refused mid-stop does not delete the record of the stop'
+# The thirty-fourth audit's criticals, both consequences of the round above. The
+# first is the argument that rule was missing — and the finding that came with it is
+# that **no entry in this table could have scored it**: a board scores flips of an
+# expression, and a discriminator that was never written has nothing to flip. What
+# these three entries score is the defect at its *new* address, which the fix
+# created by making the fact expressible: a call site answering it with a literal.
+SANDBOX_DECIDED='a sandbox the runtime reports no container in is decided by what this loop recorded'
+UNREPORTED_MID_STOP='a runtime that stops reporting a container mid-stop does not re-admit the backend'
+ONE_DERIVATION_OF_HISTORY='the fact that tells an emptied sandbox from an unreported container has one derivation'
+TRANSITION_NOT_APPLIED='a refused storage transition is not applied by the container exiting underneath it'
 
 # Single-quoted throughout: these are literals, and one of them contains the
 # quoting characters of two languages.
@@ -665,33 +690,56 @@ PROBE_UNGUARDED='            ExecRequest(
 # another spec — which is what "make these consistent" reaches for.
 CHANNEL_FIELD='timeout = spec.backends.drain.sealTimeout,'
 CHANNEL_OTHER_FIELD='timeout = spec.lifecycle.drain.sealTimeout,'
-# The two arms of the dispatched-stop record'"'"'s lifetime rule, D52 and D53.
-FRESH_CONTAINER='        WorkloadState.CREATED, WorkloadState.SANDBOX_ONLY -> false'
+# The three arms of the dispatched-stop record'"'"'s lifetime rule: D52, D53 and the
+# one the thirty-fourth audit'"'"'s critical was in, D59.
+FRESH_CONTAINER='        WorkloadState.CREATED -> false'
 SIGNALLED_CONTAINER='        WorkloadState.RUNNING, WorkloadState.EXITED, WorkloadState.UNKNOWN -> true'
+UNREPORTED_CONTAINER='        WorkloadState.SANDBOX_ONLY -> hadContainer'
 # Three sites that retire a drain record, each identified by the comment above it —
 # the call itself is the same expression at eleven places, which is the point of it
 # having one spelling.
 JOINABLE_CLEAR='            // the moment it stops, so the record of that survives this. See
             // [clearedDrainRecord].
-            drain = clearedDrainRecord(pass.previous?.drain, observation),'
+            drain = clearedDrainRecord(pass.previous?.drain, observation, pass.hadContainer),'
 REFUSAL_CLEAR='                // the refusal either way.
-                drain = clearedDrainRecord(pass.previous?.drain, observation),'
+                drain = clearedDrainRecord(pass.previous?.drain, observation, pass.hadContainer),'
 JOINABLE_DELETES='            // the moment it stops, so the record of that survives this. See
             // [clearedDrainRecord].
             drain = null,'
 JOINABLE_ASKS_NOTHING='            // the moment it stops, so the record of that survives this. See
             // [clearedDrainRecord].
-            drain = clearedDrainRecord(null, observation),'
+            drain = clearedDrainRecord(null, observation, pass.hadContainer),'
+# The address the thirty-third audit'"'"'s remedy created for the thirty-fourth
+# audit'"'"'s critical: the rule asked, with the fact it turns on answered by a
+# constant. Every other assertion about this site stays green.
+JOINABLE_ASSUMES_NOTHING='            // the moment it stops, so the record of that survives this. See
+            // [clearedDrainRecord].
+            drain = clearedDrainRecord(pass.previous?.drain, observation, hadContainer = false),'
 REFUSAL_DELETES='                // the refusal either way.
                 drain = null,'
 # The two routing lines that keep a withdrawn cause draining while its stop is out,
 # one per kind. Each is anchored on the line under it, since the call is identical.
-WITHDRAWN_BACKEND='                            ?: outstandingStopCause(pass.previous?.drain, observation)
+WITHDRAWN_BACKEND='                            ?: outstandingStopCause(pass.previous?.drain, observation, pass.hadContainer)
                     // Before the drain, never after'
-WITHDRAWN_PROXY='                            ?: outstandingStopCause(pass.previous?.drain, observation)
+WITHDRAWN_PROXY='                            ?: outstandingStopCause(pass.previous?.drain, observation, pass.hadContainer)
                     val blocker = replacementBlocker(pass, placement.node, cause)'
 CONVERGES_INSTEAD='                    // Before the drain, never after'
 CONVERGES_INSTEAD_PROXY='                    val blocker = replacementBlocker(pass, placement.node, cause)'
+# The same routing line with the fact answered by a constant rather than removed —
+# the plausible edit, and the exact defect that reopened the round above.
+ASSUMES_NO_CONTAINER='                            ?: outstandingStopCause(pass.previous?.drain, observation, hadContainer = false)
+                    // Before the drain, never after'
+# The storage guard'"'"'s state condition, and it back on the one state the drain
+# itself takes away.
+TRANSITION_STATES='                WorkloadState.RUNNING, WorkloadState.EXITED, WorkloadState.UNKNOWN -> true
+                WorkloadState.CREATED, WorkloadState.SANDBOX_ONLY -> false'
+TRANSITION_RUNNING_ONLY='                WorkloadState.RUNNING -> true
+                WorkloadState.EXITED, WorkloadState.UNKNOWN -> false
+                WorkloadState.CREATED, WorkloadState.SANDBOX_ONLY -> false'
+# ...and the storage record it writes: the definition it is refusing, rather than
+# the container it is about.
+TRANSITION_STORAGE='                storage = pass.previous?.storage?.copy(bound = true) ?: pass.storageStatus(observation),'
+TRANSITION_STORAGE_DERIVED='                storage = pass.storageStatus(observation),'
 
 # name @@ file @@ class @@ testcases that must redden (";"-separated) @@ literal @@ replacement
 #
@@ -952,7 +1000,7 @@ MUTATIONS=(
     # ever. Nothing behavioural covers this clause — `convergeProxy`'s create clears
     # the record on an `Absent` observation one step earlier — and the scenario that
     # first exposed it counted *creates* rather than reading a record, which is luck.
-    "D52@@$CONTROLLER@@$LIFETIME@@$RECORD_RETIRED@@$FRESH_CONTAINER@@        WorkloadState.CREATED, WorkloadState.SANDBOX_ONLY -> true"
+    "D52@@$CONTROLLER@@$LIFETIME@@$RECORD_RETIRED@@$FRESH_CONTAINER@@        WorkloadState.CREATED -> true"
     # The retention off altogether: every site that concludes no drain is wanted
     # deletes the record of a `SIGTERM` that is still inside the container. Scored
     # twice, as the rule and as the three paths that reach it.
@@ -977,6 +1025,28 @@ MUTATIONS=(
     # in front of `forbiddenTransition`. Scored as a shape and as a scenario.
     "D58@@$RECONCILER@@$WIRING@@$RETIRED_BY_RULE@@$REFUSAL_CLEAR@@$REFUSAL_DELETES"
     "D58D@@$RECONCILER@@$PROXY_DRAIN@@$REFUSED_MID_STOP@@$REFUSAL_CLEAR@@$REFUSAL_DELETES"
+    # The thirty-fourth audit's first critical, at the rule: a sandbox with no
+    # container reported classified as "not the container that was signalled",
+    # whatever this loop recorded. Scored twice, once as the rule and once as the
+    # path — the scenario is the one where the runtime stops enumerating a container
+    # inside its grace period, which is indistinguishable from an empty sandbox.
+    "D59@@$CONTROLLER@@$LIFETIME@@$SANDBOX_DECIDED@@$UNREPORTED_CONTAINER@@        WorkloadState.SANDBOX_ONLY -> false"
+    "D59D@@$CONTROLLER@@$PROXY_DRAIN@@$UNREPORTED_MID_STOP@@$UNREPORTED_CONTAINER@@        WorkloadState.SANDBOX_ONLY -> false"
+    # The same defect at the address the previous round's remedy created for it: the
+    # fact is a parameter now, so a site can answer it with a constant. D60 does that
+    # where the routing asks — behavioural and structural, since the shape is what
+    # says the argument is the pass's own property — and D60R where a clear asks,
+    # which no scenario reaches for the reason D56 and D57 give.
+    "D60@@$RECONCILER@@$PROXY_DRAIN@@$UNREPORTED_MID_STOP@@$WITHDRAWN_BACKEND@@$ASSUMES_NO_CONTAINER"
+    "D60S@@$RECONCILER@@$WIRING@@$ONE_DERIVATION_OF_HISTORY@@$WITHDRAWN_BACKEND@@$ASSUMES_NO_CONTAINER"
+    "D60R@@$RECONCILER@@$WIRING@@$RETIRED_BY_RULE@@$JOINABLE_CLEAR@@$JOINABLE_ASSUMES_NOTHING"
+    # The thirty-fourth audit's second critical: the storage refusal conditioned on a
+    # state the drain itself takes away, so the container exits, the refusal stops
+    # firing and the create applies the definition several passes refused. D61S is
+    # its second half — the refusal writing the storage record of the definition it
+    # is refusing, which erases the volume name recovery depends on.
+    "D61@@$RECONCILER@@$DRAIN@@$TRANSITION_NOT_APPLIED@@$TRANSITION_STATES@@$TRANSITION_RUNNING_ONLY"
+    "D61S@@$RECONCILER@@$DRAIN@@$TRANSITION_NOT_APPLIED@@$TRANSITION_STORAGE@@$TRANSITION_STORAGE_DERIVED"
     "C1@@$CONTROLLER@@$WIRING@@$EXIT@@$RULE@@val recorded = progress"
     "C2@@$CONTROLLER@@$WIRING@@$STEPPED@@$ADOPTION@@val observed = drain"
     "C3@@$CONTROLLER@@$RULES@@$ADOPTS@@$CLAUSE@@is PlayerReading.Occupied -> this"
