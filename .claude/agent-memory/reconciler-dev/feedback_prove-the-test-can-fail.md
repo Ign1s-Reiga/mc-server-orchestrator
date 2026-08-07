@@ -1,6 +1,6 @@
 ---
 name: prove-the-test-can-fail
-description: Before trusting a green run, prove the check could have gone red — Gradle skips up-to-date tasks, virtual time hides races, a level something else re-asserts must be pinned at the wire, a mutation set beats one sabotage, a precondition the compiler refuses is written as a reason where its mutation would go, a rename must sweep the retired claim and not just the identifier, and some checks belong in the type system instead
+description: Before trusting a green run, prove the check could have gone red — Gradle skips up-to-date tasks, virtual time hides races, a level something else re-asserts must be pinned at the wire, a mutation set beats one sabotage, a mutation carrying a value a constructor rejects measures the constructor, a precondition the compiler refuses is written as a reason where its mutation would go, a rename must sweep the retired claim and not just the identifier, a grep only proves what is in your own tree so check the base before disputing a quotation, and some checks belong in the type system instead
 metadata:
   type: feedback
 ---
@@ -312,6 +312,37 @@ the report parser. Re-run with a legal value (`1.hours`) and it reddened exactly
 one. **Before believing a red set, ask whether the mutation could have broken
 something every test shares**; a red count far above the claim is the tell, not a
 bonus.
+
+**A grep proves what is in *your* tree, and a worktree agent's tree is not the one
+the dispatcher is quoting.** I was quoted a sentence from `CriClientConfig.kt`,
+could not find it, checked `git log -- <path>` and saw the file had not moved since
+a commit my base contained, and reported the citation as unfindable — twice, the
+second time with the greps laid out as evidence. Every one of those checks was
+honest and the conclusion was wrong: `main` was **five commits ahead** of my base,
+and the sentence arrived in one of them. `git log -- <path>` answers "when did this
+move *in my history*", which is silent about commits I do not have, so it reads as
+confirmation when it is nothing of the kind.
+
+Before disputing a quotation, establish which tree it came from:
+
+- `git rev-list --count <base>..main` — is the branch behind at all? This is the
+  one question I did not ask, and it is the cheapest.
+- `git merge-base --is-ancestor <commit> HEAD` — do I actually have the commit the
+  claim rests on?
+- `git show main:<path> | grep …` — read the file *on the branch being quoted from*,
+  not the one checked out.
+
+`git merge-base HEAD main` returning the base is **not** evidence the branch is
+current; it returns the same value whether `main` has moved or not, and I read it
+as reassurance. The failure is symmetrical and worth naming for that reason: every
+symptom of reading a stale base is identical to the dispatcher having invented a
+quote. Being confidently wrong in *that* direction is expensive — it impugns a
+correct correction — so the base check comes before the accusation, not after.
+
+What did survive: recording the disagreement in a form that stayed **cheap to
+settle** — exact lines, exact command — is what let one `git show` end it instead
+of another round of assertions. And [[audit-remedies-are-hypotheses]]' rule held in
+both directions, including against my own rebuttal.
 
 **The family this belongs to: an instrument that looks like a result.** Three in
 two rounds — the vacuous mutation above, a waiter polling for a sentinel the

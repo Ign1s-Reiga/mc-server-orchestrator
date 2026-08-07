@@ -95,43 +95,16 @@ are visible together.
   margin rather than a bound, so spending it would be depending on somebody else's
   headroom. *State the true threshold and then say which side of it the guard sits
   on, rather than letting the guard's value stand in for the mechanism.*
-- **`CriClientConfig.kt` carries the same overstatement — disputed twice, and here
-  is the check that settles it in one command.** Two sentences key on the *cap*
-  where the true threshold is the cap plus the slack:
-
-  - `:74` — *"So when this cap fires, the container has the stop signal and will
-    **not** be killed by that call."*
-  - `:84` — *"A re-issue carrying the same **over-cap** grace period therefore ends
-    exactly as the first one did, however many times it is made."*
-
-  The premise above `:84` (*"the `SIGKILL` is reached only when that grace period is
-  what expires"*) is correct; the `therefore` then swaps it for **over-cap**, which
-  is the false step, because in `(cap, cap + slack)` the grace period *is* what
-  expires. Settle it with
-  `grep -n "over-cap\|when this cap fires" cri/.../CriClientConfig.kt`.
-
-  I was told twice that this file carves the band out, the second time with a quoted
-  sentence about a *"`deadlineSlack`-wide band"* and `GrpcCriClient` *"testing the
-  elapsed time rather than the cap"*. **That sentence is in no file in this repo** —
-  `grep -rn "band where\|tests the elapsed" --include=*.kt --include=*.md .` exits 1,
-  and the file has not changed since `86a7b21`, an ancestor of this branch's base.
-  The likely honest source is `GrpcCriClient.attributeCappedStop`, which *does*
-  discuss elapsed time and *does* say "that test is not a restatement of `capped`" —
-  for a different reason (which clock raised the `DEADLINE_EXCEEDED`, since a runtime
-  fault can raise one early), not the slack band.
-
-  **The rule works in both directions and that is the point.** [[audit-remedies-are-hypotheses]]
-  says a finding may be right and its remedy wrong; this is the mirror — a
-  *rebuttal* is a hypothesis too. Do not flip a memory to match a correction whose
-  evidence the file does not contain, and do not dig in either: record the exact
-  lines and the command, so the next reader spends ten seconds rather than
-  re-litigating. A memory that sends a future round to "fix" correct prose is bad;
-  one that certifies a real overstatement as correct is worse, because it closes the
-  finding.
-- **`docs/operating.md` does not exist**, though `CLAUDE.md` names it as the third
-  place to fix when a deliberate-and-surprising behaviour changes, and it was cited
-  to me as stating this band correctly. Nothing under `docs/` exists at all. Check
-  before treating it as a source or an obligation.
+- **`:cri` states the band correctly and has since `46d0170`; there is nothing to
+  fix there.** `CriClientConfig.kt` on `main` carries the carve-out in as many
+  words — *"the condition is that the deadline expired first, and not merely that
+  the grace period was over the cap: between the two lies a `deadlineSlack`-wide
+  band where the deadline still outlasts the grace period and the kill is still
+  reached, which is why `GrpcCriClient` tests the elapsed time rather than the
+  cap"* — and `docs/operating.md` says the same for an operator. **`:core` was the
+  only place that drifted.** My branch's prose was written against the *previous*
+  KDoc, so after a rebase some of its pointers into `:cri` may want rewording even
+  though the files do not overlap.
 - **Population empty and the residual is a ruling.** `SpecBounds` bounds both halves
   at the decode and `Reconciler` acts on nothing else, so nothing the loop presents
   is over the cap. `StopGrace.of(31.days, 30.days)` is still constructible and is
