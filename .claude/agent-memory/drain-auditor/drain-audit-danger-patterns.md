@@ -1772,3 +1772,65 @@ Related: [[standalone-paper-drain-shape]]
      rule keyed on container identity is true-by-construction in the core unit
      harness, and the defect it exists to prevent — a record outliving the container
      it names — is invisible there. Fix the fake before proposing an id-keyed record.
+
+## Round 35: the discriminator threaded, and the guard that is not total
+
+148. **A fix that replaces a derived value with a remembered one, then restores the
+     derivation behind a `?:`.** `forbiddenTransition` stopped drafting
+     `pass.storageStatus(observation)` — which is computed from the *edited*
+     definition and so recorded `persistent = false, volumeName = null` on every
+     pass that refused the edit — in favour of `pass.previous?.storage?.copy(bound
+     = true)`. The elvis is the whole of the old expression, and it fires exactly
+     where there is no record to protect: a status row decoded with `storage = null`
+     (`StatusCodec.readStorage` returns null when `storage.persistent` is absent, so
+     every row written before the field existed). On those rows the refusal writes a
+     *false* `persistent = false` instead of writing nothing, and `draft`'s own
+     default is already `previous?.storage`, so the fallback buys nothing. Same
+     family as item 64: read the elvis, not the signature.
+149. **A guard keyed on a container label is total only over the states that have a
+     container.** Widening the storage-transition refusal from `RUNNING` to
+     `RUNNING/EXITED/UNKNOWN` closes the window the drain itself opens by stopping
+     the process — but `Absent`, `SANDBOX_ONLY` and `CREATED` remain pass-through
+     because there is no container label to read, and two of those are also windows
+     the drain opens: the pass or two between `teardown` completing and `converge`
+     creating, and the partial-removal state. An `ephemeral` edit landing there is
+     applied with no refusal at all, and the server comes back on an empty world.
+     The loop's own memory of "this server had a persistent volume" is
+     `status.storage`, which `converge` (`Reconciler.kt` ~1761) and `drain`
+     (~2141) overwrite from the *desired* definition every pass — so a create-side
+     guard has nothing to ask. Ruling: the local fix is right, the general case is
+     not closable while `StorageStatus` is documented as observed and derived from
+     desired.
+150. **A refusal placed in front of `advance` is a gate on the drain, not only on
+     the edit.** `forbiddenTransition` returns before `drainController.advance`, so
+     while it fires the drain cannot reach `awaitStopped` or `teardown`. With the
+     dispatch record now retained across it, a refusal landing inside a stop's grace
+     period leaves the container signalled, the backend deregistered, the sandbox
+     un-torn-down and the workload dark until an operator reverts — no world is
+     lost, and nothing but the revert lifts it. The KDoc's "the gate does not arm so
+     passes keep coming" is true only for that retained-record case; with no
+     dispatched stop the record is cleared to null, `parkedOnTheFailure()` is true
+     and the server freezes instead. Two different outcomes, one paragraph.
+151. **Eleven sites delete a mid-flight drain record, and that is safe only while
+     every external drain step is level-triggered.** `clearedDrainRecord` returns
+     null whenever no stop was dispatched, so any converge, joinable or refusal pass
+     wipes a drain that had sealed a backend, chosen a destination and issued a
+     transfer sweep — without going through `DrainController.abort`'s
+     compensations. It holds up today because `ProxyPass.backends` derives both
+     `sealed` and `letGo` from the stored record every pass, so deleting it restores
+     routing by itself. The day a drain step gains an effect that is *not*
+     re-derived from the record (a kick, a persisted transfer ticket), these eleven
+     sites skip its undo silently. Same obligation as item 33, at the sites that
+     were never thought of as abort paths.
+152. **Mutation boards score inversions; this subsystem now produces omissions.**
+     Rounds 33, 34 and 35 each turned on a *new consumer asking a narrower question
+     than the fact supports* — a missing argument, a state left out of a `when`, a
+     guard conditioned on one state. Round 34's own note (item 146) says a board
+     cannot see a discriminator nobody wrote. The check that has found the last two
+     criticals is the same one both times: enumerate every exhaustive
+     `when (…WorkloadState)` in `:core/main` and ask each whether it consults
+     `hadContainer` or carries a written unreachability argument *at the arm*. There
+     are five: `containerIsDown`, `stopIsInFlight` (both take it),
+     `forbiddenTransition`'s `couldBeTheContainerTheEditIsAbout`, and `converge` /
+     `convergeProxy` (whose `SANDBOX_ONLY` arms are protected by the routing above
+     them, and whose argument lives at the routing site rather than at the arm).
