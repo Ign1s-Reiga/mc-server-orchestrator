@@ -2133,3 +2133,55 @@ Related: [[standalone-paper-drain-shape]]
      the permanent case — but the rule "a block is health" is only true of the
      subsystem the pass actually touched. Any future narrowing of the flapping arm
      has to say which fault a recovery is a recovery *of*.
+
+## Round 43: the second producer of a pair the funnel keeps consistent
+
+178. **"There is exactly one writer" is a claim about `:core`, and the decoder is
+     always the second writer.** `DrainController.settleLedger` maintains
+     `(faultLedger > 0) == (faultLedgerSince != null)` in one expression, and that
+     really is the only assignment in the loop — but `StatusCodec.readDrain` builds
+     the same pair from two independently-read keys, and the *lenient* read on one
+     of them (`string(...)?.toIntOrNull() ?: 0`) manufactures the half of the
+     biconditional the design did not consider: count zero beside a live instant.
+     The funnel then **adopts** it (`since = observed.faultLedgerSince ?: now`
+     keeps the stale instant whenever the pass faults), so the self-repair that was
+     argued to only ever *delay* a report advances one instead — six faults inside
+     the backoff's first 31 s against an hours-old anchor. Whenever a pair's
+     invariant is defended as "maintained at one site", enumerate the *decoders*
+     too, and prefer reading the pair jointly (`instant(...)?.takeIf { count > 0 }`)
+     over repairing it downstream.
+179. **A tolerance argued from "a refusal aborts the fleet read" is arguing from a
+     premise that was retired in round 10.** `SqliteStore.readRow` catches
+     non-retryable `StoreException` out of `readStatus` and charges it to one
+     server (`status = null`, `unreadable` set); only an unreadable *definition*
+     still fails `listServers`. So the choice between a lenient and a strict read
+     of a status field is not "one server versus the fleet" — it is "this field
+     reads zero" versus "`ReconcileLoop.resync` partitions this server out and its
+     drain stops being reconciled until a human edits the row". State the real
+     trade; the false one licenses strictness on exactly the fields that can least
+     afford it.
+180. **An edge-triggered log whose two sides are evaluated at the same `now`
+     cannot see an edge crossed by time.** `settleLedger` logs when
+     `settled.failingTooOften(now) && !observed.failingTooOften(now)`. That fires
+     only when *this pass's count change* crossed the threshold. When the count
+     reaches the threshold quickly — which at `Backoff`'s real first delays
+     (1/2/4/8/16 s) is the normal case — and the arm raises later because the
+     fifteen-minute age gate elapsed, `observed` already satisfies the predicate at
+     that same `now`, so the condition goes TRUE on the dashboard with **no log
+     line at all**. Item 46's family: the only non-dashboard channel is silent
+     exactly where the new gate does its work. Any "log on the edge" needs the
+     previous answer at the *previous* instant, or it is only a change-detector for
+     the operand the pass happened to move.
+181. **Adding a conjunct to an escalation multiplies its reachability analysis, and
+     the prose usually keeps the old one.** Gating a net-fault count on "the ledger
+     has been positive for `drainAttentionAfter`" is sound and does make the arm
+     structurally incapable of firing sooner than the age arm's own delay. What it
+     also does is require an *excursion* that both reaches N and survives the
+     window: at the real cadence (a recovering pass reports Progressed/Waiting, so
+     `WorkQueue.succeeded` puts the next delay back to 1 s) fifteen minutes is
+     several hundred passes, and for a walk below one half the chance an excursion
+     lasts that long decays exponentially in its length. `docs/operating.md`'s
+     "hours at 40%, most of a day at 30%" was computed for the count alone and
+     understates the flag by orders of magnitude. Direction is quiet, so it is a
+     doc finding — but it is the sentence an operator reads to decide whether
+     silence means health.
