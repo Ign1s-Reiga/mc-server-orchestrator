@@ -16,6 +16,7 @@ import mcorch.core.proxy.VelocityWorkloadPlanner
 import mcorch.schema.BackendRegistration
 import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
+import mcorch.schema.ControlCredential
 import mcorch.schema.FailureClass
 import mcorch.schema.FailureReason
 import mcorch.schema.SecretRef
@@ -429,6 +430,15 @@ internal class ProxyReconcileTest {
      * failure on a proxy freezes its passes and with them the routing sweep, which
      * is the one thing that restores joins to a backend whose drain has parked.
      *
+     * **And on `control` itself.** It used to reach only `failure`, and this test
+     * used to assert that `reachable` and `compatible` were both true with a
+     * remark that a reader of `control` alone learns nothing is wrong. That was
+     * the defect stated as a property: a dashboard drawing a control badge from
+     * those two fields renders green on a proxy behind which nothing can be
+     * sealed, transferred or deregistered. `credential` is the third observation
+     * and it is what the badge has to read — through `usable`, which is the one
+     * derivation of the three.
+     *
      * The proxy is not stopped and not recreated: it is serving players perfectly
      * well, and this build cannot know whether the operator would rather fix the
      * secret than restart their front door.
@@ -439,11 +449,15 @@ internal class ProxyReconcileTest {
             val backend = backendDefinition("survival-01")
             val harness = ProxyHarness(backends = listOf(backend))
             harness.bringUp()
-            harness
-                .proxyStatus()
-                .shouldNotBeNull()
-                .failure
-                .shouldBeNull()
+            val healthy = harness.proxyStatus().shouldNotBeNull()
+            healthy.failure.shouldBeNull()
+
+            // The control of the control: a working proxy records the accepted
+            // verdict, so `REJECTED` below is a change this pass produced rather
+            // than the value the field always holds.
+            val before = healthy.control.shouldNotBeNull()
+            before.credential shouldBe ControlCredential.ACCEPTED
+            before.usable.shouldBeTrue()
 
             // The secret behind the reference is rotated. Nothing in the definition
             // changed, so nothing recreates the container, and the token it holds is
@@ -458,14 +472,93 @@ internal class ProxyReconcileTest {
             failure.message shouldContain "rejecting this orchestrator's credential"
 
             // The handshake still says the endpoint is there and speaks our
-            // protocol, and both are true. That is precisely why the failure above
-            // has to exist: a reader of `control` alone learns nothing is wrong.
+            // protocol, and both are still true — the version route needs no token.
+            // What has changed is the fact those two cannot express.
             val control = status.control.shouldNotBeNull()
             control.reachable.shouldBeTrue()
             control.compatible.shouldBeTrue()
+            control.credential shouldBe ControlCredential.REJECTED
+            control.usable.shouldBeFalse()
+
+            // And the condition an alerting channel quotes moves with it, naming
+            // the remedy rather than the version or the network.
+            val condition = status.conditions.single { it.type == ConditionType.CONTROL_ENDPOINT_READY }
+            condition.status shouldBe ConditionStatus.FALSE
+            condition.message shouldContain "refused this orchestrator's credential"
 
             harness.proxyNode.stops.shouldBeEmpty()
             harness.proxyNode.removals.shouldBeEmpty()
+        }
+
+    /**
+     * The same verdict arriving by the other door.
+     *
+     * `:core` learns whether the plugin accepts its credential from the pass's
+     * *first* authenticated call, `GET /v1/self`, and that call being first is an
+     * ordering rather than a guarantee: the token is re-read per call, so a
+     * rotation can land between it and the backend assertions that follow. A
+     * verdict only one call site can write is one that goes missing the day the
+     * order changes — and what goes missing here is a control endpoint reading
+     * `usable` while every registration it is being sent is refused.
+     */
+    @Test
+    fun `a credential refused after the first call still lands on the control record`() =
+        coreTest {
+            val harness = ProxyHarness(backends = listOf(backendDefinition("survival-01")))
+            harness.bringUp()
+
+            harness.plugin.rejectsCredentialExceptState = true
+            harness.sweep()
+
+            val status = harness.proxyStatus().shouldNotBeNull()
+            val control = status.control.shouldNotBeNull()
+            // The handshake answered and so did `/v1/self`, so nothing before the
+            // backend assertions saw anything wrong.
+            control.reachable.shouldBeTrue()
+            control.compatible.shouldBeTrue()
+            control.credential shouldBe ControlCredential.REJECTED
+            control.usable.shouldBeFalse()
+            status.failure.shouldNotBeNull().reason shouldBe FailureReason.PROXY_CONTROL_UNREACHABLE
+        }
+
+    /**
+     * The other direction of the same field, and the reason it is three-valued.
+     *
+     * A proxy whose control endpoint does not answer at all has established
+     * *nothing* about the credential — no authenticated call was made, because the
+     * pass stops at the handshake. Recording `REJECTED` there would put a
+     * credential alarm on every network blip, and recording `ACCEPTED` would be a
+     * green light nobody lit; `UNTESTED` is what was observed.
+     *
+     * `usable` is false all the same, off `reachable`. That is the asymmetry the
+     * property is built on: an untested credential is *not refused*, and the flag
+     * still reports the endpoint as unusable because a different field says so.
+     */
+    @Test
+    fun `an unreachable control endpoint leaves the credential untested rather than refused`() =
+        coreTest {
+            val harness = ProxyHarness(backends = listOf(backendDefinition("survival-01")))
+            harness.bringUp()
+            harness
+                .proxyStatus()
+                .shouldNotBeNull()
+                .control
+                .shouldNotBeNull()
+                .credential shouldBe
+                ControlCredential.ACCEPTED
+
+            harness.plugin.unreachable = true
+            harness.sweep()
+
+            val control =
+                harness
+                    .proxyStatus()
+                    .shouldNotBeNull()
+                    .control
+                    .shouldNotBeNull()
+            control.reachable.shouldBeFalse()
+            control.credential shouldBe ControlCredential.UNTESTED
+            control.usable.shouldBeFalse()
         }
 
     /**

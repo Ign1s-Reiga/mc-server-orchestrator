@@ -11,6 +11,7 @@ import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.types.shouldBeInstanceOf
 import kotlinx.coroutines.test.runTest
 import mcorch.schema.BackendRoutingStatus
+import mcorch.schema.ControlCredential
 import mcorch.schema.ControlEndpointSpec
 import mcorch.schema.DrainBlockReason
 import mcorch.schema.DrainState
@@ -209,6 +210,47 @@ abstract class StoreConformanceSuite {
                         .shouldBeInstanceOf<VelocityProxyStatus>()
                 read.backends shouldBe table
                 read.backends?.backends?.map { it.server.value } shouldBe table?.backends?.map { it.server.value }
+            }
+        }
+
+    /**
+     * The three control-credential verdicts are three different claims, and a codec
+     * that collapses any two of them lies in a direction worth naming.
+     *
+     * `ACCEPTED` read back as `UNTESTED` loses nothing but a green light.
+     * `REJECTED` read back as either of the others is the defect the field was
+     * added for, restored by the storage layer: a proxy that refuses every seal,
+     * transfer and deregistration reads as healthy across a loop restart, which is
+     * exactly when a resumed drain is about to ask it for a seal. And `UNTESTED`
+     * read back as `REJECTED` is a fleet-wide credential alarm nobody observed.
+     *
+     * Asserted by name rather than left to the whole-object equality above, so a
+     * failure says which verdict was lost.
+     */
+    @Test
+    fun `every control credential verdict comes back as the one that was stored`() =
+        withStore { store ->
+            store.putDefinition(Fixtures.proxyDefinitionNamed("edge-01")).getOrThrow()
+            val base = Fixtures.fullProxyStatus("edge-01")
+            val control = base.control.shouldNotBeNull()
+
+            for (verdict in ControlCredential.entries) {
+                store.putStatus(base.copy(control = control.copy(credential = verdict))).getOrThrow()
+
+                val read =
+                    store
+                        .getServer(Fixtures.resourceName("edge-01"))
+                        .shouldNotBeNull()
+                        .status
+                        .shouldNotBeNull()
+                        .status
+                        .shouldBeInstanceOf<VelocityProxyStatus>()
+                        .control
+                        .shouldNotBeNull()
+                read.credential shouldBe verdict
+                // The derived flag follows the stored fields rather than being
+                // stored itself, so it cannot come back disagreeing with them.
+                read.usable shouldBe (verdict != ControlCredential.REJECTED)
             }
         }
 

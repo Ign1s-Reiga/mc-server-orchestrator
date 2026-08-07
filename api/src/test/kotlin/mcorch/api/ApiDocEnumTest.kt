@@ -3,6 +3,7 @@ package mcorch.api
 import io.kotest.matchers.collections.shouldContainExactly
 import io.kotest.matchers.shouldBe
 import mcorch.schema.ConditionType
+import mcorch.schema.ControlCredential
 import mcorch.schema.DrainState
 import mcorch.schema.FailureReason
 import mcorch.schema.ServerPhase
@@ -75,6 +76,7 @@ class ApiDocEnumTest {
         documentedUnion("ServerPhase") shouldContainExactly ServerPhase.entries.map { it.name }
         documentedUnion("DrainState") shouldContainExactly DrainState.entries.map { it.name }
         documentedUnion("FailureReason") shouldContainExactly FailureReason.entries.map { it.name }
+        documentedUnion("ControlCredential") shouldContainExactly ControlCredential.entries.map { it.name }
     }
 
     /**

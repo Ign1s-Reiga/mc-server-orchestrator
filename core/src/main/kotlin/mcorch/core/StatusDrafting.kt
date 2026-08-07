@@ -3,6 +3,7 @@ package mcorch.core
 import mcorch.schema.BackendRoutingStatus
 import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
+import mcorch.schema.ControlCredential
 import mcorch.schema.ControlEndpointStatus
 import mcorch.schema.DrainBlock
 import mcorch.schema.DrainState
@@ -647,15 +648,21 @@ private fun worldSavedMessage(
  *
  * `CONTROL_ENDPOINT_READY` false means seal, transfer and deregister are
  * unavailable, which means **no backend behind this proxy can complete a drain**.
- * It keeps "did not answer" apart from "answered, wrong version" in its message,
- * because only one of those two has "upgrade the proxy image" as its remedy.
+ * It keeps three cases apart in its message — "did not answer", "answered, wrong
+ * version" and "answered, refused our credential" — because the three have
+ * different remedies and only one of them is "upgrade the proxy image".
+ *
+ * The verdict itself is [ControlEndpointStatus.usable] rather than a conjunction
+ * written out here: `:api` renders the same flag, and two derivations of one
+ * verdict drift at whichever branch was added last. The message below may fan out
+ * further than the flag; the flag may not fan out at all.
  */
 private fun proxyEntries(proxy: ProxyConditions?): List<Triple<ConditionType, ConditionStatus, String>> {
     if (proxy == null) return emptyList()
     val backends = proxy.backends
     val control = proxy.control
     val resolved = backends != null && backends.matched > 0
-    val endpointReady = control != null && control.reachable && control.compatible
+    val endpointReady = control != null && control.usable
     return listOf(
         condition(
             ConditionType.BACKENDS_RESOLVED,
@@ -694,6 +701,13 @@ private fun proxyEntries(proxy: ProxyConditions?): List<Triple<ConditionType, Co
                         "`${control.pluginApiVersion}`, which this build does not. Upgrade the proxy image to " +
                         "one built from this revision; until then no backend behind this proxy can complete a " +
                         "drain"
+                }
+
+                control.credential == ControlCredential.REJECTED -> {
+                    "the plugin answered and refused this orchestrator's credential. The container holds the " +
+                        "control token it was created with, and rotating the secret behind " +
+                        "`spec.control.tokenSecret` does not recreate it — so until the two hold the same token " +
+                        "again, no backend behind this proxy can be sealed, transferred or deregistered"
                 }
 
                 else -> {

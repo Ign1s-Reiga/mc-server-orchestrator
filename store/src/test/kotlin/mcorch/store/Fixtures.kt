@@ -5,6 +5,7 @@ import mcorch.schema.BackendRoutingStatus
 import mcorch.schema.BackendStatus
 import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
+import mcorch.schema.ControlCredential
 import mcorch.schema.ControlEndpointStatus
 import mcorch.schema.DrainBlock
 import mcorch.schema.DrainBlockReason
@@ -274,6 +275,12 @@ internal object Fixtures {
                     pluginApiVersion = "1.4.2",
                     compatible = true,
                     lastContactAt = at.minusSeconds(3),
+                    // Deliberately not the default. A fixture that leaves an
+                    // optional field at its default cannot fail for a codec that
+                    // drops the key: the object comes back equal because the
+                    // constructor rebuilt the same value, and the round-trip test
+                    // measures the constructor rather than the encoding.
+                    credential = ControlCredential.ACCEPTED,
                 ),
             drain = fullDrain(drainState, at),
             failure =

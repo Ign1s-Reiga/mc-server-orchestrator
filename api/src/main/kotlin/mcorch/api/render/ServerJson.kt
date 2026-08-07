@@ -411,14 +411,19 @@ internal object ServerJson {
         }
 
     /**
-     * Whether the control endpoint answered, and whether it speaks a protocol this
-     * build understands.
+     * Whether the control endpoint answered, whether it speaks a protocol this
+     * build understands, and whether it accepts this orchestrator's credential.
      *
-     * `reachable` and `compatible` stay separate fields because the remedies
-     * differ: one is "the proxy is not answering", the other is "it answered and
-     * the plugin is the wrong version", and only the second is fixed by changing
-     * the image. `pluginApiVersion` is what the endpoint reported, never anything
-     * declared — the spec deliberately does not pin it.
+     * The three stay separate fields because the remedies differ: "the proxy is
+     * not answering", "it answered and the plugin is the wrong version", and "it
+     * answered and refused our token". Only the second is fixed by changing the
+     * image and only the third is fixed without touching the definition.
+     * `pluginApiVersion` is what the endpoint reported, never anything declared —
+     * the spec deliberately does not pin it.
+     *
+     * `usable` is `:schema`'s own derivation of the three, rendered rather than
+     * re-derived here. A client that reconstructs it from the parts is free to,
+     * but the one this document promises is this one.
      */
     private fun controlEndpoint(control: ControlEndpointStatus): Json.Obj =
         jsonObject {
@@ -426,6 +431,8 @@ internal object ServerJson {
             put("pluginApiVersion", control.pluginApiVersion)
             put("compatible", control.compatible)
             put("lastContactAt", control.lastContactAt)
+            put("credential", control.credential)
+            put("usable", control.usable)
         }
 
     private fun image(image: ImageStatus): Json.Obj =
@@ -905,6 +912,11 @@ internal object ServerJson {
                     put("backendsObserved", status.backends != null)
                     put("controlReachable", status.control?.reachable)
                     put("controlCompatible", status.control?.compatible)
+                    // The badge a fleet list draws. Without it a row renders green
+                    // off `controlReachable` and `controlCompatible` on a proxy
+                    // that is refusing every call the drain protocol is made of —
+                    // which is the whole reason the credential is observed.
+                    put("controlUsable", status.control?.usable)
                 }
             }
 

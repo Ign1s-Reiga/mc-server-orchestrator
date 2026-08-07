@@ -5,6 +5,7 @@ import mcorch.schema.BackendRoutingStatus
 import mcorch.schema.BackendStatus
 import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
+import mcorch.schema.ControlCredential
 import mcorch.schema.ControlEndpointStatus
 import mcorch.schema.DrainBlock
 import mcorch.schema.DrainBlockReason
@@ -333,6 +334,13 @@ internal object StatusCodec {
                 put("pluginApiVersion", control.pluginApiVersion)
                 put("compatible", control.compatible)
                 put("lastContactAt", control.lastContactAt)
+                // Written unconditionally, `UNTESTED` included. The value that
+                // means "nothing was established" has to be distinguishable from
+                // the key being absent only by *when* the row was written, and
+                // writing it always keeps the two the same shape on the way back
+                // in — the read defaults an absent key to `UNTESTED` for rows from
+                // builds that had no such field, which is the same claim.
+                put("credential", control.credential)
             }
         }
         status.drain?.let { drain -> writer.scope("drain") { writeDrain(this, drain) } }
@@ -421,6 +429,22 @@ internal object StatusCodec {
         )
     }
 
+    /**
+     * `credential` is the one optional key here, and its absence is not corruption.
+     *
+     * Every row written before the field existed has no such key, and what those
+     * rows recorded is exactly [ControlCredential.UNTESTED]: nothing about the
+     * credential was established, because nothing could be. Defaulting to either
+     * verdict would invent an observation for every stored proxy in the fleet at
+     * the moment of an upgrade — a false green on `ACCEPTED`, a fleet-wide false
+     * alarm on `REJECTED`.
+     *
+     * A key that is *present* and holds a value this build does not know still
+     * fails the row, through [DocumentReader.enum]. That is the codec's standing
+     * rule (`Refusing to guess`) and the direction is deliberate: an unknown
+     * verdict is a newer build's word about the credential, and quietly reading it
+     * as "untested" would turn a downgrade into a silent green.
+     */
     private fun readControl(reader: DocumentReader): ControlEndpointStatus? {
         if (!reader.has("control.reachable")) return null
         return ControlEndpointStatus(
@@ -428,6 +452,7 @@ internal object StatusCodec {
             pluginApiVersion = reader.string("control.pluginApiVersion"),
             compatible = reader.requireBoolean("control.compatible"),
             lastContactAt = reader.instant("control.lastContactAt"),
+            credential = reader.enum<ControlCredential>("control.credential") ?: ControlCredential.UNTESTED,
         )
     }
 

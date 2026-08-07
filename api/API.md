@@ -600,7 +600,8 @@ there is an observation** — it is null, not zero-filled, while the proxy is
 
 ```json
 "proxy": { "backendsMatched": 5, "backendsRegistered": 2, "backendsDestinations": 1,
-           "backendsObserved": true, "controlReachable": true, "controlCompatible": true }
+           "backendsObserved": true, "controlReachable": true, "controlCompatible": true,
+           "controlUsable": true }
 ```
 
 It exists so a fleet table can render a proxy row without reaching into
@@ -1488,7 +1489,28 @@ export interface ControlEndpointStatus {
   pluginApiVersion: string | null;
   compatible: boolean;
   lastContactAt: string | null;
+  /** What an authenticated call did. 'UNTESTED' is *no evidence*, not a verdict. */
+  credential: ControlCredential;
+  /**
+   * `reachable && compatible && credential !== 'REJECTED'`. The one derivation,
+   * computed server-side. 'UNTESTED' counts as not-refused rather than
+   * not-accepted, so this is false only where a call was actually observed to
+   * fail.
+   */
+  usable: boolean;
 }
+
+/**
+ * The handshake route (`GET /v1/version`) needs no token by design — that is what
+ * lets a wrong credential be told from a wrong port — so `reachable` and
+ * `compatible` say nothing about whether the orchestrator can drive the proxy.
+ *
+ * 'REJECTED' is reached by rotating the secret behind `spec.control.tokenSecret`:
+ * the container keeps the token it was created with, nothing in the spec hash
+ * moved, and every seal, transfer and deregistration is refused. The remedy needs
+ * no definition edit, so the failure recorded beside it is retryable.
+ */
+export type ControlCredential = 'UNTESTED' | 'ACCEPTED' | 'REJECTED';
 
 /** Absent optional fields are `null` here, not omitted. */
 export interface PaperServerStatus {
@@ -1623,6 +1645,13 @@ export interface ProxyFacts {
   backendsObserved: boolean;
   controlReachable: boolean | null;
   controlCompatible: boolean | null;
+  /**
+   * The badge to render. `controlReachable && controlCompatible` is **not** it: a
+   * proxy that answers, speaks our protocol and refuses our control token is true
+   * on both while no backend behind it can be sealed, transferred or
+   * deregistered. Server-derived, so it cannot drift from the condition.
+   */
+  controlUsable: boolean | null;
 }
 
 /**

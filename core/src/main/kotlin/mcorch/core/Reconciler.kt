@@ -13,6 +13,7 @@ import mcorch.core.proxy.VelocityWorkloadPlanner
 import mcorch.schema.BackendRegistration
 import mcorch.schema.BackendRoutingStatus
 import mcorch.schema.BackendStatus
+import mcorch.schema.ControlCredential
 import mcorch.schema.ControlEndpointStatus
 import mcorch.schema.DrainState
 import mcorch.schema.FailureClass
@@ -832,7 +833,12 @@ public class Reconciler(
                 endpoint = endpoint,
                 players = players,
                 backends = routing.status,
-                control = control,
+                // `routing.control`, never the `control` handed to it: the
+                // handshake cannot see whether the plugin accepts this
+                // orchestrator's credential, and drafting the unrefined record
+                // here is exactly the "reachable and compatible beside a failure
+                // saying nothing can be sealed" that the field exists to end.
+                control = routing.control,
                 // A drain that had aborted and then became unnecessary leaves a
                 // stale record behind, and a joinable proxy means it is over —
                 // unless this proxy has a stop of its own outstanding, which is a
@@ -929,6 +935,10 @@ public class Reconciler(
                         "build does not. No backend behind it can complete a drain"
                 }
             return ProxyRouting(
+                // Unrefined: this pass stopped before authenticating, so the
+                // credential is untested and saying anything else would be an
+                // answer to a question nobody asked.
+                control = control,
                 status = pass.previous?.backends,
                 failure =
                     recordFailure(
@@ -959,9 +969,17 @@ public class Reconciler(
         // would turn that absence into an outbound `DELETE` against a live backend.
         val listing = store.listAll()
         val matched = pass.backends(listing)
+        // The verdict of this pass's authenticated calls, and it starts at
+        // "nothing established". Every branch below that learns something writes
+        // it; the ones that learn nothing — an endpoint that stopped answering
+        // between the handshake and this call, a refusal with some other code —
+        // leave it alone rather than guessing, because `UNTESTED` is the value
+        // that claims nothing.
+        var credential = ControlCredential.UNTESTED
         val registered =
             when (val state = channel.state()) {
                 is ControlOutcome.Answered -> {
+                    credential = ControlCredential.ACCEPTED
                     state.value
                 }
 
@@ -983,13 +1001,14 @@ public class Reconciler(
                 // is wrong once, in the operator's terms, and skips assertions that
                 // could not have landed.
                 //
-                // It reaches `failure` and not `control`: `ControlEndpointStatus`
-                // has no field for "answering, but not to us", so a dashboard shows
+                // It reaches `control` as well as `failure`. The status field is
+                // `ControlEndpointStatus.credential`, and this branch is what fills
+                // it with `REJECTED`: without it a dashboard reads
                 // `reachable = true, compatible = true` beside a failure saying
-                // nothing can be sealed. **When that field lands, fill it from this
-                // branch.** The temptation is a second, authenticated probe inside
-                // `readControl`, which would be one more round trip per pass to
-                // learn what this `when` already knows.
+                // nothing can be sealed, and the two surfaces disagree about the
+                // same endpoint. The temptation is a second, authenticated probe
+                // inside `readControl`, which would be one more round trip per pass
+                // to learn what this `when` already knows.
                 is ControlOutcome.Refused if state.code == ControlErrorCode.UNAUTHENTICATED -> {
                     val message =
                         "the proxy's control endpoint is answering but rejecting this orchestrator's " +
@@ -999,6 +1018,7 @@ public class Reconciler(
                             "until the token they share is the same one again"
                     LOG.error("proxy={} is refusing this orchestrator's control token: {}", pass.name, message)
                     return ProxyRouting(
+                        control = control.copy(credential = ControlCredential.REJECTED),
                         status = pass.previous?.backends,
                         failure =
                             recordFailure(
@@ -1072,6 +1092,15 @@ public class Reconciler(
 
                 is ControlOutcome.Refused -> {
                     problem = problem ?: "`${backend.server}` could not be registered (${outcome.code})"
+                    // The same fact the `state()` branch above records, arriving by
+                    // the other door. It cannot happen while that call is made first
+                    // and 401s first — but that is an ordering, not a guarantee, and
+                    // a token rotated *between* the two calls lands here alone. A
+                    // credential verdict that only one call site can write is a
+                    // verdict that goes missing the day the order changes.
+                    if (outcome.code == ControlErrorCode.UNAUTHENTICATED) {
+                        credential = ControlCredential.REJECTED
+                    }
                     statuses +=
                         BackendStatus(
                             server = backend.server,
@@ -1154,6 +1183,7 @@ public class Reconciler(
 
         val routing = BackendRoutingStatus(observedAt = pass.now, backends = statuses)
         return ProxyRouting(
+            control = control.copy(credential = credential),
             status = routing,
             failure =
                 problem?.let {
@@ -1171,6 +1201,16 @@ public class Reconciler(
     private class ProxyRouting(
         val status: BackendRoutingStatus?,
         val failure: FailureStatus?,
+        /**
+         * The control record the handshake produced, refined by whatever the
+         * pass's *authenticated* calls then learned.
+         *
+         * It is returned rather than drafted at the call site because the verdict
+         * only exists here: `readControl` runs before this and asks the one route
+         * that needs no token, so it cannot answer "does the plugin accept us".
+         * The caller drafts this record, never the one it passed in.
+         */
+        val control: ControlEndpointStatus,
     )
 
     /**

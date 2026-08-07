@@ -10,6 +10,7 @@ import mcorch.schema.BackendRoutingStatus
 import mcorch.schema.BackendStatus
 import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
+import mcorch.schema.ControlCredential
 import mcorch.schema.ControlEndpointStatus
 import mcorch.schema.DrainBlock
 import mcorch.schema.DrainBlockReason
@@ -235,6 +236,74 @@ class VelocityProxyRenderingTest {
         ((api.call("GET", "/api/v1/servers/proxy-01").json()["display"]) as Map<*, *>)["state"] shouldBe "READY"
     }
 
+    /**
+     * Answering, speaking our protocol, and refusing our token.
+     *
+     * The row that used to render green on every control surface `:api` has: both
+     * booleans true, `display.proxy` all true, badge READY — beside a fleet in
+     * which no backend can be sealed, transferred or deregistered. The remedy is
+     * neither "restart the proxy" nor "upgrade the image", so it is neither of
+     * those two fields, and a client that draws its badge from them cannot see it.
+     *
+     * `usable` is what a badge reads, and it is rendered rather than re-derived so
+     * that a dashboard cannot end up with a third opinion about one endpoint.
+     */
+    @Test
+    fun `a proxy that refuses the orchestrator's credential is not rendered as a healthy endpoint`() {
+        createProxy().status shouldBe 201
+        observe(
+            backends =
+                BackendRoutingStatus(
+                    observedAt = at,
+                    backends = listOf(backend("survival-01", BackendRegistration.REGISTERED, online = 4)),
+                ),
+            control =
+                ControlEndpointStatus(
+                    reachable = true,
+                    pluginApiVersion = "1",
+                    compatible = true,
+                    credential = ControlCredential.REJECTED,
+                ),
+            backendsResolved = true,
+            controlMessage = "the plugin answered and refused this orchestrator's credential",
+        )
+
+        val document = api.call("GET", "/api/v1/servers/proxy-01").json()
+        val control = (document["status"] as Map<*, *>)["control"] as Map<*, *>
+        // The two older fields are still true, and both are still correct: the
+        // handshake route needs no token. That is the point.
+        control["reachable"] shouldBe true
+        control["compatible"] shouldBe true
+        control["credential"] shouldBe "REJECTED"
+        control["usable"] shouldBe false
+
+        val display = document["display"] as Map<*, *>
+        display["state"] shouldBe "DEGRADED"
+        (display["proxy"] as Map<*, *>)["controlReachable"] shouldBe true
+        (display["proxy"] as Map<*, *>)["controlCompatible"] shouldBe true
+        (display["proxy"] as Map<*, *>)["controlUsable"] shouldBe false
+        (display["detail"] as String) shouldContain "refused this orchestrator's credential"
+
+        // The control: an untested credential is not a refused one. A proxy that
+        // was never asked renders usable, because the flag may only go false where
+        // something was observed to fail — otherwise every starting proxy carries a
+        // red badge and the badge stops being read.
+        observe(
+            backends =
+                BackendRoutingStatus(
+                    observedAt = at,
+                    backends = listOf(backend("survival-01", BackendRegistration.REGISTERED, online = 4)),
+                ),
+            control = ControlEndpointStatus(reachable = true, pluginApiVersion = "1", compatible = true),
+            backendsResolved = true,
+        )
+        val untested = api.call("GET", "/api/v1/servers/proxy-01").json()
+        ((untested["status"] as Map<*, *>)["control"] as Map<*, *>)["credential"] shouldBe "UNTESTED"
+        ((untested["status"] as Map<*, *>)["control"] as Map<*, *>)["usable"] shouldBe true
+        (((untested["display"] as Map<*, *>)["proxy"]) as Map<*, *>)["controlUsable"] shouldBe true
+        (untested["display"] as Map<*, *>)["state"] shouldBe "READY"
+    }
+
     @Test
     fun `a proxy mid-drain renders the drain and the badge a delete implies`() {
         createProxy().status shouldBe 201
@@ -326,7 +395,11 @@ class VelocityProxyRenderingTest {
         backends: BackendRoutingStatus?,
         control: ControlEndpointStatus?,
         backendsResolved: Boolean?,
-        controlReady: Boolean? = control?.let { it.reachable && it.compatible },
+        // `usable`, not `reachable && compatible`. The reconciler derives the
+        // condition from the same property, and a fixture that re-derived it here
+        // from two of the three fields would model a `:core` that does not exist —
+        // and would go on passing after the third field started mattering.
+        controlReady: Boolean? = control?.usable,
         controlMessage: String = "",
         drain: DrainStatus? = null,
         drainBlocked: Boolean = false,
