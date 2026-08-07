@@ -50,15 +50,16 @@ orchestrator records the dispatch precisely so it cannot do that.
 
 ## 3. Three modules must agree on two hours
 
-A stop's grace period is capped in several places that each derive it
-independently:
+How long a stop may wait is decided by four constants, derived independently in
+three modules. Only three of them cap a grace period; the fourth caps the save
+timeout, and it is in the relation because the ceiling has a floor under it:
 
-| Module | Constant | Value |
-|---|---|---|
-| `:schema` | `PaperServerDefaults.MAX_STOP_GRACE_PERIOD` | 2h |
-| `:schema` | `SpecBounds.MAX_SAVE_TIMEOUT` | 1h |
-| `:core` | `StopGraceCeiling.MAX` | borrowed from the first |
-| `:cri` | `CriTimeouts.stopDeadlineCap` | 2h, declared independently |
+| Module | Constant | Caps | Value |
+|---|---|---|---|
+| `:schema` | `PaperServerDefaults.MAX_STOP_GRACE_PERIOD` | grace period | 2h |
+| `:core` | `StopGraceCeiling.MAX` | grace period | borrowed from the above |
+| `:cri` | `CriTimeouts.stopDeadlineCap` | the stop *call* | 2h, declared independently |
+| `:schema` | `SpecBounds.MAX_SAVE_TIMEOUT` | save timeout | 1h |
 
 The relation that matters is that **nothing a node can be handed exceeds the
 deadline `:cri` will wait for it**, and it holds **at equality between

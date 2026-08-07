@@ -63,6 +63,12 @@ constant chain, and two invariants the types do not enforce. When a change makes
 one of those sentences false, that file is the third place to fix, and it is the
 one a non-contributor reads.
 
+`docs/schema.md` is the operator's guide to writing definitions: every spec field
+of both kinds with its default, the pair rules and what they say when they fire,
+the secret-reference contract, and what gets clamped rather than rejected. A
+change to a field, a default, a bound or a validation message makes a sentence
+there false. It is the only operator-facing description of `VelocityProxy`.
+
 ## Non-negotiable invariants
 
 Breaking the ordering below loses player data. Check these first when implementing or reviewing.
