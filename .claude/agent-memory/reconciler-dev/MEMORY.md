@@ -27,4 +27,4 @@
 - [Classification scan scope](project_classification-scan-scope.md) — the two syntaxes it reads, the five exempt comparisons, the `!= RUNNING` gap left open, and the review rule I declined to fake.
 - [Producer scan scope](project_producer-scan-scope.md) — a rule in another module keyed on a state this one produces; discovery by asking the rule, the obligation moved to the producer, the guard that fires on store-dev.
 - [Cross-module constant relation](project_cross-module-constant-relation.md) — four constants at equality decide a loop's termination; why a test, not the `require`, and which mutation is informative.
-- [Flapping escalation](project_flapping-escalation.md) — it under-reports, not over-reports; the measurement that settles it, the ledger paid down by clean passes, and why the fix must be a disjunct.
+- [Flapping escalation](project_flapping-escalation.md) — closed by a ledger; why the decrement must be symmetric, where the crossover sits, and the three neutral-pass traps.

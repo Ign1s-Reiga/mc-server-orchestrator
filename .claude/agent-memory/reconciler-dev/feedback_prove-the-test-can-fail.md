@@ -340,6 +340,26 @@ foreground. Having committed first is what made recovery a one-line
 once, detached, when nothing is left to change. It is slow in a way worth planning
 around: round 38's full drain run took about 80 minutes for 89 mutations.
 
+**A test can assert a true property through a path that bypasses the code
+implementing it, and only a mutation says so.** A test for "a pass that
+establishes nothing does not spend the ledger" was built on an `UNKNOWN`
+observation — which `advance` answers *before* any step runs, so those passes
+never reach the funnel the rule lives in. The property held, the test was green,
+and making the rule's neutral branch do the opposite reddened nothing. The tell
+was a `got=[]` on a mutation I was confident about; the fix was to find the
+branch's genuinely reachable instance (`STOPPING` inside the grace period) and
+rebuild the scenario on it. **When a mutation of the exact line under test
+catches nothing, suspect the scenario reaches a different line** — an early
+return above it is the usual culprit, and `advance`-style dispatchers are full of
+them. Same family as the structurally-zero counter below, arriving through
+control flow rather than through a fake.
+
+**A red-proof's extra red is usually a true dependency; declare it rather than
+weaken the test.** Removing the ledger's floor reddened two tests, not the one
+claimed — because the drain's own healthy passes drive the count negative before
+the scenario starts, so a second test's premise (`ledger >= 1`) fails too. That is
+the instrument working. The entry gets both names.
+
 **A mutation must use a value the constructors accept, or it measures the
 constructor.** A red-proof of mine configured a CRI timeout to `Duration.ZERO`;
 `CriTimeouts.init` rejects that, so the `:core` object holding the constant failed
