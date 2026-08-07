@@ -123,6 +123,37 @@ It is the single line a future "proxies can save something" change would have to
 notice. Changing `ProxyDrainSubject` alone would remove the floor without
 touching `Node.kt` or any test of it.
 
+## 6. A drain is reported two ways, and one of them counts rather than waits
+
+`NEEDS_ATTENTION` fires for a drain in either of two independent cases, and it
+is worth knowing which one you are looking at because they read differently.
+
+**It has been failing for a while.** One fault has stood for
+`drainAttentionAfter` — fifteen minutes by default. The message names the
+failure and says how long it has been true.
+
+**It fails more often than it recovers.** This one exists because the first
+cannot see a fault that keeps clearing: a control endpoint that fails on one
+pass and behaves on the next never leaves a failure standing anywhere, and every
+recovery deletes the record and its clock. So a running total is kept instead —
+a fault adds one, a pass that finds the server healthy takes one away, floored
+at zero — and the flag fires when it reaches six. The message says *"keeps
+failing and recovering"* and quotes a count rather than a duration.
+
+The arithmetic is the whole rule and it is meant to be checkable in your head:
+**the total only grows while the drain is failing more often than it is
+working.**
+
+The surprise worth stating: **a fault that is present on exactly half the passes
+sits at the crossover and is not reported.** That is deliberate. Buying it would
+mean the decrement being smaller than the increment, and then no sentence
+describes where the threshold is. In practice an intermittent fault is not a
+metronome, so a genuine one-in-two fault does wander over the line eventually;
+an exactly alternating one never does.
+
+Neither case stops anything. The container keeps running and the loop keeps
+retrying in both, which is what makes the flag safe to alert on.
+
 ---
 
 ## What to do when a drain will not finish
@@ -135,6 +166,9 @@ In order:
 2. **Check whether it is waiting on you.** Note 1 is the common case. A missing
    secret, an unreachable proxy control endpoint and a full fleet all report
    distinctly.
+   If the message says the drain *keeps failing and recovering*, `status.failure`
+   may be empty or may hold a fault that has already cleared — see note 6. Look
+   at the logs for the whole period rather than at the one failure on the status.
 3. **Edit the definition.** A generation bump is the documented lever for a
    permanently failed drain, and for several states it is the only one.
 4. **If you stop a container by hand, save the world first.** The teardown
