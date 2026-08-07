@@ -316,8 +316,10 @@ internal class GrpcCriClient private constructor(
                     "grace period is longer than that. The runtime was asked for the whole ${gracePeriod.seconds}s " +
                     "and nothing shortened it — it has the stop signal, and it will not escalate to a kill for a " +
                     "call that has already given up. Nothing here says the runtime is unhealthy. Re-issue the stop, " +
-                    "which is idempotent and delivers the signal again, or read the container's state to see where " +
-                    "it got to. It said: " + failure.description,
+                    "which is idempotent, or read the container's state to see where it got to. A re-issue does not " +
+                    "send the stop signal a second time — the runtime records that it already sent one — but it " +
+                    "does reach the kill, if its own grace period runs out before its own deadline does. " +
+                    "It said: " + failure.description,
             cause = failure.cause,
         )
     }

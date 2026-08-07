@@ -72,15 +72,26 @@ public data class CriTimeouts(
      * went first (read against containerd 2.3.3, the release
      * `scripts/dev/containerd-env.sh` pins, and measured in
      * `cri/src/integrationTest`). So when this cap fires, the container has the
-     * stop signal and will *not* be killed by that call. A caller that re-issues
-     * the stop delivers the signal again; a container that ignores it is
-     * reported rather than killed.
+     * stop signal and will *not* be killed by that call.
+     *
+     * Re-issuing the stop is what finishes it, and not by re-delivering the
+     * signal: containerd compare-and-swaps a per-container flag the first time a
+     * stop with a timeout sends one, and skips it thereafter — *"Skipping the
+     * sending of signal terminated ... because a prior stop with timeout>0
+     * request already sent the signal"*, in its own log on 2.3.3. What a re-issue
+     * supplies is a fresh grace period on a fresh context, and the `SIGKILL` is
+     * reached only when that grace period is what expires. A re-issue carrying
+     * the same over-cap grace period therefore ends exactly as the first one did,
+     * however many times it is made.
      *
      * Measured against that runtime: a 12s grace period on a container that
      * ignores `SIGTERM`, deadlined at 4s by a 2s cap, gave up at 4.04s and left
      * the container `RUNNING` 17s after the stop was issued — five seconds past
      * the grace period containerd had been asked for, with no kill. A re-issued
-     * stop whose grace period fitted inside the cap finished it in 1.74s.
+     * stop with a 1s grace period finished it in 1.73s: 1.00s of grace, the kill,
+     * the task dead 19ms later, and 0.71s more for the exit event to reach the
+     * event monitor and settle the container's status. That tail is why
+     * [deadlineSlack] is not small.
      *
      * ## Why two hours
      *
