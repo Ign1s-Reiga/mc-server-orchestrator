@@ -54,6 +54,17 @@ implements the proxy side of the drain protocol, and most of them are arguments 
 - **`PaperServerStatus.drainInitiated` (`drain != null`) exists beside `draining`
   (`drain != null && state != DRAIN_FAILED`)**, and destination eligibility must use the former.
   `BackendStatus.eligibleAsDestination` bundles the whole rule so no caller re-derives half of it.
+- **`ControlEndpointStatus.credential` is a three-valued enum, not an `authenticated: Boolean`**
+  (added 2026-08-08, `feat/control-credential-status`). Reachable ≠ usable: `GET /v1/version` needs no
+  token by design, so `reachable`/`compatible` stay true on a proxy that 401s every seal, transfer and
+  deregistration — the state a secret rotation produces, because the spec hash carries the token's
+  *coordinates* and not its value. A boolean cannot express "no authenticated call was made this
+  pass", and either default invents an observation on every pre-existing row: `true` is a green lamp
+  nobody lit, `false` is a fleet-wide credential alarm at the instant of an upgrade. `UNTESTED` is the
+  default and means *no evidence*. One derived `usable` (`reachable && compatible && credential !=
+  REJECTED`) lives on the type so `:core`'s condition and `:api`'s badge cannot drift; it treats
+  `UNTESTED` as *not refused* rather than *not accepted*, so it can only go false where something was
+  observed to fail. Populated from calls the pass already makes — no wire change, no extra round trip.
 - **Deliberately left out of the proxy:** any Velocity/Minecraft version field (the image is already
   pinned and a proxy speaks all protocols — unlike Paper, whose launcher image downloads a build per
   version), forced hosts, motd, compression, a plugin list (the reconciler mounts the shipped plugin),

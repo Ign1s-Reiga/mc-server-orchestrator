@@ -182,7 +182,15 @@ In order:
    connected and nothing is wrong.
 2. **Check whether it is waiting on you.** Note 1 is the common case. A missing
    secret, an unreachable proxy control endpoint and a full fleet all report
-   distinctly.
+   distinctly. So does the one that looks like nothing: a proxy whose container
+   holds a control token that is no longer the one being sent answers its
+   handshake perfectly — `control.reachable` and `control.compatible` are both
+   true — while every seal, transfer and deregistration behind it is refused.
+   That reads as `control.credential: REJECTED` and `control.usable: false`, and
+   the remedy is to align the token, which needs no definition edit. Rotating the
+   secret behind `spec.control.tokenSecret` does **not** recreate the container:
+   only its coordinates are in the spec hash, deliberately, so a rotation cannot
+   restart the fleet's front door on its own.
    If the message says the drain *keeps failing and recovering*, `status.failure`
    may be empty or may hold a fault that has already cleared — see note 6. Look
    at the logs for the whole period rather than at the one failure on the status.

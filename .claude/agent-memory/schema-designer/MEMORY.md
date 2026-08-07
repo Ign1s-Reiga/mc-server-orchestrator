@@ -5,3 +5,4 @@
 - [Open schema questions](schema-open-questions.md) — contentious calls awaiting a ruling, and what was left out of each kind on purpose.
 - [Adding a kind breaks four modules](schema-sealed-hierarchy-breaks.md) — the exact `when` sites a new variant forces, and how the placeholders were written.
 - [What a violation may repeat back](schema-violation-message-rules.md) — the no-echo rule on secret paths, why `describe()` names shapes, the accepted residuals.
+- [Queued findings need their own fact](feedback_queued-findings-need-their-own-fact.md) — check each parked finding against the field you actually added; two "same field" findings were not.
