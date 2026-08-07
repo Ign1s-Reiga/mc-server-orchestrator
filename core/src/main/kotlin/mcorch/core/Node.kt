@@ -479,6 +479,15 @@ public interface Node {
  * pass, for ever. That is not a race and no retry count reaches it — it is the
  * inequality.
  *
+ * **It decides both stop sites and not only the re-issue**, which is worth knowing
+ * before reading either. `DrainController.stop` calls this with the same value: the
+ * capped deadline elapses, its `NodeException` catch aborts the drain as
+ * *retryable*, and the next pass comes back down the resume ladder into the same
+ * call — so the first stop is already the loop, and `awaitStopped`'s re-issue is
+ * reached only on the paths where that one returned cleanly. Both spin on the same
+ * inequality, and neither gives up, which is the correct behaviour of each in
+ * isolation.
+ *
  * The relation to keep true is therefore *"nothing a [Node] can be handed exceeds
  * the deadline `:cri` will wait for it"*, and it currently rests on four constants
  * in three modules meeting **at equality against a strict `>`**:
@@ -487,7 +496,7 @@ public interface Node {
  * raises this ceiling above [MAX] once a save timeout passes `MAX - margin`), and
  * `CriTimeouts.stopDeadlineCap` (two hours), whose own KDoc says in as many words
  * that `:cri` cannot see `:schema`'s cap and deliberately does not depend on it. One
- * second of movement in either of the outer two makes the loop above live.
+ * second of movement — [MAX] up, or the cap down — makes it live.
  *
  * **It is a test and not a `require`, and that is the seam's doing.** The check
  * would have gone in this object's `init`, the way `SpecBounds.init` binds its own
@@ -511,9 +520,8 @@ public interface Node {
  * nobody can retire without `crictl`. Shortening the re-issue's grace period is
  * still not the answer to that — see `DrainController.awaitStopped` and
  * `failure-modes.md` item 7 — and neither is capping this ceiling at `:cri`'s
- * number, which would clamp
- * one half of a validated pair by a rule that cannot see the other half. That is the
- * thirtieth audit's finding, two sections up.
+ * number, which would clamp one half of a validated pair by a rule that cannot see
+ * the other half. That is the thirtieth audit's finding, two sections up.
  */
 public object StopGraceCeiling {
     /**

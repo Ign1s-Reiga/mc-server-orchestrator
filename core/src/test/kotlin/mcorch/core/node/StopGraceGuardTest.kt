@@ -274,7 +274,10 @@ class StopGraceGuardTest {
      * `min(gracePeriod, CriTimeouts.stopDeadlineCap) + deadlineSlack`. Above the cap
      * the two are ordered the wrong way **by construction**, so every re-issue ends
      * exactly as the first did, on every pass, for ever. No retry count reaches that
-     * — it is the inequality.
+     * — it is the inequality. It is not confined to the re-issue either:
+     * `DrainController.stop` calls with the same value, times out on the same
+     * inequality and aborts as *retryable*, so the next pass comes back into the same
+     * call. Both stop sites spin, and each is behaving correctly in isolation.
      *
      * So the property is *"nothing a `Node` can be handed exceeds the deadline `:cri`
      * will wait for it"*, and it currently holds at **equality against a strict
@@ -319,6 +322,24 @@ class StopGraceGuardTest {
      * This says nothing about what containerd then does, which is `:cri`'s to measure
      * and is measured — `StopDeadlineCapIT`. What is asserted here is arithmetic on
      * constants, which is the whole of what was missing.
+     *
+     * ## What the red-proof found, because one result reads the wrong way
+     *
+     * Lowering `CriTimeouts.stopDeadlineCap` to an hour reddened **this test and
+     * nothing else** in 954 — the far-side constant was pinned by nothing at all.
+     * Raising `PaperServerDefaults.MAX_STOP_GRACE_PERIOD` to three hours reddened
+     * this and two others, which looks like coverage and is not: both of those
+     * (`a grace period containerd would invert is capped, not sent` here, and
+     * `BoundedDeadlineTest`) assert the constant's *value*, so somebody deliberately
+     * raising the ceiling updates them as part of the change and learns nothing.
+     * This one states a relation they cannot satisfy by being edited.
+     *
+     * The mutation for the second assertion has to decouple `SpecBounds`' two borrows
+     * — grace ceiling to three hours, save ceiling to two — because while both come
+     * from `PaperServerDefaults`, `SpecBounds.init` already forbids the pair that
+     * would break it. Under that mutation the first assertion stays green and the
+     * second fails, which is what says it is carrying its own weight rather than
+     * restating the first.
      */
     @Test
     fun `the ceiling a stop may carry stays inside the deadline that finishes it`() {
@@ -371,6 +392,12 @@ class StopGraceGuardTest {
      * three KDoc paragraphs in `Node.kt` name the constant on purpose; that is what
      * the code/comment split below is for, and it is what makes the scan need a
      * vacuity control.
+     *
+     * Red-proved by giving `LocalNode.open` a `timeouts = mcorch.cri.CriTimeouts()`,
+     * which reddened this and nothing else in 954. Note the spelling: the mutation
+     * carries no `import`, so a scan keyed on the import line would have been green
+     * on it. The token is looked for wherever it appears in code, which catches the
+     * qualified form because the simple name is a substring of it.
      */
     @Test
     fun `the shipped node runs on the default CRI timeouts`() {

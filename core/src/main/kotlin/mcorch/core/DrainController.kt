@@ -2717,9 +2717,12 @@ internal class DrainController(
      * grace period expires before that deadline. `GrpcCriClient` deadlines the call
      * at `min(gracePeriod, CriTimeouts.stopDeadlineCap) + slack`, so a grace period
      * **above** the cap has the two ordered the wrong way by construction and every
-     * re-issue from here ends exactly as the first one did. The sentence above then
-     * stops being true in the direction it matters: there is no runtime kill coming,
-     * and a shorter grace period *would* reach one. It is still not shortened —
+     * re-issue from here ends exactly as the first one did. (So does the first one:
+     * [stop]'s own call times out on the same inequality and aborts as retryable, so
+     * this branch is reached at all only on the paths where that one returned
+     * cleanly.) The sentence above then stops being true in the direction it matters:
+     * there is no runtime kill coming, and a shorter grace period *would* reach one.
+     * It is still not shortened —
      * `failure-modes.md` item 7, and a save this drain has already confirmed makes
      * the loop a report rather than a data-loss risk. What keeps the case empty is
      * the constant relation in [StopGraceCeiling] (*The relation a re-issued stop
