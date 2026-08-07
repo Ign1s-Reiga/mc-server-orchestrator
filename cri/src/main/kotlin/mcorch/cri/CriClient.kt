@@ -287,11 +287,12 @@ public interface CriClient : AutoCloseable {
      * printed an error is still a failed save.
      *
      * @param timeout how long containerd lets the command run before stopping
-     *   it. Required, and must be positive: CRI treats `0` as "run forever",
-     *   which would let a stuck save pin the reconcile loop's requeue on a call
-     *   that never returns. Size it above the maximum expected save duration and
-     *   below the stop grace period. On timeout the drain aborts and the
-     *   container stays running.
+     *   it. Required, and must be positive and finite: CRI treats `0` as "run
+     *   forever", which would let a stuck save pin the reconcile loop's requeue
+     *   on a call that never returns, and an infinite one takes this call's own
+     *   deadline away while leaving it looking deadlined. Size it above the
+     *   maximum expected save duration and below the stop grace period. On
+     *   timeout the drain aborts and the container stays running.
      * @throws CriException.Timeout when the command outran [timeout], or the
      *   transport deadline elapsed.
      * @throws CriException.NotFound when the container does not exist.

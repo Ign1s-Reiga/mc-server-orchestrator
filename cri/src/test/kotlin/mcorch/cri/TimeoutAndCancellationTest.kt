@@ -128,8 +128,19 @@ class TimeoutAndCancellationTest {
             }
         }
 
+    /**
+     * Both ends of the range are rejected, and for one reason: a command timeout
+     * this call cannot turn into a deadline.
+     *
+     * `0` is CRI's "run forever". `Duration.INFINITE` is the same hole reached
+     * from the other side — it survives an `isPositive` check, and
+     * `inWholeMilliseconds` saturates it into a deadline about 292 million years
+     * out, so the call ends up with no effective deadline while still looking
+     * deadlined. That is the hazard `CriTimeouts` already refuses for its own
+     * values; this parameter is a deadline input too and gets the same rule.
+     */
     @Test
-    fun `execSync rejects a non-positive timeout instead of running forever`() =
+    fun `execSync rejects a timeout it cannot make a deadline of`() =
         runCriTest {
             FakeCriServer().use { fake ->
                 shouldThrow<IllegalArgumentException> {
@@ -137,6 +148,9 @@ class TimeoutAndCancellationTest {
                 }
                 shouldThrow<IllegalArgumentException> {
                     fake.client.execSync(ContainerId("c"), listOf("save-all", "flush"), (-1).seconds)
+                }
+                shouldThrow<IllegalArgumentException> {
+                    fake.client.execSync(ContainerId("c"), listOf("save-all", "flush"), Duration.INFINITE)
                 }
             }
         }

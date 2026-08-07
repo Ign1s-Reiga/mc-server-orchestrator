@@ -365,9 +365,13 @@ internal class GrpcCriClient private constructor(
         timeout: Duration,
     ): ExecResult {
         require(command.isNotEmpty()) { "exec command must not be empty" }
-        require(timeout.isPositive()) {
-            "execSync timeout must be positive; CRI treats 0 as 'run forever', which would let a stuck " +
-                "command pin the reconcile loop on a call that never returns"
+        // Finiteness is checked for the reason CriTimeouts checks it: an infinite
+        // timeout is not "no command timeout", it is a deadline about 292 million
+        // years out on a call that still looks like it has one.
+        require(timeout.isPositive() && timeout.isFinite()) {
+            "execSync timeout must be a positive, finite duration; CRI treats 0 as 'run forever', which would " +
+                "let a stuck command pin the reconcile loop on a call that never returns, and an infinite one " +
+                "removes this call's deadline while leaving it looking deadlined. Got: $timeout"
         }
         // CRI carries the command timeout as whole seconds. Give the transport
         // strictly more room, so a command that outruns its own timeout is
