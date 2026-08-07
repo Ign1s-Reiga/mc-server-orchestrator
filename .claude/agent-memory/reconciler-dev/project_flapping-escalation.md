@@ -192,6 +192,57 @@ That distinction was untested until a mutation said so — swapping the gate to
 whose justification is "the obvious alternative is wrong" needs the scenario where
 the alternative differs, or the next reader deletes it.**
 
+## "Exactly one writer" was true of `:core` and false of the system
+
+Round 43's must-fix, and the most transferable thing in this file. The whole age
+gate rests on `(faultLedger > 0) == (faultLedgerSince != null)`, and I defended it
+by enumerating every construction and carry of `DrainStatus` **in `:core`**. That
+enumeration was correct and the invariant was still breakable, because the
+**decoder is a second producer**: `readDrain` built the two halves from
+independently-read keys with opposite tolerances, so `faultLedger=x` beside a
+parsable instant decoded to `(0, <old instant>)`. The funnel then *adopts* rather
+than repairs it — it computes the new count first, so the `else` branch keeps the
+stale anchor — and six faults at the real backoff satisfied the gate against
+history. Round 42's defect, restored through the store.
+
+**The rule: an invariant over two fields is a claim about every producer of the
+pair, and a codec is a producer.** Enumerating writers in the module that owns the
+logic is half the sweep. Read the pair jointly (`?.takeIf { <other half> }`) so the
+biconditional is total, rather than maintaining it in one place and hoping.
+
+The corollary I got wrong twice in one branch: **a self-repairing `?:` only
+repairs the half it can see.** `since = ... ?: now` repairs *(positive, null)* and
+silently adopts *(0, dated)*. When a repair is offered as the safety argument,
+enumerate both halves of the pair it repairs.
+
+## A retired premise restated in new code, twice in one branch
+
+The tolerance comment argued that a decode refusal "takes `listServers` down and
+with it the loop's whole view of the fleet". That is the **pre-round-10**
+behaviour — `SqliteStore.readRow` has charged an undecodable status to one row
+since then, and only an unreadable *definition* re-raises. The conclusion survived
+(neither half should be strict) but for a much larger reason: `ReconcileLoop.resync`
+holds an unreadable server out of reconciliation until a human edits the row.
+
+Both of this branch's premise failures were the same shape — a sentence that was
+true when it was first written, carried into new code where it was no longer
+checked. See [[audit-remedies-are-hypotheses]]; the sweep has to be *"is this still
+true"*, not *"did I copy it correctly"*.
+
+## An edge detected at the wrong operand
+
+The arm's log compared `settled.failingTooOften(now, …)` with
+`observed.failingTooOften(now, …)` — same `now`, so it detects the **count**
+moving, not the arm raising. Once the gate existed those became different instants:
+the count reaches the threshold in half a minute and the arm raises fifteen minutes
+later with *both operands unchanged*, so the only non-dashboard channel was silent
+on exactly the passes the gate was added for. Moved to the `NEEDS_ATTENTION`
+transition in `StatusDrafting`, which already computes it.
+
+**Generalise: when a predicate gains a `now`-dependent term, every edge detector
+that diffs its operands stops seeing the edge.** Diff the predicate's *answer*
+across passes, at a site that holds the previous answer.
+
 ## Two more instrument lessons from the same round
 
 - **A signature change silently retires every mutation written against it.** Adding

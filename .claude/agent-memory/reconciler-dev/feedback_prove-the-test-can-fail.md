@@ -354,6 +354,13 @@ return above it is the usual culprit, and `advance`-style dispatchers are full o
 them. Same family as the structurally-zero counter below, arriving through
 control flow rather than through a fake.
 
+**A `@TestFactory`'s case name is the dynamic test's name, not the method's.** A
+mutation entry naming `a row written without each field reads as declared` scored
+MISCAUGHT while the report held `DrainStatus.faultLedger` — the parent method name
+appears nowhere in the XML. Read one report before declaring an expected set
+against a parametrised class; the same trap as the trailing `(Path)` on an injected
+parameter, from the other end.
+
 **The harness sets the cadence, so a timing defect is invisible to every test
 that picks its own intervals.** `FlappingEscalationTest` advanced two to eight
 minutes per pass; the real loop spaces retries from `Backoff` (1s, 2s, 4s, 8s,
