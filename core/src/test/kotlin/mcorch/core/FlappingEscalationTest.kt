@@ -36,7 +36,7 @@ import kotlin.time.Duration.Companion.seconds
  * tests here are the four things worth pinning about it: that it fires where the
  * age arm cannot, that it stays quiet at the boundary the policy names, that the
  * age arm still fires on its own where it always did, and that a pass which
- * establishes nothing does not spend the ledger.
+ * neither records a fault nor establishes health moves it in neither direction.
  *
  * ## Read the first two together
  *
@@ -197,75 +197,97 @@ internal class FlappingEscalationTest {
         }
 
     /**
-     * **"Did not fail" is not "was found healthy".**
+     * **"Did not fail" is not "was found healthy", and neither is "a failure is
+     * standing".**
      *
-     * The ledger is paid down by a pass that establishes something — work that came
-     * back with what it asked for, or a drain that reached its gate — and left alone
-     * by one that establishes nothing. Were the rule "every non-failing pass pays one
-     * back", a drain waiting on a container that will not exit would erase real
-     * evidence at the poll interval while learning nothing about the fault.
+     * Both halves of the funnel's predicate, on one scenario, because one scenario
+     * reaches both. A stop is refused twice and then repaired; the container is
+     * slow to exit, so the drain sits in `STOPPING` inside its grace period with
+     * the earlier failure still on the record.
      *
-     * ## Which neutral pass, and why this one
+     * Each of those passes:
      *
-     * The first draft of this test used an `UNKNOWN` observation, and a mutation
-     * proved it worthless: `advance` answers that one *before* any step runs, so
-     * those passes never reach the funnel at all and making the neutral branch
-     * decrement did not redden anything. The property was true and the test was
-     * measuring a path that bypasses the code implementing it.
+     * - **records no fault.** `awaitStopped` carries the standing failure forward
+     *   untouched — a container that has not finished exiting is not a new fault —
+     *   so the increment must ask whether *this pass wrote* a failure, not whether
+     *   one is present. Asking the latter would climb the ledger once per poll on a
+     *   drain that is behaving, and escalate on a fault that happened once and was
+     *   fixed. The assertion that the failure's `attempts` does not move is what
+     *   makes this discriminating: it states that a failure is standing *and* that
+     *   this pass did not record it.
+     * - **establishes nothing.** `workDone` is false — the branch is reached
+     *   precisely because the previous stop has not taken — and there is no block.
+     *   Were the rule "every non-failing pass pays one back", these passes would
+     *   erase the evidence of the refused stop while learning nothing about it.
      *
-     * `STOPPING` inside the grace period is the reachable, repeatable neutral pass:
-     * `awaitStopped` finds the container still running, re-issues nothing it can
-     * claim, records no failure — a container that has not finished exiting yet is
-     * not a fault — and returns with `workDone` false. Twenty of them, forty seconds
-     * against a four-minute grace, so none of this is the overdue branch.
+     * ## Why not an unreported container
      *
-     * The ledger is built first by the same means as the headline test, then spent
-     * down by the honest work of finishing the drain, and what it lands on is
-     * whatever it lands on — the assertion is that those twenty passes do not move
-     * it, not what the number is.
+     * The first draft used an `UNKNOWN` observation and a mutation proved it
+     * worthless: `advance` answers that one *before* any step runs, so those passes
+     * never reach the funnel and making its neutral branch decrement reddened
+     * nothing. The property was true and the test was measuring a path that
+     * bypasses the code implementing it. `STOPPING` inside the grace period is the
+     * reachable, repeatable neutral pass — ten of them in twenty seconds against a
+     * four-minute grace, so none of this is the overdue branch, which *does* record
+     * a fault and should.
      */
     @Test
-    fun `a pass that establishes nothing does not pay the ledger down`() =
+    fun `a pass that records no fault and establishes nothing moves the ledger in neither direction`() =
         coreTest {
             val harness = Harness()
-            val name = drainingServer(harness)
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.node.online = 0
+            // The container is sent its stop and never exits, which is what keeps
+            // `awaitStopped` returning without having achieved anything.
+            harness.node.onStop = { it }
+            harness.store.deleteDefinition(name)
 
-            // Build a ledger worth protecting: two faults to one recovery, as above.
-            // Six cycles rather than three, because finishing the drain below pays
-            // several back honestly — the save, the deregistration and the stop are
-            // all real work — and a ledger that reached zero on the way would hide
-            // the property under test behind the floor.
-            repeat(6) {
-                harness.node.failAlways(NodeOperation.EXEC, harness.node.unreachable(NodeOperation.EXEC))
-                repeat(2) { step(harness, name) }
-                harness.node.clearFailures(NodeOperation.EXEC)
-                step(harness, name)
-            }
+            // Down to the stop, on an empty server. Every pass here does real work.
+            repeat(6) { step(harness, name, 2.seconds) }
             harness
                 .status(name)
                 .shouldNotBeNull()
                 .drain
                 .shouldNotBeNull()
-                .faultLedger shouldBeGreaterThanOrEqualTo 1
+                .state shouldBe DrainState.DEREGISTERED
 
-            // Everyone logs off and the drain finishes its work — which pays some of
-            // the ledger back, honestly — but the container never exits.
-            harness.node.online = 0
-            harness.node.onStop = { it }
-            repeat(8) { step(harness, name, 2.seconds) }
+            // Two refused stops: two faults, and a failure that will outlive them.
+            harness.node.failAlways(NodeOperation.STOP, harness.node.unreachable(NodeOperation.STOP))
+            repeat(2) { step(harness, name, 2.seconds) }
+            harness.node.clearFailures(NodeOperation.STOP)
 
-            val parked = harness.status(name).shouldNotBeNull().drain.shouldNotBeNull()
-            // The premise. Without it the assertion below is about some other state.
+            // The stop goes out. That pass is real work and pays one back.
+            step(harness, name, 2.seconds)
+            val parked =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
             parked.state shouldBe DrainState.STOPPING
             val earned = parked.faultLedger
             earned shouldBeGreaterThanOrEqualTo 1
+            val standing = parked.failure.shouldNotBeNull()
 
-            // Twenty passes that establish nothing either way.
-            repeat(20) { step(harness, name, 2.seconds) }
+            // Ten passes that record no fault and establish nothing.
+            repeat(10) { step(harness, name, 2.seconds) }
 
-            val after = harness.status(name).shouldNotBeNull().drain.shouldNotBeNull()
+            val after =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
             after.state shouldBe DrainState.STOPPING
             after.faultLedger shouldBe earned
+            // The premise, asserted rather than assumed: a failure was standing
+            // throughout and not one of those passes recorded it.
+            val carried = after.failure.shouldNotBeNull()
+            carried.attempts shouldBe standing.attempts
+            carried.occurredAt shouldBe standing.occurredAt
         }
 
     /** A deleted, populated server: the drain that cannot finish while people play. */
