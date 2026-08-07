@@ -391,9 +391,9 @@ class StopGraceGuardTest {
      * reaches the cap — the only way to falsify the relation is to move one of the
      * constants, which is a source mutation and not an input. So this test is a
      * *reachability* proof: it says the `require` is evaluated on the ordinary wiring
-     * path and does not spuriously refuse. Under the mutation that lowers
-     * `stopDeadlineCap` it goes red alongside the arithmetic test, and that pairing
-     * is the red-proof of both halves.
+     * path and does not spuriously refuse. Lowering `CriTimeouts.stopDeadlineCap` to
+     * an hour reddens exactly this and the arithmetic test, and this one's failure is
+     * the `require`'s own message — that pairing is the red-proof of both halves.
      *
      * `open` does not connect eagerly, so no containerd is needed and the endpoint
      * string is never dialled.
@@ -448,11 +448,24 @@ class StopGraceGuardTest {
      * purpose. That is what the code/comment split in [mainSources] is for, and it is
      * what makes the vacuity control below load-bearing rather than decoration.
      *
-     * Red-proved by giving `LocalNode.open` a `timeouts = mcorch.cri.CriTimeouts()`,
-     * which reddened this and nothing else in 954. Note the spelling: the mutation
-     * carries no `import`, so a scan keyed on the import line would have been green
-     * on it. The token is looked for wherever it appears in code, which catches the
-     * qualified form because the simple name is a substring of it.
+     * ## Red-proof
+     *
+     * Three mutations, each reddening this and nothing else in 955. The first gave
+     * `LocalNode.open` a `timeouts = mcorch.cri.CriTimeouts()`; note the spelling,
+     * which carries no `import`, so a scan keyed on the import line would have been
+     * green on it. The second was the audit's `copy` shape in a file that builds no
+     * client. The third is the one that matters, because **the old scan would have
+     * been green on it**: a helper taking a `CriClientConfig` and returning
+     * `cfg.copy(timeouts = cfg.timeouts.copy(stopDeadlineCap = …))`, which names
+     * `CriTimeouts` nowhere and `CriClientConfig(` nowhere — only the field. That is
+     * the hole, and the field being in the token set is what closes it.
+     *
+     * A fourth attempt is worth recording as a *method* note. It configured the cap
+     * to `Duration.ZERO`, which `CriTimeouts.init` rejects — so [StopGraceCeiling]'s
+     * class-init threw and **76** tests went red, this one among them. A run like
+     * that attributes nothing: the assertion under test cannot be distinguished from
+     * collateral. Give a mutation a value the constructors accept, or it is measuring
+     * the constructor.
      */
     @Test
     fun `nothing but a node's own wiring speaks about the CRI stop deadline`() {
