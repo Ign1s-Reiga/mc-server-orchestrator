@@ -268,6 +268,14 @@ two files, one of which I could not `git checkout --` because it also held real
 work. Commit first, then run the harness, then edit again — the same rule as
 sabotaging by hand, for the same reason.
 
+**And the full drain harness outruns a ten-minute tool timeout**, which kills it
+mid-mutation and leaves that mutation in the working tree — the same wreckage as a
+`pkill`, from a completely ordinary invocation. Run it detached and poll for its
+own `exit=` line rather than in the foreground. Having committed first is what made
+recovery a one-line `git checkout --` of a file I knew held no work of mine; run a
+subset first (`./scripts/dev/drain-wiring-mutations.sh D62 D63`) to iterate, and the
+whole set once, detached, when nothing is left to change.
+
 **A green `./gradlew build` did not mean the integration sources compiled.**
 Neither `:app`'s nor `:cri`'s `check` depended on `compileIntegrationTestKotlin`,
 so `EndpointTimeout` becoming `EndpointRequest.timeout`'s type left

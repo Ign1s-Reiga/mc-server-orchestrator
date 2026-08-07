@@ -17,10 +17,10 @@
 - [Unreadable state posture](project_unreadable-state-posture.md) — a bad definition row cost the fleet; a bad observation was already safe via `getServer`, and the loop's skip only buys reporting.
 - [Level-triggered seal](project_level-triggered-seal.md) — assert, never issue; anchor rules; the release keyed on the gate's answer and classed by whether it landed; every asserting site records the seal.
 - [Record where no work happens](project_record-where-no-work-happens.md) — the third critical from "did work ⇒ recovered", and why the fix was placement rather than a narrower rule.
-- [Invariants need an enforcement point](feedback_invariants-need-an-enforcement-point.md) — pin wiring by shape and every premise of an unreachability argument; two gates need a side-effect assertion.
+- [Invariants need an enforcement point](feedback_invariants-need-an-enforcement-point.md) — pin wiring by shape and every premise of an unreachability argument; the arm-level check that catches an argument nobody wrote.
 - [Replacement needs an exit](project_replacement-exit.md) — a hash input no operator can edit closes the fleet's login path; the lever, the pre-flight asked at both ends, the wait still unbounded.
 - [Gate and ceiling](project_gate-and-ceiling.md) — a block must not arm the permanent gate; a park is a park; the node caps a grace period rather than refusing it; why troubleSince was declined.
 - [Deadline ceilings](project_deadline-ceilings.md) — clamping half a validated pair inverts it; `max(K, f(other))` bounds the relation, not the wait; `:cri` owns the wait; one refusal, two classes.
 - [Dispatch record](project_dispatch-record.md) — two proxies wrong at two call sites mean a fact nobody records; the stamp that inverts the save rule; the `Rejected` ruling still open.
-- [Record lifetime](project_record-lifetime.md) — the value was right and the lifetime was inherited; the fix's own defect; the rule that was one argument short; the workload-owned record, ruled.
-- [Guard lifetime](project_guard-lifetime.md) — a refusal conditioned on a state the drain itself ends; the churn that replaced the freeze; the volume name the loop erased.
+- [Record lifetime](project_record-lifetime.md) — the value was right and the lifetime was inherited; the fix's own defect; the undo the clears skip, safe only by re-derivation.
+- [Guard lifetime](project_guard-lifetime.md) — a refusal conditioned on a state the drain itself ends; its two outcomes, only one of which churns; the `?:` that put the erasure back.

@@ -1,6 +1,6 @@
 ---
 name: guard-lifetime
-description: Round 34's second critical — a refusal conditioned on a state the drain itself ends, the ruling on the churn that replaced the freeze, and the two extensions I made past the prescription
+description: Round 34's second critical — a refusal conditioned on a state the drain itself ends, the refusal's two outcomes (only one of which churns), and how the fix's own fallback restored the erasure on the rows least able to afford it
 metadata:
   type: project
 ---
@@ -48,16 +48,49 @@ then on lives in a writable layer that dies with the next replacement. Do not le
   fix did not reach this; see [[audit-remedies-are-hypotheses]] and
   [[derive-from-the-consumer]]. The general form — `StorageStatus` is documented
   as *observed* and is derived from desired state everywhere in the loop — is
-  still open and is a `:schema`/`:api` conversation.
+  still open and is a `:schema`/`:api` conversation, now routed as its own round.
 
-## The churn, decided rather than discovered
+## Round 35: my own fix's `?:` put the erasure back
 
-With the record retained and the refusal permanent, every pass re-records the
-same failure and increments `attempts`: one store write per resync, nothing
-issued at the runtime. Accepted over arming the gate, because **this loop is the
-only thing that can notice the operator reverting the edit**, and freezing a
-workload whose container it has already signalled leaves the stop half-finished.
-The lever is asserted at the end of the scenario test, not just described.
+`storage = previous?.storage?.copy(bound = true) ?: pass.storageStatus(observation)`.
+The fallback is the removed expression, reached by every row `StatusCodec.readStorage`
+decodes as **null** — which is every status written before the field existed, i.e.
+precisely the population whose volume name is recorded nowhere else. `draft`'s own
+default is already `previous?.storage`, so deleting the elvis was the whole fix.
+
+**The shape, and it is the general one:** when the fix is *"stop deriving X from
+the wrong source"*, a fallback for "there is nothing to carry forward" derives X
+**from the wrong source**, and it fires on the rows with the least other evidence.
+Read every `?:` in a fix back as "and when we know nothing, do the thing we just
+banned". Absence has to stay absence: *"this row never said"* and *"there is no
+world here"* are different answers, and only the second tells somebody to stop
+looking — `worldSavedMessage` renders `persistent == false` as "ephemeral storage:
+there is no world to save".
+
+The existing round-34 scenario could not carry the claim (it has a recorded volume,
+so the fallback is never taken) and stayed green under the mutation. A defect
+reachable only by one *population* of rows needs a case built on that population.
+
+## The refusal has two outcomes and only one of them churns
+
+Which one a server lands in is decided by whether a stop had already been
+dispatched, and the round-34 note recorded only the rarer one:
+
+- **Stop dispatched** — `clearedDrainRecord` retains the record, it is `STOPPING`,
+  `parkedOnTheFailure()` is false, the gate stays unarmed and the passes keep
+  coming. Each re-records the same failure and increments `attempts`: one store
+  write per resync, nothing at the runtime. Accepted, because **this loop is the
+  only thing that can notice the operator reverting the edit**.
+- **No stop dispatched** — the ordinary case. The record is cleared, so
+  `parkedOnTheFailure()` is true, the gate arms, and the server **freezes** with
+  `observedAt` no longer advancing. The lever is a generation bump, which is what
+  lifts that gate.
+
+Also unstated before: while the refusal fires it is a **gate in front of `advance`**,
+so a drain in `STOPPING` never reaches `awaitStopped` or `teardown` — container
+signalled, backend deregistered, sandbox not removed, workload dark until the
+revert. That is the trade, not churn: the alternative is letting the drain run to a
+create that applies the refused definition.
 
 See [[record-lifetime]] for the round that opened the window, [[gate-and-ceiling]]
 for why a park is not automatically a gate, and [[prove-the-test-can-fail]] for

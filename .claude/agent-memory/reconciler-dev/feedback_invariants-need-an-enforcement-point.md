@@ -419,6 +419,43 @@ both are right (world-free workloads, in test code).
   place a future change removes the floor without touching the ceiling's file or
   any test of it.
 
+## A shape check for an argument nobody wrote
+
+Round 35, and it is the answer to round 34's finding that a mutation board scores
+*inversions* while three rounds running produced **omissions** — a fact modelled
+exactly in one place, approximated at a new consumer that asked a narrower
+question. There is no expression to flip, so no mutant can go red, and the board
+was honestly green through all three.
+
+The instrument that can go red is a scan whose unit is the **`when` arm**, over the
+one state that cannot be decided from the observation alone. In `:core` that is
+`WorkloadState.SANDBOX_ONLY`, and the rule is: *the arm's answer names
+`hadContainer`, **or** the contiguous `//` block above it does*. Four things make
+it work rather than being decoration:
+
+- **The arm, not the enclosing function.** `converge`'s classification sits inside a
+  local `fun status(`, so an enclosing-function scan reports the wrong name; and a
+  function taking the fact for an unrelated reason would score every arm in it safe.
+- **The arm's own line, not its block.** Both `converge` arms forward
+  `pass.hadContainer` to `clearedDrainRecord` *inside* their blocks — a different
+  question from the one the arm answers — so a block scan would have been green on
+  the day it was written.
+- **Close the `else`.** An arm scan has an alphabet, and `else ->` is how a state
+  leaves it. A second assertion refuses an `else` in any `when` that has a state
+  arm; the one `else` in the module became four enumerated arms, which costs a line.
+- **Prose can be pasted, and that is accepted.** The value is that a classification
+  written without a thought about the fact cannot compile-and-pass. Score it with
+  **two** mutations: an arm with no note, and the same arm with a note that explains
+  the branch *without naming the fact* — otherwise "carries the argument" is bought
+  off by any comment and the second half of the rule is decoration.
+
+And where an arm's note says the fact was asked **above** it, that is a constructive
+argument and its premises go in a test, per the section above: here, every
+`converge` call is an *arm* of the `when` that also routes into the drain, in a
+function that asks `outstandingStopCause` with the fact. `if (blocker != null)
+return converge(…)` above the `when` is behaviourally identical and makes the note
+quietly false, so "is a `when` arm" is asserted rather than "is in the function".
+
 See [[localnode-test-gap]] for the sibling rule about decisions,
 [[deadline-ceilings]] for the round this came from, and
 [[prove-the-test-can-fail]] for why the unit test of the function was the one

@@ -1124,7 +1124,11 @@ MUTATIONS=(
     # says the argument is the pass's own property — and D60R where a clear asks,
     # which no scenario reaches for the reason D56 and D57 give.
     "D60@@$RECONCILER@@$PROXY_DRAIN@@$UNREPORTED_MID_STOP@@$WITHDRAWN_BACKEND@@$ASSUMES_NO_CONTAINER"
-    "D60S@@$RECONCILER@@$WIRING@@$ONE_DERIVATION_OF_HISTORY@@$WITHDRAWN_BACKEND@@$ASSUMES_NO_CONTAINER"
+    # D60S's red set grew with the thirty-fifth audit's routing pin, and the extra red
+    # is a true dependency: both `converge` arms argue that the fact was asked *above*
+    # them, so a routing line that answers it with a constant makes their notes false
+    # as surely as it makes the derivation's claim false. Two assertions, one premise.
+    "D60S@@$RECONCILER@@$WIRING@@$ONE_DERIVATION_OF_HISTORY;$CONVERGE_ROUTED@@$WITHDRAWN_BACKEND@@$ASSUMES_NO_CONTAINER"
     "D60R@@$RECONCILER@@$WIRING@@$RETIRED_BY_RULE@@$JOINABLE_CLEAR@@$JOINABLE_ASSUMES_NOTHING"
     # The thirty-fourth audit's second critical: the storage refusal conditioned on a
     # state the drain itself takes away, so the container exits, the refusal stops

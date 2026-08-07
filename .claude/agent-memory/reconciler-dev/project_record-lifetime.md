@@ -112,6 +112,24 @@ sibling critical and for what the instruments could and could not have caught.
 answers, the check is a hand comparison of the two, not another test. Ours
 disagreed for a round.
 
+## What the clears skip, and the one thing that makes it safe
+
+Every site where `clearedDrainRecord` answers null **discards a mid-flight drain
+record without running `abort`'s compensations** — a converging pass, a joinable
+pass or the storage refusal can wipe a drain that had sealed a backend and swept
+its players. It is safe for exactly one reason, and the reason lives outside the
+file: `Reconciler.ProxyPass.backends` re-derives *both* effects from the stored
+record every proxy pass — `sealed` from `drain.state.sealsBackend()`, `letGo` from
+`drain.deregisteredAt` — so a record that vanishes un-seals and re-registers at the
+next assertion. The undo is a consequence of the record being gone, not an action
+any site takes.
+
+**The day a drain step gains an effect that is not re-derived from the record,
+every one of those sites skips its undo in silence** — no compile error, no test.
+Such an effect has to be re-derived the way those two are, or routed through
+`abort` instead. Written into `clearedDrainRecord`'s KDoc rather than left here,
+because the next person to add a compensating edge reads the function.
+
 See [[dispatch-record]] for why the field exists at all,
 [[level-triggered-seal]] for the sweep this protects the loop from, and
 [[audit-remedies-are-hypotheses]] for the round's own instance of that rule.
