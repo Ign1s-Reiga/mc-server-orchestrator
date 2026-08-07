@@ -1308,7 +1308,17 @@ cleanup() {
     discard_reports
     rm -rf -- "$BACKUP_DIR"
 }
-trap cleanup EXIT INT TERM
+# A signal handler has to **stop the run**, and `trap cleanup INT TERM` does not: the
+# handler returns and the loop carries on — with the backups it just deleted, so every
+# later mutation restores nothing and the killed run outlives the kill. That is where
+# the thirty-fifth round's "orphaned harness racing its own retry" came from, and the
+# mutations left in the working tree with it. Killing this script now ends it.
+#
+# `cleanup` is idempotent, so the EXIT trap firing again after these is free: `restore`
+# over a deleted backup directory matches no files, and both removals are `-f`.
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 cp -- "$REPO_ROOT/$CONTROLLER" "$BACKUP_DIR/DrainController.kt"
 cp -- "$REPO_ROOT/$RECONCILER" "$BACKUP_DIR/Reconciler.kt"

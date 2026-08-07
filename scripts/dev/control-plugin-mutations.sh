@@ -198,7 +198,13 @@ cleanup() {
     discard_reports
     rm -rf -- "$BACKUP_DIR"
 }
-trap cleanup EXIT INT TERM
+# The same correction as the sibling script's, applied here because a harness bug is
+# fixed in every harness: `trap cleanup INT TERM` cleans up and **returns**, so the run
+# carries on past the kill with its backups deleted and leaves mutations behind. These
+# stop it. `cleanup` is idempotent, so the EXIT trap firing after them costs nothing.
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 cp -- "$REPO_ROOT/$PATHS" "$BACKUP_DIR/HostPaths.kt"
 cp -- "$REPO_ROOT/$NODE" "$BACKUP_DIR/LocalNode.kt"
