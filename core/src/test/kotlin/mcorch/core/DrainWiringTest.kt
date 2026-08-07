@@ -1106,6 +1106,33 @@ internal class DrainWiringTest {
      */
     @Test
     fun `every workload-state classification either takes the fact or argues at the SANDBOX_ONLY arm`() {
+        // The fold, on the two shapes it has to tell apart — neither of which is in
+        // this module today, so neither can be demonstrated by scanning it. The first
+        // is the arm the thirty-sixth audit wrapped: three states, one arm, and the
+        // two that matter are on continuation lines. The second is every `write(` in
+        // this file, which is a `->` line with ordinary parameters above it at the
+        // same indentation and is not an arm at all.
+        Source(
+            "<a wrapped arm>",
+            listOf(
+                "            when (state) {",
+                "                WorkloadState.CREATED,",
+                "                WorkloadState.SANDBOX_ONLY,",
+                "                WorkloadState.EXITED -> false",
+                "            }",
+            ),
+        ).stateArms().single().pattern shouldBe
+            "WorkloadState.CREATED, WorkloadState.SANDBOX_ONLY, WorkloadState.EXITED"
+        Source(
+            "<a wrapped parameter list>",
+            listOf(
+                "    private fun write(",
+                "        state: WorkloadState = WorkloadState.SANDBOX_ONLY,",
+                "        outcome: () -> ReconcileOutcome,",
+                "    )",
+            ),
+        ).stateArms() shouldBe emptyList()
+
         val arms = mainSources().flatMap { it.stateArms() }
         val comparisons = mainSources().flatMap { it.stateComparisons() }
 
@@ -1640,20 +1667,23 @@ internal class DrainWiringTest {
          *
          * A pattern too long for one line is wrapped by the formatter one entry per
          * line, at the arm's own indentation, each line but the last ending in a
-         * comma — so that is what is walked back over, and nothing else. The indent
-         * and the absence of a second `->` are what stop this walking out of the arm
-         * and into whatever precedes it: the previous arm's answer does not end in a
-         * comma at the arm's own indentation, and a trailing argument list is
-         * indented further in.
+         * comma — so that is what is walked back over, and nothing else.
+         *
+         * "Entries", not "a line ending in a comma", and the difference is a
+         * wrapped **parameter list**: every `write(` in this module has
+         * `outcome: () -> ReconcileOutcome,` as its last parameter, which is a `->`
+         * line with ordinary parameters above it at the same indentation. Folding
+         * those together would make a pattern out of a signature, and the day one of
+         * them takes a `WorkloadState` it would be a classification this scan
+         * invented. [WRAPPED_PATTERN] is what tells the two apart, and the indent
+         * check is what keeps the walk inside the arm.
          */
         private fun armStart(arrow: Int): Int {
             var start = arrow
             while (start > 0) {
                 val above = start - 1
                 if (!isCode(lines[above])) break
-                val code = codeOf(lines[above])
-                if (!code.trimEnd().endsWith(",")) break
-                if (code.contains("->")) break
+                if (!WRAPPED_PATTERN.matches(codeOf(lines[above]).trim())) break
                 if (indentOf(lines[above]) != indentOf(lines[arrow])) break
                 start = above
             }
@@ -1837,6 +1867,18 @@ internal class DrainWiringTest {
 
         /** One entry of an enum declaration, on its own line as this project writes them. */
         val ENUM_ENTRY = Regex("""^\s+([A-Z][A-Z0-9_]*)\s*,?\s*$""")
+
+        /**
+         * A continuation line of a wrapped `when` pattern: entries and commas, ending
+         * in the comma that continues it.
+         *
+         * Deliberately narrower than "ends in a comma", so that a wrapped parameter
+         * list above a lambda-typed parameter is not folded into a pattern. It is
+         * also narrower than every legal pattern — a wrapped `is Foo,` does not match
+         * — which is the safe direction here: the scan's subject is enum states, and
+         * the arms this module writes are entries.
+         */
+        val WRAPPED_PATTERN = Regex("""^[\w.]+(?:\s*,\s*[\w.]+)*\s*,$""")
 
         /**
          * The [WorkloadState] entries [pattern] names **without** the type in front.
