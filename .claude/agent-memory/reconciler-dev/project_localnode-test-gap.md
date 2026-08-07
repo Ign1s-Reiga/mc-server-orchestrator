@@ -5,10 +5,20 @@ metadata:
   type: project
 ---
 
-`:core`'s tests may not name a `mcorch.cri` type (CLAUDE.md invariant 7 is
-checked by grep, and `LocalNode.kt` being the only importer is verified on every
-hand-off). `CriClient` is an interface, so a fake is technically easy — the
-constraint is the invariant, not the language.
+**Corrected 2026-08-07: the constraint is on `:core`'s _main_ sources, not on its
+tests.** `LocalNode.kt` is the only file under `core/src/main` that imports
+`mcorch.cri`, and that is what the hand-off grep checks. Four files under
+`core/src/test` name CRI types today — `FakeNode`, `AdoptAfterCollisionTest`,
+`StopGraceGuardTest` and `NodeDispatchTest` — and two of them stand up a full
+fake `CriClient` to drive `LocalNode` directly. Nothing about that touches the
+invariant.
+
+This entry used to say tests may not, and that a fake "costs the grep property
+the coordinator verifies every round". It does not, and believing it would have
+sent a whole round of `LocalNode` assertions through a redesign instead of a
+seventy-line fake. **Check `core/src/main` before concluding a `LocalNode` path
+is untestable from here.** What follows is still right about *where a decision
+belongs*; it was only wrong about what is reachable.
 
 Three findings have landed in exactly the code that constraint makes
 unreachable:
@@ -68,10 +78,11 @@ Ask what the copy still permits, and pin that by shape — see
 
 ## How to apply
 
-Reach for collapsing the decision into whichever module owns it before proposing
-a fake `CriClient` in `:core` tests — the fake costs the grep property the
-coordinator verifies every round, and `cri-integration-dev` agreed one test is
-not worth that trade.
+Reach for collapsing the decision into whichever module owns it first — not
+because a fake is forbidden (it is not; see the correction above) but because a
+decision that lives in `LocalNode` is a decision no `:core` unit test can pin
+*by shape*, only by behaviour through a fake. A fake proves the path works
+today; collapsing proves the next reader cannot rebuild the old one beside it.
 
 Where a genuine end-to-end property survives the collapse, test *that* rather
 than re-testing the decision. `FailureDetailPersistenceTest` is the example: a

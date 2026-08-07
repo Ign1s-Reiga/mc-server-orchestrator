@@ -471,7 +471,17 @@ NARROWED_REISSUE='            if (!drain.mayStop(contract, observation.startedAt
 ADVANCE_DECLARATION='    @Suppress("LongParameterList")
     suspend fun advance('
 # The tail of Reconciler.kt, for appending to.
-RECONCILER_TAIL='        require(drainAttentionAfter.isPositive()) { "drainAttentionAfter must be positive" }
+#
+# Nine mutations share this anchor, so anything appended to `ReconcilerConfig.init`
+# silently turns all nine into UNKNOWNs at once — which is not a catch, and reads
+# at a glance like a batch of real findings. It has happened once: the fault-ledger
+# `require` landed between the old last line and the closing braces and every entry
+# below reported "0 occurrences". Re-derive this after **any** edit to the bottom of
+# `Reconciler.kt`, and prefer the last `require` plus the braces over a longer
+# excerpt: the shorter the anchor, the less of the file can move it.
+RECONCILER_TAIL='        require(drainAttentionLedger > 0) {
+            "drainAttentionLedger is a net fault count and must be positive; zero flags every drain at rest"
+        }
     }
 }'
 # A second call site, in the shape the class KDoc used to be blind to: a teardown

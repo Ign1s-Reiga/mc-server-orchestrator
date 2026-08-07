@@ -123,6 +123,54 @@ It is the single line a future "proxies can save something" change would have to
 notice. Changing `ProxyDrainSubject` alone would remove the floor without
 touching `Node.kt` or any test of it.
 
+## 6. A drain is reported two ways, and one of them counts rather than waits
+
+`NEEDS_ATTENTION` fires for a drain in either of two independent cases, and it
+is worth knowing which one you are looking at because they read differently.
+
+**It has been failing for a while.** One fault has stood for
+`drainAttentionAfter` — fifteen minutes by default. The message names the
+failure and says how long it has been true.
+
+**It fails more often than it recovers.** This one exists because the first
+cannot see a fault that keeps clearing: a control endpoint that fails on one
+pass and behaves on the next never leaves a failure standing anywhere, and every
+recovery deletes the record and its clock. So a running total is kept instead —
+a fault adds one, a pass that finds the server healthy takes one away, floored
+at zero — and the flag fires when it reaches six **and** the total has been above
+zero for the same fifteen minutes. The message says *"keeps failing and
+recovering"* and quotes a count rather than a duration.
+
+Both halves matter. Six consecutive failures retry a second apart at first, so
+the count alone would reach six inside half a minute and turn one containerd
+blip into an alert. The fifteen minutes is what keeps this arm to the faults the
+first one cannot see, rather than to the ones it has not got to yet.
+
+The arithmetic is the whole rule and it is meant to be checkable in your head:
+**the total only grows while the drain is failing more often than it is
+working.**
+
+The surprise worth stating: **this flag is reliable when a drain is failing more
+often than it is working, and increasingly unlikely to fire below that.** It is
+not a promise of silence — below half the total can still wander up to six — but
+the flag also needs the total to *stay* above zero for the whole fifteen minutes,
+and a recovering pass resets the retry delay to about a second, so fifteen
+minutes is a long unbroken run of passes. Below half, the chance of a run both
+long enough and unbroken enough falls away quickly as the run gets longer.
+
+**No figure is given for how long that takes, deliberately.** It is not a
+property of the orchestrator: it depends on the pattern of the underlying fault
+and on how the loop happens to be scheduling that server, and any number quoted
+here would be a number for a model rather than for your fleet. Earlier drafts of
+this note carried two, and both were wrong by a wide margin.
+
+What to take from it: **silence on this flag is not evidence of health for a
+fault that is intermittent enough.** If you have a specific fault in mind and
+want a faster signal, alert on the log line for it rather than on this flag.
+
+Neither case stops anything. The container keeps running and the loop keeps
+retrying in both, which is what makes the flag safe to alert on.
+
 ---
 
 ## What to do when a drain will not finish
@@ -135,6 +183,9 @@ In order:
 2. **Check whether it is waiting on you.** Note 1 is the common case. A missing
    secret, an unreachable proxy control endpoint and a full fleet all report
    distinctly.
+   If the message says the drain *keeps failing and recovering*, `status.failure`
+   may be empty or may hold a fault that has already cleared — see note 6. Look
+   at the logs for the whole period rather than at the one failure on the status.
 3. **Edit the definition.** A generation bump is the documented lever for a
    permanently failed drain, and for several states it is the only one.
 4. **If you stop a container by hand, save the world first.** The teardown

@@ -2165,8 +2165,12 @@ internal class DrainTest {
             // The control, and it is what makes this a test of the timer rather
             // than of a hard-wired true: nine minutes in, the drain still has time
             // for the fleet to change under it.
-            noCapacity.escalated(startedAt.plusSeconds(9 * 60), 10.minutes).shouldBeFalse()
-            noCapacity.escalated(startedAt.plusSeconds(11 * 60), 10.minutes).shouldBeTrue()
+            // The real threshold rather than one turned off, so these assertions
+            // say the *time* arm decides here — the fixture's ledger is zero, and a
+            // ledger arm that had crept into deciding this would make the first line
+            // true.
+            noCapacity.escalated(startedAt.plusSeconds(9 * 60), 10.minutes, LEDGER).shouldBeFalse()
+            noCapacity.escalated(startedAt.plusSeconds(11 * 60), 10.minutes, LEDGER).shouldBeTrue()
 
             // And it reaches the condition, which is the artefact an alert fires
             // on. `DRAIN_BLOCKED` stays false: this one is not a healthy wait.
@@ -2178,6 +2182,7 @@ internal class DrainTest {
                     now = startedAt.plusSeconds(11 * 60),
                     phase = ServerPhase.RUNNING,
                     attentionAfter = 10.minutes,
+                    attentionLedger = LEDGER,
                     drain = noCapacity,
                 )
             status.attention().status shouldBe ConditionStatus.TRUE
@@ -2229,7 +2234,7 @@ internal class DrainTest {
                         message = "2 of 20 player slots are in use",
                         since = startedAt,
                     ),
-            ).escalated(startedAt.plusSeconds(60 * 60 * 4), 10.minutes).shouldBeFalse()
+            ).escalated(startedAt.plusSeconds(60 * 60 * 4), 10.minutes, LEDGER).shouldBeFalse()
         }
 
     /**
@@ -3162,4 +3167,18 @@ internal class DrainTest {
                 .state shouldBe WorkloadState.RUNNING
             harness.store.getServer(name).shouldNotBeNull()
         }
+
+    private companion object {
+        /**
+         * `ReconcilerConfig.drainAttentionLedger`'s shipped value, restated rather
+         * than turned off.
+         *
+         * Every fixture in this file carries a zero ledger, so passing the real
+         * threshold keeps the second escalation arm switched on and quiet — which is
+         * a stronger statement than passing something unreachable. An assertion here
+         * that started depending on the ledger arm would show up as a value this
+         * constant cannot produce.
+         */
+        const val LEDGER: Int = 6
+    }
 }

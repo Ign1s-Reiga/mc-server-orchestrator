@@ -19,8 +19,18 @@ import mcorch.schema.ServerPhase
 import mcorch.schema.StatusCondition
 import mcorch.schema.StorageStatus
 import mcorch.schema.VelocityProxyStatus
+import org.slf4j.LoggerFactory
 import java.time.Instant
 import kotlin.time.Duration
+
+/**
+ * Structured logging for the one condition an operator alerts on.
+ *
+ * A derivation file is an odd place for a logger and it earns it: the escalation's
+ * only channel outside the dashboard is a log line, and the *edge* it has to fire
+ * on is a condition transition, which is computed here and nowhere else.
+ */
+private val LOG = LoggerFactory.getLogger("mcorch.core.StatusDrafting")
 
 /**
  * Builds the observation a pass will record, carrying forward everything it did
@@ -54,6 +64,13 @@ internal fun draftStatus(
      * means.
      */
     attentionAfter: Duration,
+    /**
+     * The net fault count at which the same escalation fires regardless of how
+     * long any single fault stood. The second, independent arm — see
+     * [ReconcilerConfig.drainAttentionLedger] for where the number comes from and
+     * `DrainStatus.failingTooOften` for why the two are a disjunction.
+     */
+    attentionLedger: Int,
     ready: Boolean = false,
     image: ImageStatus? = previous?.image,
     runtime: RuntimeIdentity? = previous?.runtime,
@@ -93,6 +110,8 @@ internal fun draftStatus(
                 // above rather than a second one derived here.
                 failure = failure,
                 attentionAfter = attentionAfter,
+                attentionLedger = attentionLedger,
+                name = name,
             ),
     )
 }
@@ -121,6 +140,8 @@ internal fun draftProxyStatus(
     now: Instant,
     phase: ServerPhase,
     attentionAfter: Duration,
+    /** The other arm of the same flag. See [draftStatus]. */
+    attentionLedger: Int,
     ready: Boolean = false,
     image: ImageStatus? = previous?.image,
     runtime: RuntimeIdentity? = previous?.runtime,
@@ -159,6 +180,8 @@ internal fun draftProxyStatus(
                 drain = drain,
                 failure = failure,
                 attentionAfter = attentionAfter,
+                attentionLedger = attentionLedger,
+                name = name,
                 proxy =
                     ProxyConditions(
                         backends = backends,
@@ -185,6 +208,7 @@ internal class ProxyConditions(
 @Suppress("LongParameterList")
 private fun deriveConditions(
     previous: List<StatusCondition>,
+    name: ResourceName,
     now: Instant,
     phase: ServerPhase,
     ready: Boolean,
@@ -193,6 +217,7 @@ private fun deriveConditions(
     drain: DrainStatus?,
     failure: FailureStatus?,
     attentionAfter: Duration,
+    attentionLedger: Int,
     proxy: ProxyConditions? = null,
 ): List<StatusCondition> {
     val draining = drain != null && drain.state != DrainState.DRAIN_FAILED
@@ -202,7 +227,14 @@ private fun deriveConditions(
     // untouched — and a fact supplied by the caller would be absent on those,
     // flapping the condition off and on again between two passes of the same
     // stuck drain.
-    val drainAttention = drain?.escalated(now, attentionAfter) == true
+    val drainAttention = drain?.escalated(now, attentionAfter, attentionLedger) == true
+    // Which arm raised it, needed only for the prose. A drain over the ledger with
+    // no standing failure has nothing for `drainAttentionMessage` to quote — that
+    // sentence ends in `drain.failure.message` — and an escalation whose text is a
+    // full stop is one an operator cannot act on.
+    val drainAttentionByLedger =
+        drain?.failingTooOften(now, attentionAfter, attentionLedger) == true &&
+            drain.failingTooLong(now, attentionAfter).not()
     // The second arm, and the reason this flag is no longer a drain flag.
     //
     // A drain is not the only way the loop stops being able to move a server.
@@ -285,7 +317,11 @@ private fun deriveConditions(
             condition(
                 ConditionType.NEEDS_ATTENTION,
                 needsAttention.toConditionStatus(),
-                if (needsAttention) attentionMessage(drain, drainAttention, passFailure) else "",
+                if (needsAttention) {
+                    attentionMessage(drain, drainAttention, drainAttentionByLedger, passFailure)
+                } else {
+                    ""
+                },
             ),
             condition(
                 ConditionType.PLAYERS_EVACUATED,
@@ -305,6 +341,32 @@ private fun deriveConditions(
                 worldSavedMessage(storage, drain),
             ),
         ) + proxyEntries(proxy)
+    // **The escalation's only channel outside the dashboard, and it is logged here
+    // rather than where the ledger is written.** `settleLedger` cannot see this
+    // edge: it compares the arm's answer before and after its own arithmetic at one
+    // `now`, which detects the *count* moving. The age gate makes the arm raise on a
+    // pass where nothing moved at all — the count reached the threshold in half a
+    // minute, the fifteen minutes elapsed a quarter of an hour later, and both
+    // operands are identical across that pass. The flag went TRUE in silence,
+    // exactly where the new gate does its work.
+    //
+    // A condition transition is the honest edge and it is already computed below;
+    // this asks the same question the merge does, once, for the one arm whose
+    // wording is a count rather than a fault.
+    if (drainAttentionByLedger &&
+        previous.firstOrNull { it.type == ConditionType.NEEDS_ATTENTION }?.status != ConditionStatus.TRUE
+    ) {
+        LOG.warn(
+            "server={} needs attention: its drain has failed more often than it has recovered. ledger={} " +
+                "threshold={} since={}. Nothing is stopped and the loop keeps retrying; this is reported by " +
+                "count because a fault that clears between passes never stands long enough to be reported by " +
+                "its age",
+            name,
+            drain?.faultLedger,
+            attentionLedger,
+            drain?.faultLedgerSince,
+        )
+    }
     return entries.map { entry ->
         val before = previous.firstOrNull { it.type == entry.first }
         // The transition time is when the condition *became* what it is, not
@@ -422,9 +484,17 @@ private fun blockedMessage(block: DrainBlock?): String {
 private fun attentionMessage(
     drain: DrainStatus?,
     drainAttention: Boolean,
+    drainAttentionByLedger: Boolean,
     passFailure: FailureStatus?,
 ): String =
     when {
+        // Ahead of the ordinary drain sentence, because that one is built around a
+        // failure this case does not have. It is *not* ahead of `outrankedByPass`:
+        // a permanent pass failure still wins, for the reason it wins over the
+        // time arm — the loop is about to stop reconciling this server, and the
+        // sentence an alert quotes must not be one that says it keeps retrying.
+        drainAttentionByLedger && !outrankedByPass(drain, passFailure) -> ledgerAttentionMessage(drain)
+
         drainAttention && !outrankedByPass(drain, passFailure) -> drainAttentionMessage(drain)
 
         passFailure != null -> passAttentionMessage(drain, passFailure)
@@ -454,6 +524,36 @@ private fun outrankedByPass(
 ): Boolean =
     passFailure?.failureClass == FailureClass.PERMANENT &&
         drain?.failure?.failureClass == FailureClass.RETRYABLE
+
+/**
+ * The sentence for a drain that keeps failing and recovering.
+ *
+ * Written separately from [drainAttentionMessage] rather than sharing it, because
+ * the two report different things and only one of them has a failure to quote.
+ * *"Failing since 19:40"* is exactly what this case cannot say — the fault has
+ * started and stopped repeatedly, and the last one may have cleared — so the
+ * evidence offered is the count instead, with the arithmetic that produced it
+ * named so an operator can tell it from a single fault that has stood a long time.
+ *
+ * It states plainly that nothing is stopped and the loop is still going, for the
+ * reason every escalation message here does: an operator told a drain needs a
+ * human, and not told the container is still up and still being retried, reaches
+ * for `crictl stop`.
+ *
+ * [DrainStatus.failure] is appended when there is one, and there often is — the
+ * arm can fire on a failing pass as easily as on a recovering one. It is the last
+ * fault rather than the reason for the escalation, and it says so.
+ */
+private fun ledgerAttentionMessage(drain: DrainStatus?): String {
+    val ledger = drain?.faultLedger ?: 0
+    val latest =
+        drain?.failure?.let { " The most recent fault, which may since have cleared: ${it.message}" }.orEmpty()
+    return "this server needs a human: its drain keeps failing and recovering rather than finishing. It has " +
+        "now failed $ledger more times than it has recovered, which is why this is reported by count and not " +
+        "by how long any one fault lasted — a fault that clears between passes never stands long enough to " +
+        "be reported by its age. Nothing has been stopped, the container keeps running and the loop is still " +
+        "retrying.$latest"
+}
 
 /** Today's sentence, for a drain that cannot finish on its own. */
 private fun drainAttentionMessage(drain: DrainStatus?): String {

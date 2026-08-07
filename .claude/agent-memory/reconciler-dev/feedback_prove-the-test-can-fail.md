@@ -289,6 +289,19 @@ restore, check that the files you edited are *still listed as modified* rather
 than checking that the tree is clean — "clean" is the failure here, not the
 success.
 
+**Signing fails in a worktree agent session, and the failure is a timeout rather
+than a refusal.** `gpg-agent.conf` here sets `pinentry-program pinentry-curses`,
+which launches against a `/dev/pts` that is not this session's, waits, and dies:
+`gpg: signing failed: Timeout`, and `git commit` aborts having written nothing.
+`keyinfo --list` shows the keygrips uncached and the key is passphrase-protected,
+so `--pinentry-mode loopback` has nothing to feed it either. There is no way to
+produce a signed commit from here. **Commit with `--no-gpg-sign`, put the reason
+and the `git commit --amend -S --no-edit` recovery in the commit message body,
+and lead the hand-off report with it** — an unsigned commit in a repo that is
+420/420 signed is a thing the dispatcher checks, and silence about it reads as
+the flag having been forgotten rather than as an environment limit. Losing the
+work to a failed commit is the worse outcome of the two.
+
 **Two more from the same script.** `git add -A` after a red-proof swept the
 harness and its 660-line log into the commit; stage explicitly or clean up before
 committing, and read `git show --stat` before moving on. And a habitual
@@ -326,6 +339,42 @@ foreground. Having committed first is what made recovery a one-line
 (`./scripts/dev/drain-wiring-mutations.sh D62 D63`) to iterate, and the whole set
 once, detached, when nothing is left to change. It is slow in a way worth planning
 around: round 38's full drain run took about 80 minutes for 89 mutations.
+
+**A test can assert a true property through a path that bypasses the code
+implementing it, and only a mutation says so.** A test for "a pass that
+establishes nothing does not spend the ledger" was built on an `UNKNOWN`
+observation — which `advance` answers *before* any step runs, so those passes
+never reach the funnel the rule lives in. The property held, the test was green,
+and making the rule's neutral branch do the opposite reddened nothing. The tell
+was a `got=[]` on a mutation I was confident about; the fix was to find the
+branch's genuinely reachable instance (`STOPPING` inside the grace period) and
+rebuild the scenario on it. **When a mutation of the exact line under test
+catches nothing, suspect the scenario reaches a different line** — an early
+return above it is the usual culprit, and `advance`-style dispatchers are full of
+them. Same family as the structurally-zero counter below, arriving through
+control flow rather than through a fake.
+
+**A `@TestFactory`'s case name is the dynamic test's name, not the method's.** A
+mutation entry naming `a row written without each field reads as declared` scored
+MISCAUGHT while the report held `DrainStatus.faultLedger` — the parent method name
+appears nowhere in the XML. Read one report before declaring an expected set
+against a parametrised class; the same trap as the trailing `(Path)` on an injected
+parameter, from the other end.
+
+**The harness sets the cadence, so a timing defect is invisible to every test
+that picks its own intervals.** `FlappingEscalationTest` advanced two to eight
+minutes per pass; the real loop spaces retries from `Backoff` (1s, 2s, 4s, 8s,
+16s…). A rule that fired after six passes therefore fired in *thirty seconds* in
+production and in *half an hour* in every test, and nine green tests could not
+see it. When a rule counts passes and the loop schedules them, at least one
+scenario has to walk the scheduler's real delays — and say in its docstring that
+the cadence is the subject, or somebody will "tidy" it to match its neighbours.
+
+**A red-proof's extra red is usually a true dependency; declare it rather than
+weaken the test.** Removing the ledger's floor reddened two tests, not the one
+claimed — because the drain's own healthy passes drive the count negative before
+the scenario starts, so a second test's premise (`ledger >= 1`) fails too. That is
+the instrument working. The entry gets both names.
 
 **A mutation must use a value the constructors accept, or it measures the
 constructor.** A red-proof of mine configured a CRI timeout to `Duration.ZERO`;

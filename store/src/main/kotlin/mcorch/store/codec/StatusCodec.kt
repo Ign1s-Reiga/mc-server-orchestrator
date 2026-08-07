@@ -29,6 +29,8 @@ import mcorch.schema.StatusCondition
 import mcorch.schema.StatusReconstruction
 import mcorch.schema.StorageStatus
 import mcorch.schema.VelocityProxyStatus
+import java.time.Instant
+import java.time.format.DateTimeParseException
 
 /**
  * Encodes and decodes observed state.
@@ -479,6 +481,18 @@ internal object StatusCodec {
         // `V5BlockedDrainIsNotAFailure`.
         drain.blocked?.let { block -> scope.scope("blocked") { writeBlock(this, block) } }
         drain.failure?.let { failure -> scope.scope("failure") { writeFailure(this, failure) } }
+        // How far this drain's faults exceed its recoveries. Unlike everything
+        // above it this is not a record of a side effect, and losing it costs
+        // neither a repeat nor a reversal — it costs *evidence*: a drain that came
+        // back at zero has to re-establish a pattern that takes hours to build, and
+        // the flapping fault it exists to catch is precisely the one that survives a
+        // restart. Written unconditionally, including the zero, so a row's silence
+        // means "written before this field" and nothing else.
+        scope.put("faultLedger", drain.faultLedger)
+        // Written beside the count it dates, and null exactly when the count is
+        // zero. A drain that came back with the count and not the instant would be
+        // re-dated from the pass that noticed — one threshold later, never earlier.
+        scope.put("faultLedgerSince", drain.faultLedgerSince)
     }
 
     private fun readDrain(
@@ -486,6 +500,26 @@ internal object StatusCodec {
         prefix: String,
     ): DrainStatus? {
         if (!reader.has("$prefix.state")) return null
+        // Read as text and parsed here rather than through `int`, and read *before*
+        // the constructor because the instant below is a function of it.
+        //
+        // Neither half of this pair is strict, and the reason is not the one an
+        // earlier version of this comment gave. It said a decode refusal here "takes
+        // `listServers` down and with it the loop's whole view of the fleet" — the
+        // behaviour before round 10 made the read tolerant, and restating a retired
+        // premise in new code is how the wrong conclusion gets defended. What
+        // actually happens is `SqliteStore.readRow` catching a non-retryable
+        // `StoreException` from the status half and answering `unreadable` for that
+        // one row; `servers()` re-raises only for an unreadable *definition*.
+        //
+        // The real trade is still decisive, and larger than the one the old sentence
+        // described: `ReconcileLoop.resync` partitions an unreadable server out of
+        // reconciliation entirely until a human edits the row. Loud and safe —
+        // nothing is stopped — but a server the loop will not touch is an enormous
+        // price for a fault counter, and under the age gate it is the *instant* that
+        // would be carrying it. So both halves read tolerantly and land on the pair
+        // that cannot escalate.
+        val ledger = (reader.string("$prefix.faultLedger")?.toIntOrNull() ?: 0).coerceAtLeast(0)
         return DrainStatus(
             state = reader.requireEnum<DrainState>("$prefix.state"),
             startedAt = reader.requireInstant("$prefix.startedAt"),
@@ -502,8 +536,46 @@ internal object StatusCodec {
             destination = reader.value("$prefix.destination", ResourceName::of),
             blocked = readBlock(reader, "$prefix.blocked"),
             failure = readFailure(reader, "$prefix.failure"),
+            faultLedger = ledger,
+            // **Read jointly with the count, because this is a *second producer* of
+            // a pair `DrainController` maintains as a biconditional.** Inside
+            // `:core` the invariant `(faultLedger > 0) == (faultLedgerSince != null)`
+            // holds by construction at one funnel; a decode that built the two halves
+            // from independently-read keys was the other way in, and it landed on the
+            // dangerous side. `faultLedger=x` beside a parsable instant read as
+            // `(0, <old instant>)`, and the funnel *adopts* rather than repairs that:
+            // it computes the new count first, so the first fault after the load gave
+            // a count of 1 carrying an hours-old anchor, and six faults at the real
+            // backoff — half a minute — then satisfied the age gate. That is exactly
+            // the defect the gate was added to close, restored through the store.
+            //
+            // `takeIf` makes the biconditional total over both producers. The only
+            // pair it can now produce is (positive, null), which the funnel dates
+            // from the pass that noticed: a delay of one threshold, never an advance.
+            faultLedgerSince = instantOrNull(reader.string("$prefix.faultLedgerSince"))?.takeIf { ledger > 0 },
         )
     }
+
+    /**
+     * An instant that answers null rather than refusing the row.
+     *
+     * Used for one field, and named rather than inlined so the exception to
+     * `DocumentReader.instant` is visible: every other instant on a status is
+     * strict, because losing one silently changes what the loop believes about a
+     * side effect it issued. This one dates a fault counter, and the cost of a
+     * refusal — `SqliteStore` marking the row unreadable and `ReconcileLoop.resync`
+     * partitioning that server out of reconciliation until a human edits it — is
+     * out of all proportion to the value. Null is also the half of the pair that
+     * cannot escalate, so it errs quiet.
+     */
+    private fun instantOrNull(raw: String?): Instant? =
+        raw?.let {
+            try {
+                Instant.parse(it)
+            } catch (invalid: DateTimeParseException) {
+                null
+            }
+        }
 
     // ------------------------------------------------------------------------ block
 

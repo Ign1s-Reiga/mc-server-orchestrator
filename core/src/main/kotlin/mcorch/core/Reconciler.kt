@@ -249,6 +249,7 @@ public class Reconciler(
                 now = now,
                 phase = if (previous?.runtime == null) ServerPhase.PENDING else ServerPhase.RUNNING,
                 attentionAfter = config.drainAttentionAfter,
+                attentionLedger = config.drainAttentionLedger,
                 failure =
                     recordFailure(
                         reason = FailureReason.FORWARDING_SECRET_UNAVAILABLE,
@@ -1361,6 +1362,7 @@ public class Reconciler(
                 now = now,
                 phase = ServerPhase.FAILED,
                 attentionAfter = config.drainAttentionAfter,
+                attentionLedger = config.drainAttentionLedger,
                 failure =
                     recordFailure(
                         reason = FailureReason.CONTAINER_CREATE_FAILED,
@@ -1543,6 +1545,7 @@ public class Reconciler(
                 now = now,
                 phase = phase,
                 attentionAfter = config.drainAttentionAfter,
+                attentionLedger = config.drainAttentionLedger,
                 ready = ready,
                 image = image,
                 runtime = runtime,
@@ -1620,6 +1623,7 @@ public class Reconciler(
                 now = now,
                 phase = ServerPhase.FAILED,
                 attentionAfter = config.drainAttentionAfter,
+                attentionLedger = config.drainAttentionLedger,
                 failure =
                     recordFailure(
                         reason = FailureReason.CONTAINER_CREATE_FAILED,
@@ -2936,6 +2940,7 @@ public class Reconciler(
                 now = now,
                 phase = phase,
                 attentionAfter = config.drainAttentionAfter,
+                attentionLedger = config.drainAttentionLedger,
                 ready = ready,
                 image = image,
                 runtime = runtime,
@@ -3040,6 +3045,51 @@ public data class ReconcilerConfig(
      */
     val drainAttentionAfter: Duration = 15.minutes,
     /**
+     * How far a drain's faults may exceed its recoveries before it is *reported*
+     * as needing a human — the second, independent arm of the same flag.
+     *
+     * [drainAttentionAfter] measures **how long one fault has stood**, and it can
+     * only fire on a fault that is still standing when the threshold passes. A
+     * control endpoint that fails on one pass and behaves on the next never
+     * presents one: the recovery deletes the record, the anchor restarts, and four
+     * hours of a fault present half the time raised nothing at all. That is what
+     * [mcorch.schema.DrainStatus.faultLedger] counts and this is where it is
+     * judged.
+     *
+     * ## Where six comes from
+     *
+     * **It is not a time equivalence, and an earlier version of this paragraph
+     * tried to make it one.** That draft argued six was safe because
+     * [drainAttentionAfter] is three consecutive faulting passes at the backoff
+     * cap, so six consecutive faults "cannot happen before three". The two halves
+     * are in different units: a count is only comparable to a wall clock at one
+     * cadence, and a fault streak does not reach the cap for about eight and a half
+     * minutes. Six consecutive aborts requeue at one, two, four, eight and sixteen
+     * seconds, so the sixth lands **around half a minute in** — and one containerd
+     * blip raised the operator's single alert flag.
+     *
+     * The ordering is not this number's job at all. It belongs to the age gate on
+     * [mcorch.schema.DrainStatus.faultLedgerSince]: the arm requires the ledger to
+     * have been non-zero for [drainAttentionAfter] as well as to have reached this
+     * count, so it cannot fire until the age arm has had its whole window and
+     * declined. That is one rule in one unit, and it holds at every cadence rather
+     * than at one.
+     *
+     * What is left for this number to decide is **how much evidence of intermittency
+     * is a pattern**. Six is a net excess: six faults with nothing between them, or
+     * twelve passes at three faults in four, or eighteen at two in three. Fewer than
+     * about four and an ordinary flap — a proxy restart, a node blip and its retry —
+     * would qualify. It also keeps the arithmetic the operator is told in
+     * `docs/operating.md` legible: the count is the thing that has to be *earned*,
+     * and the fifteen minutes is the thing that has to have *elapsed*.
+     *
+     * Raising it delays an intermittent report and can never make anything quieter
+     * that is loud today, because the age gate already bounds this arm from below.
+     * Lowering it trades evidence for latency and nothing else — the blip case is
+     * held by the gate, not by the number.
+     */
+    val drainAttentionLedger: Int = 6,
+    /**
      * The Velocity build every proxy this orchestrator creates is pinned to, or
      * null for the one it ships against
      * ([mcorch.core.proxy.VelocityWorkloadPlanner.VELOCITY_BUILD]).
@@ -3070,5 +3120,11 @@ public data class ReconcilerConfig(
         require(containerPollInterval.isPositive()) { "containerPollInterval must be positive" }
         require(saveEvidenceMaxGap.isPositive()) { "saveEvidenceMaxGap must be positive" }
         require(drainAttentionAfter.isPositive()) { "drainAttentionAfter must be positive" }
+        // Zero would raise the flag on every drain that has ever existed, including
+        // one that has never failed — the ledger starts at zero and `>=` is the
+        // test. Negative is the same thing further out.
+        require(drainAttentionLedger > 0) {
+            "drainAttentionLedger is a net fault count and must be positive; zero flags every drain at rest"
+        }
     }
 }

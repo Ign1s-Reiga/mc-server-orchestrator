@@ -82,7 +82,7 @@ class MigrationTest {
             appliedVersions(directory) shouldBe listOf(1)
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6)
 
                 val servers = migrated.state.listServers().associateBy { it.name.value }
                 servers.keys shouldBe setOf("survival-a", "survival-b", "survival-c")
@@ -187,7 +187,7 @@ class MigrationTest {
             }
 
             stores.open(directory).use { second ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6)
                 second.state.listServers().map { it.name.value } shouldBe listOf("survival-a")
             }
         }
@@ -232,7 +232,7 @@ class MigrationTest {
             appliedVersions(directory) shouldBe listOf(1)
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6)
 
                 val spec =
                     migrated.state
@@ -311,7 +311,7 @@ class MigrationTest {
             statusDocument(directory, "survival-a") shouldNotContain "drain.stopDispatchedAt"
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6)
 
                 val drain =
                     migrated.state
@@ -385,7 +385,7 @@ class MigrationTest {
             appliedVersions(directory) shouldBe listOf(1, 2, 3)
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6)
 
                 // Nothing was dropped, renamed or cascaded away.
                 val server = migrated.state.getServer(definition.metadata.name).shouldNotBeNull()
@@ -458,7 +458,7 @@ class MigrationTest {
             }
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6)
 
                 val listing = migrated.state.listAll()
                 listing.servers.map { it.name.value } shouldBe listOf("survival-a")
@@ -561,7 +561,7 @@ class MigrationTest {
             appliedVersions(directory) shouldBe listOf(1, 2)
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6)
 
                 val confirmed = drainOf(migrated, "survival-a")
                 confirmed.worldSavedAt shouldBe confirmedAt
@@ -642,7 +642,7 @@ class MigrationTest {
             appliedVersions(directory) shouldBe listOf(1, 2)
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6)
                 val drain = drainOf(migrated, "survival-a")
 
                 // Undated evidence is no evidence. Nothing may appear here.
@@ -798,7 +798,7 @@ class MigrationTest {
             appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6)
 
                 for (name in listOf("survival-a", "survival-b")) {
                     val status =
@@ -891,7 +891,7 @@ class MigrationTest {
             }
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6)
 
                 val status =
                     migrated.state
@@ -916,6 +916,87 @@ class MigrationTest {
                     .shouldBeNull()
                 // And the mirrored copy, which is only dropped for a retired reason.
                 status.failure.shouldNotBeNull().reason shouldBe FailureReason.DRAIN_SAVE_TIMEOUT
+            }
+        }
+
+    /**
+     * Version 6, whose whole job is to make a *later* absence mean something.
+     *
+     * The decode already answers zero for a document with no `drain.faultLedger`
+     * key, so this migration changes no behaviour at all — which is exactly why
+     * the assertion has to be on the **stored bytes**. Read through the store, a
+     * migration that did nothing whatsoever would produce an identical result and
+     * this test would pass having measured nothing.
+     *
+     * The second half is the guard: a status with no drain on it must not come
+     * back with a stray `drain.faultLedger`, because `readDrain` decides a drain
+     * exists by looking for `drain.state` and would answer null for a document
+     * that now has drain keys in it. A future reader would have every reason to
+     * call that corrupt.
+     *
+     * And the ledger is **not** derived from the failure sitting on the row. The
+     * drain below has nine recorded attempts and still migrates to zero: those
+     * attempts are the count of one standing failure, which every recovery resets,
+     * and reading them as a fault history would hand a drain that had been
+     * retrying honestly a head start toward an escalation nobody observed.
+     */
+    @Test
+    fun `version 6 stamps an explicit zero ledger on a stored drain and leaves everything else alone`() =
+        runTest {
+            val directory = stores.directory()
+            val occurredAt = Instant.parse("2026-07-20T08:05:00Z")
+            writeVersion5Database(directory) { legacy ->
+                legacy.definition(Fixtures.definitionNamed("survival-a"), generation = 1L, revision = 1L)
+                legacy.definition(Fixtures.definitionNamed("survival-b"), generation = 1L, revision = 2L)
+                legacy.blockedLegacyStatus(
+                    name = "survival-a",
+                    revision = 3L,
+                    reason = FailureReason.DRAIN_SAVE_TIMEOUT.name,
+                    occurredAt = occurredAt,
+                    attempts = 9,
+                    message = "save completion not confirmed within the save timeout",
+                )
+                // No drain at all. `StatusCodec` writes no `drain.*` key for one,
+                // so this is the shape the guard is about.
+                legacy.status(
+                    Fixtures.fullStatus("survival-b", phase = ServerPhase.RUNNING).copy(drain = null),
+                    revision = 4L,
+                )
+            }
+
+            // The premise: version 5 wrote no such key. Without this the assertions
+            // below would pass against a migration that never ran.
+            statusDocument(directory, "survival-a") shouldNotContain "drain.faultLedger"
+
+            stores.open(directory).use { migrated ->
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6)
+
+                statusDocument(directory, "survival-a") shouldContain "drain.faultLedger=0"
+                statusDocument(directory, "survival-b") shouldNotContain "faultLedger"
+
+                val drained =
+                    migrated.state
+                        .getServer(Fixtures.resourceName("survival-a"))
+                        .shouldNotBeNull()
+                        .status
+                        .shouldNotBeNull()
+                        .status
+                        .shouldBeInstanceOf<PaperServerStatus>()
+                val drain = drained.drain.shouldNotBeNull()
+                drain.faultLedger shouldBe 0
+                // Zero from a row whose one failure has been retried nine times.
+                drain.failure.shouldNotBeNull().attempts shouldBe 9
+                drain.failure.shouldNotBeNull().occurredAt shouldBe occurredAt
+
+                val undrained =
+                    migrated.state
+                        .getServer(Fixtures.resourceName("survival-b"))
+                        .shouldNotBeNull()
+                        .status
+                        .shouldNotBeNull()
+                        .status
+                        .shouldBeInstanceOf<PaperServerStatus>()
+                undrained.drain.shouldBeNull()
             }
         }
 
@@ -1091,7 +1172,7 @@ class MigrationTest {
             val proxy = Fixtures.proxyDefinitionNamed("edge-01")
             val proxyStatus = Fixtures.fullProxyStatus("edge-01", drainState = DrainState.SEALED)
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6)
 
                 migrated.state.putDefinition(proxy).getOrThrow()
                 migrated.state.putStatus(proxyStatus).getOrThrow()
@@ -1184,6 +1265,19 @@ class MigrationTest {
     ) {
         rawConnection(directory).use { connection ->
             Migrations.migrate(connection, stores.clock, upTo = 4)
+            val writer = LegacyWriter(connection, hasDrainStateColumn = true)
+            block(writer)
+            writer.finish()
+            connection.commit()
+        }
+    }
+
+    private fun writeVersion5Database(
+        directory: Path,
+        block: (LegacyWriter) -> Unit,
+    ) {
+        rawConnection(directory).use { connection ->
+            Migrations.migrate(connection, stores.clock, upTo = 5)
             val writer = LegacyWriter(connection, hasDrainStateColumn = true)
             block(writer)
             writer.finish()
