@@ -1731,3 +1731,44 @@ Related: [[standalone-paper-drain-shape]]
      safe (the backend stays out of routing), but the field's KDoc makes the ordering
      its entire content, so the one node path that breaks the equivalence belongs in
      it.
+
+143. **One observation with two meanings, classified by state alone.**
+     `WorkloadState.SANDBOX_ONLY` means either "the container is genuinely gone and
+     the sandbox is left over" or "the runtime is not reporting a container that is
+     still serving players". The loop already knows the discriminator and uses it in
+     `containerIsDown` (`hadContainer` = a recorded `runtime.containerId`), and the
+     partial-removal branches of `teardown`/`teardownProxy` deliberately null that
+     field so the next pass reads it correctly. Any *new* rule that switches on
+     `WorkloadState` must be checked against that pair: a `when` over the five states
+     that puts `SANDBOX_ONLY` on the "nothing is running" side without asking
+     `hadContainer` contradicts the drain's own rule, and the two functions then
+     disagree about the same observation. Round 34: `stopIsInFlight` does exactly
+     this, which re-opens the round-33 re-admission critical through a narrower door.
+
+144. **A guard keyed on `state == RUNNING` stops guarding the moment the container
+     exits — including when the exit is the very stop the guard was refusing to
+     authorise.** `forbiddenTransition` refuses `persistent → ephemeral` only while
+     the container is `RUNNING`. A stop already in flight ends that window by itself,
+     so the refusal expires without the operator doing anything and the transition is
+     applied on the pass after the teardown. Ask of every refusal: what ends the state
+     it is conditioned on, and is that thing the drain itself?
+
+145. **A remedy that stops a loop gate arming turns "frozen" into "applied".**
+     Retaining a drain record made `parkedOnTheFailure()` false, which unarmed
+     `isBlockedByPermanentFailure`. A permanent refusal that used to freeze the server
+     now lets passes continue — and a refusal that only fires in one container state
+     is then out-waited. When a change alters what `parkedOnTheFailure()` returns,
+     re-audit every `FailureClass.PERMANENT` site that was relying on the gate to make
+     its refusal stick.
+
+146. **Mutation harnesses cannot see a missing discriminator.** Flipping
+     `SANDBOX_ONLY -> false` to `true` is a scored entry (D52); adding the
+     `hadContainer` argument that the clause needs is not any flip of the expression,
+     so a green mutation board says nothing about it. When a rule approximates a fact
+     the codebase models exactly somewhere else, compare the two rules by hand.
+
+147. **`FakeNode` derives container ids from the server name
+     (`"container-${spec.server}"`), so they are identical across recreations.** Any
+     rule keyed on container identity is true-by-construction in the core unit
+     harness, and the defect it exists to prevent — a record outliving the container
+     it names — is invisible there. Fix the fake before proposing an id-keyed record.
