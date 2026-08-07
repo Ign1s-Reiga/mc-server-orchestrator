@@ -582,7 +582,7 @@ internal class SqliteStore(
         requireEncoding(rows.getInt("status_doc_encoding"), what)
         return StoredStatus(
             status =
-                StatusCodec.decode(
+                decodeStatus(
                     name = name,
                     apiVersion = schemaVersion(rows.requiredString("status_api_version", what), what),
                     kind = serverKind(rows.requiredString("status_kind", what), what),
@@ -592,6 +592,54 @@ internal class SqliteStore(
             resourceVersion = ResourceVersion(resourceVersion.toString()),
             recordedAt = rows.instant("status_recorded_at", what),
         )
+    }
+
+    /**
+     * Rebuilds the observation in a row, and says so when a record had to be
+     * reconstructed.
+     *
+     * [StatusCodec.decode] restores a side-effect record that a build predating the
+     * field could not have written; see [mcorch.schema.StatusReconstruction] for
+     * which record, why it is restored on the read rather than by a migration, and
+     * why reading its absence at face value routes players onto a container that has
+     * been sent `SIGTERM`. The reporting is here rather than in the codec for
+     * [decodeDefinition]'s reason: this is the module's logger, and an inference
+     * nothing says out loud is the silent reinterpretation of stored data the codec
+     * is written to refuse.
+     *
+     * Unlike a clamp this is self-clearing — the reconcile loop carries the record
+     * it read into the observation it writes, so the next pass persists the
+     * reconstruction and the line stops. That makes it a warning about an upgrade
+     * rather than a standing condition, and it is deliberately *not* silenced on the
+     * strength of that: a line that keeps appearing means the row is not being
+     * written back, which is a different fault and one worth seeing.
+     */
+    private fun decodeStatus(
+        name: ResourceName,
+        apiVersion: SchemaVersion,
+        kind: ServerKind,
+        encoded: String,
+        what: String,
+    ): ServerStatus {
+        val decoded =
+            StatusCodec.decode(
+                name = name,
+                apiVersion = apiVersion,
+                kind = kind,
+                encoded = encoded,
+                what = what,
+            )
+        for (record in decoded.reconstructed) {
+            LOG.warn(
+                "server={} field={} was not recorded by the build that wrote this observation; " +
+                    "reading it as {} taken from {}. The stored document is unchanged",
+                name.value,
+                record.field,
+                record.value,
+                record.takenFrom,
+            )
+        }
+        return decoded.status
     }
 
     private fun unreadable(

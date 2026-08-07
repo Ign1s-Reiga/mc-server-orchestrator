@@ -1,5 +1,6 @@
 package mcorch.store
 
+import io.kotest.assertions.withClue
 import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.collections.shouldContainExactly
 import io.kotest.matchers.collections.shouldContainExactlyInAnyOrder
@@ -428,6 +429,98 @@ abstract class StoreConformanceSuite {
                     .status
                     .shouldNotBeNull()
                     .status shouldBe status
+            }
+        }
+
+    /**
+     * The one record a store may not hand back the way it found it.
+     *
+     * `DrainStatus.stopDispatchedAt` arrived inside the status document rather than
+     * as a column, so no on-disk version moved when it was added and no migration
+     * backfills it: an observation written by any older build reads null. Null means
+     * *no container has been signalled*, and a pass that believes that on a drain in
+     * `STOPPING` deletes the whole drain record when the operator withdraws the edit
+     * that asked for the replacement — after which the proxy's sweep re-registers a
+     * backend whose shutdown save has already run. Every session played there is
+     * lost.
+     *
+     * So the interface promises the record back, and `mcorch.schema.StatusReconstruction`
+     * is where the reasoning lives. Written through the ordinary API rather than by
+     * editing a document, because that is the only portable way to plant the shape —
+     * an implementation holding objects has no key to remove. The store that holds
+     * documents is asked the question in its own terms as well, by
+     * `LegacyStopDispatchTest`.
+     */
+    @Test
+    fun `a drain in STOPPING comes back with a dispatch record it was stored without`() =
+        withStore { store ->
+            store.putDefinition(Fixtures.definitionNamed("survival-02")).getOrThrow()
+            val stored = Fixtures.fullStatus("survival-02", drainState = DrainState.STOPPING)
+            val legacy = stored.drain.shouldNotBeNull().copy(stopDispatchedAt = null)
+
+            store.putStatus(stored.copy(drain = legacy)).getOrThrow()
+
+            val drain =
+                store
+                    .getServer(Fixtures.resourceName("survival-02"))
+                    .shouldNotBeNull()
+                    .status
+                    .shouldNotBeNull()
+                    .status
+                    .shouldBeInstanceOf<PaperServerStatus>()
+                    .drain
+                    .shouldNotBeNull()
+            // The assertion the record exists for: a stop is in flight, so nothing
+            // may hand this backend back to a routing table.
+            drain.stopDispatchedAt.shouldNotBeNull()
+            // From the drain's own transition into `STOPPING`, which is the pass on
+            // which the stop request returned. Not "now", which would restart the
+            // clock on every read, and not the status's `observedAt`, which is a
+            // later instant belonging to the pass rather than to the stop.
+            drain.stopDispatchedAt shouldBe legacy.enteredStateAt
+            // Nothing else moved. A reconstruction that also re-dated a save request
+            // or dropped a block would be repairing what it was not asked to.
+            drain shouldBe legacy.copy(stopDispatchedAt = legacy.enteredStateAt)
+        }
+
+    /**
+     * And the states it must **not** fire in.
+     *
+     * `DEREGISTERED` is the one a wider rule would reach for, and it is left out on
+     * purpose: it is where a drain ordinarily waits *before* any stop, so
+     * reconstructing there reports a dispatch for the common case rather than the
+     * exceptional one, and suppresses the re-registration that puts a parked drain's
+     * backend back into routing.
+     *
+     * `DRAIN_FAILED` is the one a *narrower* rule still gets wrong. It is declared
+     * after `STOPPING`, so `state >= STOPPING` sweeps it in by accident of
+     * declaration order — and it is the single state where a reconstructed stamp can
+     * never be retired, because a failed drain has no edge to a stop, so the
+     * container is never driven down and the workload is stranded out of routing for
+     * ever. That is why the rule names one state instead of comparing.
+     */
+    @Test
+    fun `a drain short of the stop keeps its absent dispatch record`() =
+        withStore { store ->
+            store.putDefinition(Fixtures.definitionNamed("survival-02")).getOrThrow()
+
+            for (state in DrainState.entries - DrainState.STOPPING) {
+                val stored = Fixtures.fullStatus("survival-02", drainState = state)
+                stored.drain
+                    .shouldNotBeNull()
+                    .stopDispatchedAt
+                    .shouldBeNull()
+
+                store.putStatus(stored).getOrThrow()
+
+                withClue(state) {
+                    store
+                        .getServer(Fixtures.resourceName("survival-02"))
+                        .shouldNotBeNull()
+                        .status
+                        .shouldNotBeNull()
+                        .status shouldBe stored
+                }
             }
         }
 

@@ -356,6 +356,17 @@ internal object Fixtures {
             resaveForcedAt = at.minusSeconds(95),
             transferStartedAt = at.minusSeconds(100),
             deregisteredAt = null,
+            // Only in `STOPPING`, because only there is it a record a build could
+            // have written: a drain reaches that state exactly when a stop request
+            // returned cleanly, so `STOPPING` with no dispatch is a document no
+            // version of this orchestrator produces. `StatusReconstruction` restores
+            // one on the way out of a store, so a fixture carrying the impossible
+            // pair would make the round-trip tests assert that a store hands back
+            // something it is required not to hand back. Distinct from
+            // `enteredStateAt` on purpose — a store that dropped the key would be
+            // served the reconstruction, and the round trip has to be able to see
+            // the difference.
+            stopDispatchedAt = if (state == DrainState.STOPPING) at.minusSeconds(8) else null,
             transferAttempts = 4,
             destination = resourceName("lobby-01"),
             failure =

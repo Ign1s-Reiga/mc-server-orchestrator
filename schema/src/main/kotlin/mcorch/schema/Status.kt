@@ -500,10 +500,22 @@ public data class DrainStatus(
      * gone* — `Reconciler.teardown`, through `clearedDrainRecord`, which is what every
      * site in the loop that would clear a drain record asks first.
      *
-     * A row written before this field existed reads null, so a drain caught mid-stop
-     * by an upgrade can re-admit once — the same one-cycle cost every anchor here
-     * pays, and cheaper than inferring a dispatch from the state, which is the proxy
-     * this field replaces.
+     * **A row written before this field existed is reconstructed on the read, and is
+     * not left to cost a cycle like the other anchors here.** This paragraph used to
+     * say the opposite — that a drain caught mid-stop by an upgrade "can re-admit
+     * once", at "the same one-cycle cost every anchor here pays". Every clause of
+     * that was wrong. [resaveForcedAt] and [transferStartedAt] cost a cycle when they
+     * are null; paragraph four above says losing *this* one costs a player's session
+     * and is the direction to design against, so the residual was priced in a
+     * sibling's currency. It is not once, either: the pass that finds no dispatch
+     * deletes the whole drain record, and nothing restores it, so the backend keeps
+     * admitting for the rest of the grace period. And inferring a dispatch from the
+     * state is not the proxy this field replaces — `state == STOPPING` was refused as
+     * the *call-site* discriminator because it **under**-reports, and on a document
+     * that carries no stamp at all the same test **over**-reports, which is the safe
+     * direction. [StatusReconstruction] owns that argument, states why the threshold
+     * is `STOPPING` and not one state earlier or later, and every [ServerStatus] a
+     * store hands back has been through it.
      */
     val stopDispatchedAt: Instant? = null,
     /**

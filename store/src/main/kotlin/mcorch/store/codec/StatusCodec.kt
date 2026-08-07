@@ -17,6 +17,7 @@ import mcorch.schema.ImageStatus
 import mcorch.schema.NodeName
 import mcorch.schema.PaperServerStatus
 import mcorch.schema.PlayerOccupancy
+import mcorch.schema.ReconstructedStatus
 import mcorch.schema.ResourceName
 import mcorch.schema.RuntimeIdentity
 import mcorch.schema.SchemaVersion
@@ -25,6 +26,7 @@ import mcorch.schema.ServerKind
 import mcorch.schema.ServerPhase
 import mcorch.schema.ServerStatus
 import mcorch.schema.StatusCondition
+import mcorch.schema.StatusReconstruction
 import mcorch.schema.StorageStatus
 import mcorch.schema.VelocityProxyStatus
 
@@ -54,18 +56,49 @@ internal object StatusCodec {
         return writer.render()
     }
 
+    /**
+     * Rebuilds an observation from its stored document, carrying every side-effect
+     * record this build acts on.
+     *
+     * ## Why the reconstruction is here
+     *
+     * Nothing below is derived or defaulted — see the note on this object. One
+     * record is the exception and it is not a decode rule but a *version* rule:
+     * [mcorch.schema.DrainStatus.stopDispatchedAt] arrived inside the document
+     * rather than as a column, so no schema version moved when it was added and no
+     * migration backfills it, and a document written by an older build carries no
+     * such key. Absent reads as null, and null means "no container has been
+     * signalled" — which is the one reading that hands players to a process inside
+     * its shutdown save. [StatusReconstruction] owns the argument for restoring it
+     * here rather than in a migration, and for the state it keys on.
+     *
+     * ## What it returns, and why it is not just the status
+     *
+     * The reconstructed records come back beside it, for the reason
+     * [DefinitionCodec.decode] returns its clamps: a stored value quietly
+     * reinterpreted on every read is the silent reinterpretation this codec exists
+     * to refuse. The caller says it out loud
+     * ([mcorch.store.sqlite.SqliteStore]). The document is **not** rewritten.
+     */
     fun decode(
         name: ResourceName,
         apiVersion: SchemaVersion,
         kind: ServerKind,
         encoded: String,
         what: String,
-    ): ServerStatus {
+    ): ReconstructedStatus {
         val reader = PropertyDocument.parse(encoded, what)
-        return when (kind) {
-            ServerKind.PAPER_SERVER -> readPaperStatus(name, apiVersion, reader, what)
-            ServerKind.VELOCITY_PROXY -> readProxyStatus(name, apiVersion, reader, what)
-        }
+        val status =
+            when (kind) {
+                ServerKind.PAPER_SERVER -> readPaperStatus(name, apiVersion, reader, what)
+                ServerKind.VELOCITY_PROXY -> readProxyStatus(name, apiVersion, reader, what)
+            }
+        // Inside `rebuilding` for the reason the readers above are: the
+        // reconstruction rebuilds the drain and the status through their ordinary
+        // constructors, and a rejection there has to arrive as a
+        // `StoreException.Corrupt` rather than as an `IllegalArgumentException`
+        // that escapes the per-row isolation and fails the whole fleet read.
+        return rebuilding(what) { StatusReconstruction.reconstruct(status) }
     }
 
     /** The drain state a status records, for the store's projection column. Null when no drain is recorded. */
@@ -424,6 +457,9 @@ internal object StatusCodec {
         // whose loss is not a repeat but a *reversal*: a drain that came back without
         // it puts the backend back into the routing table on its next park, sending
         // players to a container that has been sent SIGTERM.
+        //
+        // A document that predates the field carries no such key, which is why the
+        // decode does not read the absence at face value. See `decode`.
         scope.put("stopDispatchedAt", drain.stopDispatchedAt)
         // The anchor drain step 4's allowance is measured from. Set once, never
         // cleared, and losing it is not cosmetic: a drain that came back without it

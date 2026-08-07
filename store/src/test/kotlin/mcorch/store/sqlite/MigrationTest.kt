@@ -5,6 +5,7 @@ import io.kotest.matchers.nulls.shouldBeNull
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
+import io.kotest.matchers.string.shouldNotContain
 import io.kotest.matchers.types.shouldBeInstanceOf
 import kotlinx.coroutines.test.runTest
 import mcorch.schema.ConditionStatus
@@ -263,6 +264,99 @@ class MigrationTest {
             document shouldContain "lifecycle.stopGracePeriod=${grace.inWholeNanoseconds}"
             document shouldContain "lifecycle.drain.saveTimeout=${save.inWholeNanoseconds}"
         }
+
+    /**
+     * A drain that was mid-stop when the field recording the stop was introduced.
+     *
+     * `DrainStatus.stopDispatchedAt` lives inside the status document rather than in
+     * a column, so no on-disk version moved when it was added and none of V1..V5
+     * backfills it. The answer is the same shape as the deadline case above — the
+     * record is restored on the way *out*
+     * ([mcorch.schema.StatusReconstruction]) — and it is deliberate on both halves
+     * for one reason each of its own:
+     *
+     * *No migration writes the stamp.* The row is not wrong; it was exactly right
+     * for the build that wrote it. Writing an instant no process observed into
+     * storage makes an inference indistinguishable from an observation for ever
+     * after, and the reconcile loop persists the reconstruction itself on the first
+     * pass that acts on it — so a migration would spend a version number on work
+     * that happens one pass later anyway.
+     *
+     * *No migration refuses the store either.* An orchestrator that will not open is
+     * every drain stalled, and the document satisfies the schema in full.
+     *
+     * So this asserts the upgrade path end to end: written at version 1, migrated
+     * through every version, still keyless on disk, and served with the record.
+     */
+    @Test
+    fun `a drain stopping since before the dispatch field survives the migration and is served the record`() =
+        runTest {
+            val directory = stores.directory()
+            val running = Fixtures.definitionNamed("survival-a")
+            val terminating = Fixtures.definitionNamed("survival-b")
+            val deletedAt = Instant.parse("2026-07-20T09:00:00Z")
+
+            writeVersion1Database(directory) { legacy ->
+                legacy.definition(running, generation = 1L, revision = 1L)
+                legacy.definition(terminating, generation = 1L, revision = 2L, deletedAt = deletedAt)
+                legacy.status(stoppingBeforeTheField("survival-a"), revision = 3L)
+                legacy.status(stoppingBeforeTheField("survival-b"), revision = 4L)
+            }
+            appliedVersions(directory) shouldBe listOf(1)
+            // The fixture's premise, asserted rather than assumed: these documents
+            // are built by the current encoder from a null, which is byte-identical
+            // to what a build with no such field wrote. An encoder that started
+            // emitting the key for a null would leave this test passing while it
+            // stopped testing anything.
+            statusDocument(directory, "survival-a") shouldNotContain "drain.stopDispatchedAt"
+
+            stores.open(directory).use { migrated ->
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
+
+                val drain =
+                    migrated.state
+                        .getServer(Fixtures.resourceName("survival-a"))
+                        .shouldNotBeNull()
+                        .status
+                        .shouldNotBeNull()
+                        .status
+                        .shouldBeInstanceOf<PaperServerStatus>()
+                        .drain
+                        .shouldNotBeNull()
+                drain.state shouldBe DrainState.STOPPING
+                drain.stopDispatchedAt shouldBe drain.enteredStateAt
+                // The projection the migrations built is keyed on the drain state,
+                // which the reconstruction does not touch, so a resumed drain is
+                // still found by the query that finds it.
+                migrated.state.listByDrainState(setOf(DrainState.STOPPING)).map { it.name.value } shouldBe
+                    listOf("survival-a", "survival-b")
+
+                // The tombstoned one still goes. Reporting a dispatch that may not
+                // have happened is the safe direction for routing and the dangerous
+                // one for a lifecycle: a rule that made a populated, world-holding
+                // server undeletable is what ends in a manual `crictl stop`.
+                val tombstoned = migrated.state.getServer(Fixtures.resourceName("survival-b")).shouldNotBeNull()
+                tombstoned.definition.terminating shouldBe true
+                tombstoned.definition.deletedAt shouldBe deletedAt
+                migrated.state.deleteDefinition(Fixtures.resourceName("survival-b")).getOrThrow()
+                migrated.state.purge(Fixtures.resourceName("survival-b")).getOrThrow()
+                migrated.state.getServer(Fixtures.resourceName("survival-b")).shouldBeNull()
+            }
+
+            // No data loss and no data invented: the document is what version 1 held,
+            // after five migrations and a read that served the record.
+            statusDocument(directory, "survival-a") shouldBe
+                StatusCodec.encode(stoppingBeforeTheField("survival-a"))
+        }
+
+    /**
+     * A `STOPPING` drain recorded the way a build with no `stopDispatchedAt` field
+     * recorded one: every other key, and that key absent.
+     */
+    private fun stoppingBeforeTheField(name: String): PaperServerStatus {
+        val status = Fixtures.fullStatus(name, drainState = DrainState.STOPPING)
+        return status.copy(drain = status.drain?.copy(stopDispatchedAt = null))
+    }
 
     // ------------------------------------------------------------------ version 4
 

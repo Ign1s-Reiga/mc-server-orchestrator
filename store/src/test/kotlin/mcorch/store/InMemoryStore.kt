@@ -8,6 +8,7 @@ import mcorch.schema.ResourceName
 import mcorch.schema.ServerDefinition
 import mcorch.schema.ServerStatus
 import mcorch.schema.SpecBounds
+import mcorch.schema.StatusReconstruction
 import mcorch.schema.VelocityProxyStatus
 import java.time.Clock
 import java.time.Instant
@@ -158,11 +159,13 @@ internal class InMemoryStore(
         }
 
     override suspend fun getServer(name: ResourceName): StoredServer? =
-        guarded { definitions[name]?.let { StoredServer(it.bounded(), statuses[name]) } }
+        guarded { definitions[name]?.let { StoredServer(it.bounded(), statuses[name].reconstructed()) } }
 
     override suspend fun listServers(): List<StoredServer> =
         guarded {
-            definitions.values.sortedBy { it.name.value }.map { StoredServer(it.bounded(), statuses[it.name]) }
+            definitions.values.sortedBy { it.name.value }.map {
+                StoredServer(it.bounded(), statuses[it.name].reconstructed())
+            }
         }
 
     override suspend fun listByDrainState(states: Set<DrainState>): List<StoredServer> {
@@ -172,8 +175,11 @@ internal class InMemoryStore(
                 .sortedBy { it.name.value }
                 .mapNotNull { definition ->
                     val status = statuses[definition.name] ?: return@mapNotNull null
+                    // Selected on the *stored* state, served reconstructed. The
+                    // projection a store filters on is the drain state, which no
+                    // reconstruction here touches, so the two cannot disagree.
                     if (drainStateOf(status.status) in states) {
-                        StoredServer(definition.bounded(), status)
+                        StoredServer(definition.bounded(), status.reconstructed())
                     } else {
                         null
                     }
@@ -228,6 +234,23 @@ internal class InMemoryStore(
     private fun StoredDefinition.bounded(): StoredDefinition {
         val bounded = SpecBounds.bound(definition)
         return if (bounded.wasClamped) copy(definition = bounded.definition) else this
+    }
+
+    /**
+     * The side-effect records [Store] promises on every observation it hands back.
+     *
+     * [bounded]'s argument, for the other read-side guarantee. This store keeps
+     * `DrainStatus` objects rather than documents, so "the key is absent" and "the
+     * field is null" are the same thing here — which is the point. The rule is
+     * stated on the decoded record and not on a document key, so an implementation
+     * that never encodes anything owes it just as much as one that does, and a
+     * suite that only asked the SQLite store would be testing a codec instead of
+     * the interface.
+     */
+    private fun StoredStatus?.reconstructed(): StoredStatus? {
+        val stored = this ?: return null
+        val reconstructed = StatusReconstruction.reconstruct(stored.status)
+        return if (reconstructed.wasReconstructed) stored.copy(status = reconstructed.status) else stored
     }
 
     private fun nextVersion(): ResourceVersion {
