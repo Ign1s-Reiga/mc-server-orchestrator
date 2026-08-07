@@ -607,12 +607,27 @@ internal class SqliteStore(
      * nothing says out loud is the silent reinterpretation of stored data the codec
      * is written to refuse.
      *
-     * Unlike a clamp this is self-clearing — the reconcile loop carries the record
-     * it read into the observation it writes, so the next pass persists the
-     * reconstruction and the line stops. That makes it a warning about an upgrade
-     * rather than a standing condition, and it is deliberately *not* silenced on the
-     * strength of that: a line that keeps appearing means the row is not being
-     * written back, which is a different fault and one worth seeing.
+     * ## What the line may claim, and why it is not a warning
+     *
+     * It states the **row's condition** — this stored observation carries no value
+     * for the field, and here is what was read in its place and where that came
+     * from. It deliberately does not say which build wrote the row, which it cannot
+     * know and which would usually be wrong: as
+     * [mcorch.schema.StatusReconstruction] sets out, the drain state the rule keys on
+     * has a second producer that dispatches nothing, so the *current* build writes
+     * rows the reconstruction fires on, on an ordinary path. An earlier version of
+     * this line asserted the opposite ("was not recorded by the build that wrote this
+     * observation") and would have been false most of the times it printed.
+     *
+     * That is also why it is `info` and no longer `warn`. The line used to be read as
+     * evidence of an upgrade in progress, self-clearing because the reconcile loop
+     * carries the record it read into the observation it writes; a line that kept
+     * appearing therefore meant the row was not being written back, which is a
+     * different fault. That inference is gone — the routine population makes a
+     * persistent line indistinguishable from ordinary operation — so warning on it
+     * only teaches a reader to ignore warnings. It is not dropped to `debug` either:
+     * a stored value reinterpreted on the way out has to be visible in an ordinary
+     * deployment or it is the silent reinterpretation the codec exists to refuse.
      */
     private fun decodeStatus(
         name: ResourceName,
@@ -630,9 +645,9 @@ internal class SqliteStore(
                 what = what,
             )
         for (record in decoded.reconstructed) {
-            LOG.warn(
-                "server={} field={} was not recorded by the build that wrote this observation; " +
-                    "reading it as {} taken from {}. The stored document is unchanged",
+            LOG.info(
+                "server={} field={} is absent from this stored observation; reading it as {} taken from {}. " +
+                    "The stored document is unchanged",
                 name.value,
                 record.field,
                 record.value,

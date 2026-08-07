@@ -6,6 +6,7 @@ import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.string.shouldNotContain
+import io.kotest.matchers.string.shouldStartWith
 import io.kotest.matchers.types.shouldBeInstanceOf
 import kotlinx.coroutines.test.runTest
 import mcorch.schema.DrainState
@@ -141,6 +142,21 @@ class LegacyStopDispatchTest {
                 // Where the substitute came from, so the line says what was inferred
                 // and from what rather than only that something was.
                 logs shouldContain "status.drain.enteredStateAt"
+
+                // The row's condition, never its provenance. `STOPPING` has a second
+                // producer that dispatches nothing and stamps nothing, so the current
+                // build writes rows this fires on: a line claiming the observation
+                // came from an older build would be false most times it printed.
+                logs shouldNotContain "was not recorded by the build"
+
+                // And `info`, not `warn`, for the same reason — see the note on
+                // `SqliteStore.decodeStatus`. That routine population makes a
+                // recurring line ordinary rather than a fault, and warning on an
+                // ordinary path only teaches a reader to ignore warnings. Not
+                // `debug` either: a reinterpreted read that an ordinary deployment
+                // cannot see is the silent reinterpretation the codec refuses.
+                val line = CapturedLogs.snapshot().single { it.contains("field=status.drain.stopDispatchedAt") }
+                line shouldStartWith "INFO "
             }
         }
 
