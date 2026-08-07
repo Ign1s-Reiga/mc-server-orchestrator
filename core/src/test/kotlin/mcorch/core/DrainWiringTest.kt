@@ -961,6 +961,58 @@ internal class DrainWiringTest {
     }
 
     /**
+     * The two rules that read a sandbox with no container in it get the same fact.
+     *
+     * `SANDBOX_ONLY` is two different worlds — a workload whose container has never
+     * been created, and a live container the runtime is failing to enumerate — and
+     * nothing in the observation tells them apart. `DrainController.advance` is given
+     * a container id this loop recorded and separates them on it, because getting it
+     * wrong there tears down a sandbox with a live server inside it. [stopIsInFlight]
+     * answers the identical question on the identical observation, for the identical
+     * reason, and until the thirty-fourth audit it was **not given the fact at all**:
+     * it classified `SANDBOX_ONLY` as "not the signalled container" unconditionally,
+     * so a runtime that stopped reporting a container mid-stop made the loop converge
+     * over the top of its own `SIGTERM` and a proxy re-admit players to it.
+     *
+     * That defect is a *missing argument*, which is why this is a shape assertion and
+     * not another mutant: no flip of an expression that was never written can be
+     * scored, and the check that finds it is a hand comparison of the two rules. What
+     * can be pinned is that there is one fact, derived once per kind of pass, and that
+     * every consumer reads it rather than deriving it again or answering it with a
+     * literal.
+     */
+    @Test
+    fun `the fact that tells an emptied sandbox from an unreported container has one derivation`() {
+        val reconciler = Source.of(RECONCILER_PATH)
+        val code = reconciler.lines.filter(::isCode).map { codeOf(it).trim() }
+
+        // One derivation per kind of pass — a backend and a proxy — and nowhere
+        // else. A second spelling is how the two rules come to disagree.
+        val derived = code.filter { it.contains("runtime?.containerId != null") }
+        withClue("the container-id fact is derived somewhere other than a pass's own property: $derived") {
+            derived.toSet() shouldBe setOf("val hadContainer: Boolean get() = previous?.runtime?.containerId != null")
+        }
+        derived shouldHaveSize 2
+
+        // …and every consumer reads that property. `hadContainer = false` at a call
+        // site restores the audited defect one site at a time while every other
+        // assertion here stays green.
+        val given = code.filter { it.startsWith("hadContainer = ") }
+        given shouldHaveSize 2
+        given.toSet() shouldBe setOf("hadContainer = pass.hadContainer,")
+
+        // The routing half, which is the one the critical was found in: a withdrawn
+        // cause is kept draining by the same rule, asked with the same fact.
+        val routing = code.filter { it.contains("outstandingStopCause(") }
+        routing shouldHaveSize 2
+        routing.forEach { call ->
+            withClue("a withdrawn cause is judged without the fact that separates the two sandboxes: $call") {
+                ROUTES_ON_THE_RULE.containsMatchIn(call) shouldBe true
+            }
+        }
+    }
+
+    /**
      * The pre-flight is the create's own derivation, not a subset of it.
      *
      * `LocalNode` is the one file `:core`'s tests may not call into, so this is a
@@ -1164,13 +1216,32 @@ internal class DrainWiringTest {
         val CLEARS_DRAIN = Regex("""\bdrain\s*=\s*null\b""")
 
         /**
-         * `clearedDrainRecord(<something>.drain, <name>)`.
+         * `clearedDrainRecord(<something>.drain, <name>, <something>.hadContainer)`.
          *
          * The first argument has to be a record read off a status and the second an
          * observation this pass already has, because both are ways of writing
          * `drain = null` in a form that satisfies a scan for the call alone.
+         *
+         * **The third is pinned for the same reason and it is the newest one.** The
+         * thirty-fourth audit's critical was not a flip of the rule's expression but
+         * a *missing argument*: the rule classified `SANDBOX_ONLY` without the fact
+         * that tells a sandbox this loop has emptied from one whose container the
+         * runtime has stopped enumerating. `clearedDrainRecord(x.drain, observation,
+         * false)` restores that defect at a single call site while satisfying every
+         * other assertion here, so the argument has to be the pass's own property
+         * rather than any expression that fits.
          */
-        val ASKS_THE_RULE = Regex("""^clearedDrainRecord\([\w.?]*\bdrain,\s*\w+\)$""")
+        val ASKS_THE_RULE = Regex("""^clearedDrainRecord\([\w.?]*\bdrain,\s*\w+,\s*[\w.?]*\bhadContainer\)$""")
+
+        /**
+         * `?: outstandingStopCause(<something>.drain, <name>, <something>.hadContainer)`.
+         *
+         * The routing half of [ASKS_THE_RULE], pinned to the same shape for the same
+         * reason: this is the call that decides whether a pass whose cause has been
+         * withdrawn converges over the top of a stop it has already dispatched.
+         */
+        val ROUTES_ON_THE_RULE =
+            Regex("""outstandingStopCause\([\w.?]*\bdrain,\s*\w+,\s*[\w.?]*\bhadContainer\)$""")
 
         /**
          * The one expression that answers *"will a permanent failure recorded here

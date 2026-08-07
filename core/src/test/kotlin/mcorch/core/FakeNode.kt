@@ -228,6 +228,19 @@ internal class FakeNode(
         (alwaysFailures[NodeOperation.CREATE] as? NodeException.Rejected)?.let { throw it }
     }
 
+    /**
+     * How many containers this node has created, ever.
+     *
+     * It is in the container id, and that is not decoration: a real runtime never
+     * reuses one, so a fake that hands the *same* id to a replacement makes
+     * "is this the container the drain signalled" true by construction — and an
+     * identity test written against it reports a record correctly retired in
+     * exactly the scenario where it outlived its container. The sandbox id is not
+     * counted, because a replacement really can land in the sandbox that is
+     * already there.
+     */
+    private var containersCreated: Int = 0
+
     override suspend fun ensureWorkload(spec: WorkloadSpec): WorkloadObservation.Present {
         check(NodeOperation.CREATE)
         val existing = workload
@@ -237,9 +250,17 @@ internal class FakeNode(
         }
         creates += spec
         (spec.storage as? StorageRequest.Persistent)?.let { volumes += it.volume }
+        containersCreated++
         val created =
             WorkloadObservation.Present(
-                handle = WorkloadHandle(name, "sandbox-${spec.server}", "container-${spec.server}"),
+                handle =
+                    WorkloadHandle(
+                        name,
+                        // Adopted when it is there, the way `ensureWorkload`
+                        // adopts a sandbox rather than building a second one.
+                        (existing as? WorkloadObservation.Present)?.handle?.sandboxId ?: "sandbox-${spec.server}",
+                        "container-${spec.server}-$containersCreated",
+                    ),
                 state = WorkloadState.CREATED,
                 specHash = spec.specHash,
                 // The workload keeps the labels it was created with, the way a

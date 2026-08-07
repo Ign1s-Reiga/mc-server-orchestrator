@@ -793,6 +793,98 @@ internal class ProxyDrainTest {
         }
 
     /**
+     * The same revert, against a runtime that has stopped reporting the container.
+     *
+     * The thirty-fourth audit's critical, and it is the thirty-third's exactly one
+     * argument short. A sandbox the runtime reports no container in is two different
+     * worlds — a workload whose container was never created, and a live container
+     * `ListContainers` has stopped returning — and the observation cannot tell them
+     * apart. The drain's own `containerIsDown` refuses to call the second a dead
+     * container and says why: *getting this wrong tears down a sandbox with a live
+     * server inside it*. `stopIsInFlight` classified it without that fact, so:
+     *
+     * 1. `drainCause` answers null after the revert, as it is meant to;
+     * 2. `outstandingStopCause` answered null too — `SANDBOX_ONLY` was "not the
+     *    signalled container", unconditionally — so the pass converged;
+     * 3. `converge`'s `SANDBOX_ONLY` branch wrote `drain = null` and called
+     *    `ensureWorkload`, which is a **second** Paper container against the same
+     *    persistent host path if the runtime was merely under-reporting;
+     * 4. and the proxy's sweep read a backend with no record: `sealed` false, `letGo`
+     *    false, `assertBackend(admits = true)`.
+     *
+     * Players then land on a process whose shutdown save has already run and which
+     * has a `SIGTERM` in it.
+     *
+     * ## The scenario, and why the fake had to change first
+     *
+     * `FakeNode` used to name every container it built after the server alone, so
+     * every container it ever created had the same id and "is this the container the
+     * drain signalled" was true by construction. Ids are per-create now, which is
+     * what makes the assertion below about the record rather than about the fixture.
+     *
+     * The wire is asserted before the record, for the reason the two tests above
+     * give, and the create count is asserted beside them: re-admission and a
+     * duplicate container are two different harms from the one missing argument, and
+     * a build could close either without the other.
+     */
+    @Test
+    fun `a runtime that stops reporting a container mid-stop does not re-admit the backend`() =
+        coreTest {
+            val leaving = backendDefinition("survival-01")
+            val harness = ProxyHarness(backends = listOf(leaving))
+            val node = harness.nodeOf(leaving)
+            harness.bringUp()
+
+            node.onStop = { present -> present }
+            harness.declare(backendDefinition("survival-01", image = REPLACEMENT_SERVER_IMAGE))
+            repeat(8) { harness.pass(leaving.metadata.name) }
+            val stopping =
+                harness
+                    .status(leaving.metadata.name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            stopping.state shouldBe DrainState.STOPPING
+            stopping.stopDispatchedAt.shouldNotBeNull()
+            stopping.deregisteredAt.shouldNotBeNull()
+            node.stops shouldHaveSize 1
+            node.creates shouldHaveSize 1
+
+            // From here on nothing may re-admit this backend, and nothing may build a
+            // second container against its world.
+            val baseline = harness.plugin.asserts.size
+
+            // The runtime stops enumerating the container. The process is still in
+            // there — it is inside its stop grace period — and the sandbox still
+            // carries the spec hash the container was created with.
+            val running = node.workload.shouldBeInstanceOf<WorkloadObservation.Present>()
+            node.workload =
+                running.copy(
+                    state = WorkloadState.SANDBOX_ONLY,
+                    handle = running.handle.copy(containerId = null),
+                )
+
+            // …and the operator reverts the edit in the same window, which is the
+            // documented lever and the exact sequence the record exists for. The
+            // sandbox's hash now equals the desired one, so nothing wants a drain.
+            harness.declare(leaving)
+            repeat(3) { harness.sweep() }
+
+            harness.plugin.asserts.drop(baseline) shouldNotContain ("survival-01" to true)
+            harness.plugin.backend("survival-01") shouldBe null
+            node.creates shouldHaveSize 1
+
+            val carried =
+                harness
+                    .status(leaving.metadata.name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            carried.stopDispatchedAt shouldBe stopping.stopDispatchedAt
+            carried.deregisteredAt shouldBe stopping.deregisteredAt
+        }
+
+    /**
      * The proxy mirror, and the same missing guard.
      *
      * `proxyDrainCause` is withdrawable exactly as `drainCause` is, and

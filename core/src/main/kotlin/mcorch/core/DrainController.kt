@@ -3864,10 +3864,11 @@ internal fun DrainStatus?.parkedOnTheFailure(): Boolean =
  * the runtime is reporting.
  *
  * [DrainStatus.stopDispatchedAt] says a `SIGTERM` left this process; the
- * observation says the runtime is still reporting the container it was aimed at.
- * Both halves are needed and neither is the other: a stamp beside an
- * [WorkloadObservation.Absent] is a record of something that has already finished
- * happening, and a container with no stamp has been signalled by nobody.
+ * observation — read together with [hadContainer] — says the runtime may still be
+ * reporting the container it was aimed at. Both halves are needed and neither is
+ * the other: a stamp beside an [WorkloadObservation.Absent] is a record of
+ * something that has already finished happening, and a container with no stamp has
+ * been signalled by nobody.
  *
  * ## Which observations can be the container that was signalled
  *
@@ -3882,11 +3883,25 @@ internal fun DrainStatus?.parkedOnTheFailure(): Boolean =
  *   backend in the pass or two before the teardown removes it.
  * - `UNKNOWN` — the runtime cannot describe it, which is not evidence that the stop
  *   finished.
- * - `CREATED` and `SANDBOX_ONLY` — **not**, and this is the clause that keeps the
- *   record from outliving its container. A container in `CREATED` has never been
- *   started, so nothing can have been signalled into it; both states are what the
- *   pass *after* a create sees. Without this a record survived the container it named
- *   and the next pass drained the replacement that had just been built, for ever.
+ * - `SANDBOX_ONLY` — **[hadContainer] decides it, and nothing else can.** A sandbox
+ *   the runtime reports no container in is either a workload whose container has
+ *   never been created, or a live container the runtime is failing to enumerate, and
+ *   the two are indistinguishable *from the sandbox alone*. `containerIsDown` reads
+ *   the identical observation and separates them on the identical fact, because
+ *   getting it wrong there tears down a sandbox with a live server inside it; this
+ *   rule may not answer it differently, or the loop converges over the top of its
+ *   own stop and a proxy re-admits players to a process whose shutdown save has run.
+ *   [hadContainer] is a container id **this loop recorded**, not something a node
+ *   reported this pass, which is why the teardown's partial-removal branch nulls it
+ *   explicitly: that is how a sandbox this loop has emptied on purpose is told from
+ *   one the runtime is under-reporting.
+ * - `CREATED` — **not**, and this is a property of CRI rather than a convention
+ *   here. `ContainerState` moves `CONTAINER_CREATED` → `CONTAINER_RUNNING` →
+ *   `CONTAINER_EXITED` and never back, and container ids are not reused, so a
+ *   container this loop started and signalled can never be reported `CREATED`
+ *   again. Whatever is in `CREATED` is a container built after the signalled one,
+ *   and a record surviving into it made the next pass drain the replacement that
+ *   had just been built, for ever.
  * - [WorkloadObservation.Absent] — gone. This is the evidence the drain's own
  *   `containerIsDown` reads, and the only thing that retires the record.
  *
@@ -3894,16 +3909,22 @@ internal fun DrainStatus?.parkedOnTheFailure(): Boolean =
  * is issued, so this reads true for a stop that never reached the runtime; what it
  * costs is a workload left out of routing until the drain ends, and what the other
  * direction costs is a player's session. See [mcorch.schema.DrainStatus.stopDispatchedAt].
+ *
+ * @param hadContainer whether this loop has ever recorded a container id for this
+ *   workload — the same fact, from the same expression, that `DrainController.advance`
+ *   is given.
  */
 internal fun stopIsInFlight(
     drain: DrainStatus?,
     observation: WorkloadObservation,
+    hadContainer: Boolean,
 ): Boolean {
     if (drain?.stopDispatchedAt == null) return false
     val present = observation as? WorkloadObservation.Present ?: return false
     return when (present.state) {
         WorkloadState.RUNNING, WorkloadState.EXITED, WorkloadState.UNKNOWN -> true
-        WorkloadState.CREATED, WorkloadState.SANDBOX_ONLY -> false
+        WorkloadState.SANDBOX_ONLY -> hadContainer
+        WorkloadState.CREATED -> false
     }
 }
 
@@ -3943,7 +3964,8 @@ internal fun stopIsInFlight(
 internal fun outstandingStopCause(
     drain: DrainStatus?,
     observation: WorkloadObservation,
-): DrainCause? = if (stopIsInFlight(drain, observation)) DrainCause.REPLACEMENT else null
+    hadContainer: Boolean,
+): DrainCause? = if (stopIsInFlight(drain, observation, hadContainer)) DrainCause.REPLACEMENT else null
 
 /**
  * The drain record a pass that has concluded no drain is wanted may write.
@@ -3965,11 +3987,16 @@ internal fun outstandingStopCause(
  * record is retired *unconditionally* is where the container is confirmed gone, and
  * this returns null there anyway: an [WorkloadObservation.Absent] observation is the
  * evidence that the stop finished.
+ *
+ * [hadContainer] is passed through to [stopIsInFlight] and is not optional: a site
+ * that answered it `false` for convenience would be writing `drain = null` with more
+ * letters on the one observation where the answer is in doubt.
  */
 internal fun clearedDrainRecord(
     drain: DrainStatus?,
     observation: WorkloadObservation,
-): DrainStatus? = if (stopIsInFlight(drain, observation)) drain else null
+    hadContainer: Boolean,
+): DrainStatus? = if (stopIsInFlight(drain, observation, hadContainer)) drain else null
 
 /**
  * What a park leaves a workload's login path in, as a value the composing site can
