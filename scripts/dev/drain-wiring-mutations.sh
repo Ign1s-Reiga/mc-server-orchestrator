@@ -199,13 +199,27 @@
 #            `RUNNING` — a state the drain itself takes away — so the container exits
 #            and the create applies the very definition the loop spent passes
 #            refusing.
-#   D61E     the fix for that second critical, and its own defect: the fallback it
-#            kept for a status row carrying no storage record derives one from the
-#            *edited* definition, so a row written before the field existed — the
-#            population whose volume name is recorded nowhere else — is told
-#            "ephemeral storage: there is no world to save" by the very pass refusing
-#            to make it ephemeral. It reaches only those rows, which is why D61S's
-#            scenario stays green under it.
+#   D61S     **re-derived twice, and the claim moved the second time.** It scored the
+#   D61E     storage record being written from the *definition* the refusal was
+#            refusing, and D61E the fallback the fix for it kept — a row carrying no
+#            storage record derives one from the edited definition, so a row written
+#            before the field existed is told "ephemeral storage: there is no world to
+#            save" by the very pass refusing to make it ephemeral. Both were anchored
+#            at the refusal, and both named `pass.storageStatus(observation)` as the
+#            *defect*. The forty-fourth audit made that expression the **fix**:
+#            `StorageStatus` is observed state and was drafted from `spec.storage`
+#            everywhere, so the producer was changed to read `Labels.WORLD_DATA` off
+#            the workload and the refusal now simply calls it. A retired claim has to
+#            be swept rather than renamed, so these two are re-anchored one level in,
+#            on the producer and on its absence branch, and the class that judges them
+#            is the one that holds a status field's provenance.
+#   D73      the forty-fourth audit's own entry: the `SANDBOX_ONLY` window answered
+#            from the *sandbox's* labels. `WorkloadView` reports those alone when no
+#            container exists, so a sandbox built after a `storage.mode` edit carries
+#            that edit — the same erasure as D61S, arriving through the runtime rather
+#            than through the definition, in the one window where the status record is
+#            the only memory of what the workload held. Its red set is a single case
+#            against D61S's six, which is what makes it a separate claim.
 #   D62..D64 the thirty-fifth audit's instrument, and the first entries here that can
 #            go red for something **nobody wrote**. Rounds 33, 34 and 35 were one
 #            defect three times — a fact modelled exactly in one place, approximated
@@ -1375,7 +1389,7 @@ MUTATIONS=(
     # producer: a storage record answered from `spec.storage` rather than from the
     # workload's own label. `StorageObservationTest` is the class that holds it,
     # because the defect is a status field's provenance and not a drain step.
-    "D61S@@$RECONCILER@@$STORAGE@@$OBSERVED_PRODUCER@@$STORAGE_OBSERVED@@$STORAGE_FROM_DEFINITION"
+    "D61S@@$RECONCILER@@$STORAGE@@$OBSERVED_PRODUCER;$OBSERVED_ABSENCE;$SANDBOX_WINDOW;$NO_WORKLOAD_WINDOW;$UNLABELLED_WORKLOAD;$REFUSAL_RECORDS_CONTAINER@@$STORAGE_OBSERVED@@$STORAGE_FROM_DEFINITION"
     # The thirty-fifth audit's first item, at its new home: the fallback a fix for
     # D61S keeps growing back. It reaches only rows decoded with no storage block, so
     # every scenario whose row carries one stays green under it — which is the whole
@@ -1383,9 +1397,11 @@ MUTATIONS=(
     # set from D61S rather than a subset of it.
     "D61E@@$RECONCILER@@$STORAGE@@$OBSERVED_ABSENCE@@$STORAGE_ABSENCE@@$STORAGE_ABSENCE_FALLBACK"
     # The forty-fourth audit's own entry, and the half neither of the above can see:
-    # the `SANDBOX_ONLY` window answered from the sandbox's labels. Both entries above
-    # keep the window silent; this one fills it with the edit, which is the same
-    # erasure arriving through the runtime instead of through the definition.
+    # the `SANDBOX_ONLY` window answered from the sandbox's labels. It is the *only*
+    # one of the three whose red set is a single case, and that is the point — six
+    # cases move when the producer reads the definition, and exactly one moves when it
+    # reads the wrong object's labels, so a scan that could not tell those apart would
+    # have scored this as covered by D61S.
     "D73@@$RECONCILER@@$STORAGE@@$SANDBOX_WINDOW@@$CONTAINERS_OWN_LABELS@@$SANDBOXES_LABELS"
     # The round's instrument, proved on the shape it exists for: a classification of a
     # workload state that decides `SANDBOX_ONLY` with neither the fact nor a word about

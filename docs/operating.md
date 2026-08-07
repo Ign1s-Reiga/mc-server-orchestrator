@@ -171,6 +171,34 @@ want a faster signal, alert on the log line for it rather than on this flag.
 Neither case stops anything. The container keeps running and the loop keeps
 retrying in both, which is what makes the flag safe to alert on.
 
+## 7. `status.storage` is what was seen, so it can be absent — and it never names a volume
+
+`status.storage` reports the **container**, not your definition. `persistent` is
+read back off the label the loop put on the workload when it created it, so a
+server whose `spec.storage.mode` you have just edited keeps reporting what the
+container that is actually running was built with, until that container is
+replaced. That is the point: the previous behaviour reported the edit back at
+you, which is useless for telling a half-applied change from a finished one.
+
+Two consequences an operator meets directly.
+
+**The whole block can be missing, and missing means nothing has been observed.**
+A server the loop has not yet seen a workload for has no `storage` at all, and
+`VOLUME_BOUND` reads `Unknown` rather than `False`. Do not read either absence as
+"this server has no volume" — that is a different sentence, and only it would
+tell you to stop looking for a world. `False` on `VOLUME_BOUND` means the loop
+looked and there is nothing bound; `Unknown` means it has not looked yet.
+
+**`volumeName` is empty on every server created by this build, and that is not a
+missing volume.** Nothing observes the volume a container has mounted yet —
+reading it needs the runtime's mount list plumbed out through the node
+abstraction, which is a change that has not been made — so the field is only ever
+*carried forward*, and a server that has never had one recorded never gets one.
+The name is not lost: it is `spec.storage.volume.name` in your definition, which
+defaults to `metadata.name`. What you must not conclude from an empty
+`volumeName` is that the server is running without a volume; check
+`spec.storage.mode` for that.
+
 ---
 
 ## What to do when a drain will not finish
