@@ -11,9 +11,11 @@ import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.string.shouldNotContain
 import io.kotest.matchers.types.shouldBeInstanceOf
 import mcorch.schema.ConditionStatus
+import mcorch.schema.DrainState
 import mcorch.schema.ResourceName
 import org.junit.jupiter.api.Test
 import kotlin.time.Duration.Companion.minutes
+import kotlin.time.Duration.Companion.seconds
 
 /**
  * The second escalation arm: a drain that fails more often than it recovers is
@@ -198,57 +200,72 @@ internal class FlappingEscalationTest {
      * **"Did not fail" is not "was found healthy".**
      *
      * The ledger is paid down by a pass that establishes something — work that came
-     * back, or a drain that reached its gate — and left alone by one that
-     * establishes nothing. Here the runtime stops describing the container at all,
-     * so `advance` returns `Waiting` before any step runs: no fault, no work, no
-     * block, nothing observed about whether the endpoint has recovered.
+     * back with what it asked for, or a drain that reached its gate — and left alone
+     * by one that establishes nothing. Were the rule "every non-failing pass pays one
+     * back", a drain waiting on a container that will not exit would erase real
+     * evidence at the poll interval while learning nothing about the fault.
      *
-     * Were the rule "every non-failing pass pays one back", those passes would
-     * erase real evidence at the poll interval — a drain waiting on a container
-     * that will not exit would wipe an hour of faults while learning nothing — and
-     * this test is the difference between the two predicates.
+     * ## Which neutral pass, and why this one
      *
-     * The second half is idempotency, which is the same property from the other
-     * side: repeating a pass against unchanged state must not accumulate. It runs
-     * twenty passes and asserts the ledger, the failure and the whole status are
-     * where they were.
+     * The first draft of this test used an `UNKNOWN` observation, and a mutation
+     * proved it worthless: `advance` answers that one *before* any step runs, so
+     * those passes never reach the funnel at all and making the neutral branch
+     * decrement did not redden anything. The property was true and the test was
+     * measuring a path that bypasses the code implementing it.
+     *
+     * `STOPPING` inside the grace period is the reachable, repeatable neutral pass:
+     * `awaitStopped` finds the container still running, re-issues nothing it can
+     * claim, records no failure — a container that has not finished exiting yet is
+     * not a fault — and returns with `workDone` false. Twenty of them, forty seconds
+     * against a four-minute grace, so none of this is the overdue branch.
+     *
+     * The ledger is built first by the same means as the headline test, then spent
+     * down by the honest work of finishing the drain, and what it lands on is
+     * whatever it lands on — the assertion is that those twenty passes do not move
+     * it, not what the number is.
      */
     @Test
-    fun `a pass that establishes nothing neither pays down the ledger nor moves anything else`() =
+    fun `a pass that establishes nothing does not pay the ledger down`() =
         coreTest {
             val harness = Harness()
             val name = drainingServer(harness)
 
-            // Build a ledger worth protecting.
-            harness.node.failAlways(NodeOperation.EXEC, harness.node.unreachable(NodeOperation.EXEC))
-            repeat(3) { step(harness, name, 1.minutes) }
-            val earned =
-                harness
-                    .status(name)
-                    .shouldNotBeNull()
-                    .drain
-                    .shouldNotBeNull()
-                    .faultLedger
-            earned shouldBe 3
+            // Build a ledger worth protecting: two faults to one recovery, as above.
+            // Six cycles rather than three, because finishing the drain below pays
+            // several back honestly — the save, the deregistration and the stop are
+            // all real work — and a ledger that reached zero on the way would hide
+            // the property under test behind the floor.
+            repeat(6) {
+                harness.node.failAlways(NodeOperation.EXEC, harness.node.unreachable(NodeOperation.EXEC))
+                repeat(2) { step(harness, name) }
+                harness.node.clearFailures(NodeOperation.EXEC)
+                step(harness, name)
+            }
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldNotBeNull()
+                .faultLedger shouldBeGreaterThanOrEqualTo 1
 
-            // Now the runtime stops answering for the workload. The fault is not
-            // fixed and nothing has been established either way.
-            harness.node.clearFailures(NodeOperation.EXEC)
-            harness.node.workload =
-                harness.node.workload
-                    .shouldBeInstanceOf<WorkloadObservation.Present>()
-                    .copy(state = WorkloadState.UNKNOWN)
+            // Everyone logs off and the drain finishes its work — which pays some of
+            // the ledger back, honestly — but the container never exits.
+            harness.node.online = 0
+            harness.node.onStop = { it }
+            repeat(8) { step(harness, name, 2.seconds) }
 
-            val before = harness.status(name).shouldNotBeNull()
-            repeat(20) { step(harness, name) }
-            val after = harness.status(name).shouldNotBeNull()
+            val parked = harness.status(name).shouldNotBeNull().drain.shouldNotBeNull()
+            // The premise. Without it the assertion below is about some other state.
+            parked.state shouldBe DrainState.STOPPING
+            val earned = parked.faultLedger
+            earned shouldBeGreaterThanOrEqualTo 1
 
-            after.drain.shouldNotBeNull().faultLedger shouldBe earned
-            // Nothing else drifted either — the ledger is the field under test, but a
-            // pass that moved the drain some other way would make the line above true
-            // for an uninteresting reason.
-            after.drain shouldBe before.drain
-            harness.node.stops.shouldBeEmpty()
+            // Twenty passes that establish nothing either way.
+            repeat(20) { step(harness, name, 2.seconds) }
+
+            val after = harness.status(name).shouldNotBeNull().drain.shouldNotBeNull()
+            after.state shouldBe DrainState.STOPPING
+            after.faultLedger shouldBe earned
         }
 
     /** A deleted, populated server: the drain that cannot finish while people play. */
