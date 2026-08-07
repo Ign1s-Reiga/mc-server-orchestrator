@@ -243,7 +243,7 @@ internal class GrpcCriClient private constructor(
         // wait, and one is not the other. See [CriTimeouts.stopDeadlineCap].
         val capped = gracePeriod.duration > timeouts.stopDeadlineCap
         val waited = if (capped) timeouts.stopDeadlineCap else gracePeriod.duration
-        val deadline = waited + timeouts.deadlineSlack
+        val deadline = transportDeadline(waited)
         val startedAt = System.nanoTime()
         try {
             runtimeCall(CriOperation.STOP_CONTAINER, deadline, target = id.value) { stub ->
@@ -284,6 +284,17 @@ internal class GrpcCriClient private constructor(
      * the deadline and never before it, so an [elapsedNanos] that reached
      * [deadline] is this client giving up and the sentence below is true of it.
      * Anything shorter came back for some other reason and is reported unchanged.
+     *
+     * **That test is not a restatement of `capped`.** `capped` establishes that
+     * the deadline was shortened below the grace period. It says nothing about
+     * *which* clock produced this particular `DEADLINE_EXCEEDED`, and the runtime
+     * has clocks of its own — a shim that stops answering a kill fails one, early,
+     * and comes back with the same status code. On that failure every sentence
+     * below is wrong, the last of them dangerously: it would tell an operator that
+     * nothing here says the runtime is unhealthy, about a runtime that had just
+     * said so. So the elapsed time stays, and no tolerance is wanted on it either:
+     * [deadline] is the deadline the call actually ran under rather than a nominal
+     * one ([transportDeadline]), which is what lets this be an exact inequality.
      *
      * [CriException.Timeout.commandTimeout] stays false, which is not an
      * oversight: it means "the runtime answered, promptly, to report a timeout
@@ -362,7 +373,7 @@ internal class GrpcCriClient private constructor(
         // strictly more room, so a command that outruns its own timeout is
         // reported by containerd rather than cut off as a transport deadline.
         val commandSeconds = timeout.roundUpToWholeSeconds()
-        val deadline = commandSeconds.seconds + timeouts.deadlineSlack
+        val deadline = transportDeadline(commandSeconds.seconds)
         val startedAt = System.nanoTime()
         return try {
             runtimeCall(CriOperation.EXEC_SYNC, deadline, target = id.value) { stub ->
@@ -400,6 +411,14 @@ internal class GrpcCriClient private constructor(
      * The inequality is deliberately one-sided: when the two are too close to
      * separate — a [CriTimeouts.deadlineSlack] configured down to nothing — this
      * reports the ordinary transport timeout, which is the cautious answer.
+     *
+     * It is one-sided in the direction that costs least when it is wrong, and
+     * that is why [deadline] has to be the deadline the call *ran under* rather
+     * than a nominal one ([transportDeadline]). Compared against a bound even
+     * slightly longer than the installed one, this client giving up would fall
+     * on the wrong side and be reported as the runtime answering promptly with a
+     * slow command — a healthy verdict on a runtime that said nothing at all,
+     * which is worse than the mistake this whole function exists to undo.
      */
     private fun attributeExecTimeout(
         failure: CriException.Timeout,
@@ -473,6 +492,20 @@ internal class GrpcCriClient private constructor(
     }
 
     // ── plumbing ─────────────────────────────────────────────────────────────
+
+    /**
+     * The transport deadline for a call whose caller asked to wait [wait].
+     *
+     * Only the two operations that carry a caller's own semantic timeout —
+     * `StopContainer`'s grace period and `ExecSync`'s command timeout — build a
+     * deadline this way; everything else takes one straight from [CriTimeouts].
+     * Those two are also the only ones that later compare an elapsed time against
+     * their deadline, and the comparison is only sound if the number compared is
+     * the number installed, so the rounding happens here rather than at either
+     * call site. See [roundUpToWholeMilliseconds].
+     */
+    private fun transportDeadline(wait: Duration): Duration =
+        (wait + timeouts.deadlineSlack).roundUpToWholeMilliseconds()
 
     private suspend fun <T> runtimeCall(
         operation: CriOperation,

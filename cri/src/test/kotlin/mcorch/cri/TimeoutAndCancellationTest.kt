@@ -15,9 +15,13 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withTimeout
+import mcorch.cri.internal.roundUpToWholeMilliseconds
 import org.junit.jupiter.api.Test
+import kotlin.time.Duration
 import kotlin.time.Duration.Companion.hours
+import kotlin.time.Duration.Companion.microseconds
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.nanoseconds
 import kotlin.time.Duration.Companion.seconds
 
 /**
@@ -275,4 +279,77 @@ class TimeoutAndCancellationTest {
                 thrown.retryable.shouldBeTrue()
             }
         }
+
+    /**
+     * Both attributions measure an elapsed time against the deadline. grpc
+     * installs a deadline from `inWholeMilliseconds` and drops the remainder, so
+     * a deadline with a remainder used to be two different numbers: the one the
+     * call ran under, and the slightly longer one it was judged by. A call that
+     * gave up on its own deadline then landed below the bar.
+     *
+     * The two below are the same sub-millisecond gap read from opposite sides,
+     * and they fail differently. A capped stop loses its attribution and reads to
+     * an operator as the alarming kind of stop timeout — a runtime asked to kill
+     * a container that did not answer. An `ExecSync` gains one it has not earned
+     * and reports a healthy runtime with a slow command, on a runtime that said
+     * nothing at all. The second is the worse of the two, which is why the gap is
+     * closed rather than tolerated.
+     */
+    @Test
+    fun `a capped stop is still attributed when its deadline has a sub-millisecond remainder`() =
+        runCriTest {
+            val runtime = FakeCriServer.RuntimeBehaviour(hang = true)
+            FakeCriServer(runtime = runtime).use { fake ->
+                val client =
+                    fake.clientWith(
+                        CriTimeouts(
+                            stopDeadlineCap = 200.milliseconds,
+                            // The last 999 microseconds are ones grpc cannot install.
+                            deadlineSlack = 100.milliseconds + 999.microseconds,
+                        ),
+                    )
+
+                val thrown =
+                    shouldThrow<CriException.Timeout> {
+                        client.stopContainer(ContainerId("c"), StopGracePeriod.ofSeconds(30).getOrThrow())
+                    }
+
+                thrown.message shouldContain "grace period this stop asked for"
+                thrown.commandTimeout.shouldBeFalse()
+            }
+        }
+
+    @Test
+    fun `an exec transport timeout is not called a command timeout when the deadline has a remainder`() =
+        runCriTest {
+            val runtime = FakeCriServer.RuntimeBehaviour(hang = true)
+            FakeCriServer(runtime = runtime).use { fake ->
+                val client = fake.clientWith(CriTimeouts(deadlineSlack = 100.milliseconds + 999.microseconds))
+
+                val thrown =
+                    shouldThrow<CriException.Timeout> {
+                        client.execSync(ContainerId("c"), listOf("mc-monitor", "status"), 100.milliseconds)
+                    }
+
+                // The runtime never answered. Saying it did, promptly, would be
+                // a healthy verdict on a node that has gone quiet.
+                thrown.commandTimeout.shouldBeFalse()
+            }
+        }
+
+    /**
+     * The rounding those two rest on, on its own.
+     *
+     * Up, never down: the value is built from a wait a caller asked for, and the
+     * only direction a deadline may move on the way to the wire is the one that
+     * cannot cut a wait short.
+     */
+    @Test
+    fun `a deadline is rounded up to the millisecond grpc will install it at`() {
+        300.milliseconds.roundUpToWholeMilliseconds() shouldBe 300.milliseconds
+        (300.milliseconds + 1.nanoseconds).roundUpToWholeMilliseconds() shouldBe 301.milliseconds
+        (300.milliseconds + 999.microseconds).roundUpToWholeMilliseconds() shouldBe 301.milliseconds
+        (2.seconds + 1.microseconds).roundUpToWholeMilliseconds() shouldBe (2.seconds + 1.milliseconds)
+        Duration.ZERO.roundUpToWholeMilliseconds() shouldBe Duration.ZERO
+    }
 }
