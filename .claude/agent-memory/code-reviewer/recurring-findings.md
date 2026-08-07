@@ -24,7 +24,11 @@ reading anything else in a new or changed module.
 3. **Secrets are protected on one type and not its sibling.** A hand-written `toString`
    override guarding a token, next to a `data class` holding the same token verbatim with
    a compiler-generated `toString`/`equals`/`copy`. The guarded type gets a test; the data
-   class does not.
+   class does not. Same shape when a message is *redacted*: `SecretRef.NAME_PROBLEM`
+   collapsed four `ResourceName` branches into one flat constant while its sibling
+   `SecretRef.keyProblem` kept its empty/too-long/syntax split and de-echoed only the
+   syntax branch. When a value stops being quoted, diff the granularity against the
+   sibling field of the same type — the redaction is usually applied to one and not both.
 
 4. **Tests assert side effects well and concurrency not at all.** The suites here are
    unusually good at reading state off a fake instead of off a returned status, and
@@ -63,6 +67,17 @@ reading anything else in a new or changed module.
    `ScalarNode.value`, the raw text, and never consults the resolved tag). Weigh these as
    heavily as wrong numbers: the user says so explicitly, and a wrong reason survives
    longer because the rule it defends is correct.
+
+9. **A "guard" assertion whose safety is a call-site property the types do not encode.**
+   `MappingReader.secretRef` opens with `check(at in SecretBearingPaths.refs)`, which is a
+   crash if it ever fires. It is unreachable today only because every `MappingReader` path
+   is built from Kotlin string literals. Verify that by tracing path *construction*, not by
+   reading the KDoc: grep every `mapping(`/`of(` call for a non-literal argument, and look
+   for the one place a path segment is derived from the document — here `valueList` appends
+   `[index]`, so the same guard would crash on valid input the day a secret-bearing field
+   lands under a list. Also check *when* such a guard runs: one placed inside an optional
+   block's reader only fires for documents that write that block, which is weaker than
+   "every parse" no matter what the comment claims.
 
 **Why:** These are the findings that survived to the "fix before merge" bucket in more
 than one review. The user writes very high-quality prose around the code, which makes
