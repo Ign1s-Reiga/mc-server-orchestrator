@@ -4,8 +4,11 @@ import io.kotest.assertions.withClue
 import io.kotest.matchers.booleans.shouldBeFalse
 import io.kotest.matchers.booleans.shouldBeTrue
 import io.kotest.matchers.collections.shouldBeEmpty
+import io.kotest.matchers.comparables.shouldBeGreaterThan
 import io.kotest.matchers.comparables.shouldBeGreaterThanOrEqualTo
+import io.kotest.matchers.comparables.shouldBeLessThan
 import io.kotest.matchers.comparables.shouldBeLessThanOrEqualTo
+import io.kotest.matchers.nulls.shouldBeNull
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
@@ -13,10 +16,13 @@ import io.kotest.matchers.string.shouldNotContain
 import io.kotest.matchers.types.shouldBeInstanceOf
 import mcorch.schema.ConditionStatus
 import mcorch.schema.DrainState
+import mcorch.schema.DrainStatus
 import mcorch.schema.ResourceName
 import org.junit.jupiter.api.Test
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.toKotlinDuration
+import java.time.Duration as JavaDuration
 
 /**
  * The second escalation arm: a drain that fails more often than it recovers is
@@ -336,6 +342,96 @@ internal class FlappingEscalationTest {
             drain.failingTooOften(harness.clock.instant(), 15.minutes, LEDGER).shouldBeFalse()
             drain.failingTooLong(harness.clock.instant(), 15.minutes).shouldBeFalse()
             harness.node.stops.shouldBeEmpty()
+        }
+
+    /**
+     * **Why the age is the ledger's and not the drain's**, which is the whole
+     * justification for `faultLedgerSince` existing rather than reusing
+     * `DrainStatus.startedAt`.
+     *
+     * `startedAt` is set once and never restamped, so it looks like a free anchor —
+     * and it answers the wrong question. A drain that has been waiting healthily for
+     * four hours is four hours old with nothing wrong with it, so a gate measured
+     * from it is already open, and the blip above escalates after all. The gate has
+     * to measure how long *this run of faults* has been going, which is a fact
+     * nothing on the record answered before.
+     *
+     * Same burst as the test above, on a drain that has been running for four hours.
+     * The two instants are asserted apart so the scenario cannot quietly become the
+     * one above it.
+     */
+    @Test
+    fun `a burst late in a long healthy drain is aged from the ledger, not from the drain`() =
+        coreTest {
+            val harness = Harness()
+            val name = drainingServer(harness)
+
+            // Four hours of healthy blocking on a busy evening. Nothing is wrong and
+            // the ledger never leaves zero.
+            repeat(8) { step(harness, name, 30.minutes) }
+            val healthy =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            healthy.faultLedger shouldBe 0
+            healthy.faultLedgerSince.shouldBeNull()
+
+            harness.node.failAlways(NodeOperation.EXEC, harness.node.unreachable(NodeOperation.EXEC))
+            listOf(1, 2, 4, 8, 16).forEach { seconds -> step(harness, name, seconds.seconds) }
+            step(harness, name, 1.seconds)
+
+            val status = harness.status(name).shouldNotBeNull()
+            val drain = status.drain.shouldNotBeNull()
+
+            drain.faultLedger shouldBeGreaterThanOrEqualTo LEDGER
+            // The premise, and it is what tells the two anchors apart: the drain is
+            // hours old and its ledger is seconds old.
+            JavaDuration
+                .between(drain.startedAt, harness.clock.instant())
+                .toKotlinDuration() shouldBeGreaterThan 15.minutes
+            JavaDuration
+                .between(drain.faultLedgerSince.shouldNotBeNull(), harness.clock.instant())
+                .toKotlinDuration() shouldBeLessThan 15.minutes
+
+            status.attention().status shouldBe ConditionStatus.FALSE
+            harness.node.stops.shouldBeEmpty()
+        }
+
+    /**
+     * A stored row that carries a count with no instant is **not** escalated.
+     *
+     * Unreachable through the loop — the funnel keeps the pair consistent and
+     * re-dates a row that arrives half-written — so it is asserted directly on the
+     * rule, which is the only place the case exists. It is the reading
+     * `LegacyDrainRowTest` declares for a document written before the instant: the
+     * arm stays quiet, because firing would report on evidence whose age nothing
+     * established.
+     *
+     * The second half is the control. Without it a rule that never escalated at all
+     * would satisfy the first.
+     */
+    @Test
+    fun `a ledger with no instant is not escalated, and the same ledger with an old one is`() =
+        coreTest {
+            val clock = MutableClock()
+            val at = clock.instant()
+            val halfWritten =
+                DrainStatus(
+                    state = DrainState.DRAIN_FAILED,
+                    startedAt = at.minusSeconds(60 * 60),
+                    enteredStateAt = at,
+                    faultLedger = LEDGER + 3,
+                )
+
+            halfWritten.failingTooOften(at, 15.minutes, LEDGER).shouldBeFalse()
+            halfWritten.escalated(at, 15.minutes, LEDGER).shouldBeFalse()
+
+            halfWritten
+                .copy(faultLedgerSince = at.minusSeconds(16 * 60))
+                .failingTooOften(at, 15.minutes, LEDGER)
+                .shouldBeTrue()
         }
 
     /**
