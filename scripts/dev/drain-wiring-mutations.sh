@@ -320,6 +320,7 @@ REPLACEMENT=mcorch.core.ReplacementTest
 PLANNING=mcorch.core.proxy.VelocityWorkloadPlannerTest
 STOP_GRACE=mcorch.core.node.StopGraceGuardTest
 UNBUILDABLE=mcorch.core.UnbuildableRequestTest
+STORAGE=mcorch.core.StorageObservationTest
 
 # The test cases, by name. A mutation names the ones it must redden and no others.
 EXIT='nothing leaves advance that has not been through the record-level rule'
@@ -422,6 +423,18 @@ TRANSITION_NOT_APPLIED='a refused storage transition is not applied by the conta
 # rows with no storage record to carry forward — the population the volume name is
 # recorded nowhere else for.
 PREDATING_ROW='a status row that predates the storage field is not given a false one by the refusal'
+# The forty-fourth audit, one field further in. `StorageStatus` is documented as
+# observed and was drafted from `spec.storage` on every pass, so the record a later
+# guard would consult in the window with no container was a rewrite of the very edit
+# it needs protecting from. These three name the producer'"'"'s three claims: what it
+# answers when a container speaks, what it answers when nothing does, and whose
+# labels it is willing to hear.
+OBSERVED_PRODUCER='an edit does not move the record until the container it describes is replaced'
+OBSERVED_ABSENCE='a row with nothing observed and nothing to carry says nothing'
+SANDBOX_WINDOW="a sandbox labelled by the edit does not overwrite the container's own answer"
+NO_WORKLOAD_WINDOW='an ephemeral edit landing with no workload at all does not rewrite what was observed'
+UNLABELLED_WORKLOAD='an unlabelled workload leaves the last observation standing'
+REFUSAL_RECORDS_CONTAINER="a refused edit surfaces permanently and records the container's storage"
 # ...and the instrument the round was really about. Rounds 33, 34 and 35 were one
 # defect three times, all three of them *omissions*, and this board scores
 # inversions — so the three entries below are the first here that can go red for an
@@ -831,13 +844,41 @@ TRANSITION_RUNNING_ONLY='                WorkloadState.RUNNING -> true
                 WorkloadState.EXITED, WorkloadState.UNKNOWN -> false'
 # ...and the storage record it writes: the definition it is refusing, rather than
 # the container it is about.
-TRANSITION_STORAGE='                storage = pass.previous?.storage?.copy(bound = true),'
-TRANSITION_STORAGE_DERIVED='                storage = pass.storageStatus(observation),'
-# The same erasure through the fallback the thirty-fourth audit'"'"'s fix left behind,
-# which reaches only the rows that have no storage record to carry forward — every
-# row written before the field existed. The scenario with a *recorded* volume stays
-# green under it, which is exactly why it needed a case of its own.
-TRANSITION_STORAGE_FALLBACK='                storage = pass.previous?.storage?.copy(bound = true) ?: pass.storageStatus(observation),'
+#
+# Re-derived for the forty-fourth audit, and the *claim* moved rather than the
+# identifier. `Pass.storageStatus` used to draft the whole block from
+# `definition.spec.storage`, which is why the refusal needed a local expression and
+# why "drafting the shared one here" was the defect. It reads `Labels.WORLD_DATA`
+# off the workload now, so that mutation has become the fix — the refusal calls it,
+# and the two entries below sabotage the producer instead. The hazard is unchanged
+# and one level in: a storage record that answers from the definition.
+STORAGE_OBSERVED='            val heldWorldData =
+                (observation as? WorkloadObservation.Present)
+                    ?.takeIf { labelsDescribeItsContainer(it.state) }
+                    ?.let { Labels.booleanValue(it.labels, Labels.WORLD_DATA) }'
+STORAGE_FROM_DEFINITION='            val heldWorldData: Boolean? = definition.spec.storage is StorageSpec.Persistent'
+# The same erasure through a fallback, which is the shape a fix for the above keeps
+# growing back: "stop deriving X from the wrong source" followed by "and when there
+# is nothing to carry forward, derive X from the wrong source". It reaches only the
+# rows with no storage record at all — every row written before the field existed —
+# so a scenario whose row carries one stays green under it, which is why that
+# population needs a case of its own.
+STORAGE_ABSENCE='            if (heldWorldData == null) return carried?.copy(bound = bound)'
+STORAGE_ABSENCE_FALLBACK='            if (heldWorldData == null) {
+                return carried?.copy(bound = bound)
+                    ?: StorageStatus(
+                        persistent = definition.spec.storage is StorageSpec.Persistent,
+                        volumeName = (definition.spec.storage as? StorageSpec.Persistent)?.volume?.name,
+                        bound = bound,
+                    )
+            }'
+# A sandbox read as though its labels were the container'"'"'s. `WorkloadView` reports
+# the sandbox'"'"'s alone when no container exists, and a sandbox built after a
+# `storage.mode` edit carries that edit — so this is the definition laundered back
+# into an observed record through the runtime, in exactly the window where the record
+# is the only memory there is.
+CONTAINERS_OWN_LABELS='        WorkloadState.SANDBOX_ONLY -> false'
+SANDBOXES_LABELS='        WorkloadState.SANDBOX_ONLY -> true'
 # A sixth classification of a workload state, deciding `SANDBOX_ONLY` with neither
 # the fact that separates its two worlds nor a word about doing without it. This is
 # the *omission* shape, which is the one a board of flips cannot score: there is no
@@ -1327,15 +1368,25 @@ MUTATIONS=(
     # its second half — the refusal writing the storage record of the definition it
     # is refusing, which erases the volume name recovery depends on.
     "D61@@$RECONCILER@@$DRAIN@@$TRANSITION_NOT_APPLIED@@$TRANSITION_STATES@@$TRANSITION_RUNNING_ONLY"
-    # Re-derived for the thirty-fifth audit, and its red set grew with the source:
-    # writing the *definition's* storage is now visible to two cases, the one that has
-    # a record to erase and the one that has none and would be handed a false one.
-    "D61S@@$RECONCILER@@$DRAIN@@$TRANSITION_NOT_APPLIED;$PREDATING_ROW@@$TRANSITION_STORAGE@@$TRANSITION_STORAGE_DERIVED"
-    # The thirty-fifth audit's first item: the fallback the previous round's fix left
-    # behind. It reaches only rows decoded with no storage block, so the scenario with
-    # a recorded volume — the one D61S reddens — stays green under it, which is the
-    # whole reason that case could not carry this claim.
-    "D61E@@$RECONCILER@@$DRAIN@@$PREDATING_ROW@@$TRANSITION_STORAGE@@$TRANSITION_STORAGE_FALLBACK"
+    # Re-derived twice. The thirty-fifth audit grew D61S's red set to two cases; the
+    # forty-fourth moved the claim itself, because `Pass.storageStatus` stopped being
+    # the definition-derived expression and became the observed one — so the mutation
+    # that used to restore the defect now restores the fix. What is sabotaged is the
+    # producer: a storage record answered from `spec.storage` rather than from the
+    # workload's own label. `StorageObservationTest` is the class that holds it,
+    # because the defect is a status field's provenance and not a drain step.
+    "D61S@@$RECONCILER@@$STORAGE@@$OBSERVED_PRODUCER@@$STORAGE_OBSERVED@@$STORAGE_FROM_DEFINITION"
+    # The thirty-fifth audit's first item, at its new home: the fallback a fix for
+    # D61S keeps growing back. It reaches only rows decoded with no storage block, so
+    # every scenario whose row carries one stays green under it — which is the whole
+    # reason that population needs cases of its own, and why this claims a different
+    # set from D61S rather than a subset of it.
+    "D61E@@$RECONCILER@@$STORAGE@@$OBSERVED_ABSENCE@@$STORAGE_ABSENCE@@$STORAGE_ABSENCE_FALLBACK"
+    # The forty-fourth audit's own entry, and the half neither of the above can see:
+    # the `SANDBOX_ONLY` window answered from the sandbox's labels. Both entries above
+    # keep the window silent; this one fills it with the edit, which is the same
+    # erasure arriving through the runtime instead of through the definition.
+    "D73@@$RECONCILER@@$STORAGE@@$SANDBOX_WINDOW@@$CONTAINERS_OWN_LABELS@@$SANDBOXES_LABELS"
     # The round's instrument, proved on the shape it exists for: a classification of a
     # workload state that decides `SANDBOX_ONLY` with neither the fact nor a word about
     # doing without it. D62A is the same arm with a comment that explains the branch
