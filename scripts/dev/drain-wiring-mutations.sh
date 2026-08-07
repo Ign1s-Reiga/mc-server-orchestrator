@@ -246,6 +246,10 @@
 #   D71      the premise those notes argue from: a second route into the state
 #            dispatch, from a function nothing calls, so a state can reach its work
 #            without passing the branch that answers the container being down.
+#   D72      the way out of the new scan's alphabet, written before anybody has taken
+#            it: the state's entry imported, so a producer names no type. D66 is the
+#            same edit against the classification scan, and it went unnoticed there
+#            for a round.
 #   C1..C3   controls: the rule deleted outright, once per assertion arm. If these
 #            do not redden, the harness is not reaching the assertions at all.
 #   S1       the self-test. See below.
@@ -976,6 +980,16 @@ NEW_PRODUCER_EXCUSED="$RECONCILER_TAIL"'
 // where it was trying to get to.
 private fun stoppingAfterHandoff(drain: mcorch.schema.DrainStatus, now: java.time.Instant): mcorch.schema.DrainStatus =
     drain.copy(state = DrainState.STOPPING, enteredStateAt = now)'
+# The same producer written without its type, which is how one leaves a scan keyed on
+# the qualified spelling — the thirty-sixth audit's second hole, arriving at the new
+# instrument before anybody had written a producer that way. Refused at the import
+# rather than read, because `ServerPhase` declares `STOPPING` too and a bare entry
+# cannot be attributed to a type by a source scan at all.
+NEW_PRODUCER_UNQUALIFIED="$LAST_IMPORT"'
+import mcorch.schema.DrainState.STOPPING
+
+private fun stoppingAfterHandoff(drain: mcorch.schema.DrainStatus, now: java.time.Instant): mcorch.schema.DrainStatus =
+    drain.copy(state = STOPPING, enteredStateAt = now)'
 # A second route into the state dispatch, from a function nothing calls — so nothing
 # has been through the branch that answers the container being down, and the note at
 # that branch ("in whatever state the drain was in") stops being true of every state.
@@ -1360,6 +1374,10 @@ MUTATIONS=(
     # it to the docstring.
     "D70@@$RECONCILER@@$WIRING@@$PRODUCERS_NAMED@@$RECONCILER_TAIL@@$NEW_PRODUCER"
     "D70A@@$RECONCILER@@$WIRING@@$PRODUCERS_NAMED@@$RECONCILER_TAIL@@$NEW_PRODUCER_EXCUSED"
+    # The way out of the new scan's alphabet, written before anybody has taken it: the
+    # entry imported, so the producer names no type and the qualified-spelling scan
+    # sees nothing. D66 is the same edit against the classification scan.
+    "D72@@$RECONCILER@@$WIRING@@$PRODUCERS_NAMED@@$LAST_IMPORT@@$NEW_PRODUCER_UNQUALIFIED"
     # The premise both producers' notes argue from: every state reaches the dispatch
     # below the branch that answers the container being down. A route in from a
     # function nothing calls is how that stops being true without a line moving.

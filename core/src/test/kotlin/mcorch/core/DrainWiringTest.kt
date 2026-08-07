@@ -1497,6 +1497,26 @@ internal class DrainWiringTest {
         wrapped.answer shouldBe "drain = dispatching .moveTo(DrainState.STOPPING, now),"
         wrapped.note shouldContain "stopDispatchedAt"
 
+        // The name-resolution hole, refused rather than read. The scan is keyed on the
+        // qualified spelling, and the thirty-sixth audit's second hole was the same
+        // scan one level up going blind to `import mcorch.core.WorkloadState.SANDBOX_ONLY`
+        // — one IDE quick-fix, and the producer looks identical. Teaching the scan to
+        // read bare entries is not the answer here: `ServerPhase` declares `STOPPING`
+        // too, so a bare `STOPPING` cannot be attributed to a type at all. An alias is
+        // the same hole spelled differently and is refused with it.
+        val detector = "import mcorch.schema.$DRAIN_STATE_TYPE.STOPPING"
+        IMPORTS_A_STATE.containsMatchIn(detector) shouldBe true
+        IMPORTS_A_STATE.containsMatchIn("import mcorch.schema.$DRAIN_STATE_TYPE") shouldBe false
+        val unqualified =
+            mainSources().flatMap { source ->
+                source.lines.filter { IMPORTS_A_STATE.containsMatchIn(it) }.map { "${source.path}: ${it.trim()}" }
+            }
+        withClue(
+            "a drain state can be written without its type here, where the producer scan cannot see it: $unqualified",
+        ) {
+            unqualified shouldBe emptyList<String>()
+        }
+
         val rules = decodeRules()
         withClue(
             "no decode rule keys on a $DRAIN_STATE_TYPE any more. Either the rule whose producers this " +
@@ -2206,6 +2226,18 @@ internal class DrainWiringTest {
          * scan and the prose about it cannot drift apart.
          */
         const val DRAIN_STATE_TYPE: String = "DrainState"
+
+        /**
+         * An import that would let a drain state be written without its type: an
+         * entry imported directly, or the type imported under another name.
+         *
+         * Both are ways a producer leaves [writesOf]'s alphabet without looking any
+         * different, which is the class of hole the thirty-sixth audit found in the
+         * classification scan. Refusing them is cheaper than reading them, and here it
+         * is also the only sound option: [ServerPhase] declares `STOPPING` as well, so
+         * a bare entry cannot be attributed to a type by a source scan at all.
+         */
+        val IMPORTS_A_STATE = Regex("""^\s*import\s+[\w.]*\b$DRAIN_STATE_TYPE(?:\.[A-Z]|\s+as\s)""")
 
         /** Any instant. Nothing in a decode rule reads one; they only get copied. */
         val PROBE_AT: Instant = Instant.parse("2026-08-07T00:00:00Z")
