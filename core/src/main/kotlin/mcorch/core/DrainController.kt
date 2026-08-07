@@ -3991,6 +3991,29 @@ internal fun outstandingStopCause(
  * [hadContainer] is passed through to [stopIsInFlight] and is not optional: a site
  * that answered it `false` for convenience would be writing `drain = null` with more
  * letters on the one observation where the answer is in doubt.
+ *
+ * ## What this deletes without compensating, and why that is safe today
+ *
+ * When this answers null it **discards a mid-flight drain record without going
+ * through [DrainController.abort]**, so none of that function's compensations run.
+ * A converging pass, a joinable pass or a refused edit can therefore wipe a drain
+ * that had already sealed a backend and swept its players onto another one.
+ *
+ * That is safe for exactly one reason, and it is a reason outside this file:
+ * `Reconciler.ProxyPass.backends` re-derives **both** effects from the stored record
+ * on every proxy pass — `sealed` from `drain.state.sealsBackend()` and `letGo` from
+ * `drain.deregisteredAt` — so a record that vanishes un-seals and re-registers the
+ * backend at the next assertion, level-triggered, with nothing here having to say
+ * so. The undo is a consequence of the record being gone rather than an action any
+ * of these sites takes.
+ *
+ * **The day a drain step gains an effect that is not re-derived from the record,
+ * every one of these sites skips its undo in silence** — no compile error, no test,
+ * and the effect outlives the drain that caused it. An effect that has to be undone
+ * explicitly cannot be compensated here (these sites are ordinary converging code
+ * that has no reason to be thinking about a seal); it has to be either re-derived
+ * the way the two above are, or routed through [DrainController.abort] instead of
+ * through this.
  */
 internal fun clearedDrainRecord(
     drain: DrainStatus?,

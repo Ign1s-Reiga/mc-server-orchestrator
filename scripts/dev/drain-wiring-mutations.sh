@@ -199,6 +199,26 @@
 #            `RUNNING` — a state the drain itself takes away — so the container exits
 #            and the create applies the very definition the loop spent passes
 #            refusing.
+#   D61E     the fix for that second critical, and its own defect: the fallback it
+#            kept for a status row carrying no storage record derives one from the
+#            *edited* definition, so a row written before the field existed — the
+#            population whose volume name is recorded nowhere else — is told
+#            "ephemeral storage: there is no world to save" by the very pass refusing
+#            to make it ephemeral. It reaches only those rows, which is why D61S's
+#            scenario stays green under it.
+#   D62..D64 the thirty-fifth audit's instrument, and the first entries here that can
+#            go red for something **nobody wrote**. Rounds 33, 34 and 35 were one
+#            defect three times — a fact modelled exactly in one place, approximated
+#            at a new consumer asking a narrower question — and all three were
+#            omissions, which a board of flips cannot score. D62 adds a
+#            classification of a workload state that decides `SANDBOX_ONLY` with
+#            neither the fact nor a word about doing without it; D62A gives the same
+#            arm a comment that explains the branch without naming the fact, so that
+#            "carries the argument" cannot be bought off by any comment at all; D63
+#            folds a state into an `else`, which is how one leaves the scan's
+#            alphabet entirely; and D64 moves a converge out of the `when` that
+#            weighs it against the drain, which is the premise both `converge` arms
+#            argue from.
 #   C1..C3   controls: the rule deleted outright, once per assertion arm. If these
 #            do not redden, the harness is not reaching the assertions at all.
 #   S1       the self-test. See below.
@@ -367,6 +387,17 @@ SANDBOX_DECIDED='a sandbox the runtime reports no container in is decided by wha
 UNREPORTED_MID_STOP='a runtime that stops reporting a container mid-stop does not re-admit the backend'
 ONE_DERIVATION_OF_HISTORY='the fact that tells an emptied sandbox from an unreported container has one derivation'
 TRANSITION_NOT_APPLIED='a refused storage transition is not applied by the container exiting underneath it'
+# The thirty-fifth audit. The first is the fix above'"'"'s own fallback, reaching the
+# rows with no storage record to carry forward — the population the volume name is
+# recorded nowhere else for.
+PREDATING_ROW='a status row that predates the storage field is not given a false one by the refusal'
+# ...and the instrument the round was really about. Rounds 33, 34 and 35 were one
+# defect three times, all three of them *omissions*, and this board scores
+# inversions — so the three entries below are the first here that can go red for an
+# argument nobody wrote rather than for an expression somebody flipped.
+WORKLOAD_STATE_CLASSIFIED='every workload-state classification either takes the fact or argues at the SANDBOX_ONLY arm'
+NO_ELSE_ARM='no workload-state classification hides a state in an else arm'
+CONVERGE_ROUTED='every converge is an arm of the routing that asks the rule'
 
 # Single-quoted throughout: these are literals, and one of them contains the
 # quoting characters of two languages.
@@ -731,15 +762,65 @@ ASSUMES_NO_CONTAINER='                            ?: outstandingStopCause(pass.p
                     // Before the drain, never after'
 # The storage guard'"'"'s state condition, and it back on the one state the drain
 # itself takes away.
-TRANSITION_STATES='                WorkloadState.RUNNING, WorkloadState.EXITED, WorkloadState.UNKNOWN -> true
-                WorkloadState.CREATED, WorkloadState.SANDBOX_ONLY -> false'
+#
+# Re-derived for the thirty-fifth audit: the `SANDBOX_ONLY` arm now carries the note
+# the wiring scan requires of it, so the two arms are no longer contiguous and a
+# literal spanning both would carry prose. The anchor is the *widened* arm alone,
+# which is the whole of what this defect narrows.
+TRANSITION_STATES='                WorkloadState.RUNNING, WorkloadState.EXITED, WorkloadState.UNKNOWN -> true'
 TRANSITION_RUNNING_ONLY='                WorkloadState.RUNNING -> true
-                WorkloadState.EXITED, WorkloadState.UNKNOWN -> false
-                WorkloadState.CREATED, WorkloadState.SANDBOX_ONLY -> false'
+                WorkloadState.EXITED, WorkloadState.UNKNOWN -> false'
 # ...and the storage record it writes: the definition it is refusing, rather than
 # the container it is about.
-TRANSITION_STORAGE='                storage = pass.previous?.storage?.copy(bound = true) ?: pass.storageStatus(observation),'
+TRANSITION_STORAGE='                storage = pass.previous?.storage?.copy(bound = true),'
 TRANSITION_STORAGE_DERIVED='                storage = pass.storageStatus(observation),'
+# The same erasure through the fallback the thirty-fourth audit'"'"'s fix left behind,
+# which reaches only the rows that have no storage record to carry forward — every
+# row written before the field existed. The scenario with a *recorded* volume stays
+# green under it, which is exactly why it needed a case of its own.
+TRANSITION_STORAGE_FALLBACK='                storage = pass.previous?.storage?.copy(bound = true) ?: pass.storageStatus(observation),'
+# A sixth classification of a workload state, deciding `SANDBOX_ONLY` with neither
+# the fact that separates its two worlds nor a word about doing without it. This is
+# the *omission* shape, which is the one a board of flips cannot score: there is no
+# expression here to invert, and the defect is the argument nobody wrote. Dead code,
+# so nothing but the scan can see it — the same shape as D6 and D14.
+NEW_CLASSIFICATION="$RECONCILER_TAIL"'
+
+private fun couldStillBeServing(state: WorkloadState): Boolean =
+    when (state) {
+        WorkloadState.RUNNING, WorkloadState.EXITED, WorkloadState.UNKNOWN -> true
+        WorkloadState.SANDBOX_ONLY -> false
+        WorkloadState.CREATED -> false
+    }'
+# The same arm with a note that reads like an argument and is not one: it explains
+# the branch without naming the fact the branch turns on, which is exactly what the
+# rule this scores must refuse. Otherwise "carries the argument" is satisfied by any
+# comment at all and the second half of the check is decoration.
+NEW_CLASSIFICATION_EXCUSED="$RECONCILER_TAIL"'
+
+private fun couldStillBeServing(state: WorkloadState): Boolean =
+    when (state) {
+        WorkloadState.RUNNING, WorkloadState.EXITED, WorkloadState.UNKNOWN -> true
+
+        // Nothing has been created yet, so there is nothing that could be serving.
+        WorkloadState.SANDBOX_ONLY -> false
+
+        WorkloadState.CREATED -> false
+    }'
+# A workload state folded back into an `else`, where an instrument built to find
+# omissions cannot see it. The badge is unchanged — `CREATED` and `SANDBOX_ONLY` are
+# refused upstream — so nothing behavioural moves, and the arm scan above stops
+# finding the state at all rather than finding it unargued: the two counts fall
+# together, so the classification check stays green and only this one bites.
+PHASE_ARMS='                        WorkloadState.CREATED, WorkloadState.SANDBOX_ONLY -> ServerPhase.UNKNOWN'
+PHASE_ELSE='                        else -> ServerPhase.UNKNOWN'
+# The converge decided above the `when` rather than in it: behaviourally identical,
+# and it takes the choice out of the one place both answers are weighed together.
+ROUTING_WHEN='                    when {
+                        blocker != null -> converge(pass, placement.node, observation, blocker)'
+ROUTING_EARLY_RETURN='                    if (blocker != null) return converge(pass, placement.node, observation, blocker)
+                    when {
+                        blocker != null -> converge(pass, placement.node, observation, blocker)'
 
 # name @@ file @@ class @@ testcases that must redden (";"-separated) @@ literal @@ replacement
 #
@@ -1051,7 +1132,30 @@ MUTATIONS=(
     # its second half — the refusal writing the storage record of the definition it
     # is refusing, which erases the volume name recovery depends on.
     "D61@@$RECONCILER@@$DRAIN@@$TRANSITION_NOT_APPLIED@@$TRANSITION_STATES@@$TRANSITION_RUNNING_ONLY"
-    "D61S@@$RECONCILER@@$DRAIN@@$TRANSITION_NOT_APPLIED@@$TRANSITION_STORAGE@@$TRANSITION_STORAGE_DERIVED"
+    # Re-derived for the thirty-fifth audit, and its red set grew with the source:
+    # writing the *definition's* storage is now visible to two cases, the one that has
+    # a record to erase and the one that has none and would be handed a false one.
+    "D61S@@$RECONCILER@@$DRAIN@@$TRANSITION_NOT_APPLIED;$PREDATING_ROW@@$TRANSITION_STORAGE@@$TRANSITION_STORAGE_DERIVED"
+    # The thirty-fifth audit's first item: the fallback the previous round's fix left
+    # behind. It reaches only rows decoded with no storage block, so the scenario with
+    # a recorded volume — the one D61S reddens — stays green under it, which is the
+    # whole reason that case could not carry this claim.
+    "D61E@@$RECONCILER@@$DRAIN@@$PREDATING_ROW@@$TRANSITION_STORAGE@@$TRANSITION_STORAGE_FALLBACK"
+    # The round's instrument, proved on the shape it exists for: a classification of a
+    # workload state that decides `SANDBOX_ONLY` with neither the fact nor a word about
+    # doing without it. D62A is the same arm with a comment that explains the branch
+    # without naming the fact, which is what stops "carries the argument" being
+    # satisfied by any comment at all.
+    "D62@@$RECONCILER@@$WIRING@@$WORKLOAD_STATE_CLASSIFIED@@$RECONCILER_TAIL@@$NEW_CLASSIFICATION"
+    "D62A@@$RECONCILER@@$WIRING@@$WORKLOAD_STATE_CLASSIFIED@@$RECONCILER_TAIL@@$NEW_CLASSIFICATION_EXCUSED"
+    # The escape from that scan's alphabet: a state decided by an `else`, which names
+    # nothing and so is invisible to an instrument keyed on arms that name a state.
+    "D63@@$RECONCILER@@$WIRING@@$NO_ELSE_ARM@@$PHASE_ARMS@@$PHASE_ELSE"
+    # The premise the two `converge` arms argue from, taken away without changing what
+    # the loop does: the decision moved above the `when` that weighs it against the
+    # drain. The arms' notes would then be quietly false, which is the state rounds 18
+    # and 19 both ended in.
+    "D64@@$RECONCILER@@$WIRING@@$CONVERGE_ROUTED@@$ROUTING_WHEN@@$ROUTING_EARLY_RETURN"
     "C1@@$CONTROLLER@@$WIRING@@$EXIT@@$RULE@@val recorded = progress"
     "C2@@$CONTROLLER@@$WIRING@@$STEPPED@@$ADOPTION@@val observed = drain"
     "C3@@$CONTROLLER@@$RULES@@$ADOPTS@@$CLAUSE@@is PlayerReading.Occupied -> this"

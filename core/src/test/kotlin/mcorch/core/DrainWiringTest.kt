@@ -1053,6 +1053,196 @@ internal class DrainWiringTest {
         calls("missingSecret") shouldHaveSize 2
     }
 
+    /**
+     * Every classification of a [WorkloadState] either **takes** the fact that
+     * decides `SANDBOX_ONLY`, or **says at that arm** why it does not need it.
+     *
+     * ## Why this instrument exists, and what it is the first of
+     *
+     * Rounds 33, 34 and 35 were one defect three times: a fact this codebase models
+     * exactly in one place, approximated at a *new consumer* that asked a narrower
+     * question than the fact supports. All three were **omissions** — a missing
+     * argument, a missing clause — and a mutation board scores **inversions**, so
+     * none of them could have gone red. `drain-wiring-mutations.sh` was honestly
+     * green through all three.
+     *
+     * `SANDBOX_ONLY` is the state that needs a fact from outside the observation.
+     * It is two different worlds — a workload whose container was never created, and
+     * a live container the runtime has stopped enumerating — and nothing the node
+     * reports separates them; only [Pass.hadContainer], a container id this loop
+     * wrote down, does. A rule that classifies it *without* asking has not made a
+     * wrong choice, it has failed to notice there was one, and that is invisible to
+     * every behavioural test whose fixture cannot express the case.
+     *
+     * So the shape asserted is the weakest one that catches an omission: the arm's
+     * answer is a function of the fact, **or** the arm carries a note that names the
+     * fact and therefore says why it is doing without. Neither is a claim that the
+     * classification is *correct* — that is behaviour, and `DrainTest`,
+     * `DrainRecordLifetimeTest` and `ReplacementTest` hold it. What cannot be
+     * written any more is a sixth arm that neither reads the fact nor mentions it.
+     *
+     * ## What it costs and what it cannot see
+     *
+     * A note is prose and prose can be pasted. That is accepted: the value is that a
+     * classification added without a thought about `hadContainer` cannot compile-and-
+     * pass, and the author has to write a sentence a reviewer can disagree with.
+     *
+     * It cannot see an arm whose answer depends on the fact across several lines —
+     * `-> {` followed by a block that reads it — because "the arm's own line" is the
+     * shape this project writes and widening it to the whole block is how a scan
+     * passes on an unrelated `hadContainer` deeper inside. Both `converge` arms
+     * forward `pass.hadContainer` to [clearedDrainRecord] inside their blocks, which
+     * is a different question from the one the arm answers; scanning the block would
+     * have scored both of them as taking the fact and this test would have been
+     * green on the day it was written.
+     */
+    @Test
+    fun `every workload-state classification either takes the fact or argues at the SANDBOX_ONLY arm`() {
+        val arms = mainSources().flatMap { it.stateArms() }
+
+        // Vacuity guards. An assertion over a filtered list is satisfied by a scan
+        // that found nothing, and the count is not maintained here: what is asserted
+        // is that both kinds exist, so neither branch of the rule is dead.
+        arms.shouldNotBeEmpty()
+        val classifying = arms.filter { it.names(UNCLASSIFIED) }
+        classifying.size shouldBeGreaterThan 1
+
+        val takesTheFact = classifying.filter { it.answer.contains(THE_FACT) }
+        val argues = classifying.filter { it.note.contains(THE_FACT) }
+        withClue("no classification reads the fact, so the scan is looking at the wrong thing") {
+            takesTheFact.shouldNotBeEmpty()
+        }
+        withClue("no classification argues its way out, so the note half of the rule is untested") {
+            argues.shouldNotBeEmpty()
+        }
+
+        val silent = classifying.filterNot { it in takesTheFact || it in argues }
+        withClue(
+            "a workload state is classified without the fact that decides `$UNCLASSIFIED` and without saying " +
+                "why it does not need it: ${silent.map { it.where }}",
+        ) {
+            silent shouldBe emptyList()
+        }
+
+        // The alphabet control. `CREATED` is in every one of these `when` blocks and
+        // in none of the expressions this scan is not about, so the two counts moving
+        // together is evidence the arm scan is seeing whole blocks rather than a
+        // formatting accident.
+        classifying shouldHaveSize arms.count { it.names("CREATED") }
+    }
+
+    /**
+     * No `when` that classifies a [WorkloadState] may fold one into an `else`.
+     *
+     * The scan above has an alphabet — arms that *name* `SANDBOX_ONLY` — and an
+     * `else` arm is exactly how a state leaves it. `when (state) { RUNNING -> …;
+     * else -> … }` classifies all four other states, decides `SANDBOX_ONLY` among
+     * them, and is invisible to an instrument built for omissions, which would be
+     * the omission-shaped hole in the omission detector.
+     *
+     * There was one when this was written: the phase badge in `forbiddenTransition`,
+     * where `CREATED` and `SANDBOX_ONLY` are refused upstream and the answer is a
+     * badge rather than a decision about a container. Enumerating them there costs a
+     * line and is what makes the claim above complete rather than nearly complete.
+     */
+    @Test
+    fun `no workload-state classification hides a state in an else arm`() {
+        val hidden =
+            mainSources().flatMap { source ->
+                val blocks = source.stateArms().map { source.whenBlockAround(it.line) }.distinct()
+                // Vacuity: a `whenBlockAround` that started returning a one-line range
+                // would satisfy the scan below without having read any arm at all.
+                blocks.forEach { it.count() shouldBeGreaterThan 2 }
+                blocks.flatMap { block ->
+                    block
+                        .filter { isCode(source.lines[it]) && armPattern(codeOf(source.lines[it])) == "else" }
+                        .map { "${source.path}:${it + 1}" }
+                }
+            }
+        withClue("a workload state is decided by an `else`, where nothing goes looking for a classification: $hidden") {
+            hidden shouldBe emptyList()
+        }
+    }
+
+    /**
+     * The premise the two `converge` arms argue from, pinned rather than left in
+     * prose.
+     *
+     * Neither `converge` nor `convergeProxy` takes [Pass.hadContainer], and each
+     * one's `SANDBOX_ONLY` arm creates a container into the sandbox — which, on the
+     * observation that cannot tell an emptied sandbox from an unreported one, is the
+     * shape of a second create over the top of a stop this loop has already
+     * dispatched. Their note says the fact was asked *above* them, and that is a
+     * claim about this source with two parts:
+     *
+     * - every call to either one is inside the function that asks the rule, with the
+     *   fact ([ROUTES_ON_THE_RULE], which the test above pins the shape of); and
+     * - every such call is an arm of the same `when` that routes the other way into
+     *   the drain, so converging is the *alternative* to draining rather than
+     *   something reachable beside it.
+     *
+     * A converge reached from anywhere else is a route that never asked, and the
+     * arms' notes would be quietly false — which is the state rounds 18 and 19 both
+     * ended in, with the argument in a docstring and nothing holding it.
+     */
+    @Test
+    fun `every converge is an arm of the routing that asks the rule`() {
+        val reconciler = Source.of(RECONCILER_PATH)
+        val calls =
+            reconciler.lines.indices
+                .filter {
+                    mentions(
+                        reconciler.lines[it],
+                        "converge",
+                    ) || mentions(reconciler.lines[it], "convergeProxy")
+                }.filterNot { DECLARATION.containsMatchIn(reconciler.lines[it]) }
+
+        // Both kinds, so a name that stops matching is not read as a clean scan.
+        calls.count { mentions(reconciler.lines[it], "converge") } shouldBeGreaterThan 1
+        calls.count { mentions(reconciler.lines[it], "convergeProxy") } shouldBeGreaterThan 1
+
+        calls.forEach { call ->
+            val code = codeOf(reconciler.lines[call])
+            // An **arm**, not merely a line inside the deciding function. `if (blocker
+            // != null) return converge(…)` above the `when` is behaviourally identical
+            // and moves the decision out of the one place both answers are weighed
+            // together — after which "converging is the alternative to draining" is a
+            // sentence rather than a shape.
+            withClue("a converge at ${reconciler.path}:${call + 1} is not a `when` arm: ${code.trim()}") {
+                (armPattern(code) != null && code.substringAfter("->").contains("converge")) shouldBe true
+            }
+            val routing = reconciler.whenBlockAround(call).map { codeOf(reconciler.lines[it]) }.filter(::isCode)
+            withClue("a converge at ${reconciler.path}:${call + 1} is not an arm beside the drain it replaces") {
+                routing.any { ENTERS_DRAIN.containsMatchIn(it) } shouldBe true
+            }
+            val asking = reconciler.enclosing(call).body.map { codeOf(reconciler.lines[it]) }
+            withClue("a converge at ${reconciler.path}:${call + 1} is decided without asking whether a stop is out") {
+                asking.any { ROUTES_ON_THE_RULE.containsMatchIn(it) } shouldBe true
+            }
+        }
+    }
+
+    /**
+     * One `when` arm, split into the parts a claim about it is made of.
+     *
+     * [answer] is the arm's own line only — see the scan's docstring for why the
+     * block is deliberately outside it — and [note] is the contiguous `//` block
+     * directly above, which is where this project writes the reason for a branch.
+     */
+    private data class Arm(
+        val path: String,
+        val line: Int,
+        /** The code left of `->`: what the arm matches. */
+        val pattern: String,
+        /** The code right of `->` on the arm's own line: what it answers with. */
+        val answer: String,
+        val note: String,
+    ) {
+        val where: String get() = "$path:${line + 1}"
+
+        fun names(state: String): Boolean = pattern.contains("$WORKLOAD_STATE_TYPE.$state")
+    }
+
     private data class Binding(
         val name: String,
         val value: String,
@@ -1144,6 +1334,75 @@ internal class DrainWiringTest {
                 .filterNot { declares(verb, it) }
                 .map { enclosing(it) }
                 .filterNot { it.performs(verb) }
+
+        /**
+         * Every `when` arm in this file whose pattern names a [WorkloadState].
+         *
+         * The unit is the **arm**, not the `when` and not the enclosing function.
+         * The thirty-fourth audit's critical was one arm of one `when` deciding a
+         * state without a fact its neighbours had, and the enclosing function is the
+         * wrong unit twice over: `converge`'s classification sits inside a *local*
+         * `fun status(`, so an enclosing-function scan reports the wrong name, and a
+         * function that takes the fact for some other reason would score every arm
+         * in it as safe.
+         */
+        fun stateArms(): List<Arm> =
+            lines.indices.mapNotNull { line ->
+                if (!isCode(lines[line])) return@mapNotNull null
+                val code = codeOf(lines[line])
+                val pattern = armPattern(code) ?: return@mapNotNull null
+                if (!pattern.contains("$WORKLOAD_STATE_TYPE.")) return@mapNotNull null
+                Arm(
+                    path = path,
+                    line = line,
+                    pattern = pattern,
+                    answer = code.substringAfter("->").trim(),
+                    note = noteAbove(line),
+                )
+            }
+
+        /**
+         * The lines of the `when` whose arm is at [line], brace to brace.
+         *
+         * By indentation for the opening and bracket balance for the close, which is
+         * what makes a nested `when` resolve to the inner one: both `converge`s
+         * classify inside an outer `when` over the observation, and an arm scan that
+         * walked out to the outer block would judge an `else` that belongs to a
+         * different question.
+         */
+        fun whenBlockAround(line: Int): IntRange {
+            val indent = indentOf(lines[line])
+            val opening =
+                (line downTo 0).firstOrNull {
+                    isCode(lines[it]) && WHEN.containsMatchIn(codeOf(lines[it])) && indentOf(lines[it]) < indent
+                } ?: error("no enclosing `when` for $path line ${line + 1}")
+            var depth = 0
+            for (at in opening..lines.lastIndex) {
+                val code = codeOf(lines[at])
+                depth += code.count { it == '{' } - code.count { it == '}' }
+                if (at > opening && depth <= 0) return opening..at
+            }
+            error("no closing brace for the `when` at $path line ${opening + 1}")
+        }
+
+        /**
+         * The contiguous `//` block directly above [line], joined.
+         *
+         * Blank lines are skipped only *before* the block starts, so a note that
+         * belongs to the branch above cannot be read as this one's: once a comment
+         * line has been found, anything that is not one ends the block. A `//` on its
+         * own — how a paragraph break is written here — is a comment line.
+         */
+        private fun noteAbove(line: Int): String {
+            val note = mutableListOf<String>()
+            for (at in line - 1 downTo 0) {
+                val trimmed = lines[at].trim()
+                if (trimmed.isEmpty() && note.isEmpty()) continue
+                if (!trimmed.startsWith("//")) break
+                note += trimmed
+            }
+            return note.joinToString(" ")
+        }
 
         private fun declares(
             verb: String,
@@ -1256,6 +1515,41 @@ internal class DrainWiringTest {
 
         /** The two calls in `Reconciler` that hand a pass to `DrainController`. */
         val ENTERS_DRAIN = Regex("""\bdrain(Proxy)?\(""")
+
+        /**
+         * The type whose arms this suite classifies, named once so an assertion and
+         * the prose around it cannot drift apart.
+         */
+        const val WORKLOAD_STATE_TYPE: String = "WorkloadState"
+
+        /**
+         * The one state no observation can decide on its own, and the fact that
+         * decides it.
+         *
+         * Spelled as the bare names rather than as `WorkloadState.SANDBOX_ONLY` and
+         * `pass.hadContainer`, because the scan looks for them in two places that
+         * qualify them differently: an arm's pattern always writes the type, a note
+         * writing prose about it may not, and the fact reaches a call site as
+         * `hadContainer`, `pass.hadContainer` or a parameter of that name.
+         */
+        const val UNCLASSIFIED: String = "SANDBOX_ONLY"
+
+        const val THE_FACT: String = "hadContainer"
+
+        /** A `when` in either form — `when (subject)` and the subjectless `when {`. */
+        val WHEN = Regex("""\bwhen\s*[({]""")
+
+        /** The leading spaces of a line, as this project's formatter writes them. */
+        fun indentOf(line: String): Int = line.takeWhile { it == ' ' }.length
+
+        /**
+         * What a `when` arm matches on, or null when [code] is not an arm.
+         *
+         * The first `->` and nothing after it: an arm's *answer* may contain arrows
+         * of its own (a lambda, a second `when`), and reading past the first one is
+         * how `else` gets found inside a branch that is not one.
+         */
+        fun armPattern(code: String): String? = if (code.contains("->")) code.substringBefore("->").trim() else null
 
         const val LOCAL_NODE_PATH: String = "src/main/kotlin/mcorch/core/node/LocalNode.kt"
 

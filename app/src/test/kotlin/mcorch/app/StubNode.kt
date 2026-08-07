@@ -127,12 +127,28 @@ internal class StubNode(
     /** This node has everything. The pre-flight is a question, and here the answer is yes. */
     override suspend fun checkWorkload(spec: WorkloadSpec) = Unit
 
+    /**
+     * How many containers this node has created, ever.
+     *
+     * It is in the container id, and that is not decoration: a real runtime never
+     * reuses one, so a stub that hands the *same* id to a replacement makes "is this
+     * the container the drain signalled" true by construction. No test here turns on
+     * container identity today, which is precisely why it is free to fix — the cost
+     * of leaving it named after the server is that the first `:app` assertion keyed
+     * on identity would be true whatever the code did, and nobody would know. The
+     * sandbox id is not counted, because a replacement really can land in the sandbox
+     * that is already there. `:core`'s `FakeNode` carries the same counter for the
+     * same reason.
+     */
+    private var containersCreated: Int = 0
+
     override suspend fun ensureWorkload(spec: WorkloadSpec): WorkloadObservation.Present {
         val existing = workload
         if (existing is WorkloadObservation.Present && existing.state != WorkloadState.SANDBOX_ONLY) return existing
+        containersCreated++
         val created =
             WorkloadObservation.Present(
-                handle = WorkloadHandle(name, "sandbox-${spec.server}", "container-${spec.server}"),
+                handle = WorkloadHandle(name, "sandbox-${spec.server}", "container-${spec.server}-$containersCreated"),
                 state = WorkloadState.CREATED,
                 specHash = spec.specHash,
                 // Carried the way a real runtime carries them, because a drain

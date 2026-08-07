@@ -615,6 +615,14 @@ public class Reconciler(
 
             is WorkloadObservation.Present -> {
                 when (observation.state) {
+                    // Classified without `hadContainer`, on the same argument
+                    // [converge]'s arm carries and by the same routing: `cause ==
+                    // null` is [outstandingStopCause]'s answer, which on this state
+                    // is the `hadContainer` answer, and a `blocker` exists only where
+                    // there is no drain record to have dispatched a stop. A proxy
+                    // holds no world, so what a mistake here costs is a second front
+                    // door rather than a world — but the rule is the same one and
+                    // stating it differently on the two paths is how the pair drifts.
                     WorkloadState.SANDBOX_ONLY -> {
                         val created = node.ensureWorkload(pass.desired)
                         write(
@@ -1810,6 +1818,23 @@ public class Reconciler(
                     // The sandbox is there and the container is not. Adopting
                     // the sandbox and creating the container into it is exactly
                     // what `ensureWorkload` does — it is never a second create.
+                    //
+                    // **Classified without `hadContainer`, and the argument is at
+                    // the routing site rather than here.** This is the observation
+                    // where "the container was never created" and "the runtime has
+                    // stopped enumerating a container that may still be serving
+                    // players" are indistinguishable, and [stopIsInFlight] needs the
+                    // fact to tell them apart. This arm does not, because both routes
+                    // into `converge` have already asked it: `cause == null` means
+                    // [outstandingStopCause] answered null, which on this state *is*
+                    // the `hadContainer` answer, and `blocker != null` requires
+                    // [replacementBlocker], which returns null whenever a drain record
+                    // exists — so no stop this loop dispatched can still be inside
+                    // whatever the sandbox is hiding. What is left is a container
+                    // nobody signalled that the runtime is under-reporting, and the
+                    // only place that can be re-asked is the node: `ensureWorkload`
+                    // adopts rather than duplicating. Widening the guard here instead
+                    // would refuse the legitimate recreate after a partial teardown.
                     WorkloadState.SANDBOX_ONLY -> {
                         // The returned observation, not the one this pass
                         // started from: it carries the container that was just
@@ -2242,18 +2267,47 @@ public class Reconciler(
      * labels, so refusing there would freeze a workload on a sentence about a
      * container that is not running.
      *
-     * ## The second-order effect, decided rather than discovered
+     * ## What the refusal leaves behind, in both of its two outcomes
      *
-     * With the drain record now retained across a refusal (see
-     * [clearedDrainRecord]) the record is in `STOPPING`, so `parkedOnTheFailure()`
-     * is false, so the permanent-failure gate does not arm and the passes keep
-     * coming. Each one re-records the same refusal and increments
-     * `FailureStatus.attempts` — one store write per resync, no side effect on the
-     * server, and nothing issued at the runtime. That is accepted over arming the
-     * gate: this loop is the only thing that can notice the operator reverting
-     * `spec.storage.mode`, and freezing a workload whose container this loop has
-     * already signalled leaves the stop half-finished until a resync that a gate
-     * would suppress. Churn is the price of the lever staying live.
+     * Which one a server lands in is decided by whether a stop had already been
+     * dispatched when the edit arrived, and they are not variants of one story.
+     *
+     * - **A stop was dispatched.** [clearedDrainRecord] retains the record, so it
+     *   is still `STOPPING`, so `parkedOnTheFailure()` is false, so the
+     *   permanent-failure gate does not arm and the passes keep coming. Each one
+     *   re-records the same refusal and increments `FailureStatus.attempts` — one
+     *   store write per resync, no side effect on the server, nothing issued at the
+     *   runtime. Churn is the price of the lever staying live: this loop is the only
+     *   thing that can notice the operator reverting `spec.storage.mode`, and
+     *   freezing a workload whose container it has already signalled leaves the stop
+     *   half-finished until a resync a gate would suppress.
+     * - **No stop was dispatched** — the ordinary case, an ephemeral edit landing on
+     *   a healthy persistent server. [clearedDrainRecord] answers null, so the status
+     *   carries no drain, so `parkedOnTheFailure()` is true, the gate arms on the
+     *   next pass, and the server **freezes**: `isBlockedByPermanentFailure` returns
+     *   before anything is observed, so the status stops being refreshed altogether.
+     *   The lever is still the operator's — an edit moves the generation, which is
+     *   what lifts that gate — but nothing about this server is re-read until they
+     *   pull it, and `observedAt` stops advancing rather than the failure's
+     *   `attempts` climbing.
+     *
+     * The first is the rarer one, and the paragraph that used to be here described
+     * only its second-order effect. Both are correct; a reader reasoning about a
+     * refused server has to know which of the two they are looking at before
+     * "the passes keep coming" means anything.
+     *
+     * ## What a refused edit costs a drain already in `STOPPING`, stated as the trade
+     *
+     * While this fires it is a **gate in front of `advance`**: the refusal returns
+     * from [drain] before the controller is entered, so a drain that had reached
+     * `STOPPING` never reaches `awaitStopped` and never reaches [teardown]. The
+     * container has been signalled and the backend deregistered; the sandbox is not
+     * removed and the workload stays dark until the operator reverts the edit. That
+     * is the intended trade rather than an oversight — the alternative is letting the
+     * drain run to a create that applies the definition this function exists to
+     * refuse, which is the empty-world outcome above — and it is the reason the
+     * first outcome keeps its passes: a frozen half-stopped workload has nothing
+     * watching for the revert that releases it.
      */
     private suspend fun forbiddenTransition(
         pass: Pass,
@@ -2265,6 +2319,28 @@ public class Reconciler(
         val couldBeTheContainerTheEditIsAbout =
             when (present.state) {
                 WorkloadState.RUNNING, WorkloadState.EXITED, WorkloadState.UNKNOWN -> true
+
+                // Classified without `hadContainer`, and unlike the two `converge`
+                // arms the reason is at this arm rather than above it: **this rule
+                // reads the labels, not the container**, and the fact that decides
+                // it is already in hand. `SANDBOX_ONLY` carries the *sandbox's*
+                // labels, so `Labels.WORLD_DATA` below would answer about the wrong
+                // object; `hadContainer` cannot repair that, because knowing a
+                // container once existed says nothing about what it was built with.
+                // `CREATED` is a container that was never started and so holds
+                // nothing to discard.
+                //
+                // The pass-through is not free and is not claimed to be: an
+                // ephemeral edit landing in the gap between a replacement drain's
+                // teardown and the next create is refused by nothing, and converges
+                // onto an empty world beside an orphaned volume. It cannot be closed
+                // from here — `StorageStatus` is overwritten from the *desired*
+                // definition by [converge] and by [drain] on every pass, so a pass
+                // later there is no record left to ask — and making it observed in
+                // fact as well as in KDoc is a `:schema`/`:api` change routed
+                // separately. Widening this arm instead would freeze every
+                // replacement of an always-ephemeral lobby on advice that does not
+                // apply to it.
                 WorkloadState.CREATED, WorkloadState.SANDBOX_ONLY -> false
             }
         if (!couldBeTheContainerTheEditIsAbout) return null
@@ -2324,7 +2400,16 @@ public class Reconciler(
                         // saying a dead server is fine.
                         WorkloadState.EXITED -> ServerPhase.STOPPED
 
-                        else -> ServerPhase.UNKNOWN
+                        WorkloadState.UNKNOWN -> ServerPhase.UNKNOWN
+
+                        // Refused by `couldBeTheContainerTheEditIsAbout` above, so
+                        // unreachable here — enumerated rather than folded into an
+                        // `else` because an `else` is how a classification of this
+                        // state stops being visible to anything that goes looking
+                        // for one. `hadContainer` is not asked for the reason that
+                        // arm gives; this is a badge either way, not a decision
+                        // about a container.
+                        WorkloadState.CREATED, WorkloadState.SANDBOX_ONLY -> ServerPhase.UNKNOWN
                     },
                 runtime = pass.runtimeIdentity(present),
                 // The container's storage, not the edited definition's.
@@ -2336,7 +2421,21 @@ public class Reconciler(
                 // nothing else in the system remembers. The previous record is the
                 // one the container was created under; `bound` is the only part of
                 // it this observation can still speak to.
-                storage = pass.previous?.storage?.copy(bound = true) ?: pass.storageStatus(observation),
+                //
+                // **No fallback, and that is the whole of it.** A row decoded with
+                // no storage block at all — `StatusCodec.readStorage` answers null
+                // whenever `storage.persistent` is absent, which is every row
+                // written before the field existed — has *no* record of the volume,
+                // and deriving one from the edited definition here would write the
+                // very claim this refusal exists to prevent: `persistent = false`,
+                // which `StatusDrafting.worldSavedMessage` renders as "ephemeral
+                // storage: there is no world to save" for a server the loop is
+                // refusing to make ephemeral, on exactly the population where the
+                // volume name is recorded nowhere else. Absence stays absence;
+                // [draft] defaults this argument to the same `previous?.storage`,
+                // so a null here carries the row forward unchanged rather than
+                // inventing an answer for it.
+                storage = pass.previous?.storage?.copy(bound = true),
                 // Refusing the *edit* is not withdrawing a drain that is already
                 // stopping this container, and this is the third site that would
                 // have deleted the dispatch record to say so: the edit can land

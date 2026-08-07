@@ -8,6 +8,7 @@ import io.kotest.matchers.collections.shouldNotBeEmpty
 import io.kotest.matchers.comparables.shouldBeGreaterThan
 import io.kotest.matchers.comparables.shouldBeLessThan
 import io.kotest.matchers.ints.shouldBeGreaterThan
+import io.kotest.matchers.nulls.shouldBeNull
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
@@ -28,6 +29,7 @@ import mcorch.schema.PaperServerDefaults
 import mcorch.schema.RconSpec
 import mcorch.schema.ServerPhase
 import mcorch.schema.StorageSpec
+import mcorch.store.getOrThrow
 import org.junit.jupiter.api.Test
 import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.minutes
@@ -2519,6 +2521,60 @@ internal class DrainTest {
                 .image.canonical shouldBe replacement
             // The world was on the volume throughout, and nothing removed it.
             harness.node.volumes shouldHaveSize 1
+        }
+
+    /**
+     * A row that records no storage at all keeps recording none.
+     *
+     * The fix above kept the *container's* storage record instead of drafting one
+     * from the edited definition, and it kept a fallback for the case where there is
+     * no previous record: `pass.previous?.storage?.copy(bound = true) ?:
+     * pass.storageStatus(observation)`. The fallback is the erasure again, on the one
+     * population least able to afford it. `StatusCodec.readStorage` answers **null**
+     * whenever `storage.persistent` is absent — every status row written before the
+     * field existed — so those rows reach the refusal with nothing to carry forward,
+     * take the fallback, and have `persistent = false, volumeName = null` derived from
+     * the very definition the pass is refusing to apply.
+     *
+     * No world is lost by it. What is produced is a **false sentence at the surface an
+     * operator diagnoses from**: `StatusDrafting.worldSavedMessage` renders
+     * `persistent == false` as "ephemeral storage: there is no world to save", for a
+     * server the loop is at that moment refusing to make ephemeral, and whose volume
+     * name is recorded nowhere else in the system. Absence has to stay absence —
+     * "this row never said" is a different answer from "there is no world here", and
+     * only the second one tells somebody to stop looking.
+     *
+     * The failure assertion is the positive control: it is what proves the refusal
+     * fired in this scenario at all, without which the two negative assertions below
+     * are satisfied by a pass that never reached the guard.
+     */
+    @Test
+    fun `a status row that predates the storage field is not given a false one by the refusal`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+
+            // The row as an older build left it: everything else observed, and no
+            // storage block, which is exactly what the decoder hands back for one.
+            val settled = harness.status(name).shouldNotBeNull()
+            settled.storage.shouldNotBeNull()
+            harness.store.putStatus(settled.copy(storage = null)).getOrThrow()
+
+            harness.store.putDefinition(paperDefinition(storage = StorageSpec.Ephemeral()))
+            harness.pass(name).shouldBeInstanceOf<ReconcileOutcome.Failed>()
+
+            val refused = harness.status(name).shouldNotBeNull()
+            refused.failure.shouldNotBeNull().message shouldContain "storage.mode"
+            // Still absent. A record derived here is one derived from the edit.
+            refused.storage.shouldBeNull()
+            // …and the sentences an operator reads say nothing about a world that is
+            // not there. Both are derived from `storage.persistent == false`, which is
+            // what the fallback used to write.
+            refused.condition(ConditionType.WORLD_SAVED).message shouldNotContain "ephemeral storage"
+            refused.condition(ConditionType.VOLUME_BOUND).message shouldNotContain "ephemeral storage"
         }
 
     @Test
