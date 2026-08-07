@@ -268,6 +268,19 @@ two files, one of which I could not `git checkout --` because it also held real
 work. Commit first, then run the harness, then edit again — the same rule as
 sabotaging by hand, for the same reason.
 
+**A killed harness did not die, and that was a bug in the harness.** Both scripts
+carried `trap cleanup EXIT INT TERM`, and a signal handler that only cleans up
+**returns**: the run restored the sources, deleted its backup directory and carried
+on, so every later mutation was applied with nothing left to restore it. A TERM I
+sent mid-run left two mutated files in the working tree, reported the next entry
+UNKNOWN, and kept printing verdicts. That is also where the previous round's
+"orphaned harness racing its own retry" came from — it was never orphaned, it was
+never stopped. `trap 'cleanup; exit 130' INT` and the TERM equivalent are the fix,
+in *both* harnesses. Two rules from it: **a trap handler that does not exit is not a
+kill**, and when a run has to be stopped, check `git status` afterwards rather than
+trusting the trap — the tree being committed first is what makes that a one-line
+recovery.
+
 **And the full drain harness outruns a ten-minute tool timeout**, which kills it
 mid-mutation and leaves that mutation in the working tree — the same wreckage as a
 `pkill`, from a completely ordinary invocation. Run it detached and poll for its
