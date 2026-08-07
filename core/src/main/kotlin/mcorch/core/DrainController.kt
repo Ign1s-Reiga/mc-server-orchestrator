@@ -344,6 +344,17 @@ internal class DrainController(
         // probe either, since the handle has no container to exec into, so this
         // stops here and comes back.
         //
+        // `hadContainer` is what makes that first sentence true, and it is asked
+        // **above** rather than here: `containerIsDown(hadContainer)` splits this
+        // state's two worlds and returns for the one this loop emptied itself, so
+        // the only world that reaches this line is the under-reported container.
+        // Re-asking it here would be a second derivation of a fact that has one,
+        // which is the shape the thirty-fourth audit's critical had. The premises
+        // — one call, taking this pass's own parameter, bound and guarded by a
+        // `return` above this line — are pinned in `DrainWiringTest` rather than
+        // asserted in this sentence, because a sentence is what rounds 18 and 19
+        // ended with.
+        //
         // The registration is deliberately left alone, and this is the one early
         // return where that is the right answer: the process may still be serving
         // players, so removing it from routing is `failure-modes.md` item 3 with

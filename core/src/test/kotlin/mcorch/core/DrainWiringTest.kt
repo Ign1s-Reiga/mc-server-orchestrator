@@ -1055,7 +1055,15 @@ internal class DrainWiringTest {
 
     /**
      * Every classification of a [WorkloadState] either **takes** the fact that
-     * decides `SANDBOX_ONLY`, or **says at that arm** why it does not need it.
+     * decides `SANDBOX_ONLY`, or **says at the site** why it does not need it.
+     *
+     * Two syntaxes are classifications and both are scanned: a `when` arm whose
+     * pattern names a state, and an `==`/`!=` against `SANDBOX_ONLY`. The second was
+     * added by the thirty-sixth audit, which found the docstring claiming "every
+     * classification" over a scan that read arms alone — with three comparisons
+     * already in `:core/main`, one of them the drain's own abort. What is *not*
+     * covered is written on [Source.stateComparisons]: a comparison against a
+     * different state lumps the two sandboxes together without naming either.
      *
      * ## Why this instrument exists, and what it is the first of
      *
@@ -1098,15 +1106,47 @@ internal class DrainWiringTest {
      */
     @Test
     fun `every workload-state classification either takes the fact or argues at the SANDBOX_ONLY arm`() {
+        // The fold, on the two shapes it has to tell apart — neither of which is in
+        // this module today, so neither can be demonstrated by scanning it. The first
+        // is the arm the thirty-sixth audit wrapped: three states, one arm, and the
+        // two that matter are on continuation lines. The second is every `write(` in
+        // this file, which is a `->` line with ordinary parameters above it at the
+        // same indentation and is not an arm at all.
+        Source(
+            "<a wrapped arm>",
+            listOf(
+                "            when (state) {",
+                "                WorkloadState.CREATED,",
+                "                WorkloadState.SANDBOX_ONLY,",
+                "                WorkloadState.EXITED -> false",
+                "            }",
+            ),
+        ).stateArms().single().pattern shouldBe
+            "WorkloadState.CREATED, WorkloadState.SANDBOX_ONLY, WorkloadState.EXITED"
+        Source(
+            "<a wrapped parameter list>",
+            listOf(
+                "    private fun write(",
+                "        state: WorkloadState = WorkloadState.SANDBOX_ONLY,",
+                "        outcome: () -> ReconcileOutcome,",
+                "    )",
+            ),
+        ).stateArms() shouldBe emptyList()
+
         val arms = mainSources().flatMap { it.stateArms() }
+        val comparisons = mainSources().flatMap { it.stateComparisons() }
 
         // Vacuity guards. An assertion over a filtered list is satisfied by a scan
         // that found nothing, and the count is not maintained here: what is asserted
         // is that both kinds exist, so neither branch of the rule is dead.
         arms.shouldNotBeEmpty()
-        val classifying = arms.filter { it.names(UNCLASSIFIED) }
-        classifying.size shouldBeGreaterThan 1
+        val classifyingArms = arms.filter { it.names(UNCLASSIFIED) }
+        classifyingArms.size shouldBeGreaterThan 1
+        // …and that both *syntaxes* exist, so neither reader is scanning for a shape
+        // this module has stopped writing.
+        comparisons.shouldNotBeEmpty()
 
+        val classifying = classifyingArms.map { it.asDecision() } + comparisons
         val takesTheFact = classifying.filter { it.answer.contains(THE_FACT) }
         val argues = classifying.filter { it.note.contains(THE_FACT) }
         withClue("no classification reads the fact, so the scan is looking at the wrong thing") {
@@ -1124,11 +1164,75 @@ internal class DrainWiringTest {
             silent shouldBe emptyList()
         }
 
-        // The alphabet control. `CREATED` is in every one of these `when` blocks and
-        // in none of the expressions this scan is not about, so the two counts moving
-        // together is evidence the arm scan is seeing whole blocks rather than a
-        // formatting accident.
-        classifying shouldHaveSize arms.count { it.names("CREATED") }
+        // The alphabet control, over the arms alone: `CREATED` is in every one of
+        // these `when` blocks and in none of the expressions this scan is not about,
+        // so the two counts moving together is evidence the arm scan is seeing whole
+        // blocks rather than a formatting accident.
+        //
+        // It is a *control*, and the thirty-sixth audit's first hole was that it had
+        // become the only thing watching a whole shape: a wrapped pattern took an arm
+        // out of the alphabet, and because `CREATED` wrapped with it both counts fell
+        // together and this balanced anyway. Folding continuation lines back into the
+        // pattern is what puts such an arm back in front of the silent check above;
+        // this line is not what catches it and was never meant to be.
+        classifyingArms shouldHaveSize arms.count { it.names("CREATED") }
+    }
+
+    /**
+     * A classification of a [WorkloadState] writes the type in front of the entry.
+     *
+     * The other way out of the alphabet, and it takes the control with it. The scan
+     * above keys on the qualified name, so a `when` whose arms read `SANDBOX_ONLY ->`
+     * contributes **zero** classifying arms and **zero** `CREATED` arms: no count
+     * moves, nothing reads as silent, and the state and its control disappear
+     * together. The thirty-sixth audit's second hole.
+     *
+     * ## How a bare entry gets written, which is not what that audit said
+     *
+     * It gave Kotlin's context-sensitive resolution — `SANDBOX_ONLY -> true` in a
+     * `when` over the enum — and against this build's compiler that does not compile:
+     * every entry reads "Unresolved reference". What does compile, in every Kotlin
+     * version, is `import mcorch.core.WorkloadState.SANDBOX_ONLY`, which is one IDE
+     * quick-fix away and leaves the arm looking exactly the same. The finding was
+     * right about the hole and wrong about the way in, so the mutation that scores it
+     * imports the entries — and the day a Kotlin release turns the other form on, this
+     * rule already covers it.
+     *
+     * Refusing the shape is the answer rather than teaching the scan to read bare
+     * entries, because the qualified name is what tells this type's `RUNNING` from
+     * [mcorch.schema.ServerPhase]'s. A bare arm that is *not* a workload state at all
+     * is refused too, and that is the honest cost: the demand is to qualify it, which
+     * is what every arm in this module already does and what makes the alphabet
+     * readable in the first place.
+     */
+    @Test
+    fun `no workload-state classification writes a bare enum entry`() {
+        val states = Source.of(NODE_PATH).enumEntries(WORKLOAD_STATE_TYPE)
+
+        // The alphabet is read from the declaration, so it has to be checked that
+        // something was read: an empty list makes every assertion below vacuous.
+        states.size shouldBeGreaterThan 2
+        states shouldContain UNCLASSIFIED
+        states shouldContain "CREATED"
+
+        // And the detector has to be able to fire. These are the two lines the whole
+        // rule is about, and asserting the qualified one is *not* reported is what
+        // stops a matcher that flags everything from reading as a clean scan.
+        bareStates("$UNCLASSIFIED -> true", states) shouldBe listOf(UNCLASSIFIED)
+        bareStates("$WORKLOAD_STATE_TYPE.$UNCLASSIFIED -> true", states) shouldBe emptyList()
+
+        val unqualified =
+            mainSources().flatMap { source ->
+                source.arms().filter { bareStates(it.pattern, states).isNotEmpty() }.map {
+                    "${it.where} (${bareStates(it.pattern, states)})"
+                }
+            }
+        withClue(
+            "a `when` arm names a workload state without its type, where the classification scan cannot " +
+                "see it: $unqualified",
+        ) {
+            unqualified shouldBe emptyList()
+        }
     }
 
     /**
@@ -1223,16 +1327,90 @@ internal class DrainWiringTest {
     }
 
     /**
+     * The premise the drain's `SANDBOX_ONLY` abort argues from, pinned rather than
+     * left in prose.
+     *
+     * `advanceOnce` classifies the state with an `if`, not an arm, and it does not
+     * read the fact at that line — the abort it takes is right *because* the same
+     * observation has already been through `containerIsDown(hadContainer)`, which
+     * returns for the world this loop emptied itself. What reaches the comparison is
+     * therefore the other world: a workload that has had a container the runtime has
+     * stopped reporting, which is the one thing that must not be torn down.
+     *
+     * That is a constructive argument, so its premises go in a test rather than in
+     * the note beside it — this file's own rule, and the third time it has been
+     * applied. Four of them, and each is a way the note goes quietly false:
+     *
+     * - the rule is asked in this function at all, **once**, so there is no second
+     *   derivation to disagree with;
+     * - it is asked with the enclosing function's own `hadContainer` parameter,
+     *   rather than a constant, which is the exact shape of the thirty-fourth
+     *   audit's critical;
+     * - its answer is *bound* and the guard reads that name, so a rewrap or a rename
+     *   stays green and a substitution does not; and
+     * - the guard **returns**, above the comparison, which is what makes "what
+     *   reaches this line" a fact rather than a hope.
+     */
+    @Test
+    fun `the drain's sandbox abort is reached only past the rule that separates the two sandboxes`() {
+        val sites =
+            LINES.indices.filter { isCode(LINES[it]) && COMPARES_UNCLASSIFIED.containsMatchIn(codeOf(LINES[it])) }
+        withClue("the drain classifies `$UNCLASSIFIED` somewhere this claim has not been read against: $sites") {
+            sites shouldHaveSize 1
+        }
+        val classification = sites.single()
+        val deciding = enclosing(classification)
+
+        val asked = deciding.body.filter { mentions(LINES[it], "containerIsDown") }
+        withClue("the sandbox rule is asked ${asked.size} times in `${deciding.name}`, not once") {
+            asked shouldHaveSize 1
+        }
+        val rule = asked.single()
+        withClue("the abort classifies the state before the rule that separates its two worlds is asked") {
+            (rule < classification) shouldBe true
+        }
+
+        // The fact, read off this function's own parameter list rather than restated,
+        // so that renaming it stays green and answering it with `false` does not.
+        val fact = parametersOf(deciding.body).single { it == THE_FACT }
+        val down = binding(LINES[rule])
+        withClue("the sandbox rule is asked with something other than this pass's observation and fact") {
+            down.value shouldBe "observation.containerIsDown($fact)"
+        }
+
+        val guard =
+            deciding.body.first { it > rule && codeOf(LINES[it]).trim().startsWith("if (${down.name} != null)") }
+        val guarded = CONTROLLER.bodyOf(guard)
+        withClue("the answer to the sandbox rule is read and then fallen through, so nothing is decided by it") {
+            codeIn(guarded).any { RETURN.containsMatchIn(it) } shouldBe true
+        }
+        withClue("the abort is inside the branch that already handled the container being down") {
+            (classification > guarded.last) shouldBe true
+        }
+    }
+
+    /**
      * One `when` arm, split into the parts a claim about it is made of.
      *
      * [answer] is the arm's own line only — see the scan's docstring for why the
      * block is deliberately outside it — and [note] is the contiguous `//` block
      * directly above, which is where this project writes the reason for a branch.
+     *
+     * [pattern] is the **whole** pattern, folded back together when the formatter
+     * has wrapped it over several lines. The thirty-sixth audit's first hole was
+     * that it was not: `armPattern` reads the `->` line alone, so widening an arm
+     * by one state — which is what
+     * `WorkloadState.CREATED, WorkloadState.SANDBOX_ONLY -> false` is one edit away
+     * from — makes spotless push the two states that matter onto continuation
+     * lines, and the arm leaves the scan's alphabet entirely. Both counts fall
+     * together, so the alphabet control below balances and the whole thing stays
+     * green while the state it exists for is classified by an arm nothing reads.
      */
     private data class Arm(
         val path: String,
+        /** The arm's **first** line, which is its pattern's, not necessarily its `->`. */
         val line: Int,
-        /** The code left of `->`: what the arm matches. */
+        /** The code left of `->`, including any wrapped continuation lines: what the arm matches. */
         val pattern: String,
         /** The code right of `->` on the arm's own line: what it answers with. */
         val answer: String,
@@ -1241,7 +1419,35 @@ internal class DrainWiringTest {
         val where: String get() = "$path:${line + 1}"
 
         fun names(state: String): Boolean = pattern.contains("$WORKLOAD_STATE_TYPE.$state")
+
+        /** This arm as a classification of a workload state, whatever it is written as. */
+        fun asDecision(): Decision = Decision(where = where, answer = answer, note = note)
     }
+
+    /**
+     * One place a workload state is classified, whatever syntax it is written in.
+     *
+     * A `when` arm is the shape this module writes today; `if (state ==
+     * WorkloadState.SANDBOX_ONLY)` is the shape that was outside the scan while its
+     * docstring claimed "every classification", and `:core/main` already held three
+     * of them — one of which is a drain decision. The rule applied to both is the
+     * same one: the decision's own code names the fact, or the note above it does.
+     */
+    private data class Decision(
+        val where: String,
+        /**
+         * The code the decision is written in: an arm's own line right of `->`, or
+         * the whole statement a comparison is part of.
+         *
+         * A statement rather than a line, unlike an arm, and the difference is
+         * deliberate. An arm's block is a different question from the arm's own —
+         * both `converge` arms forward `pass.hadContainer` inside theirs — where a
+         * comparison folded across lines by the formatter is one expression, and the
+         * fact appearing anywhere in it is part of the same decision.
+         */
+        val answer: String,
+        val note: String,
+    )
 
     private data class Binding(
         val name: String,
@@ -1336,7 +1542,7 @@ internal class DrainWiringTest {
                 .filterNot { it.performs(verb) }
 
         /**
-         * Every `when` arm in this file whose pattern names a [WorkloadState].
+         * Every `when` arm in this file, wrapped patterns folded back together.
          *
          * The unit is the **arm**, not the `when` and not the enclosing function.
          * The thirty-fourth audit's critical was one arm of one `when` deciding a
@@ -1346,20 +1552,72 @@ internal class DrainWiringTest {
          * function that takes the fact for some other reason would score every arm
          * in it as safe.
          */
-        fun stateArms(): List<Arm> =
+        fun arms(): List<Arm> =
             lines.indices.mapNotNull { line ->
                 if (!isCode(lines[line])) return@mapNotNull null
                 val code = codeOf(lines[line])
-                val pattern = armPattern(code) ?: return@mapNotNull null
-                if (!pattern.contains("$WORKLOAD_STATE_TYPE.")) return@mapNotNull null
+                val tail = armPattern(code) ?: return@mapNotNull null
+                val start = armStart(line)
+                val wrapped = (start until line).joinToString("") { codeOf(lines[it]).trim() + " " }
                 Arm(
                     path = path,
-                    line = line,
-                    pattern = pattern,
+                    line = start,
+                    pattern = (wrapped + tail).trim(),
                     answer = code.substringAfter("->").trim(),
-                    note = noteAbove(line),
+                    // Above the arm, not above its `->`: a wrapped pattern puts
+                    // several lines between the note and the answer, and the note
+                    // belongs to the whole arm.
+                    note = noteAbove(start),
                 )
             }
+
+        /** Every arm in this file whose pattern names a [WorkloadState]. */
+        fun stateArms(): List<Arm> = arms().filter { it.pattern.contains("$WORKLOAD_STATE_TYPE.") }
+
+        /**
+         * Every `==` or `!=` in this file that classifies [UNCLASSIFIED].
+         *
+         * The other half of "every classification". A comparison against one of the
+         * *other* four states is deliberately outside this: what the rule is about is
+         * telling `SANDBOX_ONLY`'s two worlds apart, and only an expression that
+         * singles that state out makes the distinction at all. `state ==
+         * WorkloadState.UNKNOWN` decides something else and answers `false` for both
+         * worlds alike.
+         *
+         * The limitation that leaves, stated rather than papered over: `state !=
+         * WorkloadState.RUNNING` lumps the two worlds in with `EXITED` **without
+         * naming them**, and nothing here sees it. The `when` form of the same
+         * mistake is caught, because an arm has to enumerate what it matches and the
+         * `else` that would avoid that is refused; the comparison form has no such
+         * obligation. A rule that answers "not running" for a sandbox is the shape to
+         * read this scan's silence about.
+         */
+        fun stateComparisons(): List<Decision> =
+            lines.indices
+                .filter { isCode(lines[it]) && COMPARES_UNCLASSIFIED.containsMatchIn(codeOf(lines[it])) }
+                .map { line ->
+                    val start = statementStart(line)
+                    Decision(
+                        where = "$path:${line + 1}",
+                        answer = (start..line).joinToString(" ") { codeOf(lines[it]).trim() },
+                        note = noteAbove(start),
+                    )
+                }
+
+        /**
+         * The entries of the enum [type] declared in this file, in declaration order.
+         *
+         * Read from the declaration rather than listed here, so that a sixth
+         * [WorkloadState] joins the alphabet on the day it is written rather than on
+         * the day somebody remembers this file.
+         */
+        fun enumEntries(type: String): List<String> {
+            val declaration = lines.indexOfFirst { isCode(it) && codeOf(it).contains("enum class $type") }
+            check(declaration >= 0) { "no `enum class $type` in $path" }
+            return bodyAt(declaration)
+                .filter { isCode(lines[it]) }
+                .mapNotNull { ENUM_ENTRY.find(codeOf(lines[it]))?.groupValues?.get(1) }
+        }
 
         /**
          * The lines of the `when` whose arm is at [line], brace to brace.
@@ -1402,6 +1660,57 @@ internal class DrainWiringTest {
                 note += trimmed
             }
             return note.joinToString(" ")
+        }
+
+        /**
+         * The first line of the arm whose `->` is at [arrow].
+         *
+         * A pattern too long for one line is wrapped by the formatter one entry per
+         * line, at the arm's own indentation, each line but the last ending in a
+         * comma — so that is what is walked back over, and nothing else.
+         *
+         * "Entries", not "a line ending in a comma", and the difference is a
+         * wrapped **parameter list**: every `write(` in this module has
+         * `outcome: () -> ReconcileOutcome,` as its last parameter, which is a `->`
+         * line with ordinary parameters above it at the same indentation. Folding
+         * those together would make a pattern out of a signature, and the day one of
+         * them takes a `WorkloadState` it would be a classification this scan
+         * invented. [WRAPPED_PATTERN] is what tells the two apart, and the indent
+         * check is what keeps the walk inside the arm.
+         */
+        private fun armStart(arrow: Int): Int {
+            var start = arrow
+            while (start > 0) {
+                val above = start - 1
+                if (!isCode(lines[above])) break
+                if (!WRAPPED_PATTERN.matches(codeOf(lines[above]).trim())) break
+                if (indentOf(lines[above]) != indentOf(lines[arrow])) break
+                start = above
+            }
+            return start
+        }
+
+        /**
+         * The first line of the statement [line] is part of.
+         *
+         * A comparison the formatter has wrapped — `val settled =` on one line, the
+         * `&&` on the next, the state on the third — has its note above the first of
+         * them, and reading only the line the state is on would find no note however
+         * carefully one was written. Continuation lines are indented further than the
+         * line they continue; a line ending in `{` is a block being opened rather
+         * than a statement being continued, which is what stops this at the enclosing
+         * `if` instead of walking out to the function declaration.
+         */
+        private fun statementStart(line: Int): Int {
+            var start = line
+            while (start > 0) {
+                val above = start - 1
+                if (!isCode(lines[above])) break
+                if (indentOf(lines[above]) >= indentOf(lines[start])) break
+                if (codeOf(lines[above]).trimEnd().endsWith("{")) break
+                start = above
+            }
+            return start
         }
 
         private fun declares(
@@ -1536,6 +1845,54 @@ internal class DrainWiringTest {
 
         const val THE_FACT: String = "hadContainer"
 
+        /**
+         * `x == WorkloadState.SANDBOX_ONLY`, in either order, qualified or not.
+         *
+         * The `when` arm is not the only way to classify a state, and the docstring
+         * above claimed "every classification" while the scan read arms alone. Three
+         * comparisons were already in `:core/main` when that was written, one of them
+         * a drain decision.
+         *
+         * The optional qualifier is what makes this see the bare form as well —
+         * `state == SANDBOX_ONLY` compiles — and no false positive comes with it: the
+         * alternation demands the entry name *immediately* after the operator, so
+         * `x == Other.SANDBOX_ONLY` matches neither branch. No other enum in this
+         * build declares the name in any case.
+         */
+        val COMPARES_UNCLASSIFIED =
+            Regex(
+                """[=!]=\s*(?:$WORKLOAD_STATE_TYPE\.)?$UNCLASSIFIED\b""" +
+                    """|(?<![\w.])(?:$WORKLOAD_STATE_TYPE\.)?$UNCLASSIFIED\s*[=!]=""",
+            )
+
+        /** One entry of an enum declaration, on its own line as this project writes them. */
+        val ENUM_ENTRY = Regex("""^\s+([A-Z][A-Z0-9_]*)\s*,?\s*$""")
+
+        /**
+         * A continuation line of a wrapped `when` pattern: entries and commas, ending
+         * in the comma that continues it.
+         *
+         * Deliberately narrower than "ends in a comma", so that a wrapped parameter
+         * list above a lambda-typed parameter is not folded into a pattern. It is
+         * also narrower than every legal pattern — a wrapped `is Foo,` does not match
+         * — which is the safe direction here: the scan's subject is enum states, and
+         * the arms this module writes are entries.
+         */
+        val WRAPPED_PATTERN = Regex("""^[\w.]+(?:\s*,\s*[\w.]+)*\s*,$""")
+
+        /**
+         * The [WorkloadState] entries [pattern] names **without** the type in front.
+         *
+         * `(?<![\w.])` is the whole of it: it is what tells a bare `SANDBOX_ONLY`
+         * from `WorkloadState.SANDBOX_ONLY`, and also from another type's entry of
+         * the same name — `ServerPhase.RUNNING` is not a workload state and is not
+         * reported here.
+         */
+        fun bareStates(
+            pattern: String,
+            states: List<String>,
+        ): List<String> = states.filter { Regex("""(?<![\w.])$it\b""").containsMatchIn(pattern) }
+
         /** A `when` in either form — `when (subject)` and the subjectless `when {`. */
         val WHEN = Regex("""\bwhen\s*[({]""")
 
@@ -1553,10 +1910,13 @@ internal class DrainWiringTest {
 
         const val LOCAL_NODE_PATH: String = "src/main/kotlin/mcorch/core/node/LocalNode.kt"
 
+        /** Where [WorkloadState] is declared, and so where its entries are read from. */
+        const val NODE_PATH: String = "src/main/kotlin/mcorch/core/Node.kt"
+
         /** The interface and the implementations of it — the files that perform, never decide. */
         val NODE_FILES =
             listOf(
-                "src/main/kotlin/mcorch/core/Node.kt",
+                NODE_PATH,
                 LOCAL_NODE_PATH,
             )
 

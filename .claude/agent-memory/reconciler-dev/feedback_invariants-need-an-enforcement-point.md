@@ -1,6 +1,6 @@
 ---
 name: invariants-need-an-enforcement-point
-description: An invariant held by every call site doing the right thing is not enforced — collapse it into one function whose return type carries it, distrust any comment counting call sites, and pin wiring that no input can exercise by asserting on the source (shapes only: unconditional application, exits, gates, classification rather than lists, and the call site rather than the file as the unit; prefer a constructive unreachability argument to a survey of inputs, pin every premise of it including which object reaches the callee, and cover two gates in series with an assertion about the side effect rather than the refusal)
+description: An invariant held by every call site doing the right thing is not enforced — collapse it into one function whose return type carries it, distrust any comment counting call sites, and pin wiring that no input can exercise by asserting on the source (shapes only: unconditional application, exits, gates, classification rather than lists, and the call site rather than the file as the unit; prefer a constructive unreachability argument to a survey of inputs, pin every premise of it including which object reaches the callee, and cover two gates in series with an assertion about the side effect rather than the refusal; a source scan's holes are the meaning-preserving edits — the formatter's wrapping, the resolver's spellings, the syntax of the decision — and a control keyed on a sibling count is not one if the failure moves both)
 metadata:
   type: feedback
 ---
@@ -460,3 +460,37 @@ See [[localnode-test-gap]] for the sibling rule about decisions,
 [[deadline-ceilings]] for the round this came from, and
 [[prove-the-test-can-fail]] for why the unit test of the function was the one
 that mattered.
+
+## A source scan's holes are the edits that preserve meaning
+
+Round 36 put three shapes past that scan and **every one was green, alphabet
+control included**. They are worth listing as a class, because they are not three
+accidents — they are the three ways source can change without the program
+changing, and a scan reads source:
+
+- **The formatter.** A pattern too long for a line gets wrapped, and a scan keyed
+  on the `->` line loses whatever moved above it. Widening an arm by one state is
+  an ordinary edit; here it was one state away from a live guard.
+- **Name resolution.** The same entry can be written qualified, imported, or (in
+  some compilers) bare. A scan keyed on the qualified spelling sees none of the
+  others.
+- **The syntax of the decision.** `when` arm, `==`, `!=`, `in a set` — one rule,
+  four spellings, and a scan usually reads one.
+
+Before trusting a source scan, take its subject and write it the other legal ways:
+reformat it, re-import it, re-spell it. That is a five-minute exercise and it is
+the whole of what an "instrument" is worth beyond a comment.
+
+**And a control keyed on a sibling quantity is not a control if the failure moves
+both.** The alphabet check here was *"the number of arms naming `SANDBOX_ONLY`
+equals the number naming `CREATED`"* — sound reasoning, and it balanced under all
+three holes, because every one of them removed the arm entirely and both counts
+fell together. A control is only worth its line if there is an edit it survives
+and the primary does not; ask which edit that is, and if the honest answer is
+"one that renames a state", say so beside it rather than letting the next round
+read a balanced count as coverage.
+
+**Fix the primary, not the control.** The repair for the wrapped arm was to fold
+continuation lines back into the pattern, so that the *silent* check — the one
+that carries the rule — is what refuses it. Tightening the count instead would
+have produced a second thing that goes red for reasons nobody can read.

@@ -24,3 +24,4 @@
 - [Dispatch record](project_dispatch-record.md) — two proxies wrong at two call sites mean a fact nobody records; the stamp that inverts the save rule; the `Rejected` ruling still open.
 - [Record lifetime](project_record-lifetime.md) — the value was right and the lifetime was inherited; the fix's own defect; the undo the clears skip, safe only by re-derivation.
 - [Guard lifetime](project_guard-lifetime.md) — a refusal conditioned on a state the drain itself ends; its two outcomes, only one of which churns; the `?:` that put the erasure back.
+- [Classification scan scope](project_classification-scan-scope.md) — the two syntaxes it reads, the five exempt comparisons, the `!= RUNNING` gap left open, and the review rule I declined to fake.

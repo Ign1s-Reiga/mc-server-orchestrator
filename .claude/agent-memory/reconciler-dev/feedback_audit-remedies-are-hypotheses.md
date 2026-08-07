@@ -1,6 +1,6 @@
 ---
 name: audit-remedies-are-hypotheses
-description: An audit's finding and its prescribed remedy carry different weight — the named helper may be wrong, and a remedy for "the same root" may reach only one of the defects it was filed against
+description: An audit's finding and its prescribed remedy carry different weight — the named helper may be wrong, a remedy for "the same root" may reach only one of the defects it was filed against, and even a demonstrated hole can be given a mechanism that does not compile here
 metadata:
   type: feedback
 ---
@@ -193,6 +193,26 @@ Two things to carry:
   stale — which is this file's oldest rule, arriving from the other direction: not
   "the fix breaks a test that was right", but "the fix creates a defect the old
   test was already watching for".
+
+## A demonstrated hole can come with a mechanism that is not real
+
+Round 36 demonstrated three holes in a source scan and was right about all three.
+One of them was stated as *"Kotlin 2.4.10 resolves enum entries context-sensitively
+in `when`, so `SANDBOX_ONLY -> true` compiles"* — and against this build's compiler
+it does not: every entry reads `Unresolved reference`. The hole was real by a
+different route (`import mcorch.core.WorkloadState.SANDBOX_ONLY`, legal in every
+Kotlin version and one IDE quick-fix away), so the fix stood and the mutation that
+scores it had to be rewritten.
+
+**Compile the shape before writing the entry that scores it.** A finding of the form
+"X is expressible and your check cannot see it" has two halves, and an auditor can
+verify the second by reading while taking the first from a release note. Under this
+harness a non-compiling mutation leaves no XML and reads as UNKNOWN, which is a
+failure and not a catch — so believing the stated mechanism would have cost a round.
+And when the mechanism turns out to be wrong, say so **in the instrument**, with what
+would make it true later: a Kotlin release enabling that resolution is exactly when
+somebody needs the second entry. See [[prove-the-test-can-fail]] for the sibling rule
+about signature changes turning mutations into UNKNOWNs.
 
 ## Arguing to leave something open
 
