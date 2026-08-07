@@ -1146,10 +1146,12 @@ public class LocalNode internal constructor(
                     "only be retired with crictl. This refuses at the cap alone, one slack short of where the " +
                     "behaviour changes, so that it does not depend on a margin :cri may retune. The fix is to " +
                     "raise CriTimeouts.stopDeadlineCap: it bounds only how long one call waits, never the grace " +
-                    "period the container is given. Lowering the ceiling instead means lowering " +
-                    "PaperServerDefaults.MAX_TIMEOUT, which is the cap PaperServerReader applies to several spec " +
-                    "timeouts and not just the save timeout — and MAX_STOP_GRACE_PERIOD cannot come down on its " +
-                    "own, because SpecBounds.init requires it to stay a margin above MAX_TIMEOUT"
+                    "period the container is given. Lowering the ceiling instead is possible but narrower than " +
+                    "it looks: PaperServerDefaults.MAX_STOP_GRACE_PERIOD can only fall as far as " +
+                    "MAX_TIMEOUT + MIN_STOP_GRACE_MARGIN before SpecBounds.init refuses it, so on the shipped " +
+                    "constants that is 1h30s and it helps only for a cap somewhere in (1h30s, 2h). Going below " +
+                    "that means lowering MAX_TIMEOUT too, which is the ceiling PaperServerReader applies to " +
+                    "several spec timeouts and not only the save timeout"
             }
             return LocalNode(
                 name = config.name,

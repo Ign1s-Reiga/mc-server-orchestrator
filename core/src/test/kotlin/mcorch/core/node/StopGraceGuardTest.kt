@@ -16,6 +16,7 @@ import mcorch.core.StopGrace
 import mcorch.core.StopGraceCeiling
 import mcorch.core.WorkloadHandle
 import mcorch.core.coreTest
+import mcorch.core.testing.KotlinSource
 import mcorch.cri.ContainerFilter
 import mcorch.cri.ContainerId
 import mcorch.cri.ContainerSpec
@@ -221,9 +222,10 @@ class StopGraceGuardTest {
      * cannot observe.
      *
      * **What it does have to point at, since the thirty-eighth audit.** The month
-     * built below is *above* that cap, and a stop above the cap is one whose re-issue
-     * can never reach the runtime's kill — so this is the shape of the value that
-     * would park a drain for ever, constructed here in a green test. It is legal to
+     * built below is far past `stopDeadlineCap + deadlineSlack` — the threshold past
+     * which a re-issue can never reach the runtime's kill, which is the cap plus the
+     * slack and not the cap — so this is the shape of the value that would park a
+     * drain for ever, constructed here in a green test. It is legal to
      * construct and no definition the loop acts on produces one; what keeps that true
      * is a relation between three modules' constants, and it is asserted rather than
      * surveyed in `the ceiling a stop may carry stays inside the deadline that
@@ -340,6 +342,11 @@ class StopGraceGuardTest {
      *
      * Lowering `CriTimeouts.stopDeadlineCap` to an hour reddened **this test and
      * nothing else** in 954 — the far-side constant was pinned by nothing at all.
+     * That measurement predates `LocalNode.open`'s `require`; the same mutation now
+     * reddens this *and* the pre-flight test, which is what the record further down
+     * says. The suite total is the tell that two records were taken at different
+     * times, and it is the reason a red set is written with the count it was measured
+     * against.
      * Raising `PaperServerDefaults.MAX_STOP_GRACE_PERIOD` to three hours reddened
      * this and two others, which looks like coverage and is not: both of those
      * (`a grace period containerd would invert is capped, not sent` here, and
@@ -667,104 +674,15 @@ class StopGraceGuardTest {
      * one and it was stale by the end of the same commit, which is the failure
      * `DrainController`'s own class note warns about.
      *
-     * Block-comment state is tracked rather than guessed from the line prefix. The
-     * prefix test alone reads a continuation line that does **not** start with `*`
-     * as code, so a paragraph wrapped by hand or by a future formatter setting could
-     * turn this red for a token that is prose — a scan going spuriously red is how a
-     * scan gets deleted.
-     *
-     * Tracking depth introduces the opposite failure, which is why [codeLinesOf]
-     * hands the depth back and this asserts on it: red for prose is a nuisance,
-     * **green for a blanked file is a defect**, and only one of the two announces
-     * itself.
+     * The stripping, the block-comment nesting and the fail-open check all live in
+     * [KotlinSource], shared with `:app`'s startup-channel scan rather than copied —
+     * its KDoc carries the reasoning, including which unmatched-opener spelling is
+     * loud and which is silent.
      */
-    private fun mainSources(): List<Pair<String, List<String>>> =
-        Path
-            .of("src/main/kotlin")
-            .toFile()
-            .walkTopDown()
-            .filter { it.isFile && it.extension == "kt" }
-            .map { file ->
-                val (code, depth) = codeLinesOf(file.readLines())
-                // **The stripper fails open and this is what closes it.** An unmatched
-                // terminator in prose is a compile error, loud and immediate. An
-                // unmatched *opener* — a KDoc line mentioning one, or a multi-line raw
-                // string containing one — silently blanks every line after it, so the
-                // scans below would find nothing in the rest of the file and report
-                // green. A scan that can be switched off by a comment is worse than no
-                // scan, so the depth has to come back to zero.
-                check(depth == 0) {
-                    "${file.invariantSeparatorsPath} ends inside a block comment (depth $depth). The stripper " +
-                        "has blanked the rest of the file, so every scan over it is silently vacuous — find the " +
-                        "unmatched opener, in prose or in a raw string, before trusting a green run"
-                }
-                file.invariantSeparatorsPath to code
-            }.sortedBy { it.first }
-            .toList()
-
-    /**
-     * [lines] with comments removed and string literals blanked, positions
-     * preserved.
-     *
-     * Deliberately does not try to be a Kotlin lexer. It handles the two things
-     * this repo actually writes — block comments, KDoc included, and `//` tails —
-     * and blanks literals first so that neither a `//` nor a block opener inside a
-     * string can open or close anything. Nesting is counted because Kotlin permits
-     * it.
-     *
-     * (This paragraph originally spelled the block delimiters out. The closing one
-     * ended the KDoc four lines early and the rest of the sentence was compiled as
-     * Kotlin — which is the same class of hazard the function exists to handle, met
-     * while documenting it.)
-     */
-    private fun codeLinesOf(lines: List<String>): Pair<List<String>, Int> {
-        var depth = 0
-        val stripped =
-            lines.map { raw ->
-                val line = raw.replace(STRING_LITERAL, "\"\"")
-                val kept = StringBuilder()
-                var i = 0
-                while (i < line.length) {
-                    when {
-                        depth == 0 && line.startsWith("/*", i) -> {
-                            depth++
-                            i += 2
-                        }
-
-                        depth > 0 && line.startsWith("/*", i) -> {
-                            depth++
-                            i += 2
-                        }
-
-                        depth > 0 && line.startsWith("*/", i) -> {
-                            depth--
-                            i += 2
-                        }
-
-                        depth > 0 -> {
-                            i++
-                        }
-
-                        line.startsWith("//", i) -> {
-                            i = line.length
-                        }
-
-                        else -> {
-                            kept.append(line[i])
-                            i++
-                        }
-                    }
-                }
-                kept.toString()
-            }
-        return stripped to depth
-    }
+    private fun mainSources(): List<Pair<String, List<String>>> = KotlinSource.tree("src/main/kotlin")
 
     private companion object {
         val NODE: NodeName = NodeName.of("test-node").getOrThrow()
-
-        /** A string literal, so a scan for a token cannot be fooled by prose inside one. */
-        val STRING_LITERAL = Regex(""""([^"\\]|\\.)*"""")
 
         /**
          * The save timeout of a workload with no world, which is what
