@@ -99,11 +99,17 @@ public data class ReconstructedStatus(
  * is taken *before* the state machine runs, for any drain whose workload the runtime
  * reports absent, exited, merely created, or sandbox-only having never had a
  * container — and it moves the record to `STOPPING` having **dispatched nothing**.
- * The teardown persists that record. So the current build writes `state == STOPPING`
- * with no stamp on the ordinary path of every drain of a container that was already
- * down, this rule fires on those rows, and the stamp it synthesises for them is for
- * a dispatch that never happened. They are false positives, and nothing in a
- * document tells them from the rows above.
+ * The teardown persists that record.
+ *
+ * It *carries* the record it was handed and never writes the stamp itself, so which
+ * population it produces depends on where the drain had got to. A drain that already
+ * reached step 7 arrives carrying step 7's stamp and is not a false positive at all.
+ * The rows this paragraph is about are the ones that reached the branch **without
+ * ever reaching step 7** — a workload the runtime reported gone before the drain had
+ * anything to stop. On those the current build writes `state == STOPPING` with no
+ * stamp, this rule fires, and the stamp it synthesises is for a dispatch that never
+ * happened. They are false positives, and nothing in a document tells them from the
+ * rows above.
  *
  * **What makes them harmless is the observation gate, not the paragraph above it.**
  * The stamp has one reader, `stopIsInFlight`, and it answers `true` only for a stamp
