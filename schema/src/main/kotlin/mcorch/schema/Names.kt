@@ -22,6 +22,15 @@ public value class ResourceName private constructor(
 
         private val PATTERN = Regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 
+        /**
+         * The rule in words, for the one caller that may not quote what was
+         * written back at the operator: a coordinate of a secret reference
+         * ([SecretRef.NAME_PROBLEM]). Stated here so it cannot drift from
+         * [PATTERN].
+         */
+        internal val SYNTAX: String =
+            "lowercase letters, digits and `-`, starting and ending alphanumeric, at most $MAX_LENGTH characters"
+
         public fun of(raw: String): Result<ResourceName> {
             val problem = problemWith(raw)
             return if (problem == null) Result.success(ResourceName(raw)) else invalidValue(problem)

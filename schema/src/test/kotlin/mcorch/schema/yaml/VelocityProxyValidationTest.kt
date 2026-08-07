@@ -135,6 +135,11 @@ class VelocityProxyValidationTest {
                     "inline secrets are not supported",
                 ),
                 ValidationCase(
+                    "proxy-inline-forwarding-block.yaml",
+                    "spec.forwarding",
+                    "inline secrets are not supported",
+                ),
+                ValidationCase(
                     "proxy-empty-selector.yaml",
                     "spec.backends.selector.matchLabels",
                     "matches every server in the fleet",
