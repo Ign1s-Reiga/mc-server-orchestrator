@@ -43,6 +43,10 @@ This extends to *documented* claims about what a future change will break. Writi
 **Why:** the user wants to route work deliberately when a branch is about to be signed; an unplanned fix landing inside a docs-only pass muddies what is being signed off. Said explicitly during the 2026-07-28 documentation pass.
 **How to apply:** in a scoped pass (docs-only, comments-only), if something turns out to be a real defect, finish the scoped work and surface the defect in the report. Keep the diff to the stated scope — a `git diff` filtered to non-comment lines returning empty is a cheap way to prove it.
 
+**A round-trip fixture that encodes a state no build could write turns into a false assertion the day a read-side rule lands. Check the fixtures before writing the rule.**
+**Why:** `Fixtures.fullDrain` built a `STOPPING` drain with `stopDispatchedAt = null` — a pair the orchestrator never produces, since `STOPPING` is only reached after a stop returned. `StatusReconstruction` made `every drain state round-trips` fail in *both* implementations, which was the right signal, but the fix is to correct the fixture (stamp it only in `STOPPING`, at an instant distinct from the one the rule synthesises, so a dropped key is still visible) rather than to weaken the round-trip claim. Deleting or narrowing the test would have been the forbidden move.
+**How to apply:** before adding any read-side rule, grep the shared fixtures for records that violate the invariant the rule assumes. Two failing tests on the first run is confirmation the rule reaches both implementations — read it as evidence, not as a problem.
+
 **Deviating from a reviewer's prescribed mechanism is fine if the mechanism does not close the hole — say why in the code.**
 **Why:** the review asked for `@Volatile` plus a compare-and-set on `SecretValue.destroyed`. A CAS makes the wipe happen once but does not stop a `use` that already passed the check from copying a half-wiped buffer, so the fix took a lock for the copy/wipe critical section and kept `@Volatile` for the lock-free flag read.
 
