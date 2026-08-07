@@ -354,6 +354,15 @@ return above it is the usual culprit, and `advance`-style dispatchers are full o
 them. Same family as the structurally-zero counter below, arriving through
 control flow rather than through a fake.
 
+**The harness sets the cadence, so a timing defect is invisible to every test
+that picks its own intervals.** `FlappingEscalationTest` advanced two to eight
+minutes per pass; the real loop spaces retries from `Backoff` (1s, 2s, 4s, 8s,
+16s…). A rule that fired after six passes therefore fired in *thirty seconds* in
+production and in *half an hour* in every test, and nine green tests could not
+see it. When a rule counts passes and the loop schedules them, at least one
+scenario has to walk the scheduler's real delays — and say in its docstring that
+the cadence is the subject, or somebody will "tidy" it to match its neighbours.
+
 **A red-proof's extra red is usually a true dependency; declare it rather than
 weaken the test.** Removing the ledger's floor reddened two tests, not the one
 claimed — because the drain's own healthy passes drive the count negative before

@@ -1,9 +1,13 @@
 ---
 name: flapping-escalation
-description: The flapping item under-reports rather than over-reports; the ledger that closed it, why the decrement must be symmetric, why the crossover sits at exactly half, and the three neutral-pass traps the red-proof found
+description: The flapping item under-reports rather than over-reports; the ledger that closed it, why a count needed an age gate, why the gate could not reuse startedAt, and the neutral-pass traps the red-proofs found
 metadata:
   type: project
 ---
+
+> **Round 42 added the second half.** A count on its own fires in thirty seconds
+> at the bottom of the backoff; the arm now needs a count *and* a duration. Read
+> *"A count is not a duration"* below before anything above it.
 
 The long-standing open item on `DrainController.blocked`. **Closed 2026-08-08**
 by `DrainStatus.faultLedger` (option 2 below), on the user's ruling. What follows
@@ -139,6 +143,63 @@ the guarantee is structural rather than argued. Replacing the time arm with a
 count arm does not have that property — a count and a grown backoff are in
 different units. That sentence is in the code at the disjunct, because "simplify
 this into one predicate" is exactly what a later reader will try.
+
+## A count is not a duration, and my derivation compared the two
+
+The round-42 must-fix, and the shape is worth more than the instance. I argued
+`N = 6` was safe because `drainAttentionAfter` is three faulting passes *at the
+backoff cap*, so "six consecutive faults cannot happen before three". Both halves
+were true and the comparison was meaningless: six consecutive `Retry` outcomes
+requeue at 1s, 2s, 4s, 8s, 16s, so the sixth lands **about thirty seconds in**,
+and one containerd blip raised the operator's only alert flag. A streak does not
+reach the cap for eight and a half minutes.
+
+The tell was inside my own KDoc: the paragraph after the bullet said *"early in a
+drain the same counts take seconds to minutes"* — the counter-example, three
+lines below the claim, written by me in the same commit. **When a derivation
+converts between units, the sentence that states the conversion factor and the
+sentence that states the range are the same argument; if they disagree, the
+conversion is the wrong one.**
+
+The fix is a gate, not a bigger N: the arm requires the ledger to have been
+non-zero for the same `drainAttentionAfter`. That makes it structurally incapable
+of reporting anything the age arm has not already had its full window on, at
+*every* cadence rather than at one — so N stops carrying the ordering argument at
+all and only has to answer "how much evidence is a pattern".
+
+**The tests could not see it because the harness sets the cadence.** Every
+scenario in `FlappingEscalationTest` advanced minutes per pass; the real loop
+takes its spacing from `queue.failed`. A drain test that picks its own intervals
+is choosing which failure modes are expressible — the blip test now walks
+`Backoff`'s actual first five delays, and it is the only one that can see this.
+
+## The new anchor, and why `startedAt` was not it
+
+`DrainStatus.faultLedgerSince`. The reflex here — this codebase has withdrawn two
+anchors — is to reuse an existing instant, and `startedAt` is set once and never
+restamped, so it looks free. It answers the wrong question: a drain blocked
+healthily for four hours is four hours old with nothing wrong, so a gate measured
+from it is already open when the blip arrives.
+
+What makes the new field *not* the withdrawn shape is that it has **no lifetime
+of its own**: stamped and cleared by the same expression that moves the count, at
+the same single funnel, non-null exactly while the count is positive. `troubleSince`
+failed because nothing on the healthy path cleared it; here the thing that clears
+it is the arithmetic it dates.
+
+That distinction was untested until a mutation said so — swapping the gate to
+`startedAt` reddened nothing, because every scenario had a young drain. **A field
+whose justification is "the obvious alternative is wrong" needs the scenario where
+the alternative differs, or the next reader deletes it.**
+
+## Two more instrument lessons from the same round
+
+- **A signature change silently retires every mutation written against it.** Adding
+  parameters to `failingTooOften` left three entries matching zero occurrences —
+  reported UNKNOWN, which reads like a pass. Re-derive the literals after any
+  signature change, and read UNKNOWN as a failure.
+- **A prefix-matched filter selects more than you asked for.** `case "$name" in "$w"*`
+  ran M10–M14 when I asked for M1. Match the first token exactly.
 
 See [[gate-and-ceiling]] for why `troubleSince` was declined and
 [[blocked-is-not-failed]] for the three states a consumer must tell apart.
