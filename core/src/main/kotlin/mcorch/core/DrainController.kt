@@ -2715,13 +2715,18 @@ internal class DrainController(
      * timeout already sent one and skips it — so all it supplies is a fresh grace
      * period on a fresh transport deadline, and it reaches the kill only when that
      * grace period expires before that deadline. `GrpcCriClient` deadlines the call
-     * at `min(gracePeriod, CriTimeouts.stopDeadlineCap) + slack`, so a grace period
-     * **above** the cap has the two ordered the wrong way by construction and every
-     * re-issue from here ends exactly as the first one did. (So does the first one:
-     * [stop]'s own call times out on the same inequality and aborts as retryable, so
-     * this branch is reached at all only on the paths where that one returned
-     * cleanly.) The sentence above then stops being true in the direction it matters:
-     * there is no runtime kill coming, and a shorter grace period *would* reach one.
+     * at `min(gracePeriod, CriTimeouts.stopDeadlineCap) + deadlineSlack`, so the
+     * ordering flips at **the cap plus the slack** and not at the cap — between the
+     * two the runtime's own wait still expires first and the kill still fires. Past
+     * that every re-issue from here ends exactly as the first one did. (So does the
+     * first one: [stop]'s own call times out on the same inequality and aborts as
+     * retryable. This branch is *usually* reached where that call returned cleanly,
+     * but not only — the already-down branch moves a drain to `STOPPING` from the
+     * observation without dispatching anything, so a drain that arrived that way and
+     * then sees `RUNNING` reaches the re-issue below as its first stop. It is gated
+     * and stamped here regardless, so that costs nothing but the sentence.) The
+     * sentence above then stops being true in the direction it matters: there is no
+     * runtime kill coming, and a shorter grace period *would* reach one.
      * It is still not shortened —
      * `failure-modes.md` item 7, and a save this drain has already confirmed makes
      * the loop a report rather than a data-loss risk. What keeps the case empty is
@@ -3105,9 +3110,13 @@ internal class DrainController(
      *   where the request went out, this client stopped waiting, and the drain is
      *   still `DEREGISTERED`.
      * - `failure is NodeException.Timeout` misses [awaitStopped]'s re-issue catch. A
-     *   `Rejected` or a `Busy` there still follows a *first* stop that returned
-     *   successfully — that is the only thing that puts a drain in `STOPPING` — so the
-     *   container has had its `SIGTERM` whatever the second call said.
+     *   `Rejected` or a `Busy` there usually follows a *first* stop that returned
+     *   successfully, so the container has had its `SIGTERM` whatever the second call
+     *   said. **"That is the only thing that puts a drain in `STOPPING`" is what this
+     *   line used to say and it is false** — the already-down branch reaches the state
+     *   from the observation and dispatches nothing — which is why the clause is
+     *   wrong even on the half it looked right on, and why the stamp below is the
+     *   discriminator rather than any reading of the state.
      *
      * Their disjunction is correct at both catches and still short of the fact: the
      * lap back through [goingRoundInCircles] leaves `SAVING` carrying a dispatched
@@ -3116,8 +3125,9 @@ internal class DrainController(
      * container running for longer rather than dying sooner — the window is real and
      * it is the re-issue that ends it, on every grace period the loop can present.
      * (Only on those: a re-issue reaches the kill when its own grace period expires
-     * before its own deadline, so one carrying a grace period above
-     * `CriTimeouts.stopDeadlineCap` ends nothing. That widens this window without
+     * before its own deadline, so one carrying a grace period past
+     * `CriTimeouts.stopDeadlineCap + deadlineSlack` ends nothing. That widens this
+     * window without
      * limit and does not narrow it, so it changes nothing about the discriminator
      * below — see [StopGraceCeiling], *The relation a re-issued stop terminates on*,
      * for why the case is empty.)

@@ -14,6 +14,7 @@ import mcorch.core.NodeException
 import mcorch.core.NodeOperation
 import mcorch.core.NodeStatus
 import mcorch.core.StopGrace
+import mcorch.core.StopGraceCeiling
 import mcorch.core.StorageRequest
 import mcorch.core.WorkloadHandle
 import mcorch.core.WorkloadObservation
@@ -45,6 +46,7 @@ import mcorch.schema.ImageRef
 import mcorch.schema.NodeName
 import mcorch.schema.ResourceName
 import mcorch.schema.SecretRef
+import mcorch.schema.SpecBounds
 import mcorch.store.SecretStore
 import mcorch.store.StoreException
 import org.slf4j.LoggerFactory
@@ -1088,14 +1090,50 @@ public class LocalNode internal constructor(
          * Does not connect eagerly: the first call is what discovers containerd
          * is down, and it fails with a retryable
          * [NodeException.Unreachable].
+         *
+         * ## The one pre-flight, and why it is here rather than at the ceiling
+         *
+         * A stop this node issues is deadlined by `:cri` at
+         * `min(gracePeriod, stopDeadlineCap) + deadlineSlack`, and a grace period
+         * past that deadline can never reach the runtime's kill however many times
+         * the drain re-issues it — [StopGraceCeiling], *The relation a re-issued stop
+         * terminates on*, has the mechanism and the measurement. So the largest grace
+         * period [StopGrace] will hand this node has to stay inside the cap the
+         * client is actually built with.
+         *
+         * `StopGraceCeiling`'s own `init` was the obvious place and it cannot be:
+         * `Node.kt` is the distribution seam, and a `:cri` type named there would
+         * make the interface's policy ceiling a statement about one runtime's
+         * transport configuration. **This** class is the one `:core` already permits
+         * to name CRI types, and it is the one holding the [CriClientConfig] — so it
+         * is the only place the relation can be checked against the value the process
+         * will really run on rather than against `CriTimeouts()`. The arithmetic on
+         * the constants is pinned separately, in `StopGraceGuardTest`; this binds the
+         * deployment, and neither subsumes the other.
+         *
+         * It throws at wiring time, which is the right blast radius: nothing has been
+         * reconciled yet, no container exists to be stranded, and the repair is a
+         * code or configuration change. That is the split round 24 drew — a `require`
+         * may enforce what a *planner* gets wrong, never what an operator supplies on
+         * a definition, because the latter freezes a server nobody can then retire.
          */
         public fun open(
             config: LocalNodeConfig,
             secrets: SecretStore,
-        ): LocalNode =
-            LocalNode(
+        ): LocalNode {
+            val criConfig = CriClientConfig(endpoint = CriEndpoint.parse(config.runtimeEndpoint))
+            val ceiling = StopGraceCeiling.ceilingFor(SpecBounds.MAX_SAVE_TIMEOUT)
+            require(ceiling <= criConfig.timeouts.stopDeadlineCap) {
+                "a stop this node issues may carry a grace period of up to $ceiling, but its CRI client gives up " +
+                    "on a stop after ${criConfig.timeouts.stopDeadlineCap}. A grace period past that deadline " +
+                    "never reaches the runtime's kill, and the drain re-issues it on every pass for ever — a " +
+                    "container that can only be retired with crictl. Raise CriTimeouts.stopDeadlineCap, or lower " +
+                    "PaperServerDefaults.MAX_STOP_GRACE_PERIOD and MAX_TIMEOUT, which is where the ceiling comes " +
+                    "from"
+            }
+            return LocalNode(
                 name = config.name,
-                client = CriClient.connect(CriClientConfig(endpoint = CriEndpoint.parse(config.runtimeEndpoint))),
+                client = CriClient.connect(criConfig),
                 secrets = secrets,
                 volumeRoot = config.volumeRoot,
                 logRoot = config.logRoot,
@@ -1103,6 +1141,7 @@ public class LocalNode internal constructor(
                 sandboxNamespace = config.sandboxNamespace,
                 cgroupParent = config.cgroupParent,
             )
+        }
     }
 }
 

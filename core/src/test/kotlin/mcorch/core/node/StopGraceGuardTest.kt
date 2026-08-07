@@ -293,11 +293,12 @@ class StopGraceGuardTest {
      * its own: [StopGraceCeiling.ceilingFor] has a **floor**, so past a save timeout
      * of `MAX - margin` the effective ceiling is the save timeout and rises with it —
      * which puts a fourth constant, `SpecBounds.MAX_SAVE_TIMEOUT`, inside the
-     * relation. The third runs the real factory over the extreme pair the loop can
-     * present, and it stands for the whole population rather than one point:
-     * `StopGraceCeiling.bound` is `min(requested, ceilingFor(saveTimeout))` for a
-     * finite request and `ceilingFor` is non-decreasing, so a pair inside both of
-     * `SpecBounds`' ceilings lands at or under what this asserts.
+     * relation. The third is **logically implied by the second** —
+     * `min(r, ceilingFor(s)) <= ceilingFor(s)` for any `r` — and is not extra
+     * coverage of the arithmetic. What it adds is the *path*: it runs the real
+     * [StopGrace.of], so it is the assertion that goes red if `of` ever stops
+     * routing through [StopGraceCeiling.bound], which is the one way the first two
+     * could both hold while what reaches a node does not.
      *
      * The one value that escapes that argument is a non-finite request, which
      * `SpecBounds.capStop` and [StopGraceCeiling.bound] both pass through untouched —
@@ -365,8 +366,9 @@ class StopGraceGuardTest {
         }
 
         withClue(
-            "the extreme pair SpecBounds admits builds a StopGrace above the deadline, so some definition the " +
-                "reconcile loop acts on can park a drain in STOPPING with no exit but crictl",
+            "the extreme pair SpecBounds admits builds a StopGrace above the deadline. Implied by the assertion " +
+                "above unless StopGrace.of has stopped routing through StopGraceCeiling.bound — check that " +
+                "first, it is the only way this fails on its own",
         ) {
             StopGrace
                 .of(SpecBounds.MAX_STOP_GRACE_PERIOD, SpecBounds.MAX_SAVE_TIMEOUT)
@@ -375,23 +377,76 @@ class StopGraceGuardTest {
     }
 
     /**
-     * The premise the test above rests on, asserted rather than surveyed.
+     * The pre-flight in `LocalNode.open` runs, and passes on the shipped constants.
      *
-     * It reads `CriTimeouts()`, the default. That stands for the value the shipped
-     * orchestrator runs on only while nothing in this module configures the type —
-     * `LocalNode.open` builds its `CriClientConfig` with the endpoint alone. A
-     * `LocalNodeConfig` field plumbed through to `stopDeadlineCap` would be an
-     * entirely reasonable thing to add and would make the relation above assert
-     * something nobody runs, silently, because a `CriClient` does not hand its
-     * timeouts back.
+     * The `require` it asserts is the thirty-ninth audit's answer to my having
+     * demoted this check to a test: `LocalNode` is the one class `:core` permits to
+     * name CRI types and the one holding the [mcorch.cri.CriClientConfig] it just
+     * built, so it can bind the relation to the cap the process **actually runs on**
+     * rather than to `CriTimeouts()`. The arithmetic test above pins the constants;
+     * this pins the deployment.
      *
-     * The claim is deliberately the whole type rather than the one field: `:core`
-     * naming `CriTimeouts` at all is the event that has to be re-read here, and it is
-     * the same line `core/build.gradle.kts` draws for the seam — `LocalNode` is the
-     * only class in this module that may name a CRI type. Prose is exempt because
-     * three KDoc paragraphs in `Node.kt` name the constant on purpose; that is what
-     * the code/comment split below is for, and it is what makes the scan need a
-     * vacuity control.
+     * **It cannot be driven to its failure from a test**, and that is worth saying
+     * rather than leaving as a gap. `open` builds the config itself, so no argument
+     * reaches the cap — the only way to falsify the relation is to move one of the
+     * constants, which is a source mutation and not an input. So this test is a
+     * *reachability* proof: it says the `require` is evaluated on the ordinary wiring
+     * path and does not spuriously refuse. Under the mutation that lowers
+     * `stopDeadlineCap` it goes red alongside the arithmetic test, and that pairing
+     * is the red-proof of both halves.
+     *
+     * `open` does not connect eagerly, so no containerd is needed and the endpoint
+     * string is never dialled.
+     */
+    @Test
+    fun `opening a node runs the stop deadline pre-flight and passes on the shipped constants`(
+        @TempDir root: Path,
+    ) {
+        val config =
+            LocalNodeConfig(
+                name = NODE,
+                runtimeEndpoint = "unix:///run/containerd/containerd.sock",
+                volumeRoot = root.resolve("volumes").createDirectories(),
+                logRoot = root.resolve("logs").createDirectories(),
+                assetRoot = root.resolve("assets").createDirectories(),
+            )
+
+        LocalNode.open(config, UnusedSecretStore).use { node ->
+            node.name shouldBe NODE
+        }
+    }
+
+    /**
+     * A review trigger over who may speak about the CRI stop deadline in `:core`.
+     * **It is not what makes the relation hold** — `LocalNode.open`'s `require` is,
+     * and it binds the config the process is actually built with. This exists so the
+     * *arithmetic* test above, which reads `CriTimeouts()`, keeps standing for the
+     * shipped value, and so a second place growing an opinion about the cap is read
+     * rather than merged.
+     *
+     * ## What it looks for, after the thirty-ninth audit widened it
+     *
+     * The first version banned the token `CriTimeouts` outright, and that had a hole
+     * the audit named: both `CriClientConfig` and `CriTimeouts` are data classes, so
+     * `cfg.copy(timeouts = cfg.timeouts.copy(stopDeadlineCap = 1.hours))` configures
+     * the cap and contains no `CriTimeouts` token at all. Scan green, relation
+     * asserted against a default nobody runs. `stopDeadlineCap` is in the token set
+     * now, which catches that shape at both of its halves.
+     *
+     * Widening it that far means the `require` — which reads the field on purpose —
+     * is itself a hit, so this cannot be a ban any more and is a **classification**:
+     * a file that names either token is either one that builds a [CriClientConfig],
+     * which is a `Node` implementation wiring its own transport and is entitled to an
+     * opinion about its own deadline, or it is a finding. That is deliberately
+     * coarser than the call-site unit this repo prefers, and the reason is worth
+     * writing rather than tightening: a wrapper file could buy it off, and the
+     * `require` is the enforcement point standing behind it. A list of permitted
+     * *paths* was the alternative and is worse — the next `Node` implementation would
+     * have to be edited past it, which is the seam this project protects.
+     *
+     * Prose is exempt: `Node.kt` names the constant in several KDoc paragraphs on
+     * purpose. That is what the code/comment split in [mainSources] is for, and it is
+     * what makes the vacuity control below load-bearing rather than decoration.
      *
      * Red-proved by giving `LocalNode.open` a `timeouts = mcorch.cri.CriTimeouts()`,
      * which reddened this and nothing else in 954. Note the spelling: the mutation
@@ -400,28 +455,33 @@ class StopGraceGuardTest {
      * qualified form because the simple name is a substring of it.
      */
     @Test
-    fun `the shipped node runs on the default CRI timeouts`() {
+    fun `nothing but a node's own wiring speaks about the CRI stop deadline`() {
         val sources = mainSources()
 
         withClue("expected to run with the :core module directory as the working directory") {
             sources.shouldNotBeEmpty()
         }
 
-        // The control. A scan for "this token is absent" is worth nothing unless
-        // something findable is found, and the *right* something: the call that would
-        // carry the override has to be in scope and has to survive the comment strip.
+        // The control, and it has to be the *classifier's* subject rather than any
+        // findable token: if nothing builds a CriClientConfig in code, every file is
+        // trivially "not wiring" and the partition below says nothing.
+        val wiring = sources.filter { (_, code) -> code.any { "CriClientConfig(" in it } }.map { it.first }
         withClue("no CriClientConfig( in :core's code — this scan is not reading the file the claim is about") {
-            sources.filter { (_, code) -> code.any { "CriClientConfig(" in it } }.shouldNotBeEmpty()
+            wiring.shouldNotBeEmpty()
         }
 
-        val naming = sources.filter { (_, code) -> code.any { "CriTimeouts" in it } }.map { it.first }
+        val speaking =
+            sources
+                .filter { (_, code) -> code.any { "CriTimeouts" in it || "stopDeadlineCap" in it } }
+                .map { it.first }
 
         withClue(
-            "these files configure the CRI timeouts, so CriTimeouts() is no longer the cap the shipped node " +
-                "runs on. Re-derive `the ceiling a stop may carry stays inside the deadline that finishes it` " +
-                "against the value actually configured before changing this assertion: $naming",
+            "these files name the CRI stop deadline without building the client it belongs to, so CriTimeouts() " +
+                "may no longer be the cap the shipped node runs on. Re-derive `the ceiling a stop may carry " +
+                "stays inside the deadline that finishes it` against the value actually configured, and check " +
+                "LocalNode.open's require still binds it: ${speaking - wiring.toSet()}",
         ) {
-            naming.shouldBeEmpty()
+            (speaking - wiring.toSet()).shouldBeEmpty()
         }
     }
 
@@ -567,12 +627,18 @@ class StopGraceGuardTest {
      * Every `.kt` under this module's main sources as `path to its code lines`.
      *
      * Comments are dropped and string literals blanked before anything is looked
-     * for, because the token this scans for is written on purpose in three KDoc
-     * paragraphs of `Node.kt` — a scan that could not tell those from an import
+     * for, because the tokens scanned here are written on purpose in the KDoc of
+     * `Node.kt` and `LocalNode.kt` — a scan that could not tell those from an import
      * would be red on the day it was written and would stay red by being weakened.
-     * Line-prefix stripping is enough here and is the same fold `DrainWiringTest`
-     * uses: this repo writes block comments as `/** … */` with continuation lines
-     * starting `*`, and spotless enforces it.
+     * No count of those paragraphs is given: the first draft of this note carried
+     * one and it was stale by the end of the same commit, which is the failure
+     * `DrainController`'s own class note warns about.
+     *
+     * Block-comment state is tracked rather than guessed from the line prefix. The
+     * prefix test alone reads a continuation line that does **not** start with `*`
+     * as code, so a paragraph wrapped by hand or by a future formatter setting could
+     * turn this red for a token that is prose — a scan going spuriously red is how a
+     * scan gets deleted.
      */
     private fun mainSources(): List<Pair<String, List<String>>> =
         Path
@@ -580,19 +646,65 @@ class StopGraceGuardTest {
             .toFile()
             .walkTopDown()
             .filter { it.isFile && it.extension == "kt" }
-            .map { file ->
-                val code =
-                    file.readLines().map { line ->
-                        val trimmed = line.trimStart()
-                        if (trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("/*")) {
-                            ""
-                        } else {
-                            line.replace(STRING_LITERAL, "\"\"").substringBefore("//")
-                        }
-                    }
-                file.invariantSeparatorsPath to code
-            }.sortedBy { it.first }
+            .map { file -> file.invariantSeparatorsPath to codeLinesOf(file.readLines()) }
+            .sortedBy { it.first }
             .toList()
+
+    /**
+     * [lines] with comments removed and string literals blanked, positions
+     * preserved.
+     *
+     * Deliberately does not try to be a Kotlin lexer. It handles the two things
+     * this repo actually writes — block comments, KDoc included, and `//` tails —
+     * and blanks literals first so that neither a `//` nor a block opener inside a
+     * string can open or close anything. Nesting is counted because Kotlin permits
+     * it.
+     *
+     * (This paragraph originally spelled the block delimiters out. The closing one
+     * ended the KDoc four lines early and the rest of the sentence was compiled as
+     * Kotlin — which is the same class of hazard the function exists to handle, met
+     * while documenting it.)
+     */
+    private fun codeLinesOf(lines: List<String>): List<String> {
+        var depth = 0
+        return lines.map { raw ->
+            val line = raw.replace(STRING_LITERAL, "\"\"")
+            val kept = StringBuilder()
+            var i = 0
+            while (i < line.length) {
+                when {
+                    depth == 0 && line.startsWith("/*", i) -> {
+                        depth++
+                        i += 2
+                    }
+
+                    depth > 0 && line.startsWith("/*", i) -> {
+                        depth++
+                        i += 2
+                    }
+
+                    depth > 0 && line.startsWith("*/", i) -> {
+                        depth--
+                        i += 2
+                    }
+
+                    depth > 0 -> {
+                        i++
+                    }
+
+                    line.startsWith("//", i) -> {
+                        i = line.length
+                    }
+
+                    else -> {
+                        kept.append(line[i])
+                        i++
+                    }
+                }
+            }
+            kept.toString()
+        }
+    }
 
     private companion object {
         val NODE: NodeName = NodeName.of("test-node").getOrThrow()

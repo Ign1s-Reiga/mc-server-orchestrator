@@ -473,20 +473,34 @@ public interface Node {
  * its own deadline**.
  *
  * `GrpcCriClient` sets that deadline to `min(gracePeriod, stopDeadlineCap) + slack`.
- * So while the grace period is at or under the cap the grace period expires first
- * and the kill fires; above the cap the two are ordered the other way **by
- * construction**, and every re-issue ends exactly as the first one did, on every
- * pass, for ever. That is not a race and no retry count reaches it — it is the
- * inequality.
+ * So the ordering flips at `stopDeadlineCap + deadlineSlack` and **not at the cap**,
+ * which is worth doing the arithmetic on rather than reading off the name: for a
+ * grace period between the cap and the cap plus the slack the deadline is
+ * `cap + slack`, the runtime's own wait still expires first, and the kill still
+ * fires. Past that the two are ordered the other way and every attempt ends exactly
+ * as the first one did, on every pass, for ever. That is not a race and no retry
+ * count reaches it — it is the inequality.
+ *
+ * **The guard below is nevertheless written against the bare cap, deliberately.**
+ * `deadlineSlack` is `:cri`'s to change and is a margin rather than a bound, so a
+ * relation that spent it would be one this module could lose without touching
+ * anything of its own. Thirty seconds of headroom is not worth a dependency on
+ * somebody else's margin.
  *
  * **It decides both stop sites and not only the re-issue**, which is worth knowing
  * before reading either. `DrainController.stop` calls this with the same value: the
  * capped deadline elapses, its `NodeException` catch aborts the drain as
  * *retryable*, and the next pass comes back down the resume ladder into the same
- * call — so the first stop is already the loop, and `awaitStopped`'s re-issue is
- * reached only on the paths where that one returned cleanly. Both spin on the same
- * inequality, and neither gives up, which is the correct behaviour of each in
- * isolation.
+ * call — so on the ordinary path the first stop is already the loop and the re-issue
+ * is reached where that one returned cleanly. It is *not* reached only that way:
+ * `STOPPING` has a second producer, `DrainController`'s already-down branch, which
+ * moves a drain there from the **observation** and dispatches nothing, so a drain
+ * that arrived that way and then observes `RUNNING` lands in `awaitStopped` with the
+ * re-issue as the first stop ever sent. Nothing is lost by it — that path gates on
+ * its own `mayStop` and stamps `stopDispatchedAt` before its own call — and the
+ * outcome under an over-cap grace period is the same retryable abort. Both spin on
+ * the same inequality, and neither gives up, which is the correct behaviour of each
+ * in isolation.
  *
  * The relation to keep true is therefore *"nothing a [Node] can be handed exceeds
  * the deadline `:cri` will wait for it"*, and it currently rests on four constants
@@ -495,8 +509,10 @@ public interface Node {
  * from, `SpecBounds.MAX_SAVE_TIMEOUT` (one hour — because [ceilingFor]'s floor
  * raises this ceiling above [MAX] once a save timeout passes `MAX - margin`), and
  * `CriTimeouts.stopDeadlineCap` (two hours), whose own KDoc says in as many words
- * that `:cri` cannot see `:schema`'s cap and deliberately does not depend on it. One
- * second of movement — [MAX] up, or the cap down — makes it live.
+ * that `:cri` cannot see `:schema`'s cap and deliberately does not depend on it.
+ * Thirty-one seconds of movement — [MAX] up, or the cap down — spends the slack and
+ * makes it live; one second spends the guard's own margin, which is why the guard is
+ * where the alarm goes off rather than the container.
  *
  * **It is a test and not a `require`, and that is the seam's doing.** The check
  * would have gone in this object's `init`, the way `SpecBounds.init` binds its own
