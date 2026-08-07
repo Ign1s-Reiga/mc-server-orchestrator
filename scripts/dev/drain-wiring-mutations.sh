@@ -234,6 +234,18 @@
 #            `containerIsDown(hadContainer)` has already returned for the other world.
 #            The mutation answers that call with a literal, which leaves every token
 #            the note names in place.
+#   D69..D70 the thirty-seventh audit, one level out again: not a rule written
+#            without a fact, but a rule in `:schema` whose premise is a *survey* of
+#            this module's producers. `StatusReconstruction` reads `STOPPING` as
+#            evidence a stop was dispatched; two producers of that state, one
+#            surveyed. D69 is the live defect restored — the already-down producer
+#            with nothing said about the record — and D69A excuses it with a note
+#            that argues the branch without naming the record. D70 and D70A are the
+#            same pair in a file the drain controller's own scans never read, which
+#            is what makes the claim a claim about the module.
+#   D71      the premise those notes argue from: a second route into the state
+#            dispatch, from a function nothing calls, so a state can reach its work
+#            without passing the branch that answers the container being down.
 #   C1..C3   controls: the rule deleted outright, once per assertion arm. If these
 #            do not redden, the harness is not reaching the assertions at all.
 #   S1       the self-test. See below.
@@ -419,6 +431,18 @@ CONVERGE_ROUTED='every converge is an arm of the routing that asks the rule'
 # the scan never read.
 BARE_ENTRY='no workload-state classification writes a bare enum entry'
 SANDBOX_ABORT_ROUTED='the drain'"'"'s sandbox abort is reached only past the rule that separates the two sandboxes'
+# The thirty-seventh audit, and the instrument is one level out again: not a rule in
+# this module written without a fact, but a rule in `:schema` whose *premise* is a
+# survey of this module's producers. `StatusReconstruction` reconstructs a stop
+# dispatch from `DrainState.STOPPING` alone, justified by "a drain reaches STOPPING
+# only after a stop request returned cleanly", and there were two producers of that
+# state with one surveyed. The scan enumerates the producers of every state a decode
+# rule keys on — the keyed states discovered by asking the rule, never listed — and
+# requires each to name the record.
+PRODUCERS_NAMED='every producer of a state a decode rule keys on names the record it reconstructs'
+# The premise both of those producers' notes rest on, which is the same fact that
+# falsified the exclusion `:schema`'s rule was written with.
+DISPATCH_BELOW_DOWN='every drain state'"'"'s work is dispatched below the branch that answers the container being down'
 
 # Single-quoted throughout: these are literals, and one of them contains the
 # quoting characters of two languages.
@@ -910,6 +934,59 @@ ROUTING_WHEN='                    when {
 ROUTING_EARLY_RETURN='                    if (blocker != null) return converge(pass, placement.node, observation, blocker)
                     when {
                         blocker != null -> converge(pass, placement.node, observation, blocker)'
+# The already-down branch as the thirty-seventh audit found it: a producer of
+# `STOPPING` that dispatches nothing and says nothing about the record a decode rule
+# reconstructs from that state. This is the live defect rather than an invented one,
+# which is why it is the first entry of the set — an instrument that cannot re-report
+# the case it was built for is scoring itself.
+DOWN_BRANCH_NOTED='                //
+                // **This producer of `STOPPING` dispatches nothing**, and that is the
+                // fact a reader downstream needs. The state is reached from the
+                // *observation* — the runtime says the container is gone, in whatever
+                // state the drain was in, including one that never got near step 7 —
+                // so no stop request left this process and `stopDispatchedAt` stays
+                // whatever it was, which for every such drain is null. `STOPPING`
+                // therefore does not imply a dispatch; the stamp is the only thing
+                // that does, which is why [stopIsInFlight] answers on the stamp and
+                // not on the state. Safe here for a second reason as well: this
+                // branch is reached only from [WorkloadObservation.containerIsDown],
+                // so there is no live container to withhold from a routing table.
+                drain ='
+DOWN_BRANCH_SILENT='                drain ='
+# The same branch with a note that reads like an argument and is not one: it explains
+# why the state is right without a word about the record, which is what stops "names
+# the record" being bought off by any comment at all. The pair is the same shape as
+# D62/D62A one level up, and for the same reason — prose can be pasted, so the half
+# of the rule that costs nothing has to be scored separately.
+DOWN_BRANCH_EXCUSED='                //
+                // The runtime says the container is gone, so the drain is already
+                // where it was trying to get to and this is the state that says so.
+                drain ='
+# A producer of a keyed state in a file that holds none, which is what makes the
+# claim about the *module* rather than about `DrainController.kt`. Never called, so
+# nothing but the scan can see it. Fully qualified because `Reconciler.kt` imports
+# neither type and a mutation that does not compile proves nothing.
+NEW_PRODUCER="$RECONCILER_TAIL"'
+
+private fun stoppingAfterHandoff(drain: mcorch.schema.DrainStatus, now: java.time.Instant): mcorch.schema.DrainStatus =
+    drain.copy(state = DrainState.STOPPING, enteredStateAt = now)'
+NEW_PRODUCER_EXCUSED="$RECONCILER_TAIL"'
+
+// The players are gone and the container is on its way out, so the drain is already
+// where it was trying to get to.
+private fun stoppingAfterHandoff(drain: mcorch.schema.DrainStatus, now: java.time.Instant): mcorch.schema.DrainStatus =
+    drain.copy(state = DrainState.STOPPING, enteredStateAt = now)'
+# A second route into the state dispatch, from a function nothing calls — so nothing
+# has been through the branch that answers the container being down, and the note at
+# that branch ("in whatever state the drain was in") stops being true of every state.
+# The premise is about this source, so this is the edit that expires it.
+RELEASE_DECLARATION='    private suspend fun releaseRegistration('
+SECOND_ROUTE_INTO_STEP='    private suspend fun retryCurrentState(
+        pass: DrainPass,
+        drain: DrainStatus,
+    ): DrainProgress = step(pass, drain)
+
+    private suspend fun releaseRegistration('
 
 # name @@ file @@ class @@ testcases that must redden (";"-separated) @@ literal @@ replacement
 #
@@ -1269,6 +1346,24 @@ MUTATIONS=(
     # the one address the fix left for it, and the shape a `false` at a call site always
     # has: every token the note names is still there and the fact is gone.
     "D68@@$CONTROLLER@@$WIRING@@$SANDBOX_ABORT_ROUTED@@$ASKS_SANDBOX_RULE@@$ASKS_WITH_A_LITERAL"
+    # The thirty-seventh audit's finding, and the first entry here that restores a
+    # defect the *current build* shipped rather than one an audit invented: the
+    # already-down producer of `STOPPING` with nothing said about the record a decode
+    # rule reconstructs from that state alone. D69A is the same site excused by a note
+    # that argues the branch without naming the record, which is what keeps the cheap
+    # half of the rule from being decoration.
+    "D69@@$CONTROLLER@@$WIRING@@$PRODUCERS_NAMED@@$DOWN_BRANCH_NOTED@@$DOWN_BRANCH_SILENT"
+    "D69A@@$CONTROLLER@@$WIRING@@$PRODUCERS_NAMED@@$DOWN_BRANCH_NOTED@@$DOWN_BRANCH_EXCUSED"
+    # The same omission written where a scan scoped to the drain controller could not
+    # see it. The unit is the state literal in a writing position, so the file it lands
+    # in is not supposed to matter — this is the entry that says so rather than leaving
+    # it to the docstring.
+    "D70@@$RECONCILER@@$WIRING@@$PRODUCERS_NAMED@@$RECONCILER_TAIL@@$NEW_PRODUCER"
+    "D70A@@$RECONCILER@@$WIRING@@$PRODUCERS_NAMED@@$RECONCILER_TAIL@@$NEW_PRODUCER_EXCUSED"
+    # The premise both producers' notes argue from: every state reaches the dispatch
+    # below the branch that answers the container being down. A route in from a
+    # function nothing calls is how that stops being true without a line moving.
+    "D71@@$CONTROLLER@@$WIRING@@$DISPATCH_BELOW_DOWN@@$RELEASE_DECLARATION@@$SECOND_ROUTE_INTO_STEP"
     "C1@@$CONTROLLER@@$WIRING@@$EXIT@@$RULE@@val recorded = progress"
     "C2@@$CONTROLLER@@$WIRING@@$STEPPED@@$ADOPTION@@val observed = drain"
     "C3@@$CONTROLLER@@$RULES@@$ADOPTS@@$CLAUSE@@is PlayerReading.Occupied -> this"
