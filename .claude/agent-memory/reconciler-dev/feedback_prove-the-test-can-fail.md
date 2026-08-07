@@ -228,6 +228,18 @@ retired version, in the header, which is the string read first. The identifiers
 are what the tooling sees; the sentences are what a human uses to decide whether
 a green run means anything.
 
+**And a retired premise usually has no identifier to grep at all.** Round 38's
+was *"the re-issue is what finishes it"*, corrected in `:cri`'s KDoc and operator
+message in the same round it was measured — and left standing in **three**
+`:core` sentences that share no token with it: *"it is the re-issue that ends
+it"*, *"a shorter grace period cannot make a stuck container stop any faster than
+the runtime's own kill already will"*, and *"the stop is re-issued, the container
+goes"*. The audit named one of the three. What found the other two was grepping
+the **verb of the mechanism** (`re-issu`) across every module and reading each
+hit for what it *asserts* rather than what it mentions. Do that before closing a
+correction, and expect the count to be more than one: this project has now had
+"the correction landed in one file of N" twice in consecutive rounds.
+
 **Adding a test can grow an existing mutation's red set, and that is a result to
 read rather than a nuisance to suppress.** Round 26's new retryable-abort test
 spends six passes in `blocked` proving the seal is never handed back, so D23 —
