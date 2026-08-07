@@ -2217,6 +2217,43 @@ public class Reconciler(
      *
      * A delete is never refused. Whatever else is true, an operator who asked
      * for a server to go away must be able to have it drained.
+     *
+     * ## Why it is not conditioned on the container still running
+     *
+     * It was, and that made the refusal expire on a state the *drain itself*
+     * produces. An edit landing inside the stop grace period of a drain some
+     * earlier edit asked for is refused while the container is `RUNNING`; the
+     * signalled container then exits on its own, `RUNNING` stops being true, the
+     * refusal stops firing, the drain resumes, and the create applies the very
+     * definition several passes had refused. No world is discarded — the volume's
+     * files are untouched and the drain flushed the container before it stopped —
+     * but the server comes back serving a **freshly generated empty world**, and
+     * everything built from then on lives in a writable layer that dies with the
+     * next replacement.
+     *
+     * `Labels.WORLD_DATA` is read off the container and is still there when it has
+     * `EXITED`, so the discriminator outlives the process and the refusal now does
+     * too. `UNKNOWN` refuses for the same reason: the labels are the container's
+     * own, so the premise the message states still holds, and the loop's posture on
+     * a state it cannot read is to act on nothing — which here *is* the refusal.
+     * `CREATED` and `SANDBOX_ONLY` are the pass-through, where the reasoning below
+     * about not guessing applies: a container that was never started holds nothing
+     * to discard, and a sandbox reporting no container carries only the sandbox's
+     * labels, so refusing there would freeze a workload on a sentence about a
+     * container that is not running.
+     *
+     * ## The second-order effect, decided rather than discovered
+     *
+     * With the drain record now retained across a refusal (see
+     * [clearedDrainRecord]) the record is in `STOPPING`, so `parkedOnTheFailure()`
+     * is false, so the permanent-failure gate does not arm and the passes keep
+     * coming. Each one re-records the same refusal and increments
+     * `FailureStatus.attempts` — one store write per resync, no side effect on the
+     * server, and nothing issued at the runtime. That is accepted over arming the
+     * gate: this loop is the only thing that can notice the operator reverting
+     * `spec.storage.mode`, and freezing a workload whose container this loop has
+     * already signalled leaves the stop half-finished until a resync that a gate
+     * would suppress. Churn is the price of the lever staying live.
      */
     private suspend fun forbiddenTransition(
         pass: Pass,
@@ -2225,7 +2262,12 @@ public class Reconciler(
     ): ReconcileOutcome? {
         if (cause != DrainCause.REPLACEMENT) return null
         val present = observation as? WorkloadObservation.Present ?: return null
-        if (present.state != WorkloadState.RUNNING) return null
+        val couldBeTheContainerTheEditIsAbout =
+            when (present.state) {
+                WorkloadState.RUNNING, WorkloadState.EXITED, WorkloadState.UNKNOWN -> true
+                WorkloadState.CREATED, WorkloadState.SANDBOX_ONLY -> false
+            }
+        if (!couldBeTheContainerTheEditIsAbout) return null
         // Absent means the workload predates the label, which is not the same as
         // "it holds no world data" — and guessing either way from an edited
         // definition is exactly the mistake being guarded against.
@@ -2244,11 +2286,17 @@ public class Reconciler(
         if (!heldWorldData) return null
         if (pass.definition.spec.storage !is StorageSpec.Ephemeral) return null
 
+        // True of a container that has exited as well as one that is running,
+        // because the refusal now outlives the process. A sentence that says "the
+        // container now running" is the first thing an operator reads, and the
+        // guard would be quietly wrong for the whole window it was widened to
+        // cover.
         val message =
-            "refusing to change storage.mode to `ephemeral` on a running server: the container now running was " +
-                "created with persistent world data, and applying this edit means draining and replacing it. " +
-                "Whatever is in memory would be discarded rather than flushed. Revert spec.storage.mode; to " +
-                "retire this server instead, delete it — that drains and saves it first"
+            "refusing to change storage.mode to `ephemeral`: the container this server holds was created with " +
+                "persistent world data, and applying this edit means draining and replacing it with one that " +
+                "mounts no volume. Anything still in memory would be discarded rather than flushed, and the " +
+                "replacement would come up on a new, empty world while the old one stays on the volume. Revert " +
+                "spec.storage.mode; to retire this server instead, delete it — that drains and saves it first"
         LOG.error("server={} refused a storage mode change: {}", pass.name, message)
         val failure =
             recordFailure(
@@ -2263,9 +2311,29 @@ public class Reconciler(
             )
         val status =
             pass.draft(
-                phase = ServerPhase.RUNNING,
+                phase =
+                    when (present.state) {
+                        WorkloadState.RUNNING -> ServerPhase.RUNNING
+
+                        // The refusal outlives the process, and the badge has to
+                        // follow the container rather than the guard: a `RUNNING`
+                        // phase on a container that has exited is a fleet table
+                        // saying a dead server is fine.
+                        WorkloadState.EXITED -> ServerPhase.STOPPED
+
+                        else -> ServerPhase.UNKNOWN
+                    },
                 runtime = pass.runtimeIdentity(present),
-                storage = pass.storageStatus(observation),
+                // The container's storage, not the edited definition's.
+                // [Pass.storageStatus] derives from the definition, so drafting it
+                // here records `persistent = false, volumeName = null` for a
+                // workload this pass has just refused to make ephemeral — erasing
+                // the loop's own record of which volume holds the world, which is
+                // the name an operator needs to recover with and the one thing
+                // nothing else in the system remembers. The previous record is the
+                // one the container was created under; `bound` is the only part of
+                // it this observation can still speak to.
+                storage = pass.previous?.storage?.copy(bound = true) ?: pass.storageStatus(observation),
                 // Refusing the *edit* is not withdrawing a drain that is already
                 // stopping this container, and this is the third site that would
                 // have deleted the dispatch record to say so: the edit can land

@@ -4,6 +4,7 @@ import io.kotest.matchers.booleans.shouldBeFalse
 import io.kotest.matchers.booleans.shouldBeTrue
 import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.collections.shouldHaveSize
+import io.kotest.matchers.collections.shouldNotBeEmpty
 import io.kotest.matchers.comparables.shouldBeGreaterThan
 import io.kotest.matchers.comparables.shouldBeLessThan
 import io.kotest.matchers.ints.shouldBeGreaterThan
@@ -2408,6 +2409,116 @@ internal class DrainTest {
             harness.node.saves shouldHaveSize 0
             harness.node.stops shouldHaveSize 0
             harness.node.removals shouldHaveSize 0
+        }
+
+    /**
+     * The refusal outlives the container, because the drain is what ends it.
+     *
+     * The thirty-fourth audit's second critical, and it is a consequence of the
+     * thirty-third's fix rather than of the guard. The refusal used to be
+     * conditioned on `RUNNING`, which is a state the *drain itself* takes away:
+     *
+     * 1. an image edit starts a `REPLACEMENT` and the stop is dispatched;
+     * 2. a second edit lands inside the grace period — `storage.mode` persistent →
+     *    ephemeral — and is refused, permanently;
+     * 3. the refusal keeps the dispatch record now, so the drain is in `STOPPING`,
+     *    so `parkedOnTheFailure()` is false, so the permanent-failure gate does not
+     *    arm and passes keep coming. Before that fix the record was deleted here,
+     *    the gate armed, and the server froze with the edit unapplied;
+     * 4. the signalled container exits on its own;
+     * 5. `RUNNING` stops being true, the refusal stops firing, the drain resumes and
+     *    the teardown runs;
+     * 6. and the create applies the ephemeral definition.
+     *
+     * No world is discarded — the volume's files are untouched and the drain flushed
+     * the container before it stopped — which is why invariant 2 holds literally and
+     * this is still a critical. The server comes back on a **freshly generated empty
+     * world**, everything built from then on lives in a writable layer that dies with
+     * the next replacement, and the observed status the operator would recover from
+     * has stopped naming the volume that holds the real world.
+     *
+     * `Labels.WORLD_DATA` is read off the container and is still there when it has
+     * `EXITED`, so the discriminator outlives the process and the refusal now does
+     * too. The close of the test is the other half: a refusal that cannot be lifted
+     * is a wedge, so reverting `spec.storage.mode` has to let the drain finish the
+     * container it signalled and apply the edit that was never in question.
+     */
+    @Test
+    fun `a refused storage transition is not applied by the container exiting underneath it`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            val replacement = "docker.io/itzg/minecraft-server:2026.7.0"
+            harness.declare(definition)
+            harness.settle(name)
+            harness.node.volumes shouldHaveSize 1
+
+            // A container that takes the stop and does not exit, which is what every
+            // container looks like for the length of its grace period.
+            harness.node.onStop = { present -> present }
+            harness.store.putDefinition(paperDefinition(image = replacement))
+            repeat(8) { harness.pass(name) }
+            val stopping =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            stopping.state shouldBe DrainState.STOPPING
+            stopping.stopDispatchedAt.shouldNotBeNull()
+            // Not a count: a standalone drain whose container does not exit re-issues
+            // the stop, which is `awaitStopped` doing its job and has nothing to do
+            // with what this test is about. What matters is that one went out.
+            harness.node.stops.shouldNotBeEmpty()
+
+            // The second edit, landing inside that grace period.
+            harness.store.putDefinition(paperDefinition(image = replacement, storage = StorageSpec.Ephemeral()))
+            harness.pass(name).shouldBeInstanceOf<ReconcileOutcome.Failed>()
+
+            // The signalled container exits on its own. Nothing about the edit has
+            // changed; only the state the refusal used to read.
+            val signalled = harness.node.workload.shouldBeInstanceOf<WorkloadObservation.Present>()
+            harness.node.workload =
+                signalled.copy(
+                    state = WorkloadState.EXITED,
+                    finishedAt = harness.clock.instant(),
+                    exitCode = 0,
+                )
+            repeat(6) { harness.pass(name) }
+
+            // The edit is still refused, and — the assertion this test exists for —
+            // it is **not applied**: no teardown, and no container built from a
+            // definition that mounts nothing.
+            harness.node.removals shouldHaveSize 0
+            harness.node.creates shouldHaveSize 1
+            val refused = harness.status(name).shouldNotBeNull()
+            val failure = refused.failure.shouldNotBeNull()
+            failure.failureClass shouldBe FailureClass.PERMANENT
+            failure.message shouldContain "storage.mode"
+            // …and the loop has not erased its own record of which volume holds the
+            // world. `storageStatus` derives from the *definition*, so a refusal that
+            // drafted it would report `persistent = false, volumeName = null` for a
+            // server it is refusing to make ephemeral — leaving recovery to depend on
+            // the operator remembering the name.
+            val storage = refused.storage.shouldNotBeNull()
+            storage.persistent.shouldBeTrue()
+            storage.volumeName.shouldNotBeNull()
+
+            // The lever: reverting the transition is what lifts the refusal, and the
+            // drain then finishes the container it had already signalled and applies
+            // the edit that was never in question.
+            harness.store.putDefinition(paperDefinition(image = replacement))
+            harness.settle(name, limit = 16)
+            harness.node.removals shouldHaveSize 1
+            harness.node.creates shouldHaveSize 2
+            harness.node.creates[1]
+                .storage
+                .shouldBeInstanceOf<StorageRequest.Persistent>()
+            harness.node.creates[1]
+                .image.canonical shouldBe replacement
+            // The world was on the volume throughout, and nothing removed it.
+            harness.node.volumes shouldHaveSize 1
         }
 
     @Test
