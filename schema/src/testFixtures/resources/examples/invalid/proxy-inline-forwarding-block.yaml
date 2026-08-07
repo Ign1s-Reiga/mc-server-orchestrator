@@ -1,0 +1,26 @@
+# Expected: spec.forwarding — inline secrets are not supported
+#
+# The whole block abbreviated to one line, which is what an operator writes when
+# they read `spec.forwarding.secret` as "the forwarding secret goes here". To the
+# reader it is only a scalar where a mapping belongs, and the generic report for
+# that shape used to quote the scalar back — putting whatever was written into an
+# API response body and a log line, for the one value CLAUDE.md says never leaves
+# the secret store.
+#
+# So the block answers with the secret-store message, not with "expected a
+# mapping", and no message on this path repeats what was written. The same holds
+# for `control:` and `network.rcon:`, which are covered by SecretEchoTest rather
+# than by three near-identical files.
+apiVersion: mcorch.dev/v1alpha1
+kind: VelocityProxy
+metadata:
+  name: proxy-01
+spec:
+  image: docker.io/itzg/mc-proxy:2026.6.1
+  resources:
+    memory: 1Gi
+  forwarding: <not-supported-name-it-in-the-secret-store>
+  backends:
+    selector:
+      matchLabels:
+        mcorch.dev/fleet: main

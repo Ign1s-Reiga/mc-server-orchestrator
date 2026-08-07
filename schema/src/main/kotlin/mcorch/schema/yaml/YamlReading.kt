@@ -10,6 +10,7 @@ import org.snakeyaml.engine.v2.nodes.MappingNode
 import org.snakeyaml.engine.v2.nodes.Node
 import org.snakeyaml.engine.v2.nodes.ScalarNode
 import org.snakeyaml.engine.v2.nodes.SequenceNode
+import org.snakeyaml.engine.v2.nodes.Tag
 import kotlin.time.Duration
 
 /**
@@ -51,17 +52,129 @@ internal class ViolationSink(
     }
 }
 
-/** What a node is, in words an operator recognises from their own file. */
+/**
+ * What a node is, in words an operator recognises from their own file — its
+ * *shape*, never its value.
+ *
+ * These strings are only ever used to report a shape mismatch ("expected a
+ * mapping, found a string"), where the shape is the whole diagnostic: the
+ * violation already carries the field path and `file:line:column`, so an
+ * operator is being pointed at their own value rather than told what it was.
+ *
+ * Quoting it back cost something. `forwarding:`, `control:` and `rcon:` are the
+ * plausible abbreviations of a block whose leaf takes a secret reference, and a
+ * scalar written there used to be reported as ``found the value `…` `` — into an
+ * API response body and a log line, for material CLAUDE.md says never travels
+ * outside the secret store. Describing the shape instead closes that for every
+ * path at once, including the ones nobody thought to mark: it cannot be
+ * reopened by adding a field. [SecretBearingPaths] then improves the message on
+ * the paths we do know about; it is not what makes them safe.
+ */
 internal fun describe(node: Node): String =
     when (node) {
         is MappingNode -> "a mapping"
         is SequenceNode -> "a list"
-        is ScalarNode -> if (isNullScalar(node)) "an empty value" else "the value `${node.value}`"
+        is ScalarNode -> if (isNullScalar(node)) "an empty value" else describeScalar(node)
         else -> "an unsupported node"
+    }
+
+/**
+ * A plain scalar by the shape its own tag resolved to, so that `port: 25565`
+ * reads "a number" rather than the flatter "a string". Anything quoted resolves
+ * to a string, which is the truthful answer for it.
+ */
+private fun describeScalar(node: ScalarNode): String =
+    when (node.tag) {
+        Tag.INT, Tag.FLOAT -> "a number"
+        Tag.BOOL -> "a boolean"
+        else -> "a string"
     }
 
 internal fun isNullScalar(node: Node): Boolean =
     node is ScalarNode && node.isPlain && node.value.trim() in setOf("", "~", "null", "Null", "NULL")
+
+/**
+ * Every field in every kind that takes a [SecretRef], written as the dotted path
+ * an operator writes it at, plus the block each one lives in.
+ *
+ * One list, read from two directions, which is what makes it a guard rather than
+ * documentation:
+ *
+ * - forwards, [MappingReader.secretRef] refuses to run at a path this list does
+ *   not name. The check fires when the *enclosing block* is read, not when the
+ *   field is written, so an unlisted field fails on every document that opens
+ *   its block — but a block no document opens is never read, and two of the
+ *   three here are optional. "Unlisted fails immediately" is therefore true
+ *   because `SecretEchoTest` requires every [containers] entry to be written by
+ *   a `valid/` example, not because it follows from the check alone;
+ * - backwards, `SecretEchoTest` walks the list and requires each entry to answer
+ *   a scalar with [MappingReader.INLINE_SECRET_PROBLEM] and to quote nothing.
+ *
+ * It stops at the block holding the reference (`spec.forwarding`) and does not
+ * climb to its ancestors (`spec`, `spec.network`, the document). Those are not
+ * abbreviations anyone reaches for, and telling someone who wrote `spec: hello`
+ * about the secret store would be a worse message, not a safer one. Nothing is
+ * at stake in where the line falls: [describe] quotes no value at any path, so
+ * this list only decides which message is the *helpful* one.
+ */
+internal object SecretBearingPaths {
+    /**
+     * The fields that take a reference.
+     *
+     * A field under a list is written with an empty index — `spec.backends[]
+     * .tokenSecret` — because [normalised] is what these are compared against.
+     * There is no such field today; the spelling is fixed here so that the day
+     * one lands, listing it works instead of throwing on every document.
+     */
+    val refs: Set<String> =
+        setOf(
+            "spec.network.rcon.passwordSecret",
+            "spec.forwarding.secret",
+            "spec.control.tokenSecret",
+        )
+
+    /**
+     * The blocks that hold one — the shorthand a hurried operator collapses to a
+     * scalar.
+     *
+     * Derived rather than listed so the two cannot drift, which makes the shape
+     * of a [refs] entry load-bearing: a reference written directly under `spec`
+     * would derive the container `spec`, and then `spec: <anything>`, on every
+     * kind, would answer with the secret-store message — the outcome this
+     * object's own reasoning calls worse than the generic one. A reference
+     * belongs in a block that is about it.
+     */
+    val containers: Set<String> =
+        refs.mapTo(mutableSetOf()) { ref ->
+            val container = ref.substringBeforeLast('.')
+            require(container.contains('.')) {
+                "$ref would make `$container` a secret-bearing block, and a block that shallow is read " +
+                    "for every document of its kind: a scalar written there would be answered with the " +
+                    "secret store rather than with its shape. Put the reference inside a block of its own."
+            }
+            container
+        }
+
+    fun isRef(path: String): Boolean = normalised(path) in refs
+
+    fun holds(path: String): Boolean = normalised(path).let { it in refs || it in containers }
+
+    /**
+     * A field path with its list positions flattened: `spec.backends[2].token`
+     * becomes `spec.backends[].token`.
+     *
+     * [MappingReader.pathOf] composes literals, but [MappingReader.valueList]
+     * puts a document *position* in the path, so a path is not always something
+     * a `Set<String>` of literals can hold. Without this, a secret-bearing field
+     * under a list would make [MappingReader.secretRef]'s check throw on every
+     * well-formed document rather than on the developer error it is aimed at —
+     * a guard that fires on valid input is worse than no guard. Violations keep
+     * the real index; only the membership test sees this form.
+     */
+    fun normalised(path: String): String = if ('[' in path) path.replace(LIST_INDEX, "[]") else path
+
+    private val LIST_INDEX = Regex("""\[\d+]""")
+}
 
 /**
  * Reads one YAML mapping, tracking which keys were consumed.
@@ -76,6 +189,13 @@ internal class MappingReader private constructor(
     private val path: String,
     private val entries: Map<String, Node>,
     private val sink: ViolationSink,
+    /**
+     * True when this mapping is, or is inside, a block that holds a secret
+     * reference. It changes which message a scalar-where-a-mapping-belongs gets,
+     * not whether the value is quoted — nothing quotes it. See
+     * [SecretBearingPaths].
+     */
+    private val secretBearing: Boolean,
 ) {
     private val consumed = mutableSetOf<String>()
 
@@ -139,7 +259,7 @@ internal class MappingReader private constructor(
             missing(name, required)
             return null
         }
-        return of(pathOf(name), node, sink)
+        return of(pathOf(name), node, sink, inherited = secretBearing)
     }
 
     fun string(
@@ -358,11 +478,22 @@ internal class MappingReader private constructor(
      * The complementary rule lives in [done]: a key that *looks* like a secret
      * and was never claimed by a reader is rejected too, so `forwardingSecret:`
      * at any depth is caught whether or not this kind has such a field.
+     *
+     * The two coordinates are read here rather than through [value] so that a
+     * rejected one is described instead of quoted: an operator who collapsed the
+     * reference into `name:` has put material in a field whose ordinary
+     * "must be lowercase, found `…`" would print it.
      */
     fun secretRef(
         name: String,
         required: Boolean = false,
     ): SecretRef? {
+        val at = pathOf(name)
+        check(SecretBearingPaths.isRef(at)) {
+            "$at takes a secret reference but SecretBearingPaths.refs does not name it, so a scalar written " +
+                "there would be reported as a plain shape mismatch instead of being sent to the secret store. " +
+                "Add the path to that list."
+        }
         if (!entries.containsKey(name)) {
             consumed += name
             missing(name, required)
@@ -370,11 +501,20 @@ internal class MappingReader private constructor(
         }
         val node = node(name) ?: return null
         if (node is ScalarNode) {
-            sink.add(pathOf(name), INLINE_SECRET_PROBLEM, node)
+            sink.add(at, INLINE_SECRET_PROBLEM, node)
             return null
         }
-        val reader = of(pathOf(name), node, sink) ?: return null
-        val secretName = reader.value("name", required = true, parse = ResourceName::of)
+        val reader = of(at, node, sink, inherited = true) ?: return null
+        val secretName =
+            reader.string("name", required = true)?.let { raw ->
+                val problem = SecretRef.nameProblem(raw)
+                if (problem != null) {
+                    reader.violation("name", problem)
+                    null
+                } else {
+                    ResourceName.of(raw).getOrNull()
+                }
+            }
         val key = reader.string("key", required = true)
         if (key != null) {
             SecretRef.keyProblem(key)?.let { reader.violation("key", it) }
@@ -455,6 +595,10 @@ internal class MappingReader private constructor(
          * the mapping shape, so the literal spelling
          * `forwarding.secret: "<value>"` is still refused, by that path rather
          * than this one. Anything nobody claims lands here.
+         *
+         * A *claimed* key is out of reach of this rule, which is why
+         * `forwarding: "<value>"` needed [SecretBearingPaths]: `forwarding` is a
+         * known field and does not look secret-like, so it never reaches here.
          */
         private val SECRET_LIKE_KEYS =
             setOf(
@@ -474,18 +618,35 @@ internal class MappingReader private constructor(
                 "and reference it by coordinates — `{name: <secret name>, key: <key within it>}` — the way " +
                 "`network.rcon.passwordSecret` and `forwarding.secret` do"
 
-        /** Reports "expected a mapping" and returns null when [node] is anything else. */
+        /**
+         * Reports "expected a mapping" and returns null when [node] is anything
+         * else — except at a path that holds a secret reference, where a scalar
+         * gets [INLINE_SECRET_PROBLEM] instead.
+         *
+         * `forwarding: <material>` is a shape mismatch and nothing else to this
+         * reader, but "expected a mapping, found a string" would send an operator
+         * off to add braces around the thing they must instead stop writing in a
+         * definition and rotate. Both messages quote nothing; this one is the
+         * useful half of the fix, not the safe half.
+         *
+         * [inherited] carries the flag down from the enclosing mapping, so a
+         * nested block under a secret reference is covered without being listed.
+         */
         fun of(
             path: String,
             node: Node,
             sink: ViolationSink,
+            inherited: Boolean = false,
         ): MappingReader? {
+            val secretBearing = inherited || SecretBearingPaths.holds(path)
             if (node !is MappingNode) {
-                sink.add(
-                    path.ifEmpty { "<document>" },
-                    "expected a mapping, found ${describe(node)}",
-                    node,
-                )
+                val problem =
+                    if (secretBearing && node is ScalarNode && !isNullScalar(node)) {
+                        INLINE_SECRET_PROBLEM
+                    } else {
+                        "expected a mapping, found ${describe(node)}"
+                    }
+                sink.add(path.ifEmpty { "<document>" }, problem, node)
                 return null
             }
             val entries = LinkedHashMap<String, Node>()
@@ -510,7 +671,7 @@ internal class MappingReader private constructor(
                 }
                 entries[key] = tuple.valueNode
             }
-            return MappingReader(path, entries, sink)
+            return MappingReader(path, entries, sink, secretBearing)
         }
 
         private fun closestMatch(

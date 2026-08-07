@@ -260,24 +260,40 @@ They are `spec.network.rcon.passwordSecret` on a Paper server, and
 `spec.forwarding.secret` and `spec.control.tokenSecret` on a proxy. Both
 sub-keys are required.
 
-**Nothing may be inline, anywhere, on any kind.** Two separate guards enforce it:
-writing a scalar where a ref belongs, and writing *any* unrecognised key whose
-name looks secret-like — `password`, `token`, `secret`, `forwardingSecret`,
-`apiKey`, `credentials` and similar, at any depth. Both produce:
+**Nothing may be inline, anywhere, on any kind.** Three guards enforce it:
+writing a scalar where a ref belongs, writing a scalar where the *block* holding
+one belongs (`forwarding:`, `control:`, `network.rcon:` — the abbreviation people
+actually reach for), and writing *any* unrecognised key whose name looks
+secret-like — `password`, `token`, `secret`, `forwardingSecret`, `apiKey`,
+`credentials` and similar, at any depth. All three produce:
 
 > inline secrets are not supported anywhere in a definition. Put the value in the
 > secret store and reference it by coordinates — `{name: <secret name>, key: <key
 > within it>}` — the way `network.rcon.passwordSecret` and `forwarding.secret` do
 
-That particular message deliberately never echoes what you wrote. **Do not rely
-on that in general.** Other validation messages do quote the offending scalar —
-notably when a mapping was expected and a string was given, which is exactly what
-`spec.forwarding: "<the secret>"` produces — and those messages reach logs and
-API responses.
+**No validation message quotes the scalar it rejected on a path that can hold a
+secret**, and no "expected a mapping / a list / a string" message quotes it
+anywhere: those name the shape you wrote (`found a string`, `found a number`) and
+leave the value where it is. The violation still carries the field path and
+`file:line:column`, which is what sends you to it. The two coordinates of a
+reference, `name` and `key`, are also described rather than quoted when rejected,
+because that is where material lands when someone abbreviates the reference away.
+
+Two things still repeat what you wrote, and both are outside that rule by
+construction rather than by oversight:
+
+- a *key* is part of the field path it is reported on — writing secret material
+  as a key (`forwarding: {<the secret>: x}`) puts it in the path of an
+  "unknown field" violation. Nothing can redact that without making violations
+  stop naming the field they are about;
+- fields that hold no secret still quote their value, including the non-secret
+  fields *inside* a secret block (`forwarding.mode: <what you wrote>`). That is
+  the useful diagnostic on a field nobody pastes a secret into.
 
 So: if you ever paste a secret into a definition, treat it as disclosed and
-rotate it. Reference it by coordinates and the value never enters the system at
-all.
+rotate it — it was on disk, in a store row, and in whatever ran `git add`, none
+of which this rule reaches. Reference it by coordinates and the value never
+enters the system at all.
 
 The forwarding secret in particular is only ever handed to backends by the
 reconciler. A `PaperServer` never names it, and never names the proxy.
@@ -427,9 +443,9 @@ the test suite parses, so they cannot drift from the code.
 | `proxy-minimal.yaml` | the smallest `VelocityProxy` |
 | `proxy-full.yaml` | every `VelocityProxy` field written out |
 
-**`invalid/`** — 30 files, each headed by a comment naming the violation it is
+**`invalid/`** — 31 files, each headed by a comment naming the violation it is
 there to produce. Worth reading before writing your first definition: they are
 the mistakes people actually make, including `inline-secret.yaml`,
-`grace-below-save-timeout.yaml`, `heap-exceeds-memory.yaml`,
-`proxy-published-control-without-token.yaml`, and `many-problems.yaml`, which
-produces seven violations from one parse.
+`proxy-inline-forwarding-block.yaml`, `grace-below-save-timeout.yaml`,
+`heap-exceeds-memory.yaml`, `proxy-published-control-without-token.yaml`, and
+`many-problems.yaml`, which produces seven violations from one parse.

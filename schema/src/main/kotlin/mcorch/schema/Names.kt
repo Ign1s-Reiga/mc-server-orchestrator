@@ -22,6 +22,17 @@ public value class ResourceName private constructor(
 
         private val PATTERN = Regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 
+        /**
+         * The rule in words, for messages that state it instead of quoting what
+         * was written: a coordinate of a secret reference
+         * ([SecretRef.NAME_PROBLEM]), and `:api`'s own wording on the secret
+         * routes, where the definition-file framing of that message does not
+         * apply. Public so those callers share one phrasing; stated here so it
+         * cannot drift from [PATTERN].
+         */
+        public val SYNTAX: String =
+            "lowercase letters, digits and `-`, starting and ending alphanumeric, at most $MAX_LENGTH characters"
+
         public fun of(raw: String): Result<ResourceName> {
             val problem = problemWith(raw)
             return if (problem == null) Result.success(ResourceName(raw)) else invalidValue(problem)
