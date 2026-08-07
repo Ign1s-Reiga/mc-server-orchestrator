@@ -2271,9 +2271,12 @@ public class Reconciler(
         // Absent means the workload predates the label, which is not the same as
         // "it holds no world data" — and guessing either way from an edited
         // definition is exactly the mistake being guarded against.
-        // Only a workload that positively says it holds a world. Unknown is
-        // deliberately *not* refused here, and the two guards differ on purpose
-        // because they answer different questions. This one asks "is this edit a
+        // Only a workload that positively says it holds a world. A **missing
+        // label** is deliberately *not* refused here — which is a different
+        // question from `WorkloadState.UNKNOWN` above, and the two are answered
+        // opposite ways on purpose: an unreadable container state leaves the label
+        // in hand, an unlabelled container leaves nothing in hand at all. The two
+        // guards differ for the same reason. This one asks "is this edit a
         // transition away from persistent storage" — and on a workload carrying
         // no label there is no way to tell a transition from a lobby that has
         // always been ephemeral, so refusing would make every replacement of
