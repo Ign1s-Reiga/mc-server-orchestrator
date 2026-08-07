@@ -1,0 +1,19 @@
+# Expected: spec.backends.selector — is required
+#
+# A fallback list names servers; it does not enrol them. Without a selector this
+# proxy has no backends at all.
+apiVersion: mcorch.dev/v1alpha1
+kind: VelocityProxy
+metadata:
+  name: proxy-01
+spec:
+  image: docker.io/itzg/mc-proxy:2026.6.1
+  resources:
+    memory: 1Gi
+  forwarding:
+    secret:
+      name: fleet-forwarding
+      key: modern-forwarding
+  backends:
+    fallback:
+      - lobby-01

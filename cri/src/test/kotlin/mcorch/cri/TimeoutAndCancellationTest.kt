@@ -5,16 +5,23 @@ import io.kotest.assertions.throwables.shouldThrow
 import io.kotest.matchers.booleans.shouldBeFalse
 import io.kotest.matchers.booleans.shouldBeTrue
 import io.kotest.matchers.longs.shouldBeLessThan
+import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
+import io.kotest.matchers.string.shouldNotContain
 import io.kotest.matchers.types.shouldBeInstanceOf
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withTimeout
+import mcorch.cri.internal.roundUpToWholeMilliseconds
 import org.junit.jupiter.api.Test
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.hours
+import kotlin.time.Duration.Companion.microseconds
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.nanoseconds
 import kotlin.time.Duration.Companion.seconds
 
 /**
@@ -75,7 +82,7 @@ class TimeoutAndCancellationTest {
                     }
                     shouldThrow<CriException.Timeout> { client.startContainer(ContainerId("c")) }
                     shouldThrow<CriException.Timeout> {
-                        client.stopContainer(ContainerId("c"), StopGracePeriod.ofSeconds(1))
+                        client.stopContainer(ContainerId("c"), StopGracePeriod.ofSeconds(1).getOrThrow())
                     }
                     shouldThrow<CriException.Timeout> { client.removeContainer(ContainerId("c")) }
                     shouldThrow<CriException.Timeout> { client.containerStatus(ContainerId("c")) }
@@ -121,8 +128,19 @@ class TimeoutAndCancellationTest {
             }
         }
 
+    /**
+     * Both ends of the range are rejected, and for one reason: a command timeout
+     * this call cannot turn into a deadline.
+     *
+     * `0` is CRI's "run forever". `Duration.INFINITE` is the same hole reached
+     * from the other side — it survives an `isPositive` check, and
+     * `inWholeMilliseconds` saturates it into a deadline about 292 million years
+     * out, so the call ends up with no effective deadline while still looking
+     * deadlined. That is the hazard `CriTimeouts` already refuses for its own
+     * values; this parameter is a deadline input too and gets the same rule.
+     */
     @Test
-    fun `execSync rejects a non-positive timeout instead of running forever`() =
+    fun `execSync rejects a timeout it cannot make a deadline of`() =
         runCriTest {
             FakeCriServer().use { fake ->
                 shouldThrow<IllegalArgumentException> {
@@ -130,6 +148,9 @@ class TimeoutAndCancellationTest {
                 }
                 shouldThrow<IllegalArgumentException> {
                     fake.client.execSync(ContainerId("c"), listOf("save-all", "flush"), (-1).seconds)
+                }
+                shouldThrow<IllegalArgumentException> {
+                    fake.client.execSync(ContainerId("c"), listOf("save-all", "flush"), Duration.INFINITE)
                 }
             }
         }
@@ -177,6 +198,83 @@ class TimeoutAndCancellationTest {
             }
         }
 
+    /**
+     * The deadline of a stop is capped; the grace period it sends is not.
+     *
+     * Before this, the two were the same number, so a grace period nobody
+     * bounded was a call nobody bounded — a definition carrying 30 days of grace
+     * parked a reconcile worker for 30 days, and CLAUDE.md's "everything
+     * crossing the `:cri` boundary has timeouts" had no owner above two hours.
+     * Capping the *grace period* instead cannot fix it: the grace period is half
+     * of a schema-validated pair with the save timeout, and shortening it below
+     * the save inverts the pair and kills a container mid-save.
+     *
+     * So both halves are asserted here together, and the second is the one not
+     * to relax: whatever the deadline does, `timeout` on the wire stays the whole
+     * grace period.
+     */
+    @Test
+    fun `a grace period past the cap is deadlined at the cap and still sends the whole grace period`() =
+        runCriTest {
+            val runtime = FakeCriServer.RuntimeBehaviour(hang = true)
+            FakeCriServer(runtime = runtime).use { fake ->
+                val client =
+                    fake.clientWith(
+                        CriTimeouts(stopDeadlineCap = 200.milliseconds, deadlineSlack = 100.milliseconds),
+                    )
+                val thirtyDays = 30L * 24 * 60 * 60
+
+                val startedAt = System.nanoTime()
+                val thrown =
+                    shouldThrow<CriException.Timeout> {
+                        client.stopContainer(ContainerId("c"), StopGracePeriod.ofSeconds(thirtyDays).getOrThrow())
+                    }
+                val elapsed = (System.nanoTime() - startedAt) / 1_000_000L
+
+                elapsed shouldBeLessThan 5_000L
+                // Retryable, and this is load-bearing rather than incidental: the
+                // caller re-issues the stop, and a permanent classification would
+                // turn a slow-but-working stop into a drain that aborts for good.
+                thrown.retryable.shouldBeTrue()
+                // This client gave up. The runtime did not report anything, so
+                // the flag that means "the runtime answered promptly" is false.
+                thrown.commandTimeout.shouldBeFalse()
+                thrown.message shouldContain "${thirtyDays}s grace period"
+                thrown.message shouldContain "nothing shortened it"
+
+                // The half that must not move: containerd was asked for the
+                // whole thirty days.
+                runtime.lastStopContainer.shouldNotBeNull().timeout shouldBe thirtyDays
+            }
+        }
+
+    @Test
+    fun `a grace period inside the cap still waits the grace period out`() =
+        runCriTest {
+            val runtime = FakeCriServer.RuntimeBehaviour(hang = true)
+            FakeCriServer(runtime = runtime).use { fake ->
+                // Cap far above the grace period, so if the deadline were taken
+                // from the cap this would wait an hour instead of a second.
+                val client =
+                    fake.clientWith(CriTimeouts(stopDeadlineCap = 1.hours, deadlineSlack = 200.milliseconds))
+
+                val startedAt = System.nanoTime()
+                val thrown =
+                    shouldThrow<CriException.Timeout> {
+                        client.stopContainer(ContainerId("c"), StopGracePeriod.ofSeconds(1).getOrThrow())
+                    }
+                val elapsed = (System.nanoTime() - startedAt) / 1_000_000L
+
+                // It waited the grace period out before giving up...
+                (elapsed >= 1_000L).shouldBeTrue()
+                elapsed shouldBeLessThan 30_000L
+                // ...and this is the alarming kind of stop timeout, not the
+                // expected one: the deadline outlasted the grace period, so the
+                // runtime should have killed the container and did not answer.
+                thrown.message shouldNotContain "grace period this stop asked for"
+            }
+        }
+
     @Test
     fun `a runtime that stops answering an exec is still reported as a transport timeout`() =
         runCriTest {
@@ -195,4 +293,77 @@ class TimeoutAndCancellationTest {
                 thrown.retryable.shouldBeTrue()
             }
         }
+
+    /**
+     * Both attributions measure an elapsed time against the deadline. grpc
+     * installs a deadline from `inWholeMilliseconds` and drops the remainder, so
+     * a deadline with a remainder used to be two different numbers: the one the
+     * call ran under, and the slightly longer one it was judged by. A call that
+     * gave up on its own deadline then landed below the bar.
+     *
+     * The two below are the same sub-millisecond gap read from opposite sides,
+     * and they fail differently. A capped stop loses its attribution and reads to
+     * an operator as the alarming kind of stop timeout — a runtime asked to kill
+     * a container that did not answer. An `ExecSync` gains one it has not earned
+     * and reports a healthy runtime with a slow command, on a runtime that said
+     * nothing at all. The second is the worse of the two, which is why the gap is
+     * closed rather than tolerated.
+     */
+    @Test
+    fun `a capped stop is still attributed when its deadline has a sub-millisecond remainder`() =
+        runCriTest {
+            val runtime = FakeCriServer.RuntimeBehaviour(hang = true)
+            FakeCriServer(runtime = runtime).use { fake ->
+                val client =
+                    fake.clientWith(
+                        CriTimeouts(
+                            stopDeadlineCap = 200.milliseconds,
+                            // The last 999 microseconds are ones grpc cannot install.
+                            deadlineSlack = 100.milliseconds + 999.microseconds,
+                        ),
+                    )
+
+                val thrown =
+                    shouldThrow<CriException.Timeout> {
+                        client.stopContainer(ContainerId("c"), StopGracePeriod.ofSeconds(30).getOrThrow())
+                    }
+
+                thrown.message shouldContain "grace period this stop asked for"
+                thrown.commandTimeout.shouldBeFalse()
+            }
+        }
+
+    @Test
+    fun `an exec transport timeout is not called a command timeout when the deadline has a remainder`() =
+        runCriTest {
+            val runtime = FakeCriServer.RuntimeBehaviour(hang = true)
+            FakeCriServer(runtime = runtime).use { fake ->
+                val client = fake.clientWith(CriTimeouts(deadlineSlack = 100.milliseconds + 999.microseconds))
+
+                val thrown =
+                    shouldThrow<CriException.Timeout> {
+                        client.execSync(ContainerId("c"), listOf("mc-monitor", "status"), 100.milliseconds)
+                    }
+
+                // The runtime never answered. Saying it did, promptly, would be
+                // a healthy verdict on a node that has gone quiet.
+                thrown.commandTimeout.shouldBeFalse()
+            }
+        }
+
+    /**
+     * The rounding those two rest on, on its own.
+     *
+     * Up, never down: the value is built from a wait a caller asked for, and the
+     * only direction a deadline may move on the way to the wire is the one that
+     * cannot cut a wait short.
+     */
+    @Test
+    fun `a deadline is rounded up to the millisecond grpc will install it at`() {
+        300.milliseconds.roundUpToWholeMilliseconds() shouldBe 300.milliseconds
+        (300.milliseconds + 1.nanoseconds).roundUpToWholeMilliseconds() shouldBe 301.milliseconds
+        (300.milliseconds + 999.microseconds).roundUpToWholeMilliseconds() shouldBe 301.milliseconds
+        (2.seconds + 1.microseconds).roundUpToWholeMilliseconds() shouldBe (2.seconds + 1.milliseconds)
+        Duration.ZERO.roundUpToWholeMilliseconds() shouldBe Duration.ZERO
+    }
 }

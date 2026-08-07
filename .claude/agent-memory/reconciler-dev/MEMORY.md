@@ -2,14 +2,27 @@
 
 - [Standalone drain decision](project_standalone-drain-decision.md) — the human's ruling on no-proxy drains, plus my follow-on calls that are still open to overruling.
 - [Paper image contract](project_unverified-paper-image-contract.md) — the in-container commands, now verified, and the 60–95s startup window that makes probes time out normally.
+- [Proxy image contract](project_proxy-image-contract.md) — verified: TYPE defaults to BungeeCord, /plugins is staging, and a third-party velocity.toml decides the player port.
 - [Assert on side effects](feedback_assert-on-side-effects.md) — how tests here go green while proving nothing, and the habits that prevent it.
 - [Drain against the container](feedback_drain-against-the-container.md) — save evidence expires, and a drain reads the workload's labels rather than the edited definition.
-- [Escalation ruling](project_escalation-ruling.md) — how far item 7 reaches: escalate the report of a stuck drain, never the container's fate.
+- [Escalation ruling](project_escalation-ruling.md) — item 7's reach, and why NEEDS_ATTENTION stopped being a drain flag; the anchor that decides alarm fatigue.
+- [Blocked is not failed](project_blocked-is-not-failed.md) — a block clears a retryable failure and keeps a permanent one; the three states, the flapping anchor still open.
 - [Integration freeze that never was](project_integration-freeze.md) — runBlocking parented the loop, so only *passing* tests hung. Resolved; keep for the diagnosis method.
 - [LocalNode test gap](project_localnode-test-gap.md) — collapse a decision into the module that owns it; a raw value plus a flag about it means the seam is wrong.
 - [Classify narrowly, contain broadly](feedback_classify-narrowly-and-contain-broadly.md) — keep the never-retry bucket small; let no exception escape a worker.
-- [Audit remedies are hypotheses](feedback_audit-remedies-are-hypotheses.md) — the finding is established, the prescribed helper may itself be wrong; the suite arbitrates.
-- [Prove the test can fail](feedback_prove-the-test-can-fail.md) — `--rerun` or it never ran; virtual time hides races; a control assertion can be unfindable.
+- [Audit remedies are hypotheses](feedback_audit-remedies-are-hypotheses.md) — the finding is established, the remedy may be wrong or reach only half the defects; trace it per case.
+- [Prove the test can fail](feedback_prove-the-test-can-fail.md) — `--rerun` or it never ran; mutate in sets, read the XML, and sweep the retired claim, not the identifier.
 - [Cancellation exposure](project_cancellation-exposure.md) — what the save-record shield covers, the two windows left open on purpose, and why write-ahead was rejected on its merits.
 - [Derive from the consumer](feedback_derive-from-the-consumer.md) — a status field is judged by what reads it; two of my defects passed every `:core` test and needed a real dashboard.
 - [Unreadable state posture](project_unreadable-state-posture.md) — a bad definition row cost the fleet; a bad observation was already safe via `getServer`, and the loop's skip only buys reporting.
+- [Level-triggered seal](project_level-triggered-seal.md) — assert, never issue; anchor rules; the release keyed on the gate's answer and classed by whether it landed; every asserting site records the seal.
+- [Record where no work happens](project_record-where-no-work-happens.md) — the third critical from "did work ⇒ recovered", and why the fix was placement rather than a narrower rule.
+- [Invariants need an enforcement point](feedback_invariants-need-an-enforcement-point.md) — pin wiring by shape and every premise of an unreachability argument; the arm-level check that catches an argument nobody wrote.
+- [Replacement needs an exit](project_replacement-exit.md) — a hash input no operator can edit closes the fleet's login path; the lever, the pre-flight asked at both ends, the wait still unbounded.
+- [Gate and ceiling](project_gate-and-ceiling.md) — a block must not arm the permanent gate; a park is a park; the node caps a grace period rather than refusing it; why troubleSince was declined.
+- [Deadline ceilings](project_deadline-ceilings.md) — clamping half a validated pair inverts it; `max(K, f(other))` bounds the relation, not the wait; `:cri` owns the wait; one refusal, two classes.
+- [Dispatch record](project_dispatch-record.md) — two proxies wrong at two call sites mean a fact nobody records; the stamp that inverts the save rule; the `Rejected` ruling still open.
+- [Record lifetime](project_record-lifetime.md) — the value was right and the lifetime was inherited; the fix's own defect; the undo the clears skip, safe only by re-derivation.
+- [Guard lifetime](project_guard-lifetime.md) — a refusal conditioned on a state the drain itself ends; its two outcomes, only one of which churns; the `?:` that put the erasure back.
+- [Classification scan scope](project_classification-scan-scope.md) — the two syntaxes it reads, the five exempt comparisons, the `!= RUNNING` gap left open, and the review rule I declined to fake.
+- [Producer scan scope](project_producer-scan-scope.md) — a rule in another module keyed on a state this one produces; discovery by asking the rule, the obligation moved to the producer, the guard that fires on store-dev.

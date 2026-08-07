@@ -1,0 +1,20 @@
+# Expected: spec.backends.selector.matchLabels — must not be empty
+#
+# An empty selector matches every server in the fleet. Kubernetes reads that as
+# "select everything"; here it would enrol servers this proxy was never meant to
+# front and hand them its forwarding secret.
+apiVersion: mcorch.dev/v1alpha1
+kind: VelocityProxy
+metadata:
+  name: proxy-01
+spec:
+  image: docker.io/itzg/mc-proxy:2026.6.1
+  resources:
+    memory: 1Gi
+  forwarding:
+    secret:
+      name: fleet-forwarding
+      key: modern-forwarding
+  backends:
+    selector:
+      matchLabels: {}

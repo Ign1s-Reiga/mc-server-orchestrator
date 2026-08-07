@@ -53,10 +53,25 @@ internal class RecordingScheduler(
     val requests: MutableList<PlacementRequest> = mutableListOf()
     val decisions: MutableList<PlacementDecision> = mutableListOf()
 
+    /**
+     * Every destination search, so a test can prove the drain asked the scheduler
+     * rather than choosing inside `DrainController` — which is the seam CLAUDE.md
+     * says must have a real call site.
+     */
+    val destinationRequests: MutableList<DestinationRequest> = mutableListOf()
+    val destinationDecisions: MutableList<DestinationDecision> = mutableListOf()
+
     override suspend fun schedule(request: PlacementRequest): PlacementDecision {
         requests += request
         val decision = delegate.schedule(request)
         decisions += decision
+        return decision
+    }
+
+    override suspend fun selectDestination(request: DestinationRequest): DestinationDecision {
+        destinationRequests += request
+        val decision = delegate.selectDestination(request)
+        destinationDecisions += decision
         return decision
     }
 }

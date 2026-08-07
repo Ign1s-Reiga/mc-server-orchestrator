@@ -52,6 +52,34 @@ configurations["integrationTestImplementation"]
 configurations["integrationTestRuntimeOnly"]
     .extendsFrom(configurations["testRuntimeOnly"])
 
+// The proxy's control plugin, as a *file* this build produces rather than a path
+// anybody writes down. `:core` asks a node for `VELOCITY_CONTROL_PLUGIN` and the
+// node answers out of its configured asset directory, so the integration harness
+// has to stage a real artefact there — and the only honest source for one is the
+// task that builds it. Declared as a resolvable configuration rather than
+// `project(":velocity-plugin").tasks…` so the wiring survives configuration-cache
+// and does not reach across project boundaries at execution time.
+val controlPlugin: Configuration by configurations.creating {
+    isCanBeConsumed = false
+    isCanBeResolved = true
+}
+
+dependencies {
+    controlPlugin(project(mapOf("path" to ":velocity-plugin", "configuration" to "controlPlugin")))
+}
+
+// Compiled by `check`, and so by `build`, without being *run* by it.
+//
+// A run needs a containerd nobody has in CI or in an agent's worktree; a compile
+// needs nothing, and it is the only thing that tells a change to a shared type
+// that it has broken this source set. Without it a signature change survives
+// every green build and fails for whoever next has a runtime to point at.
+//
+// That is not hypothetical: `EndpointRequest.timeout` became a value class and
+// this source set stopped compiling, invisibly, for a whole round while the
+// suite reported green over code that excluded it.
+tasks.named("check") { dependsOn("compileIntegrationTestKotlin") }
+
 tasks.register<Test>("integrationTest") {
     group = "verification"
     description = "Runs integration tests against a real local containerd (see scripts/dev/containerd-up.sh)."
@@ -59,6 +87,15 @@ tasks.register<Test>("integrationTest") {
     classpath = integrationTest.runtimeClasspath
     useJUnitPlatform()
     shouldRunAfter(tasks.named("test"))
+
+    // Where the harness stages it from. A proxy brought up without it comes up
+    // perfectly well and has no control endpoint, so the suite refuses to run
+    // rather than reporting green on a fixture it quietly skipped.
+    val jar = controlPlugin.elements.map { it.single().asFile.absolutePath }
+    inputs.files(controlPlugin)
+    jvmArgumentProviders.add(
+        CommandLineArgumentProvider { listOf("-Dmcorch.plugin.jar=${jar.get()}") },
+    )
     // A binding is on this classpath now, but Gradle swallows a test's output
     // unless asked. These runs take ten minutes against a real runtime and the
     // whole reason for the binding is to be able to see what the loop did while

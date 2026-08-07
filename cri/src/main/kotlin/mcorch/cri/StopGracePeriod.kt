@@ -7,7 +7,7 @@ import kotlin.time.Duration.Companion.seconds
 /**
  * How long containerd waits after the stop signal before it kills the container.
  *
- * There is deliberately no default and no `Duration` overload. Every call to
+ * There is deliberately no default and no unchecked constructor. Every call to
  * [CriClient.stopContainer] has to name a grace period, because for a Minecraft
  * server the wrong one loses a world:
  *
@@ -21,6 +21,15 @@ import kotlin.time.Duration.Companion.seconds
  *
  * CRI carries this as whole seconds, so [of] rounds **up**: a 90.5s grace period
  * becomes 91s, never 90s.
+ *
+ * ## Bigger is not always safer
+ *
+ * The intuition the drain protocol reasons with — a longer grace period is the
+ * conservative choice — stops holding above [MAX_SECONDS], where the runtime's
+ * own arithmetic wraps and a very long grace period becomes a very short one or
+ * none at all. That is why construction is checked and why it is checked *here*,
+ * at the boundary that renders the value onto the wire, rather than wherever a
+ * caller happens to read it from. See [MAX_SECONDS].
  */
 @JvmInline
 public value class StopGracePeriod private constructor(
@@ -34,23 +43,72 @@ public value class StopGracePeriod private constructor(
 
     public companion object {
         /**
+         * The largest grace period containerd carries out as asked: 9223372036
+         * seconds, about 292 years.
+         *
+         * CRI sends the grace period as `int64` *seconds*
+         * (`StopContainerRequest.timeout`) and containerd multiplies it by a
+         * billion to get a Go `time.Duration`, which is `int64` *nanoseconds*.
+         * Above `(2^63 - 1) / 1e9 = 9223372036.85…` that product does not fit,
+         * so it wraps — and containerd neither checks nor reports it. A wrapped
+         * value that lands negative makes containerd skip the stop signal
+         * entirely and `SIGKILL` immediately; one that lands positive produces a
+         * grace period of a few arbitrary seconds. Either way the RPC succeeds:
+         * `StopContainerResponse` has no fields, so `{}` is the whole answer and
+         * the caller cannot tell the difference.
+         *
+         * **Measured against containerd 2.3.3** (the release
+         * `scripts/dev/containerd-env.sh` pins), on a container whose init
+         * process ignores `SIGTERM`, with a client deadline of 12s so a grace
+         * period that is really being served shows up as the client giving up
+         * first:
+         *
+         * | `timeout` sent        | what containerd did                       |
+         * |-----------------------|-------------------------------------------|
+         * | 2147483647            | still waiting at 12s, container `RUNNING`  |
+         * | **9223372036**        | still waiting at 12s, container `RUNNING`  |
+         * | **9223372037**        | killed it, RPC returned `{}` in 359 ms     |
+         * | 18446744073           | killed it, RPC returned `{}` in 1.9 s      |
+         * | 18446744083           | **584 years asked, 9.7 s served**          |
+         * | 9223372036854775807   | killed it, RPC returned `{}` in 414 ms     |
+         *
+         * The 18446744083 row is the one to keep in mind, because it is the shape
+         * that passes review: the wrap lands 9.29 s past zero
+         * (18446744083e9 − 2^64 = 9290448384 ns), the container is signalled,
+         * waited for and killed exactly as a stop is supposed to look, and a save
+         * that needed longer than nine seconds is gone. `cri/src/integrationTest`
+         * re-measures both sides of the boundary against the runtime that is
+         * actually installed; if that test fails, containerd's behaviour has
+         * changed and this number is what to re-derive.
+         *
+         * This is a bound on what can be *expressed*, not a policy. How long a
+         * given server may take to save is a `:schema` question, and the caps
+         * there are far below this.
+         */
+        public const val MAX_SECONDS: Long = 9_223_372_036L
+
+        /**
          * A grace period of [duration], rounded up to whole seconds.
          *
-         * @throws IllegalArgumentException if [duration] is not strictly
-         *   positive. Zero is not reachable through this function on purpose;
-         *   it is spelled [IMMEDIATE_KILL].
+         * Fails when [duration] is not strictly positive, is not finite, or
+         * exceeds [MAX_SECONDS]. Zero is not reachable through this function on
+         * purpose; it is spelled [IMMEDIATE_KILL].
          */
-        public fun of(duration: Duration): StopGracePeriod {
-            require(duration.isPositive()) {
-                "stop grace period must be positive; for a zero-grace kill use StopGracePeriod.IMMEDIATE_KILL " +
-                    "and be sure the container holds no unsaved world data"
+        public fun of(duration: Duration): Result<StopGracePeriod> =
+            if (!duration.isFinite()) {
+                // Checked before rounding: `roundUpToWholeSeconds` on an infinite
+                // duration would add one to `Long.MAX_VALUE` and hand the range
+                // check a negative number.
+                rejected(
+                    "must be finite, got: $duration. An unbounded wait is not a safer stop — CRI has no way " +
+                        "to express one, and the largest value it can carry is $MAX_SECONDS seconds",
+                )
+            } else {
+                checked(duration.roundUpToWholeSeconds(), "$duration")
             }
-            require(duration.isFinite()) { "stop grace period must be finite, got: $duration" }
-            return StopGracePeriod(duration.roundUpToWholeSeconds())
-        }
 
-        /** A grace period of [wholeSeconds] seconds. @throws IllegalArgumentException if not positive. */
-        public fun ofSeconds(wholeSeconds: Long): StopGracePeriod = of(wholeSeconds.seconds)
+        /** A grace period of [wholeSeconds] seconds. Fails under the same conditions as [of]. */
+        public fun ofSeconds(wholeSeconds: Long): Result<StopGracePeriod> = checked(wholeSeconds, "${wholeSeconds}s")
 
         /**
          * Kill immediately, with no grace at all (CRI timeout `0`).
@@ -65,5 +123,40 @@ public value class StopGracePeriod private constructor(
          * up in a drain audit.
          */
         public val IMMEDIATE_KILL: StopGracePeriod = StopGracePeriod(0)
+
+        /**
+         * The one place the range is decided.
+         *
+         * [asWritten] is the caller's own spelling of the value rather than the
+         * rounded seconds, so a rejection names what was passed in.
+         */
+        private fun checked(
+            seconds: Long,
+            asWritten: String,
+        ): Result<StopGracePeriod> =
+            when {
+                seconds <= 0L -> {
+                    rejected(
+                        "must be positive, got: $asWritten. For a zero-grace kill use " +
+                            "StopGracePeriod.IMMEDIATE_KILL and be sure the container holds no unsaved world data",
+                    )
+                }
+
+                seconds > MAX_SECONDS -> {
+                    rejected(
+                        "must be at most $MAX_SECONDS seconds, got: $asWritten. Above that, containerd's " +
+                            "conversion to nanoseconds overflows and the runtime kills the container with little " +
+                            "or no grace while still reporting success — a longer grace period is not a safer " +
+                            "one past this point. See StopGracePeriod.MAX_SECONDS",
+                    )
+                }
+
+                else -> {
+                    Result.success(StopGracePeriod(seconds))
+                }
+            }
+
+        private fun rejected(reason: String): Result<StopGracePeriod> =
+            Result.failure(IllegalArgumentException("stop grace period $reason"))
     }
 }

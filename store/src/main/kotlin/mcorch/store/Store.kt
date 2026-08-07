@@ -62,6 +62,45 @@ import mcorch.schema.ServerStatus
  * cannot decode. That belongs to the one server it was stored for, so it comes
  * back attached to that server ([Unreadable]) and leaves the rest of the read
  * whole. A point read still raises it — see [getServer].
+ *
+ * ## Deadlines are bounded on the way out
+ *
+ * Every definition handed back by a read has passed through
+ * [mcorch.schema.SpecBounds]: no duration that becomes a transport deadline
+ * exceeds the widest value a reader would have accepted for it. **Every**
+ * implementation owes this, not just the embedded one, and it is a read-side
+ * guarantee on purpose — the stored record keeps whatever it holds, so nothing is
+ * lost and a later, wider ceiling gives the declared value back.
+ *
+ * It is here rather than in the reconcile loop because a store is where a
+ * definition that never came through a YAML reader enters the system: a
+ * hand-edited row, a restored backup, a migration. Nothing else sees all of them,
+ * and nothing else holds both halves of the `stopGracePeriod`/`saveTimeout` pair
+ * at the moment either could be bounded. A caller that acts on a definition read
+ * from here may assume every deadline on it is one it can afford to wait for; it
+ * may not assume the same of a definition it built itself.
+ *
+ * A write echoes the definition it was given, unbounded — the caller has it
+ * already, and pretending to have adjusted an argument is a worse answer than
+ * saying what the next read will return. Read it back to see the bounded form.
+ *
+ * ## Side-effect records survive a version the row predates
+ *
+ * Every observation handed back has passed through
+ * [mcorch.schema.StatusReconstruction]. A drain record says which irreversible
+ * things have already been done to a container — a save requested, a backend
+ * deregistered, a stop dispatched — and the loop reads it to decide what **not**
+ * to do again. A record that a store hands back missing because the build that
+ * wrote the row had no field for it is not a stale timestamp: it is the loop being
+ * told a `SIGTERM` was never sent, which is how players are routed onto a process
+ * inside its shutdown save.
+ *
+ * So this is a read-side guarantee like the bound above, owed by **every**
+ * implementation and not just the embedded one, and for the same reason: the
+ * stored record keeps whatever it holds, so nothing is lost and no version number
+ * is spent. It is stated here rather than in the reconcile loop because a store is
+ * where an observation written by a *different build* enters the system, and
+ * nothing else sees all of them.
  */
 public interface Store : AutoCloseable {
     // ---------------------------------------------------------------- desired state

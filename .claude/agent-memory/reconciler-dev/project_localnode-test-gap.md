@@ -20,6 +20,12 @@ unreachable:
    `FailureStatus.message`, and so SQLite and the API. Go's
    `fmt.Errorf("...: %+v", config)` habit means a rejected `CreateContainer` can
    come back with the container's environment in it.
+4. **(2026-08-06, drain-critical)** `mountsFor`'s `StorageRequest.Ephemeral`
+   branch answering `emptyList()` while discarding the `mountPath` it was
+   given — so the proxy's control plugin was requested by a planner, dropped
+   here, and every backend behind a `:core`-created proxy was undrainable.
+   Twenty-three static audit rounds and the whole unit suite passed over it;
+   integration found it.
 
 ## Two ways out, and the second is much better
 
@@ -40,6 +46,25 @@ only the safe string, **deleted** the gap instead of documenting it.
 **The tell:** if a fix leaves `:core` holding both a raw value *and* a flag
 about that value, the seam is in the wrong place. A caller that can only receive
 the already-correct answer cannot get it wrong.
+
+## The residual hop needs a structural pin
+
+The fourth finding took the first way out — the derivation moved to
+`HostPaths.mounts` over `:core`'s own types — and that closed the *decision*.
+What it cannot close is the hop from that function to the CRI mount list, which
+is still inside `LocalNode` and still unreachable from a test here. Somebody can
+rebuild the old `when` beside the call and every behavioural test stays green.
+
+So a source-shape assertion carries it: one `HostPaths.mounts(` call, one
+`VolumeMount(` construction, the second built from the first, and no `when (` or
+`emptyList()` between them. `WorkloadMountsTest` holds it and
+`scripts/dev/control-plugin-mutations.sh` P10 is the proof it bites — it writes
+the defect back at its original address, which is the only mutation in that set
+no behavioural test catches.
+
+**Generalise:** collapsing a decision out of `LocalNode` leaves a *copy* behind.
+Ask what the copy still permits, and pin that by shape — see
+[[invariants-need-an-enforcement-point]].
 
 ## How to apply
 

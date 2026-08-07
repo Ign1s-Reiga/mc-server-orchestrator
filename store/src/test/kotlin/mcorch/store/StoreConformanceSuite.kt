@@ -1,5 +1,6 @@
 package mcorch.store
 
+import io.kotest.assertions.withClue
 import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.collections.shouldContainExactly
 import io.kotest.matchers.collections.shouldContainExactlyInAnyOrder
@@ -9,12 +10,22 @@ import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.types.shouldBeInstanceOf
 import kotlinx.coroutines.test.runTest
+import mcorch.schema.BackendRoutingStatus
+import mcorch.schema.ControlEndpointSpec
+import mcorch.schema.DrainBlockReason
 import mcorch.schema.DrainState
+import mcorch.schema.PaperServerDefaults
+import mcorch.schema.PaperServerSpec
 import mcorch.schema.PaperServerStatus
 import mcorch.schema.ResourceName
+import mcorch.schema.SecretRef
 import mcorch.schema.ServerPhase
+import mcorch.schema.SpecBounds
+import mcorch.schema.VelocityProxySpec
+import mcorch.schema.VelocityProxyStatus
 import org.junit.jupiter.api.Assumptions
 import org.junit.jupiter.api.Test
+import kotlin.time.Duration.Companion.hours
 
 /**
  * The contract every [Store] has to satisfy, written against the interface and
@@ -93,6 +104,175 @@ abstract class StoreConformanceSuite {
         }
 
     @Test
+    fun `a stored proxy definition comes back exactly as it went in`() =
+        withStore { store ->
+            for (example in listOf("proxy-minimal.yaml", "proxy-full.yaml")) {
+                val definition = Fixtures.proxyDefinition(example)
+
+                store.putDefinition(definition).getOrThrow()
+
+                val stored = store.getServer(definition.metadata.name).shouldNotBeNull()
+                stored.definition.definition shouldBe definition
+                // Whole-object equality already covers these, but naming them says
+                // which ones a silent loss would cost most: the selector decides what
+                // the proxy fronts at all, and the two secret coordinates are the only
+                // copy of where the material lives.
+                val spec =
+                    stored.definition.definition.spec
+                        .shouldBeInstanceOf<VelocityProxySpec>()
+                spec.backends.selector shouldBe definition.spec.backends.selector
+                spec.backends.fallback shouldBe definition.spec.backends.fallback
+                spec.forwarding.secret shouldBe definition.spec.forwarding.secret
+                spec.control.tokenSecret shouldBe definition.spec.control.tokenSecret
+            }
+        }
+
+    /**
+     * The published-control shape, which no valid example carries.
+     *
+     * `proxy-full.yaml` leaves the control endpoint unpublished, so its
+     * `tokenSecret` is null and the example alone only ever exercises the absent
+     * branch. Publishing it makes the token required — that pairing is a parse
+     * rule — and it is the one place a second secret coordinate is stored.
+     */
+    @Test
+    fun `a published control endpoint keeps its token secret coordinate`() =
+        withStore { store ->
+            val parsed = Fixtures.proxyDefinitionNamed("edge-01")
+            val tokenSecret = SecretRef(name = Fixtures.resourceName("edge-control"), key = "token")
+            val definition =
+                parsed.copy(
+                    spec =
+                        parsed.spec.copy(
+                            control = ControlEndpointSpec(port = 8375, hostPort = 18375, tokenSecret = tokenSecret),
+                        ),
+                )
+
+            store.putDefinition(definition).getOrThrow()
+
+            val spec =
+                store
+                    .getServer(definition.metadata.name)
+                    .shouldNotBeNull()
+                    .definition.definition.spec
+                    .shouldBeInstanceOf<VelocityProxySpec>()
+            spec.control.tokenSecret shouldBe tokenSecret
+            spec.control.hostPort shouldBe 18375
+        }
+
+    @Test
+    fun `a fully populated proxy status comes back exactly as it went in`() =
+        withStore { store ->
+            store.putDefinition(Fixtures.proxyDefinitionNamed("edge-01")).getOrThrow()
+            val status = Fixtures.fullProxyStatus("edge-01")
+
+            store.putStatus(status).getOrThrow()
+
+            store
+                .getServer(Fixtures.resourceName("edge-01"))
+                .shouldNotBeNull()
+                .status
+                .shouldNotBeNull()
+                .status shouldBe status
+        }
+
+    /**
+     * Three different facts, and the codec has to keep them apart.
+     *
+     * A null routing table means nothing has been observed. An empty one means the
+     * selector matched nothing — a real condition an operator has to see, and one
+     * that reads as "not observed yet" if the encoding cannot tell empty from
+     * absent. A populated one has to come back element for element, in order.
+     */
+    @Test
+    fun `a proxy routing table round-trips whether it is absent, empty or populated`() =
+        withStore { store ->
+            store.putDefinition(Fixtures.proxyDefinitionNamed("edge-01")).getOrThrow()
+            val tables =
+                listOf(
+                    null,
+                    BackendRoutingStatus(observedAt = Fixtures.T0.minusSeconds(4)),
+                    Fixtures.fullBackends(),
+                )
+
+            for (table in tables) {
+                val status = Fixtures.fullProxyStatus("edge-01", backends = table)
+                store.putStatus(status).getOrThrow()
+
+                val read =
+                    store
+                        .getServer(Fixtures.resourceName("edge-01"))
+                        .shouldNotBeNull()
+                        .status
+                        .shouldNotBeNull()
+                        .status
+                        .shouldBeInstanceOf<VelocityProxyStatus>()
+                read.backends shouldBe table
+                read.backends?.backends?.map { it.server.value } shouldBe table?.backends?.map { it.server.value }
+            }
+        }
+
+    /**
+     * The field a lost round trip costs most.
+     *
+     * `drainInitiated` is how a drain excludes a backend that is itself on the way
+     * down. Dropped, every backend reads as eligible, and two servers draining at
+     * once can be handed each other's players — a transfer cycle neither leaves.
+     * Whole-object equality above would catch it too; this asserts it by name so a
+     * failure says which field and why it matters.
+     */
+    @Test
+    fun `a backend that is itself draining still says so after a round trip`() =
+        withStore { store ->
+            store.putDefinition(Fixtures.proxyDefinitionNamed("edge-01")).getOrThrow()
+            val status = Fixtures.fullProxyStatus("edge-01")
+            val expected = status.backends.shouldNotBeNull().backends
+
+            store.putStatus(status).getOrThrow()
+
+            val read =
+                store
+                    .getServer(Fixtures.resourceName("edge-01"))
+                    .shouldNotBeNull()
+                    .status
+                    .shouldNotBeNull()
+                    .status
+                    .shouldBeInstanceOf<VelocityProxyStatus>()
+                    .backends
+                    .shouldNotBeNull()
+                    .backends
+
+            read.map { it.drainInitiated } shouldBe expected.map { it.drainInitiated }
+            read.map { it.eligibleAsDestination } shouldBe expected.map { it.eligibleAsDestination }
+            // The fixture is only meaningful if the two lists disagree somewhere.
+            expected.map { it.eligibleAsDestination }.toSet() shouldBe setOf(true, false)
+        }
+
+    @Test
+    fun `a proxy drain in flight survives being written and read back`() =
+        withStore { store ->
+            store.putDefinition(Fixtures.proxyDefinitionNamed("edge-01")).getOrThrow()
+            val status = Fixtures.fullProxyStatus("edge-01", drainState = DrainState.SEALED)
+
+            store.putStatus(status).getOrThrow()
+
+            val drain =
+                store
+                    .getServer(Fixtures.resourceName("edge-01"))
+                    .shouldNotBeNull()
+                    .status
+                    .shouldNotBeNull()
+                    .status
+                    .shouldBeInstanceOf<VelocityProxyStatus>()
+                    .drain
+                    .shouldNotBeNull()
+            drain shouldBe status.drain.shouldNotBeNull()
+            // The projection the loop finds an interrupted drain by has to see a
+            // proxy exactly as it sees a server: one state machine, one query.
+            store.listByDrainState(setOf(DrainState.SEALED)).map { it.name.value } shouldBe listOf("edge-01")
+        }
+
+    @Test
     fun `a fully populated status comes back exactly as it went in`() =
         withStore { store ->
             val definition = Fixtures.definitionNamed("survival-02")
@@ -157,6 +337,12 @@ abstract class StoreConformanceSuite {
      * `saveRequestedAt`, a drain that had finished its save comes back believing
      * a request went out and never returned — it wedges permanently and asks a
      * human to verify a world that is already on disk.
+     *
+     * It carries `stopDispatchedAt` too, and that one fails in the opposite
+     * direction from every other field here. Losing a side-effect record usually
+     * costs a **repeat**; losing this one costs a **reversal** — the drain comes
+     * back believing no stop was dispatched and hands the backend back to the
+     * proxy, which routes players onto a container that has been sent SIGTERM.
      */
     @Test
     fun `a confirmed world save comes back as a confirmation, not as an outstanding request`() =
@@ -183,6 +369,50 @@ abstract class StoreConformanceSuite {
             // Disjoint: a confirmed save has no request outstanding, and a store
             // that resurrected one would wedge the drain on the next pass.
             drain.saveRequestedAt.shouldBeNull()
+            drain.stopDispatchedAt shouldBe expected.stopDispatchedAt
+        }
+
+    /**
+     * The third record, and the one whose meaning is carried by a null.
+     *
+     * A blocked drain is waiting for players to log off. It records a
+     * `DrainBlock` and **no** `FailureStatus`, and that absence is what keeps the
+     * escalation quiet — so a store that resurrected a failure here, or dropped
+     * the block and left the drain looking like an ordinary abort, would put a
+     * server with people happily playing on it back into the "a human must act"
+     * path on the first read after a restart.
+     *
+     * Field for field rather than by equality alone, because the fields differ in
+     * how they fail. A dropped `since` re-dates the wait to the restart; a dropped
+     * `observations` says the loop has looked once when it has looked forty times.
+     */
+    @Test
+    fun `a drain blocked on players comes back blocked, and comes back with no failure`() =
+        withStore { store ->
+            store.putDefinition(Fixtures.definitionNamed("survival-04")).getOrThrow()
+            val expected = Fixtures.blockedDrain()
+            val status = Fixtures.fullStatus("survival-04").copy(drain = expected, failure = null)
+
+            store.putStatus(status).getOrThrow()
+
+            val drain =
+                store
+                    .getServer(Fixtures.resourceName("survival-04"))
+                    .shouldNotBeNull()
+                    .status
+                    .shouldNotBeNull()
+                    .status
+                    .shouldBeInstanceOf<PaperServerStatus>()
+                    .drain
+                    .shouldNotBeNull()
+            drain shouldBe expected
+            val blocked = drain.blocked.shouldNotBeNull()
+            blocked.reason shouldBe DrainBlockReason.AWAITING_ZERO_PLAYERS
+            blocked.message shouldBe expected.blocked?.message
+            blocked.since shouldBe expected.blocked?.since
+            blocked.observations shouldBe expected.blocked?.observations
+            // The assertion the record exists for.
+            drain.failure.shouldBeNull()
         }
 
     @Test
@@ -199,6 +429,100 @@ abstract class StoreConformanceSuite {
                     .status
                     .shouldNotBeNull()
                     .status shouldBe status
+            }
+        }
+
+    /**
+     * The one record a store may not hand back the way it found it.
+     *
+     * `DrainStatus.stopDispatchedAt` arrived inside the status document rather than
+     * as a column, so no on-disk version moved when it was added and no migration
+     * backfills it: an observation written by any older build reads null. Null means
+     * *no container has been signalled*, and a pass that believes that on a drain in
+     * `STOPPING` deletes the whole drain record when the operator withdraws the edit
+     * that asked for the replacement — after which the proxy's sweep re-registers a
+     * backend whose shutdown save has already run. Every session played there is
+     * lost.
+     *
+     * So the interface promises the record back, and `mcorch.schema.StatusReconstruction`
+     * is where the reasoning lives. Written through the ordinary API rather than by
+     * editing a document, because that is the only portable way to plant the shape —
+     * an implementation holding objects has no key to remove. The store that holds
+     * documents is asked the question in its own terms as well, by
+     * `LegacyStopDispatchTest`.
+     */
+    @Test
+    fun `a drain in STOPPING comes back with a dispatch record it was stored without`() =
+        withStore { store ->
+            store.putDefinition(Fixtures.definitionNamed("survival-02")).getOrThrow()
+            val stored = Fixtures.fullStatus("survival-02", drainState = DrainState.STOPPING)
+            val legacy = stored.drain.shouldNotBeNull().copy(stopDispatchedAt = null)
+
+            store.putStatus(stored.copy(drain = legacy)).getOrThrow()
+
+            val drain =
+                store
+                    .getServer(Fixtures.resourceName("survival-02"))
+                    .shouldNotBeNull()
+                    .status
+                    .shouldNotBeNull()
+                    .status
+                    .shouldBeInstanceOf<PaperServerStatus>()
+                    .drain
+                    .shouldNotBeNull()
+            // The assertion the record exists for: a stop is in flight, so nothing
+            // may hand this backend back to a routing table.
+            drain.stopDispatchedAt.shouldNotBeNull()
+            // From the drain's own transition into `STOPPING`, which is the pass on
+            // which the stop request returned. Not "now", which would restart the
+            // clock on every read, and not the status's `observedAt`, which is a
+            // later instant belonging to the pass rather than to the stop.
+            drain.stopDispatchedAt shouldBe legacy.enteredStateAt
+            // Nothing else moved. A reconstruction that also re-dated a save request
+            // or dropped a block would be repairing what it was not asked to.
+            drain shouldBe legacy.copy(stopDispatchedAt = legacy.enteredStateAt)
+        }
+
+    /**
+     * And the states it must **not** fire in.
+     *
+     * `DEREGISTERED` is the one a wider rule would reach for, and it is left out on
+     * purpose: it is where a drain ordinarily waits *before* any stop, so
+     * reconstructing there reports a dispatch for the common case rather than the
+     * exceptional one, and suppresses the re-registration that puts a parked drain's
+     * backend back into routing.
+     *
+     * `DRAIN_FAILED` is the one a *narrower* rule still gets wrong. It is declared
+     * after `STOPPING`, so `state >= STOPPING` sweeps it in by accident of
+     * declaration order. It is excluded for `DEREGISTERED`'s reason rather than a
+     * structural one: a failed drain does have a way to a stop, because the
+     * reconciler asks whether the container is already down on every pass whatever
+     * the state, but it is where a drain parks after aborting at any step, so its
+     * records overwhelmingly never dispatched and a stamp invented there reports the
+     * common case. That is why the rule names one state instead of comparing.
+     */
+    @Test
+    fun `a drain short of the stop keeps its absent dispatch record`() =
+        withStore { store ->
+            store.putDefinition(Fixtures.definitionNamed("survival-02")).getOrThrow()
+
+            for (state in DrainState.entries - DrainState.STOPPING) {
+                val stored = Fixtures.fullStatus("survival-02", drainState = state)
+                stored.drain
+                    .shouldNotBeNull()
+                    .stopDispatchedAt
+                    .shouldBeNull()
+
+                store.putStatus(stored).getOrThrow()
+
+                withClue(state) {
+                    store
+                        .getServer(Fixtures.resourceName("survival-02"))
+                        .shouldNotBeNull()
+                        .status
+                        .shouldNotBeNull()
+                        .status shouldBe stored
+                }
             }
         }
 
@@ -720,6 +1044,147 @@ abstract class StoreConformanceSuite {
 
             // The untouched server is untouched: one bad record costs one server.
             servers.single { it.name.value == "survival-b" }.status.shouldNotBeNull()
+        }
+
+    // ------------------------------------------------------- bounded deadlines
+
+    /**
+     * Three durations on a spec become transport deadlines, and only a YAML reader
+     * bounds them. A definition that reached the store another way — a hand-edited
+     * row, a restored backup, a migration — therefore carries whatever the record
+     * can express, and a reconcile worker that acts on it is parked with no
+     * effective timeout. Enough of those and the loop reconciles nothing.
+     *
+     * The bound is a property of the *interface*, not of an encoding: a store is
+     * where a definition nobody validated enters the system, and it is the only
+     * place holding both halves of the `stopGracePeriod` / `saveTimeout` pair.
+     * Every implementation owes this, which is why it is asserted here rather than
+     * in the embedded store's own tests.
+     */
+    @Test
+    fun `a definition read back has every deadline inside its ceiling`() =
+        withStore { store ->
+            val paper = Fixtures.unboundedDefinition("survival-a")
+            val proxy = Fixtures.unboundedProxyDefinition("edge-a")
+            store.putDefinition(paper).getOrThrow()
+            store.putDefinition(proxy).getOrThrow()
+
+            val paperSpec =
+                store
+                    .getServer(paper.metadata.name)
+                    .shouldNotBeNull()
+                    .definition.definition.spec
+                    .shouldBeInstanceOf<PaperServerSpec>()
+            paperSpec.lifecycle.stopGracePeriod shouldBe SpecBounds.MAX_STOP_GRACE_PERIOD
+            paperSpec.lifecycle.drain.saveTimeout shouldBe SpecBounds.MAX_SAVE_TIMEOUT
+
+            val proxySpec =
+                store
+                    .getServer(proxy.metadata.name)
+                    .shouldNotBeNull()
+                    .definition.definition.spec
+                    .shouldBeInstanceOf<VelocityProxySpec>()
+            proxySpec.backends.drain.sealTimeout shouldBe SpecBounds.MAX_HANDSHAKE_TIMEOUT
+            proxySpec.lifecycle.stopGracePeriod shouldBe SpecBounds.MAX_PROXY_STOP_GRACE_PERIOD
+
+            // A listing is the read the reconcile loop actually resyncs from, so
+            // the guarantee has to hold there and not only on a point read.
+            val listed =
+                store
+                    .listServers()
+                    .single { it.name == paper.metadata.name }
+                    .definition.definition.spec
+                    .shouldBeInstanceOf<PaperServerSpec>()
+            listed.lifecycle.stopGracePeriod shouldBe SpecBounds.MAX_STOP_GRACE_PERIOD
+        }
+
+    /**
+     * The bound must not break the pair it sits inside.
+     *
+     * `stopGracePeriod` has to exceed `saveTimeout` by
+     * [PaperServerDefaults.MIN_STOP_GRACE_MARGIN] or the container is SIGKILLed
+     * part-way through Paper's shutdown save — a torn region file, CLAUDE.md
+     * invariant 3. A ceiling applied to one half without the other in hand inverts
+     * exactly that, which is why the bound is here and not at a consumer.
+     */
+    @Test
+    fun `bounding a stored definition never inverts the stop grace invariant`() =
+        withStore { store ->
+            val definition =
+                Fixtures.unboundedDefinition(
+                    "survival-a",
+                    stopGracePeriod = 30.hours,
+                    saveTimeout = 20.hours,
+                )
+            store.putDefinition(definition).getOrThrow()
+
+            val spec =
+                store
+                    .getServer(definition.metadata.name)
+                    .shouldNotBeNull()
+                    .definition.definition.spec
+                    .shouldBeInstanceOf<PaperServerSpec>()
+
+            val minimum = spec.lifecycle.drain.saveTimeout + PaperServerDefaults.MIN_STOP_GRACE_MARGIN
+            (spec.lifecycle.stopGracePeriod >= minimum) shouldBe true
+        }
+
+    /**
+     * The whole reason this is a clamp rather than a refusal.
+     *
+     * An unreadable definition is one the loop cannot act on at all, so the
+     * container it describes keeps running, keeps its players, and the delete that
+     * would retire it has no spec to drain against — the state that ends in a
+     * manual `crictl stop`. A bounded one is an ordinary server that can be
+     * deleted, drained against and purged.
+     */
+    @Test
+    fun `a server whose deadlines were bounded can still be deleted and purged`() =
+        withStore { store ->
+            val definition = Fixtures.unboundedDefinition("survival-a")
+            store.putDefinition(definition).getOrThrow()
+            val name = definition.metadata.name
+
+            store.deleteDefinition(name).getOrThrow()
+
+            // Tombstoned, still readable, and still carrying the spec the drain
+            // needs — bounded, so the drain's own stop has a deadline it can meet.
+            val terminating = store.getServer(name).shouldNotBeNull()
+            terminating.definition.terminating shouldBe true
+            terminating.definition.definition.spec
+                .shouldBeInstanceOf<PaperServerSpec>()
+                .lifecycle.stopGracePeriod shouldBe SpecBounds.MAX_STOP_GRACE_PERIOD
+
+            // A drain still records progress against it.
+            store.putStatus(Fixtures.fullStatus("survival-a")).getOrThrow()
+
+            store.purge(name).getOrThrow()
+            store.getServer(name).shouldBeNull()
+        }
+
+    /**
+     * The bound is narrow on purpose. `startupTimeout` and `playerTransferTimeout`
+     * are wall-clock comparisons rather than deadlines on a call — the loop records
+     * an instant and compares against it on a later pass — so an absurd value there
+     * parks nothing and shortening it would be a behaviour change with no defect
+     * behind it. They were examined and cleared; this is the guard against a later
+     * pass tidying them in.
+     */
+    @Test
+    fun `durations that are not deadlines survive the round trip untouched`() =
+        withStore { store ->
+            val definition = Fixtures.unboundedDefinition("survival-a")
+            store.putDefinition(definition).getOrThrow()
+
+            val spec =
+                store
+                    .getServer(definition.metadata.name)
+                    .shouldNotBeNull()
+                    .definition.definition.spec
+                    .shouldBeInstanceOf<PaperServerSpec>()
+
+            spec.lifecycle.startupTimeout shouldBe definition.spec.lifecycle.startupTimeout
+            spec.lifecycle.drain.playerTransferTimeout shouldBe definition.spec.lifecycle.drain.playerTransferTimeout
         }
 
     // --------------------------------------------------------------- change feed

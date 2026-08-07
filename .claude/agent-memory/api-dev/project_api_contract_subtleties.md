@@ -109,4 +109,66 @@ identity is optional. Ask what happens when the key is null before writing the
 loop — and tell the client the derivation is suspended, because a dashboard that
 silently stopped reporting deletions is worse than one that never reported them.
 
+**One fact, one derivation — and a reassurance never outranks a failure.**
+`display.drainBlocked` and `display.detail` must both come from the
+`DRAIN_BLOCKED` *condition*, never from `drain.blocked` directly. In `detail`,
+`status.failure` (when it differs from `drain.failure`) beats `drain.failure`
+beats the block.
+
+**Why:** the eleventh drain audit found the two derived separately and
+disagreeing. The reachable sequence needs no bad data: a drain blocks on players,
+the next pass throws a `NodeException`, and `Reconciler.nodeFailure` carries the
+block forward while recording on `status.failure` — so an operator was told
+"waiting, not stuck" about a server whose node was unreachable.
+
+**How to apply:** when a `require` enforcing disjointness is declined for cost
+reasons, the precedence becomes the entire specification and must hold at *every*
+site that reads it — extract a function rather than trusting review. And check
+whether two failure fields are the same event before ranking them: an aborted
+drain writes the same value to both, so a naive "newest wins" drops the better
+wording.
+
+**Never tell a client to derive a status fact in TypeScript.** If `API.md` needs
+`server.status?.failure` to decide what to *render*, the fact belongs in a
+condition and should reach the client as a flag.
+
+**Why:** I added `: server.status?.failure ? 'not progressing'` to the drain chip
+snippet, which made dashboards derive "the loop has stopped moving this server" a
+fourth time with no threshold — so a one-pass blip rendered as a problem. The
+eleventh-round audit cited that snippet as the strongest argument the fact
+belonged in `NEEDS_ATTENTION`, which then widened to cover it.
+
+**How to apply:** thresholds and precedence live server-side. A client snippet in
+`API.md` should read `display.*` flags almost exclusively; reaching into `status`
+to compute a judgement is the smell.
+
+**Invariants stated in bold in `API.md` age badly.** "`drainBlocked` and
+`needsAttention` are never both true" became false when `NEEDS_ATTENTION` widened
+beyond drains, and the doc had built render guidance on it.
+
+**How to apply:** prefer "order these, first wins" to "these are exclusive". An
+ordering stays correct when a flag's scope widens; an exclusivity claim does not,
+and any snippet built on it silently renders the wrong thing.
+
+**Never `as? ConcreteStatus` in the renderer.** A failed cast is indistinguishable
+from no observation, so the whole kind renders as `UNKNOWN` the day a second kind
+exists. Erase the kind once into a private view of what the badge and the sentence
+need, and let a `when` over the sealed type be the only place that knows.
+
+**Why:** `displayState` and `display` both cast to `PaperServerStatus`, and a
+`VelocityProxy` therefore rendered `UNKNOWN` with no error anywhere.
+
+**How to apply:** the same shape catches the next kind for free. And a throwing
+placeholder branch for an unrendered kind is only safe while nothing readable can
+be one — it stops being safe the moment `:store` accepts it, and the blast radius
+is the whole fleet list plus every open SSE stream, because both read every row.
+
+**A badge value should name the *shape* of the problem, not the kind.**
+`DEGRADED` (up, accepting, cannot do its job) rather than `NO_BACKENDS`; which
+capability is missing goes in `detail` and the conditions.
+
+**How to apply:** a new kind then needs no new badge, and a capability condition
+added later is rendered without touching `DisplayState`. Fire it only on a
+condition that is *explicitly* `False`, so kinds that raise none are unaffected.
+
 Related: [[api-module-decisions]], [[divergences-from-drain-audits]].

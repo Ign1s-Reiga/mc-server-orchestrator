@@ -24,6 +24,7 @@ import mcorch.schema.SchemaVersion
 import mcorch.schema.SecretRef
 import mcorch.schema.StatusCondition
 import mcorch.schema.StorageSpec
+import mcorch.schema.VelocityProxyStatus
 import mcorch.schema.VolumeSpec
 import java.time.Clock
 import java.time.Instant
@@ -78,8 +79,15 @@ internal class MutableClock(
  * never derived at all is exactly the green-for-the-wrong-reason this suite has
  * been bitten by. Absence fails here.
  */
-internal fun PaperServerStatus.attention(): StatusCondition =
-    conditions.single { it.type == ConditionType.NEEDS_ATTENTION }
+internal fun PaperServerStatus.attention(): StatusCondition = condition(ConditionType.NEEDS_ATTENTION)
+
+/** Any condition, with the same insistence that it be present. */
+internal fun PaperServerStatus.condition(type: ConditionType): StatusCondition = conditions.single { it.type == type }
+
+/** The same two, for a proxy. Absence fails here for the same reason. */
+internal fun VelocityProxyStatus.attention(): StatusCondition = condition(ConditionType.NEEDS_ATTENTION)
+
+internal fun VelocityProxyStatus.condition(type: ConditionType): StatusCondition = conditions.single { it.type == type }
 
 internal fun resourceName(raw: String): ResourceName = ResourceName.of(raw).getOrThrow()
 
@@ -91,6 +99,18 @@ internal fun secretRef(
     name: String = "survival-01-rcon",
     key: String = "password",
 ): SecretRef = SecretRef.of(name, key).getOrThrow()
+
+/** What a fixture server runs unless a test is asking for a replacement. */
+internal const val DEFAULT_SERVER_IMAGE: String = "docker.io/itzg/minecraft-server:2026.6.1"
+
+/**
+ * A second image, so that declaring it is a container replacement.
+ *
+ * Named because a test that withdraws a replacement has to declare the *first*
+ * image again, and two spellings of "the one it was created with" is how such a
+ * test comes to assert against an edit it never reverted.
+ */
+internal const val REPLACEMENT_SERVER_IMAGE: String = "docker.io/itzg/minecraft-server:2026.7.0"
 
 /**
  * A deliberately boring definition, close to `schema/src/testFixtures/resources/examples`.
@@ -106,20 +126,33 @@ internal fun secretRef(
  */
 internal fun paperDefinition(
     name: String = "survival-01",
-    image: String = "docker.io/itzg/minecraft-server:2026.6.1",
+    labels: Map<String, String> = emptyMap(),
+    image: String = DEFAULT_SERVER_IMAGE,
     storage: StorageSpec = StorageSpec.Persistent(VolumeSpec(resourceName("$name-world"))),
     rcon: RconSpec = RconSpec.Enabled(passwordSecret = secretRef()),
     maxPlayers: Int = 20,
     hostPort: Int? = 30001,
     placement: PlacementSpec = PlacementSpec(),
     saveTimeout: Duration = 3.minutes,
+    /**
+     * Independent of [saveTimeout] on purpose, though the default is the schema's
+     * own derivation of it.
+     *
+     * They are two quantities and the schema only relates them one way — a
+     * `PaperServer`'s grace period must *exceed* the save timeout, not track it —
+     * so an operator may set a long one for a reason of their own. A fixture that
+     * could not express that made every `:core` test one where the two moved
+     * together, which is how a bound on a save came to be written in terms of the
+     * grace period.
+     */
+    stopGracePeriod: Duration = saveTimeout + 60.seconds,
     startupTimeout: Duration = 5.minutes,
     memoryBytes: Long = 4L * MemoryQuantity.GIB,
     heapBytes: Long = 3L * MemoryQuantity.GIB,
 ): PaperServerDefinition =
     PaperServerDefinition(
         apiVersion = SchemaVersion.CURRENT,
-        metadata = ObjectMetadata(name = resourceName(name)),
+        metadata = ObjectMetadata(name = resourceName(name), labels = labels),
         spec =
             PaperServerSpec(
                 image = ImageRef.parse(image).getOrThrow(),
@@ -136,7 +169,7 @@ internal fun paperDefinition(
                 lifecycle =
                     LifecycleSpec(
                         drain = DrainSpec(saveTimeout = saveTimeout),
-                        stopGracePeriod = saveTimeout + 60.seconds,
+                        stopGracePeriod = stopGracePeriod,
                         startupTimeout = startupTimeout,
                     ),
                 placement = placement,

@@ -44,19 +44,32 @@ internal data class MigrationReport(
 /**
  * The ordered migration list and the runner that applies it.
  *
- * ## Adding version 5
+ * ## Adding version 6
  *
- * 1. Write a `V5Something : Migration` below with `version = 5`.
- * 2. Append it to [ALL]. Do not renumber, do not reorder, do not touch V1 to V4.
+ * 1. Write a `V6Something : Migration` below with `version = 6`.
+ * 2. Append it to [ALL]. Do not renumber, do not reorder, do not touch V1 to V5.
  * 3. If it reads a stored document, it must check `doc_encoding` against a frozen
  *    literal and refuse anything else, rather than parse whatever is on disk.
  *    [V3SplitWorldSavedInstant] is the worked example, down to why the literal is
  *    not `PropertyDocument.ENCODING_VERSION`. [V2StatusDrainProjection] has no such
  *    check because it shipped before the rule, which is a grandfathered gap and not
  *    a precedent.
- * 4. Add a case to the migration test: write data through the store at the previous
+ * 4. If it rewrites a document by copying the old keys and writing new ones on top,
+ *    its duplicate-key guard must cover **every** key it writes, not one
+ *    representative. [DocumentWriter.put] refuses a repeat with an
+ *    `IllegalArgumentException`, which is not a [StoreException] and so crosses the
+ *    store boundary as a type `:core` cannot classify — the exact outcome such a
+ *    guard exists to prevent. Guard on the prefix
+ *    (`document.keys().any { it.startsWith(...) }`) when the keys share one, so a
+ *    field added to the record later is covered without anyone remembering this
+ *    rule. Two migrations have now been found guarding one key while writing
+ *    several; [V3SplitWorldSavedInstant] is safe only because each branch writes
+ *    exactly one key and names it.
+ * 5. Add a case to the migration test: write data through the store at the previous
  *    version, migrate, assert every field is still there and anything new is
- *    correctly derived from the data that was already on disk.
+ *    correctly derived from the data that was already on disk. A refusal needs a
+ *    case per key that can trigger it — a parametrised one, so the set cannot drift
+ *    from what the guard checks.
  *
  * A store whose recorded version is *higher* than [latest] is refused outright.
  * An older binary that reinterpreted a newer layout would be the one failure mode
@@ -66,7 +79,13 @@ internal object Migrations {
     private val logger = LoggerFactory.getLogger(Migrations::class.java)
 
     val ALL: List<Migration> =
-        listOf(V1BaseSchema, V2StatusDrainProjection, V3SplitWorldSavedInstant, V4RejectUnnamedRows)
+        listOf(
+            V1BaseSchema,
+            V2StatusDrainProjection,
+            V3SplitWorldSavedInstant,
+            V4RejectUnnamedRows,
+            V5BlockedDrainIsNotAFailure,
+        )
 
     val latest: Int = ALL.maxOf { it.version }
 
@@ -494,4 +513,163 @@ private object V4RejectUnnamedRows : Migration {
             SELECT RAISE(ABORT, '$table.name must not be NULL: a row nothing can refer to cannot be read, reconciled or purged');
         END
         """.trimIndent()
+}
+
+/**
+ * Turns a drain that was blocked on players into a *block* rather than a failure.
+ *
+ * **No column changes, and it still needs a migration**, for the same reason
+ * [V3SplitWorldSavedInstant] did: the meaning of an existing key changed. A row
+ * written before this with `drain.failure.reason=DRAIN_NO_DESTINATION` says
+ * *there are players on this server and nowhere to send them, which is the
+ * protocol working*. That reason now means something else entirely — *a
+ * destination was searched for and the fleet had no capacity* — and the two want
+ * opposite treatment. Read by the new code the same bytes would put a healthy
+ * server's drain into the escalation path, so every stored one raises
+ * `NEEDS_ATTENTION` the moment it is older than `drainAttentionAfter`. Which is
+ * to say: every drain that was quietly waiting for a busy evening to end comes
+ * back from an upgrade calling for a human, and the operator is sent to look at a
+ * server where people are simply playing. That is the exact alert-fatigue failure
+ * this whole change removes, delivered by the upgrade that removed it.
+ *
+ * So each status document is rewritten:
+ *
+ * - `drain.failure.*` with a retired reason becomes `drain.blocked.*`. The
+ *   message carries over verbatim — it described what was true and still does —
+ *   `occurredAt` becomes `since` and `attempts` becomes `observations`. Those two
+ *   are renames, not re-derivations: an operator's "waiting since" must not jump
+ *   to the moment of the upgrade.
+ * - the *top-level* `failure.*` with a retired reason is dropped. The reconciler
+ *   copies a drain's failure onto `status.failure`, so these rows carry the same
+ *   fact twice, and a blocked drain records no failure at either level.
+ *
+ * Two things are deliberately left alone. The `drain_state` projection column
+ * still reads `DRAIN_FAILED`, because a blocked drain still parks there — the
+ * state means *not advancing*, and only the record beside it says why. And the
+ * stored `conditions` array is untouched: the next pass re-derives every
+ * condition from the fields, and a migration inventing a `lastTransitionAt` for
+ * the new `DRAIN_BLOCKED` entry would be dating something it cannot know. Both
+ * self-correct on the first pass after the upgrade; neither is read for a drain
+ * decision in the meantime.
+ *
+ * `DRAIN_AWAITING_ZERO_PLAYERS` is handled beside `DRAIN_NO_DESTINATION` even
+ * though no released build ever wrote it. It existed for exactly one commit, as
+ * the intended home for the waiting case before it was decided the case is not a
+ * failure at all, and a dev store opened against that commit is a real file on
+ * somebody's disk. Being total over the retired vocabulary costs one branch;
+ * being nearly total costs a store that will not open, because the value is no
+ * longer in the enum and the decode would report the row corrupt.
+ *
+ * Like V2 and V3 this works at the key level and never builds a `:schema` object,
+ * so it keeps producing the same result after `DrainStatus` moves again — and it
+ * pins the document encoding it was written against for the reason set out on
+ * [V3SplitWorldSavedInstant.ENCODING_WRITTEN_AGAINST].
+ */
+private object V5BlockedDrainIsNotAFailure : Migration {
+    override val version: Int = 5
+    override val description: String = "record a drain blocked on players as a block rather than as a failure"
+
+    private const val DRAIN_FAILURE = "drain.failure"
+    private const val DRAIN_BLOCK = "drain.blocked"
+    private const val STATUS_FAILURE = "failure"
+
+    /**
+     * The reasons that meant "waiting for players" when these rows were written.
+     *
+     * String literals rather than `FailureReason` values, and that is the rule
+     * rather than an accident: one of the two is not in the enum any more, and the
+     * other one's *meaning* is what this migration exists to correct. A shipped
+     * migration has to keep asking the question it was written to ask, which it
+     * cannot do through a type that has since moved on.
+     */
+    private val RETIRED = setOf("DRAIN_NO_DESTINATION", "DRAIN_AWAITING_ZERO_PLAYERS")
+
+    /** Frozen too, for the same reason. See [RETIRED]. */
+    private const val BLOCK_REASON = "AWAITING_ZERO_PLAYERS"
+
+    /** See [V3SplitWorldSavedInstant.ENCODING_WRITTEN_AGAINST]: pinned, never read from the live constant. */
+    private const val ENCODING_WRITTEN_AGAINST = 1
+
+    override fun apply(connection: Connection) {
+        val rewritten = mutableListOf<Pair<String, String>>()
+        connection.query("SELECT name, status_doc, doc_encoding FROM server_status") { rows ->
+            while (rows.next()) {
+                val name = rows.getString("name")
+                val encoding = rows.getInt("doc_encoding")
+                val what = "status of `$name`"
+                if (encoding != ENCODING_WRITTEN_AGAINST) {
+                    // Loudly, and before anything is written. A migration that
+                    // skipped rows it did not recognise would leave some drains
+                    // reading a healthy wait as a fleet-capacity failure, which is
+                    // the whole thing this exists to prevent.
+                    throw StoreException.Corrupt(
+                        "$what is encoded at version $encoding, but this migration only understands " +
+                            "$ENCODING_WRITTEN_AGAINST",
+                    )
+                }
+                val document = PropertyDocument.parse(rows.getString("status_doc"), what)
+                if (!document.retired(DRAIN_FAILURE) && !document.retired(STATUS_FAILURE)) continue
+                rewritten += name to rewrite(document, what)
+            }
+        }
+        for ((name, document) in rewritten) {
+            connection.update("UPDATE server_status SET status_doc = ? WHERE name = ?") {
+                setString(1, document)
+                setString(2, name)
+            }
+        }
+    }
+
+    private fun DocumentReader.retired(prefix: String): Boolean = string("$prefix.reason") in RETIRED
+
+    private fun rewrite(
+        document: DocumentReader,
+        what: String,
+    ): String {
+        val block = document.retired(DRAIN_FAILURE)
+        // The copy loop below carries any pre-existing `drain.blocked.*` across,
+        // so writing the derived one on top would trip `DocumentWriter`'s
+        // duplicate-key guard and leave an `IllegalArgumentException` crossing the
+        // store boundary — where `:core` has only `StoreException.retryable` to
+        // classify by. Nothing that wrote these rows could produce the
+        // combination, so refuse in the store's own vocabulary and name the row: a
+        // store that will not open is when an operator most needs to be told which
+        // one to go and look at.
+        //
+        // Every key under the prefix, not the one that happens to be written
+        // first. The rewrite below writes four, so a guard naming one of them
+        // leaves a row carrying only `message`, `since` or `observations` to
+        // collide anyway — which is this refusal failing in exactly the way it
+        // exists to prevent. Prefix, so a key added to the block record later is
+        // covered without anyone remembering to come back here.
+        val existingBlock = document.keys().filter { it.startsWith("$DRAIN_BLOCK.") }
+        if (block && existingBlock.isNotEmpty()) {
+            throw StoreException.Corrupt(
+                "$what records a drain that is both blocked (${existingBlock.joinToString(", ") { "`$it`" }}) " +
+                    "and failed with `${document.string("$DRAIN_FAILURE.reason")}`. Nothing that wrote these " +
+                    "rows could produce that combination, so the row has been edited by hand and this " +
+                    "migration cannot tell which of the two the operator meant. Refusing to guess: remove " +
+                    "either the `$DRAIN_BLOCK` keys or the `$DRAIN_FAILURE` ones and open the store again",
+            )
+        }
+        val writer = DocumentWriter()
+        for (key in document.keys()) {
+            if (block && key.startsWith("$DRAIN_FAILURE.")) continue
+            // The reconciler mirrors a drain's failure onto the status, so this is
+            // the same fact one level up. A blocked drain has neither.
+            if (document.retired(STATUS_FAILURE) && key.startsWith("$STATUS_FAILURE.")) continue
+            writer.put(key, document.string(key))
+        }
+        if (block) {
+            writer.put("$DRAIN_BLOCK.reason", BLOCK_REASON)
+            // Verbatim. It said "the server keeps running, the drain resumes once
+            // it is empty", which is exactly as true after this migration as
+            // before it, and rewriting operator prose in a migration is how a
+            // stored message stops matching the code that produced it.
+            writer.put("$DRAIN_BLOCK.message", document.string("$DRAIN_FAILURE.message"))
+            writer.put("$DRAIN_BLOCK.since", document.string("$DRAIN_FAILURE.occurredAt"))
+            writer.put("$DRAIN_BLOCK.observations", document.string("$DRAIN_FAILURE.attempts"))
+        }
+        return writer.render()
+    }
 }

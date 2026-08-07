@@ -164,3 +164,617 @@ force stop". See [[drain-audit-danger-patterns]], especially items 7 and 8.
   stands unweakened — a server the loop has given up on must be surfaced, and
   here it can be, without writing anything to the corrupt row. See
   [[drain-audit-danger-patterns]] item 30 for what `:api` says instead today.
+
+## What the Velocity proxy kind supersedes (round 11, pre-implementation)
+
+Reviewed against `main` at `c85e7fd` before any proxy code existed. The human
+decisions above stand as decisions; what follows is which of *my* rulings were
+reasoned from the absence of a proxy and do not survive it.
+
+- **"Adding a proxy later fills in bodies rather than reshaping the flow" is
+  false.** `requireEmpty` wraps `SEALED`, `TARGET_RESOLVED` and `TRANSFERRING`,
+  so the three states that exist to move players abort on players being present.
+  The flow does get reshaped: the zero-player gate must apply from `SAVING`
+  onward only. See [[drain-audit-danger-patterns]] item 35.
+- **Round 7's cancellation window splits.** It survives for a *transfer* — the
+  effect is observable as the SLP count, so a repeat is benign — but only while
+  nothing gates a re-issue on a stored "transfer issued" flag. It does **not**
+  survive for the seal or the deregistration, and not because a repeat is
+  harmful: those are the first effects that need *undoing* on abort, which
+  inverts item 23's safe direction. See items 32 and 33.
+- **`DRAIN_NO_DESTINATION`'s escalation exclusion does not survive.** Its premise
+  ("this resolves itself when they log off") holds only for a drain with no
+  transfer counterparty. Split the reason; keep the exclusion on the
+  waiting-for-zero-players one.
+- **`FailureStatus.init`'s `DRAIN_NO_DESTINATION ⇒ RETRYABLE` survives on the
+  merits** — "no capacity anywhere" is still something the loop should keep
+  trying, and `PERMANENT` only ever means "stop trying" — but its stated
+  justification in the KDoc is the escalation exclusion, which does not. Re-argue
+  it rather than inheriting it.
+- **The round-5 actor mapping survives unchanged and gains rows.** SLP-off-Netty
+  vs RCON-on-main-thread is untouched by a third actor. What is new is that the
+  proxy's player count must never replace SLP for the gate (item 36), and that a
+  proxy restart silently forgets an in-memory seal.
+
+**How to apply:** when auditing proxy drain code, the first two questions are
+"what does the abort path restore at the proxy" and "what re-asserts the seal
+after the proxy restarts". Neither has an answer in the standalone machine.
+
+## Round 11 rulings: blocked is not failed
+
+Audited on `feat/velocity-proxy-kind`. No stop path was touched; the two
+`stopWorkload` sites, `mayStop`, `saveIsCurrent`, `forgetSaveEvidence`,
+`containerIsDown` and `teardown` are byte-identical to `main`.
+
+- **`DrainState.DRAIN_FAILED` holding a blocked drain is accepted**, and the
+  strongest argument is one the implementer did not give:
+  `ReconcileLoop.RESUMABLE_DRAIN_STATES` is `DrainState.entries - DRAIN_FAILED`,
+  so a new `DRAIN_BLOCKED` state would land in the *resumable* set by silent
+  set-subtraction. The three consumers of the state — `draining`, the
+  `DRAIN_FAILED → ServerPhase.RUNNING` mapping, and the resume branch — all want
+  the same answer for a block as for an abort. The cost (`display.drainState`
+  reads `DRAIN_FAILED` on a healthy wait) is only tolerable because
+  `display.drainBlocked` is rendered beside it. Do not let a later change drop
+  that flag and leave the state as the only discriminator.
+- **No decode-time `require` for blocked/failure disjointness: upheld**
+  ([[drain-audit-danger-patterns]] item 28). But with no `require`, the *precedence*
+  is the whole specification, and it is not implemented at both sites — see item
+  39. "The failure wins" also has to say which failure; `drain.failure` and
+  `status.failure` are different fields and the pair is reachable via
+  `Reconciler.nodeFailure`.
+- **Retiring `FailureReason.DRAIN_AWAITING_ZERO_PLAYERS` and deleting
+  `escalates()`'s reason parameter is right**, and it retires both round-9/10
+  findings against that mechanism rather than moving them. `DRAIN_NO_DESTINATION`
+  now has **zero production writers**; `FailureStatus.ALWAYS_RETRYABLE` and its
+  `require` are purely forward-looking for the fleet-capacity case, which is the
+  correct posture and should be re-argued, not inherited, when that case lands.
+- **The `:app` conformance property must stay end-to-end.** `:api` cannot call
+  `:core`, so `DrainBlockRenderingTest` hand-builds the condition list; the only
+  thing proving `:core`'s derivation and `:api`'s reading of it agree is
+  `DisplayConformanceTest`. Do not let it be moved into `:api`.
+
+## Round 12 ruling: `NEEDS_ATTENTION` is a general flag, not a drain flag
+
+Charter question on `feat/velocity-proxy-kind`, read-only. No stop path examined
+was changed; the ruling is about reporting only.
+
+- **The drain-only scope is an accident and should widen to `status.failure`.**
+  `escalates()` is already class-based and drain-free; only the adapter
+  (`DrainStatus.escalated()`) is drain-shaped. See
+  [[drain-audit-danger-patterns]] items 43 and 44. `ConditionType.NEEDS_ATTENTION`'s
+  own KDoc already says the name is deliberately general and a permanently failed
+  bring-up is the next thing to raise it.
+- **The alarm-fatigue objection is real but does not apply to the two-armed
+  rule.** It only bites if `status.failure` is folded in flat. Under
+  `escalates()` a retryable node blip escalates no sooner than
+  `drainAttentionAfter`, and `recordFailure` supplies the anchor: `occurredAt`
+  survives same-reason repeats, resets on a different reason, and `Pass.draft`'s
+  `failure = null` default clears the whole thing on any successful pass. The
+  widened flag is *more* self-clearing than the drain-only one and errs quiet on
+  a flapping node. Do not re-propose the flat fold, and do not anchor a pass
+  failure on `drain.startedAt` — that fires instantly on a long-running block.
+- **`Reconciler.nodeFailure` must keep leaving `drain.failure` null.** Writing it
+  would (1) abort a drain that never ran this pass, (2) destroy the `DrainBlock`
+  via `abort`'s `blocked = null`, restarting `since`/`observations` on a
+  transport blip, and (3) collapse the very distinction `detail()`'s precedence
+  discriminates on. Node failures *inside* the drain's own steps already become
+  drain failures through `abort` (`NodeOperation.EXEC`/`STOP` → `DRAIN_STALLED`).
+- **`status.failure == drain.failure` on an aborted drain is structural, not
+  incidental**: one expression, `Reconciler.kt` `failure = progress.drain.failure`
+  in the drain branch. Three consumers now depend on it — `detail()`'s
+  precedence, migration V5's decision to drop the retired top-level `failure`,
+  and the copy itself — and nothing enforces it. It holds because line 693 is a
+  *copy*; it breaks the moment anything assigns a derived value there
+  (`?.copy(...)` to add context), and `detail()` then silently drops the "the
+  drain aborted" framing for every failed drain.
+
+**How to apply:** when the widening lands, the invariants to hold are that
+nothing branches on the condition (`NEEDS_ATTENTION` must stay with zero readers
+in `core/src/main`), that `drainMessage` receives the *drain* arm only (a widened
+flag would make it assert a blocked drain is failing — item 27), and that
+`attentionMessage` never says "the drain cannot finish" about a server with no
+drain and never asserts joinability. `DisplayConformanceTest` needs a second
+property — *a server carrying a PERMANENT failure is flagged, whatever its badge*
+— driven through `forbiddenTransition`, which is the case that renders `RUNNING`.
+
+## Round 12 rulings: the Velocity control surface (`:velocity-plugin`)
+
+Audited on `feat/velocity-proxy-kind` with `:core` not yet written. The module
+contains no container operation at all, so none of the seven stop invariants can
+be violated from inside it; every finding is about what it makes `:core` able or
+unable to do correctly.
+
+- **The seal/deregistration separation holds.** Only `DELETE /v1/backends/{name}`
+  reaches `unregisterServer`. There is no set-assert endpoint, so no backend can
+  be removed by omission; `ADDRESS_CONFLICT` refuses the upsert that would have
+  hidden an unregister inside step 2; a finished sweep and a seal touch only
+  `transfers` and `AdmissionRegistry`. Do not re-derive this — re-check it only if
+  a list-shaped assert or a force flag is proposed.
+- **`PlayerHandle` having no `disconnect` is real, not decorative.** The sweep is
+  written against the port, the adapter uses `connect()` (never
+  `connectWithIndication`/`fireAndForget`), `classify` is exhaustive with no
+  `else`, and `TransferNeverKicksTest` greps the module's sources. Every failure
+  branch counts and leaves the player attached.
+- **`InitialChoice.AdmitAnyway` is the right trade** (Velocity issue 689: a
+  login-path `denied()` strands the client). The leak is bounded by `:core`'s own
+  SLP zero-player gate, so it costs convergence, never data. What is *not* right
+  is the claim that the leak is always counted — see
+  [[drain-audit-danger-patterns]] item 45.
+- **Refusing `DELETE` on a populated backend with no force flag is correct** and
+  does not by itself wedge `:core`: the occupancy resolves when players leave or
+  when the backend dies. The only path that makes it permanent is the wedged
+  sweep (item 43), and the fix belongs there.
+- **The proxy's own seal (`PUT /v1/proxy`) is load-bearing for convergence and
+  nothing says so.** With every backend sealed, `onInitialChoice` returns
+  `AdmitAnyway` for every joining player, so a fleet-wide drain never reaches
+  zero. `onPreLogin` is the only mechanism that stops it, and it is safe (a
+  refused login is not a disconnect). `:core` must assert it before sealing the
+  last admitting backend.
+- **`/v1/state`'s `backends[].players` is the tempting wrong gate.** It is the
+  proxy's view and cannot see a client connected straight to the backend port
+  ([[drain-audit-danger-patterns]] item 36). It is the right source for the
+  `BACKEND_OCCUPIED` guard — a directly-connected player is unaffected by
+  deregistration — and the wrong source for the stop gate. Both facts need to be
+  in the protocol doc before `:core` reads the field.
+
+**How to apply:** when `:core`'s proxy client lands, the first three questions are
+(1) does it keep the transfer retry count itself, since a fresh sweep zeroes the
+tallies, (2) does it treat a counter going *down* as a proxy restart that voids
+evacuation evidence, and (3) does it ever send a `PUT` address derived from the
+desired definition rather than the running container.
+
+## Round 14 rulings: the transfer bound is a clock
+
+- **A purely temporal bound satisfies the plugin author's handover, and the count
+  loses nothing.** The handover ("`:core` owns the step-4 retry limit, because a
+  fresh sweep zeroes the plugin's tallies") is a statement about *where* the bound
+  lives, not about its unit: it forbids `:core` inferring "stop asking" from the
+  proxy's own counters. A duration held by `:core` is orchestrator-side, survives a
+  fresh sweep and survives a plugin restart, so it implements the handover rather
+  than reinterpreting it. A count-based ceiling protects nothing here — an ask
+  costs the counterparty nothing (start-or-join dedupes) and a settled sweep can
+  restart every pass — so its removal is a deletion, not a gap. Do not re-propose
+  a count. What the trade *does* cost is that the bound now rests on one nullable
+  timestamp: see [[drain-audit-danger-patterns]] items 58 and 59.
+- **`wanted` dropping undecodable rows is not a choice between two unrepairable
+  states.** The framing ("repair it and the sweep suppresses GC for a whole pass")
+  is a false dilemma; the store already publishes the third option.
+  `ServerListing.unreadable` carries the stored name for exactly this consumer, so
+  `wanted` should be the matched names **union** the unreadable names: per-pass GC
+  keeps working for every readable row and only the specific unreadable names are
+  exempted. Not a data-loss path — the plugin refuses `DELETE` on an occupied
+  backend with no force flag — so it is a warning, but it became live rather than
+  theoretical with `DefinitionCodec.rebuilding`, which deliberately widens what
+  counts as a corrupt definition row.
+
+## Round 15 rulings: the anchor holds, the resume does not
+
+- **`DrainStatus.transferStartedAt` is the right anchor and the enumeration
+  checks out.** Every path that can reach `exhausted` passes a stamp: both
+  `secureDestination` branches that enter `TARGET_RESOLVED` with a router, and
+  `transferStep`'s players-online branch for the three paths that never had a
+  bodied step-3 pass. The no-router entry to `TARGET_RESOLVED` does not stamp and
+  does not need to — `transferStep` short-circuits to `requireEmpty` whenever
+  `router == null || destination == null`. Nothing clears it: `moveTo`,
+  `forgetSaveEvidence`, `forgetSaveConfirmation`, `dropUnusableSaveEvidence`,
+  `abort`, `blocked`, `restoreRegistration` and the container-down branch are all
+  `copy`-based, and the only `drain = null` sites in `Reconciler` discard the
+  whole record with the workload. Persistence does not reopen critical 2: the key
+  is nullable (`PropertyDocument.instant` returns null on a missing key),
+  `ENCODING_VERSION` is unchanged at 1, and an old row costs one extra allowance.
+  Do not re-litigate the anchor.
+- **The ruling on module ownership: a two-line codec edit by the `:core` owner is
+  what the rule intends.** CLAUDE.md's "changes spanning `:schema` or `:cri` go to
+  a single agent as one unit" is a rule against *leaving one side stale*, not a
+  rule about who may type in which directory. The `:store` and `:api` edits here
+  are the mechanical consequence of one `:schema` field — one `scope.put`, one
+  `reader.instant`, one `put` in `ServerJson` — and routing them would have split
+  a single semantic change across three reviews with a window in which the field
+  existed and was not persisted. The line to hold is behavioural: route when the
+  other module has to make a *decision* (a migration, a precedence, a badge rank),
+  keep it when the other module only has to carry the value.
+- **A green suite with no test XML is not a result.** A wedged Gradle daemon that
+  reports `BUILD FAILED` and writes no reports is indistinguishable from "nothing
+  ran"; treating it as an unknown was correct. Never accept a signed count that
+  cannot be traced to per-module XML.
+
+## Round 16 rulings: the alarm hysteresis
+
+- **The inversion (`derivedOnly` → `workDone`, default false) is right and the
+  claim about what it does and does not close checks out.** The implementer's
+  ruling — critical 1 closed, critical 2 not, because "a save says nothing about
+  a stop" — is correct: `save()`'s `Confirmed` branch does real work and must
+  claim it, so the failure-clearing rule cannot be `workDone` alone. Splitting
+  the backoff question (`workDone`) from the recovery question (`workDone &&
+  !resuming`) is the right split, and the stated reason (a drain that emptied
+  after a play session must not wait out a five-minute backoff) is the reason.
+  Do not re-propose a single rule for both.
+- **The hysteresis creates no stuck state *inside* `DrainState`.** A resume that
+  exits `DRAIN_FAILED` makes the next pass `resuming = false`, so the ordinary
+  step that clears the failure is always one pass away. The stuck state is one
+  level up, in `Reconciler`'s permanent-failure gate — see
+  [[drain-audit-danger-patterns]] item 67. Answer the state-machine question and
+  the gate question separately; they look like the same question.
+- **The once-per-cycle `save-all flush` on a parked drain is the correct
+  resolution and should not be suppressed.** The evidence genuinely expires
+  across a backoff longer than `saveEvidenceMaxGap`, invariant 3 requires a fresh
+  confirmation, `save-all flush` is idempotent, and the pass that issues it has
+  just confirmed zero players. It is only acceptable *because* the escalation now
+  fires; a re-save loop that told nobody would be item 63 again.
+- **A green targeted sabotage is not evidence that a test is sound; a targeted
+  sabotage and a whole-file revert prove different things.** Recorded as a
+  general rule after the fifth instrument-that-cannot-fail in this project. The
+  targeted sabotage proves the assertion is wired to the line it names; the
+  whole-file revert proves the assertion is not *already satisfied* by something
+  else in the scenario. A stale-block assertion passed a targeted sabotage
+  because a later `abort` had cleared the block anyway, and the revert only went
+  red on an unrelated wording assertion first. Require both, and when the revert
+  goes red on a different assertion than the one under test, that is not a pass —
+  re-run it with the other assertions removed.
+
+## Round 17 rulings: the re-probe, the anchor and the three questions asked
+
+- **The `NonCancellable` re-probe is the right side of the trade, for a reason
+  the code does not give.** Ruled at the seventeenth audit. The region is one SLP
+  ping bounded by `PaperServerAgent.PROBE_TIMEOUT` (10 s) and by `:cri`'s
+  `withDeadlineAfter`, so a shutdown waits ten seconds, not the 180 s save
+  timeout `Main` promises never to wait out. What it buys is invariant 5 — the
+  save is not repeated across a cancellation — **not** the permanent wedge the
+  comment claims, which that branch cannot reach (see
+  [[drain-audit-danger-patterns]] item 72). Do not widen the shield on the
+  strength of the wedge argument, and do not narrow it: the round-7 "prefer the
+  benign repeat" ruling was about the *exec*, not about a record already in hand.
+- **`containerIsDown` keeping the recorded failure: confirmed.** The pass ran no
+  step, so it has no evidence about why the drain was failing, and clearing a
+  permanent `DRAIN_SAVE_TIMEOUT` there erases the one record an operator arrives
+  looking for. The sixteenth audit's harm through it is independently closed by
+  the parked clause on the gate, since that branch moves to `STOPPING` and a
+  non-`DRAIN_FAILED` drain no longer arms `isBlockedByPermanentFailure`. Do not
+  re-open.
+- **`settleRecords` clearing `blocked` unconditionally: the finding stays open,
+  and the grounds offered for closing it are wrong.** The conclusion (do not
+  narrow, do not add a third carrier on speculation) is right; the argument
+  ("clearing only on `workDone` cannot fire") is false for a proxied drain that
+  resumes into `secureDestination`'s `Chosen`, which is the file's one documented
+  `workDone = false` branch. Leave the behaviour, fix the sentence.
+- **The escalation reports the re-save cycle; it does not pace it.** Ruled that
+  the once-per-cycle `save-all flush` is still permissible — idempotent, on a
+  server a probe just confirmed empty, and now escalated — but the premise "the
+  lap is bounded" does not hold: `abort → Retry` alternating with
+  `resume → save → Progressed` resets `WorkQueue.succeeded` every other pass. If
+  pacing is ever wanted, the place is `resumeInto`'s `workDone` rule for a drain
+  already carrying `resaveForcedAt`, not the failure rule kept separate in rounds
+  15 and 16.
+
+## Round 19 rulings: the record-level rule, and what it does not reach
+
+Audited at `0061f5c` (both `feat/velocity-proxy-kind` and `fix/save-evidence-stamping`).
+No critical. The two `stopWorkload` sites, `mayStop`, `letGoAndStop`, `teardown`
+and `LocalNode.removeWorkload` are unchanged by the round-19 diff.
+
+- **The four-state claim is genuinely retired, not relocated.** The old exemption
+  was safe only because `worldSavedAt` was provably null in `SEALED`,
+  `TARGET_RESOLVED`, `TRANSFERRING` and `SAVING`. With the pass-entry adoption,
+  for every state, `pass.occupancy.online > 0` implies the drain handed to that
+  state has `worldSavedAt == null` — by one expression, not by an enumeration.
+  The only writer of `worldSavedAt` (`save`'s `Confirmed` → re-probe
+  `Empty`/`Unanswered`) sits behind `requireEmpty`, so no pass can mint a
+  confirmation while its own occupancy is positive. Do not re-derive; re-check
+  only if a state gains a body above its gate or `save` gains a second writer.
+- **The "net repairs the record, adoption governs the decision" ruling holds**,
+  and the condition under which they stop agreeing is a step that reads
+  `saveIsCurrent`/`mayStop` before `requireEmpty`. There is exactly one today —
+  `resumeInto`'s ladder, ungated for a router-bearing subject — and it cannot
+  reach a stop. See [[drain-audit-danger-patterns]] items 79 and 81 for the two
+  residuals: the pair is jointly pinned and individually unpinned, and the net is
+  unreachable so it can only ever be pinned structurally.
+- **`DrainSubject.saveTimeout` does not weaken the Node/Scheduler/Store seam.**
+  It is a per-workload spec value with one reader, node-independent, resolved
+  from the definition the same way `stopGracePeriod` and `playerTransferTimeout`
+  already were; `Node.kt`'s change is KDoc only. `Duration.ZERO` for the proxy is
+  inert in practice — an unlabelled proxy container reads `holdsWorldData = true`
+  (`VelocityProxyAgent.contractOf`), so `goingRoundInCircles` *is* reachable for
+  one, but only on a first lap where `circling == 0`, and the `SAVING` pass after
+  it aborts `PERMANENT` on `SaveOutcome.Unconfirmable`. It becomes a live
+  30-second bound the day a proxy gains a save channel.
+- **The fixture root cause generalises and belongs with the instrument rules.**
+  *A fixture whose defaults are derived from one another cannot fail a test that
+  confuses them.* `Fixtures.paperDefinition` had `stopGracePeriod = saveTimeout + 60s`
+  hard-wired, so every `:core` test moved the two together and the substitution in
+  `goingRoundInCircles` was untestable. This sits beside the round-16 rule (a
+  targeted sabotage and a whole-file revert prove different things) and the
+  round-18 one ("unobservable in this harness" is usually a claim about the
+  default fixture) — all three are the same family: the instrument's *defaults*
+  are part of what it can express.
+
+## Round 21 rulings: the two deviations, and where the pin stops
+
+Audited at `6d291d7` (`fix/save-evidence-stamping` = `feat/velocity-proxy-kind`).
+No critical. The only executable change in `:core` main sources was extracting
+`adoptSaveClause` and rewording one operator message; both `Node.stopWorkload`
+call sites, `mayStop`, `saveIsCurrent`, `letGoAndStop`, `requireEmpty`,
+`Reconciler.teardown` and `LocalNode.removeWorkload` are byte-identical.
+
+- **`\breturn\b` without a `(?!@)` lookahead is right.** Confirmed against the
+  relayed prescription, which was wrong. `return@advance` *is* an exit from
+  `advance`; excluding it would exclude a real one. The only cost is a false red
+  on a lambda-local `return@forEach`, which is a red on a refactor rather than a
+  green on a defect. `codeOf` strips string literals *before* truncating at `//`,
+  so both ways prose could fake the keyword are closed; block comments are not
+  stripped, which is the same safe direction. Do not re-propose the lookahead.
+- **Classifying the stop-scan's files beats listing them, and the price is
+  item 90.** The reasoning (a literal set becomes something a distributed `Node`
+  has to be edited past) matches CLAUDE.md's Node seam and should stand. What it
+  bought is an exemption keyed on a *name*, so a same-named private wrapper is
+  exempt for the wrong reason. Repair the predicate, not the approach.
+- **A source-scanning drain test standing in the way of a second `Node`
+  implementation: upheld.** A `RemoteNode` with an `override` passes untouched;
+  only a new *decision point* to stop a container fails, and CLAUDE.md requires
+  every container operation to go through the Node abstraction, so a red there is
+  the system working. Two caveats to carry forward: the exemption is by name
+  (above), and the rescheduling path the test's own KDoc names as its motivation
+  reaches `Node.removeWorkload`, which is outside the scan's alphabet entirely.
+- **`awaitStopped`'s `mayStop` gate has no behavioural backstop.** Its detail
+  string appears in no test. Both `goingRoundInCircles` scenarios in `DrainTest`
+  end at `harness.node.stops.shouldBeEmpty()`, i.e. they exercise the
+  `DEREGISTERED` gate and never enter `STOPPING`. So that gate is pinned by a
+  presence assertion and by one mutation that deletes it outright. See
+  [[drain-audit-danger-patterns]] item 89 for the narrowing that walks through
+  both.
+
+## Round 22 rulings: the classifier, and the three judgements sustained
+
+Audited at `e95f814` (`fix/save-evidence-stamping` = `feat/velocity-proxy-kind`).
+No critical. `:core` main-source change was KDoc only; both `Node.stopWorkload`
+call sites, `mayStop`, `saveIsCurrent`, `letGoAndStop`, `requireEmpty`,
+`goingRoundInCircles`, `Reconciler.teardown`/`teardownProxy` and
+`LocalNode.removeWorkload` are byte-identical to the previous audit.
+
+- **All three offered judgements sustained, and the second is provable rather than
+  argued.** `DrainController.stop` is reached only from `letGoAndStop`, whose
+  no-router / already-deregistered arm calls `stop(pass, drain)` with the *same*
+  drain the `DEREGISTERED` branch just tested `mayStop` on, with identical
+  arguments in the same pass; the `Asserted` arm returns without stopping. So a
+  narrowing of `stop`'s own gate is invisible to every input by construction, not
+  by enumeration. Stating it in the KDoc and naming the extract-and-unit-test
+  alternative is the right posture — do not manufacture a scenario for it.
+- **The `adoptSaveClause` two-argument shape is right.** Fusing receiver and
+  reading needs every `PlayerReading` to carry a drain, including `Unanswered`,
+  which is the collapse `readPlayers` exists to refuse (its three callers disagree
+  about silence). The structural receiver pin (`callee(reading.value)`) plus D8 is
+  the available substitute.
+- **`removeWorkload`'s pin being "one deciding file, not a gate" is right in kind
+  and wrong in granularity** — see [[drain-audit-danger-patterns]] item 93. The
+  posture (a red routes to a drain audit rather than to an appended list) is the
+  one to keep; the assertion as written will not fire on the rescheduling case it
+  names, because rescheduling is reconcile-loop work and `Reconciler.kt` is already
+  on the list.
+- **The round-21 gate warning is genuinely closed.** `DrainTest`'s
+  `a stop is not re-issued at a container that restarted underneath the drain`
+  reaches `awaitStopped`'s gate with the probe silent so the `Occupied` arm cannot
+  fire, asserts the `goingRoundInCircles` detail string that previously appeared
+  nowhere in the suite, and ends on an ordering assertion (`saves == 2` at the
+  second stop) rather than on a refusal — so it cannot be satisfied by a drain that
+  simply never finishes. D10 (`&& !drain.playersEvacuated`) is caught by it because
+  the scenario asserts `playersEvacuated` is true at that point.
+
+## Round 23 rulings: the backstop's argument, and the two judgements sustained
+
+Audited at `3dfc643` (`feat/paper-server-kind` = the branch under review). No
+critical — the fifth clean round in six. `:core` main sources carry **zero**
+executable change this round (`git diff` of the round is three KDoc lines in
+`DrainController`); `Reconciler.kt`, `LocalNode.kt`, `WorkloadView.kt` and
+`Node.kt` are byte-identical.
+
+- **The new test carries the constructive argument, not its shadow — with one
+  premise left in prose.** `stop has one caller, reached from a branch that has
+  already asked mayStop` really does pin what makes the backstop unreachable, and
+  the `private`-on-both-declarations precondition is asserted rather than assumed.
+  What it does not pin is "the same drain with the same arguments", which is the
+  premise that decides whether the backstop is dead or live. See
+  [[drain-audit-danger-patterns]] items 96 and 97 — 97 is the reason this is a
+  warning and not a critical.
+- **Both offered judgements sustained.** D17's absence is right: `internal suspend
+  fun stop` is an `EXPOSED_PARAMETER_TYPE` error against the `private class
+  DrainPass` (`DrainController.kt:864`), and the harness scores a non-compiling
+  mutation UNKNOWN → failure, so adding it would have produced a red run that
+  proved nothing. Writing the reason where the mutation would have gone, rather
+  than skipping the number, is the right posture. The rename is right for the
+  reason given — the audit trail reads those strings — and the follow-through is
+  incomplete, see item 99.
+- **Round 22's three warnings are all genuinely closed.** Item 93: `deciding` is
+  now one entry per call, `(path, enclosing.name)`, and D15 demonstrates the file
+  unit was blind. Item 94: the asymmetry of *strength* between the two verbs is
+  now stated. Item 95: the omitted-container residual is named at
+  `DrainController.kt:41` and in the `DrainWiringTest` bullet, with the containerd
+  2.3.3 precedent, and my re-read of `WorkloadView.kt:171-196` and
+  `LocalNode.kt:558-563` confirms the description is exact.
+
+## Round 25 rulings: the seal waiver, and the pre-flight's aim
+
+Audited at `079f9dd` (`feat/velocity-proxy-kind` = `fix/save-evidence-stamping`).
+No critical. `DrainController.stop`, `awaitStopped`, `mayStop`, `requireEmpty`,
+`letGoAndStop`, `Reconciler.teardown`/`teardownProxy` and `LocalNode.removeWorkload`
+are byte-identical to round 24.
+
+- **`sealIsPrecondition` is narrow by construction, not by enumeration, and the
+  construction is one line in `Reconciler`.** The waiver fires only when
+  `router == null` and the pass read a fresh `PlayerReading.Empty`.
+  `PaperDrainSubject(seal = link, router = link)` (`Reconciler.drain`) gives every
+  Paper subject `seal != null ⟺ router != null`, so a standalone server
+  short-circuits at `NothingToSeal` before `abortSeal` and a backend always parks.
+  `ProxyDrainSubject` is the only reachable waiver. That equality is the whole
+  narrowness argument and nothing in the types enforces it — re-check it whenever
+  `PaperDrainSubject`'s construction moves.
+- **The `sealRequestedAt`/`workDone` claim checks out.** `sealed = hold ==
+  SealHold.Asserted`, `Asserted` comes only from `SealOutcome.Asserted` with
+  `!admits`, `DRAIN_REQUESTED` is entered once (the resume ladder tops out at
+  `SEALED`), and `sealRequestedAt` has no gating reader anywhere — `:store` and
+  `:api` carry it, nothing branches on it. So the `else null` erases nothing.
+- **The RETRYABLE/PERMANENT split for the pre-flight and the token branch:
+  sustained**, on the mechanism rather than the preference — see
+  [[drain-audit-danger-patterns]] item 108. Note the cost that is not stated: a
+  RETRYABLE failure escalates only after `drainAttentionAfter`, where PERMANENT
+  fires at once (round 8's rule), and the round-8 justification — "the documented
+  remedy is a human" — is true of both new cases too.
+- **`anyAdmitting` being false for an empty fleet is functional, not a drain
+  concern.** With no backends registered a joining player has nowhere to be sent
+  anyway; the seal changes "no available servers" into a refused login and
+  self-corrects the moment a backend enrols. The drain-relevant half of that same
+  expression is that `assertBackends` is the *only* assertor of `admits = true` —
+  item 110.
+- **The backend-behind-a-dead-proxy exit is real, with two qualifications.**
+  `ProxyFleet.resolve` reads the fleet fresh each pass, so losing the claim makes
+  the subject standalone and `holdSeal` returns `NothingToSeal`. But (a) deleting
+  the proxy *definition* is not enough on its own — a tombstoned row still claims
+  the backend until `teardownProxy` purges it, which needs the proxy's own
+  aggregate count to reach zero; and (b) `spec.backends.selector` is **not** in
+  `canonicalSpec`, so narrowing the selector un-claims the backend instantly with
+  no container operation at all. (b) is the remedy to document.
+
+## Round 27 rulings: the permanent-only release, and what bounds the wait
+
+Audited at `d4bda89` (`feat/paper-server-kind`). One critical, on the *completeness*
+of round 26's fix rather than on the fix itself. `stop`, `awaitStopped`, `mayStop`,
+`requireEmpty`, `saveIsCurrent`, `Reconciler.teardown`/`teardownProxy`,
+`WorkloadView.kt` and `LocalNode.kt` executable code are byte-identical to round 26.
+
+- **The `deregisteredAt`-guard pushback is right and the relayed severity was
+  wrong.** `releaseSeal` returns on `subject.router != null`, and `deregisteredAt`
+  is written only by `letGoAndStop` and `releaseRegistration`, both of which need a
+  `DrainRouter`. The body is therefore unreachable with `deregisteredAt` set, and if
+  it ever were reachable the `PUT`'s register half is the same compensation
+  `restoreRegistration` performs on a park — a record inconsistency, not a stop
+  hazard. Do not re-raise this as a stop-ordering finding.
+- **The retryable-park-stays-sealed cost is bounded, and by a mechanism worth
+  naming.** A sealed proxy's population is monotonically non-increasing, and the
+  round-25 waiver (`sealIsPrecondition` → `Waived` on a fresh `PlayerReading.Empty`)
+  lets the drain finish *through* a dead control endpoint once it reaches zero. So
+  the exit is "the last live session ends", not "the fault clears" — the three exits
+  the implementer listed understate it. The genuinely unbounded case is the drain
+  that never got its seal on in the first place; see
+  [[drain-audit-danger-patterns]] item 118.
+- **On the open product decision (a fleet that never empties):** "leave it" is the
+  only safe option of the three. A sticky give-up state reproduces round 26's
+  critical if it releases the seal and is a permanent fleet blackout if it does not;
+  a declared maintenance window that ends in a stop is `failure-modes.md` item 7.
+  What is missing is reporting, not a lever.
+
+## Round 28: the gated resume's new seal assertion does not reach this shape
+
+`DrainController.resume` now runs `holdSeal` before `requireEmpty` whenever
+`gated` — and `gated` is `subject.router == null`, which is true of a standalone
+`PaperServer` as well as of a proxy. It is a no-op here: `PaperDrainSubject` takes
+one `ProxyFleet.linkFor` result as both `seal` and `router`, so a standalone
+server has `seal == null` and `holdSeal` returns `NothingToSeal` on the first
+line. Consequences worth keeping:
+
+- Every behavioural change of round 28 — the extra control call per parked pass,
+  `blocked` becoming a `RETRYABLE` `PROXY_CONTROL_UNREACHABLE`, `NEEDS_ATTENTION`
+  after `drainAttentionAfter` — is **proxy-only**, one object per fleet. That
+  bounds the alarm-fatigue exposure and is the answer to give when the change is
+  argued against round 8.
+- The same fact removes the defence for `blocked`'s `failure = null` on this
+  shape. "The door is shut, so the wait is real" is a sentence about a subject
+  that has a door. This one does not; see danger pattern 123 for the delete +
+  unconfirmed-save sequence it produces.
+
+## Round 30 rulings: the narrowed gate, the cap, and a design of mine that was wrong
+
+Audited at `1db654b` (`fix/save-evidence-stamping` = the branch under review). No
+critical. `DrainController.stop`, `awaitStopped`, `mayStop`, `saveIsCurrent`,
+`requireEmpty`'s branching, `letGoAndStop`, `Reconciler.teardown`/`teardownProxy`
+and `LocalNode.removeWorkload` are byte-identical to round 29; the round's only
+executable changes are `parkedOnTheFailure`, one message composition in `blocked`,
+and `StopGraceCeiling` in `LocalNode.stopWorkload`.
+
+- **My round-29 prescriptions were both wrong and the implementer's third answer
+  is right.** Narrowing the retention to `!permanentFailureStopsPasses` re-creates
+  round 28's finding on the other branch, and a message-only wedge leaves
+  `DRAIN_BLOCKED` ("do not act") beside a sentence saying waiting does not finish
+  it. Fixing the *gate* is correct: a drain waiting on players is parked on
+  players, and that is the one park a later pass gets past with nobody doing
+  anything. Verified as a strict narrowing plus the three facts that make it safe —
+  see [[drain-audit-danger-patterns]] item 131.
+- **Capping beats refusing at a *stop*, and the reason is stronger than the one
+  given.** My relayed "refuse at the node" carried over round 24's ruling, which
+  was about a **create** (a refused create strands nothing). A refused *stop* is
+  `NodeException.Rejected` → non-retryable → `PERMANENT` drain abort →
+  `isBlockedByPermanentFailure` → a populated, world-holding server whose only
+  remedy is a definition edit that does not fix the row — i.e. danger patterns 104
+  and 108 arriving through the node. Do not re-propose refusing an over-long grace
+  period. The residual is that the cap is applied where `saveTimeout` is invisible
+  (item 128).
+- **The `INFINITE`/zero/negative passthrough is right today on a premise that lives
+  in `:store`.** `PropertyDocument.putDuration` refuses a non-finite duration and
+  `duration()` reads `Long` nanoseconds, so `Duration.INFINITE` cannot arrive from
+  a stored row — only from a fixture or a future caller. Zero and negative must
+  stay refusals (a zero grace is a force kill). `INFINITE` is the one value where
+  refusing is *worse* than capping, since it strands the stop exactly as above, so
+  if it ever becomes reachable the split has to be re-taken.
+- **The `troubleSince` design I proposed is declined, and the counter-scenario
+  holds.** `settleRecords` returns early on `DRAIN_FAILED`, so no block clears
+  anything; a set-once instant stamped by one transient abort survives an
+  arbitrarily long healthy wait and makes the next hiccup escalate instantly —
+  the same alarm-fatigue shape the round-12 ruling already refused for
+  `drain.startedAt`. `AttentionTest`'s *"a drain failure after a long healthy block
+  is not flagged by the drain's age"* asserts `drain.failure == null` at the block,
+  so it cannot see it. Retaining the *retryable failure* across a block instead has
+  the same defect plus a wrong badge (`DRAIN_BLOCKED` is `blocked != null &&
+  failure == null`). Do not re-propose either; the only sound carrier clears on
+  evidence proportional to what set it — some count of clean passes.
+
+## Round 31 rulings: the bound moved into the type, and where the yield went
+
+Audited at `06e29a9` (`fix/save-evidence-stamping` = `feat/velocity-proxy-kind`). No
+critical — the sixth clean round. Both `Node.stopWorkload` call sites, `mayStop`,
+`requireEmpty`, `saveIsCurrent`, `letGoAndStop`, `Reconciler.teardown`/`teardownProxy`
+and `LocalNode.removeWorkload`'s teardown plan are unchanged in substance; the round's
+executable changes are `StopGrace`/`ExecTimeout` as parameter types, the
+`DrainController.stopGrace` derivation, and `LoginPath`.
+
+- **Shortening an operator's declared grace period is acceptable, and the argument is
+  the schema's own.** `bound` always returns at least `saveTimeout +
+  MIN_STOP_GRACE_MARGIN`, which `SpecInvariants.stopGraceProblem` states *is* the
+  smallest grace that does not kill a container part-way through a save. The
+  operation is monotone downward and lands exactly on the schema's boundary; leaving
+  the row whole reopens the unbounded park. Sustained. It holds **only because**
+  `PaperDrainSubject` takes both halves off one `LifecycleSpec`, so `init`'s
+  guarantee applies to the pair `stopGrace` sees. `ProxyDrainSubject` pairs a
+  `ProxyLifecycleSpec` grace with a hard-coded `Duration.ZERO`, so a proxy gets no
+  floor — right today, and the one place a future "proxies can save" change silently
+  removes it.
+- **`awaitStopped`'s overdue check as a third caller of `stopGrace`: sustained, and
+  the stronger half of the change.** Reporting a container overdue against a period
+  the runtime was never given is danger pattern 27's shape. The `DrainWiringTest` pin
+  on the *enclosing function* rather than on a count is the right instrument.
+- **"No mutation left, because the node cannot express one" is sustained and is
+  language-enforced**, not conventional: `StopGrace` is a `@JvmInline value class`
+  with a private constructor and one factory, so there is no `copy` and no second
+  path. The residual is that the type proves the ceiling was *applied*, not that it
+  was applied with the right `saveTimeout` — `StopGrace.of(x, Duration.ZERO)` is a
+  legal call from anywhere and disables the floor, which two test call sites already
+  make. The cheapest close is one more `DrainWiringTest` line: `StopGrace.of` is
+  called only from `stopGrace`.
+- **Re-deriving D6/D13 rather than counting them caught: right.** A non-compiling
+  mutation scores UNKNOWN and proves neither "the type caught it" nor "the test caught
+  it". *"The type is a bound, not a gate"* is exact: `StopGrace` constrains the value
+  and says nothing about who may call `stopWorkload`. Counting it would have been the
+  fifth instrument-that-cannot-fail here.
+- **Open item 1 was accepted on a false premise; the other two rulings stand.** See
+  [[drain-audit-danger-patterns]] item 134. On item 3, the fixture for
+  adopt-after-collision belongs at `FakeNode` (a create answering `ALREADY_EXISTS` on
+  the first call), not at a real-runtime race — the branch under test is `:core`'s,
+  and two concurrent suites on one containerd manufacture phantoms that read like
+  label defects.
+
+**Where the yield is, after 31 rounds.** The stop *ordering* is done: three
+consecutive rounds have found nothing in it, and the last two rounds' real findings
+both came from outside the drain code — `:cri` deadline derivation and `:api`
+rendering. Point the next rounds at (1) definition durations that become transport
+deadlines, closed **once at the decode** rather than as N ceilings at N consumers
+(item 127's ruling, now three rounds unactioned — a spec `init` is still wrong there,
+because `rejectDefinition` makes a populated server undeletable), (2) paths with no
+test at all, of which adopt-after-collision is the named one, and (3) the
+message-derivation family (items 119/121/123/124 and this round's `LoginPath`), which
+loses no world directly but is what produces a manual `crictl stop`.

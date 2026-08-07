@@ -9,18 +9,23 @@ import mcorch.schema.PaperServerStatus
 import mcorch.schema.ResourceName
 import mcorch.schema.ServerDefinition
 import mcorch.schema.ServerStatus
+import mcorch.schema.VelocityProxyStatus
 import mcorch.store.ChangeFeed
 import mcorch.store.ChangeKind
 import mcorch.store.ConflictReason
 import mcorch.store.Precondition
 import mcorch.store.ResourceVersion
 import mcorch.store.ServerChange
+import mcorch.store.ServerListing
+import mcorch.store.StatePart
 import mcorch.store.Store
 import mcorch.store.StoreCursor
 import mcorch.store.StoreException
 import mcorch.store.StoredDefinition
 import mcorch.store.StoredServer
 import mcorch.store.StoredStatus
+import mcorch.store.Unreadable
+import mcorch.store.UnreadableServer
 import mcorch.store.WriteOutcome
 import java.time.Clock
 import java.time.Instant
@@ -43,6 +48,23 @@ import java.time.Instant
  * conflicts with `KIND_MISMATCH`, every [Precondition] is honoured, an
  * identical status write is a no-op, a stale `observedDefinition` conflicts,
  * and a purge of a live definition is refused.
+ *
+ * ## One clause it does not implement, on purpose
+ *
+ * [Store] promises that every definition a read hands back has been through
+ * `SpecBounds` — no duration that becomes a transport deadline above the widest
+ * value a reader would have accepted. **This fake hands the record back exactly as
+ * it was stored**, and that is a ruling rather than a gap: `:core` keeps its own
+ * ceilings for definitions that never went through a store, several tests drive
+ * those ceilings through this fake, and a fake that clamped would make every one of
+ * them assert its own arithmetic. The reasoning, and what would change it, is in
+ * `TestStoreContractTest`'s
+ * `a definition with a deadline past its ceiling comes back exactly as it was
+ * stored` — which pins the divergence so that closing it is a decision.
+ *
+ * Note the direction. Permissive about a *read* means the loop is tested against
+ * inputs wider than a real store can produce; permissive about a *write* is the one
+ * that turns a suite into a tautology, and this fake is strict there.
  *
  * [statusWrites] is what the idempotency test asserts on: a settled server must
  * not produce store traffic.
@@ -86,6 +108,20 @@ internal class TestStore(
      * the API server replacing a definition while a pass is in flight.
      */
     var beforeStatusWrite: (suspend () -> Unit)? = null
+
+    /**
+     * Rows whose *definition* this build cannot decode, reported by [listAll].
+     *
+     * A hand-edited spec document, in practice. They are entries rather than a
+     * failure so one bad row cannot break a fleet read — and a caller that drops
+     * them is not being tolerant, it is treating "this build cannot describe that
+     * server" as "that server is gone". The proxy's routing sweep is the consumer
+     * where that difference becomes an outbound `DELETE`.
+     *
+     * A null entry is the row with no name at all, which SQLite permits and which
+     * nothing can refer to.
+     */
+    val unreadableDefinitions: MutableList<String?> = mutableListOf()
 
     override suspend fun putDefinition(
         definition: ServerDefinition,
@@ -208,7 +244,9 @@ internal class TestStore(
     override suspend fun listServers(): List<StoredServer> =
         guarded {
             fleetReadThrows?.let { throw it }
-            definitions.values.map { StoredServer(it, statuses[it.name]) }
+            definitions.values
+                .filterNot { it.name in hidden }
+                .map { StoredServer(it, statuses[it.name]) }
         }
 
     override suspend fun listByDrainState(states: Set<DrainState>): List<StoredServer> =
@@ -217,10 +255,50 @@ internal class TestStore(
             if (states.isEmpty()) return@guarded emptyList()
             definitions.values.mapNotNull { definition ->
                 val status = statuses[definition.name] ?: return@mapNotNull null
-                val drain = (status.status as? PaperServerStatus)?.drain?.state
+                val drain =
+                    when (val recorded = status.status) {
+                        is PaperServerStatus -> recorded.drain?.state
+                        is VelocityProxyStatus -> recorded.drain?.state
+                        else -> null
+                    }
                 if (drain in states) StoredServer(definition, status) else null
             }
         }
+
+    /**
+     * Makes a stored definition undecodable, the way a hand-edited spec document
+     * does: the row is still there and its container is still running, but this
+     * build cannot describe it. It leaves [listServers] and appears in
+     * [ServerListing.unreadable].
+     */
+    suspend fun hide(name: ResourceName) {
+        guarded {
+            if (definitions.containsKey(name)) hidden += name
+        }
+    }
+
+    suspend fun unhide(name: ResourceName) {
+        guarded { hidden -= name }
+    }
+
+    private val hidden = mutableSetOf<ResourceName>()
+
+    override suspend fun listAll(): ServerListing =
+        ServerListing(
+            servers = listServers(),
+            unreadable =
+                (unreadableDefinitions + hidden.map { it.value }).map { name ->
+                    UnreadableServer(
+                        name = name,
+                        unreadable =
+                            Unreadable(
+                                part = StatePart.DESIRED,
+                                reason = "the stored spec document could not be decoded",
+                                retryable = false,
+                            ),
+                    )
+                },
+        )
 
     override suspend fun currentCursor(): StoreCursor = guarded { StoreCursor(revision.toString()) }
 
@@ -246,6 +324,10 @@ internal class TestStore(
     /** The status as stored, for assertions. */
     suspend fun statusOf(name: ResourceName): PaperServerStatus? =
         guarded { statuses[name]?.status as? PaperServerStatus }
+
+    /** The same, for a proxy. */
+    suspend fun proxyStatusOf(name: ResourceName): VelocityProxyStatus? =
+        guarded { statuses[name]?.status as? VelocityProxyStatus }
 
     suspend fun recordedAt(name: ResourceName): Instant? = guarded { statuses[name]?.recordedAt }
 

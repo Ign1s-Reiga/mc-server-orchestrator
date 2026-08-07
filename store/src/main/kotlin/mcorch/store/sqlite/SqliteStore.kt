@@ -5,6 +5,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import mcorch.schema.DrainState
+import mcorch.schema.DurationFormat
 import mcorch.schema.ResourceName
 import mcorch.schema.SchemaVersion
 import mcorch.schema.ServerDefinition
@@ -581,7 +582,7 @@ internal class SqliteStore(
         requireEncoding(rows.getInt("status_doc_encoding"), what)
         return StoredStatus(
             status =
-                StatusCodec.decode(
+                decodeStatus(
                     name = name,
                     apiVersion = schemaVersion(rows.requiredString("status_api_version", what), what),
                     kind = serverKind(rows.requiredString("status_kind", what), what),
@@ -591,6 +592,69 @@ internal class SqliteStore(
             resourceVersion = ResourceVersion(resourceVersion.toString()),
             recordedAt = rows.instant("status_recorded_at", what),
         )
+    }
+
+    /**
+     * Rebuilds the observation in a row, and says so when a record had to be
+     * reconstructed.
+     *
+     * [StatusCodec.decode] restores a side-effect record that a build predating the
+     * field could not have written; see [mcorch.schema.StatusReconstruction] for
+     * which record, why it is restored on the read rather than by a migration, and
+     * why reading its absence at face value routes players onto a container that has
+     * been sent `SIGTERM`. The reporting is here rather than in the codec for
+     * [decodeDefinition]'s reason: this is the module's logger, and an inference
+     * nothing says out loud is the silent reinterpretation of stored data the codec
+     * is written to refuse.
+     *
+     * ## What the line may claim, and why it is not a warning
+     *
+     * It states the **row's condition** — this stored observation carries no value
+     * for the field, and here is what was read in its place and where that came
+     * from. It deliberately does not say which build wrote the row, which it cannot
+     * know and which would usually be wrong: as
+     * [mcorch.schema.StatusReconstruction] sets out, the drain state the rule keys on
+     * has a second producer that dispatches nothing, so the *current* build writes
+     * rows the reconstruction fires on, on an ordinary path. An earlier version of
+     * this line asserted the opposite ("was not recorded by the build that wrote this
+     * observation") and would have been false most of the times it printed.
+     *
+     * That is also why it is `info` and no longer `warn`. The line used to be read as
+     * evidence of an upgrade in progress, self-clearing because the reconcile loop
+     * carries the record it read into the observation it writes; a line that kept
+     * appearing therefore meant the row was not being written back, which is a
+     * different fault. That inference is gone — the routine population makes a
+     * persistent line indistinguishable from ordinary operation — so warning on it
+     * only teaches a reader to ignore warnings. It is not dropped to `debug` either:
+     * a stored value reinterpreted on the way out has to be visible in an ordinary
+     * deployment or it is the silent reinterpretation the codec exists to refuse.
+     */
+    private fun decodeStatus(
+        name: ResourceName,
+        apiVersion: SchemaVersion,
+        kind: ServerKind,
+        encoded: String,
+        what: String,
+    ): ServerStatus {
+        val decoded =
+            StatusCodec.decode(
+                name = name,
+                apiVersion = apiVersion,
+                kind = kind,
+                encoded = encoded,
+                what = what,
+            )
+        for (record in decoded.reconstructed) {
+            LOG.info(
+                "server={} field={} is absent from this stored observation; reading it as {} taken from {}. " +
+                    "The stored document is unchanged",
+                name.value,
+                record.field,
+                record.value,
+                record.takenFrom,
+            )
+        }
+        return decoded.status
     }
 
     private fun unreadable(
@@ -731,14 +795,42 @@ internal class SqliteStore(
         rawName: String?,
     ): String = if (rawName == null) "$part of an unnamed row" else "$part of `$rawName`"
 
-    private fun decodeDefinition(row: DefinitionRow): ServerDefinition =
-        DefinitionCodec.decode(
-            apiVersion = row.apiVersion,
-            kind = row.kind,
-            encodedMetadata = row.metadataDoc,
-            encodedSpec = row.specDoc,
-            what = "definition of `${row.name}`",
-        )
+    /**
+     * Rebuilds the definition in [row], bounded, and says so when the bound bit.
+     *
+     * [DefinitionCodec.decode] caps the durations that become transport deadlines;
+     * see [mcorch.schema.SpecBounds] for why a stored row can carry one that parks a
+     * reconcile worker and why the answer is a cap rather than a refusal. The
+     * reporting is here rather than in the codec because this is the module's
+     * logger, and because a clamp that nothing says out loud is the silent
+     * reinterpretation of stored data the whole codec is written to refuse.
+     *
+     * Logged on every read, deliberately, on the same reasoning as [report]: the row
+     * is unchanged on disk, so the condition persists until an operator edits it and
+     * they should keep being told. On a healthy store this costs one comparison of
+     * an empty list per row.
+     */
+    private fun decodeDefinition(row: DefinitionRow): ServerDefinition {
+        val bounded =
+            DefinitionCodec.decode(
+                apiVersion = row.apiVersion,
+                kind = row.kind,
+                encodedMetadata = row.metadataDoc,
+                encodedSpec = row.specDoc,
+                what = "definition of `${row.name}`",
+            )
+        for (clamp in bounded.clamped) {
+            LOG.warn(
+                "server={} field={} declares {} above the {} this build will act on; " +
+                    "using the ceiling. The stored value is unchanged — edit the definition to clear this",
+                row.name.value,
+                clamp.field,
+                DurationFormat.render(clamp.declared),
+                DurationFormat.render(clamp.applied),
+            )
+        }
+        return bounded.definition
+    }
 
     private fun requireEncoding(
         encoding: Int,

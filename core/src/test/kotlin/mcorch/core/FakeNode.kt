@@ -3,6 +3,7 @@ package mcorch.core
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import mcorch.core.paper.PaperCommands
+import mcorch.cri.StopGracePeriod
 import mcorch.schema.ImageRef
 import mcorch.schema.NodeName
 import mcorch.schema.ResourceName
@@ -52,6 +53,23 @@ internal class FakeNode(
     /** Containers removed, whether or not the sandbox went with them. */
     val containerRemovals: MutableList<WorkloadHandle> = mutableListOf()
     val execs: MutableList<List<String>> = mutableListOf()
+
+    /**
+     * The whole request, so a test can assert on the **deadline** an exec was given
+     * and not only on what it ran.
+     *
+     * [execs] is the list nearly every assertion wants and it stays the primary one.
+     * This exists because `ExecRequest.timeout` is a duration a definition supplies
+     * and a `Node` turns into a transport deadline — see `ExecTimeoutCeiling` — so
+     * "what was this call allowed to take" is a side effect like any other.
+     */
+    val execRequests: MutableList<ExecRequest> = mutableListOf()
+
+    /** Every control-channel request, so a test can count seals and transfers at the wire. */
+    val endpointCalls: MutableList<EndpointRequest> = mutableListOf()
+
+    /** What is listening inside the sandbox, by port. A proxy's plugin goes here. */
+    val endpoints: MutableMap<Int, FakeProxyPlugin> = mutableMapOf()
 
     /** Every call that reached the node, failed ones included. Counts attempts. */
     val calls: MutableList<NodeOperation> = mutableListOf()
@@ -104,6 +122,21 @@ internal class FakeNode(
         failure: NodeException,
     ) {
         alwaysFailures[operation] = failure
+    }
+
+    /**
+     * Lifts every fault armed against [operation].
+     *
+     * The operator half of a repair. A node fault that a human fixes — a
+     * permission corrected, a wedged runtime restarted — is not expressible with
+     * [failOnce] alone, because that decides in advance how many passes the fault
+     * lasts; a gate that only lifts on a definition change needs the fault to
+     * outlive an arbitrary number of passes and then stop.
+     */
+    fun clearFailures(operation: NodeOperation) {
+        alwaysFailures.remove(operation)
+        onceFailures.remove(operation)
+        rawFailures.remove(operation)
     }
 
     /**
@@ -177,6 +210,37 @@ internal class FakeNode(
         return ImageAvailability(image, id = "sha256:${reference.hashCode().toUInt()}", pulled = false)
     }
 
+    /**
+     * The pre-flight, and deliberately **not** `check(NodeOperation.CREATE)`.
+     *
+     * `LocalNode` answers this out of its own mount derivation and never touches
+     * the runtime, so a one-shot CRI flake armed against the create is not
+     * something this call could see — and consuming one here would silently spend a
+     * budget a test set for the create itself, which is the fake being *more*
+     * permissive than the thing it stands in for in one direction and less in the
+     * other.
+     *
+     * A standing [NodeException.Rejected] is exactly the shape it does see: an
+     * artefact that is not on this host is not there for the pre-flight either.
+     */
+    override suspend fun checkWorkload(spec: WorkloadSpec) {
+        currentCoroutineContext().ensureActive()
+        (alwaysFailures[NodeOperation.CREATE] as? NodeException.Rejected)?.let { throw it }
+    }
+
+    /**
+     * How many containers this node has created, ever.
+     *
+     * It is in the container id, and that is not decoration: a real runtime never
+     * reuses one, so a fake that hands the *same* id to a replacement makes
+     * "is this the container the drain signalled" true by construction — and an
+     * identity test written against it reports a record correctly retired in
+     * exactly the scenario where it outlived its container. The sandbox id is not
+     * counted, because a replacement really can land in the sandbox that is
+     * already there.
+     */
+    private var containersCreated: Int = 0
+
     override suspend fun ensureWorkload(spec: WorkloadSpec): WorkloadObservation.Present {
         check(NodeOperation.CREATE)
         val existing = workload
@@ -186,9 +250,17 @@ internal class FakeNode(
         }
         creates += spec
         (spec.storage as? StorageRequest.Persistent)?.let { volumes += it.volume }
+        containersCreated++
         val created =
             WorkloadObservation.Present(
-                handle = WorkloadHandle(name, "sandbox-${spec.server}", "container-${spec.server}"),
+                handle =
+                    WorkloadHandle(
+                        name,
+                        // Adopted when it is there, the way `ensureWorkload`
+                        // adopts a sandbox rather than building a second one.
+                        (existing as? WorkloadObservation.Present)?.handle?.sandboxId ?: "sandbox-${spec.server}",
+                        "container-${spec.server}-$containersCreated",
+                    ),
                 state = WorkloadState.CREATED,
                 specHash = spec.specHash,
                 // The workload keeps the labels it was created with, the way a
@@ -219,16 +291,59 @@ internal class FakeNode(
             throw NodeException.Rejected(name, NodeOperation.EXEC, "the container is not running")
         }
         execs += request.command
+        execRequests += request
         return onExec(request.command)
+    }
+
+    /**
+     * The in-sandbox HTTP channel, answered by whatever is listening on that port.
+     *
+     * A port with nothing on it is [NodeException.Unreachable], which is what a
+     * real node reports for a refused connection — and it is the state a proxy
+     * whose plugin failed to load is in, so it has to be reachable from a test.
+     */
+    override suspend fun callEndpoint(
+        handle: WorkloadHandle,
+        request: EndpointRequest,
+    ): EndpointResponse {
+        check(NodeOperation.ENDPOINT)
+        endpointCalls += request
+        val listener =
+            endpoints[request.port]
+                ?: throw NodeException.Unreachable(
+                    name,
+                    NodeOperation.ENDPOINT,
+                    "nothing is listening on port ${request.port}",
+                )
+        return try {
+            listener.handle(request)
+        } catch (refused: java.io.IOException) {
+            throw NodeException.Unreachable(name, NodeOperation.ENDPOINT, refused.message.orEmpty(), refused)
+        }
     }
 
     override suspend fun stopWorkload(
         handle: WorkloadHandle,
-        gracePeriod: Duration,
+        gracePeriod: StopGrace,
     ) {
-        require(gracePeriod.isPositive()) { "the fake node holds the real node to its contract" }
+        // The same rule the real node applies, asked of the same object, so this
+        // fake cannot accept a grace period `LocalNode` would refuse. It used to
+        // be a local `isPositive()`, which is the *weaker* half — a caller that
+        // reached this fake with an unbounded or overflowing value would have
+        // been told it was fine.
+        //
+        // The interface's *own* ceiling is not re-asked here, and could not be:
+        // since the thirtieth audit it is carried by [StopGrace], so a caller
+        // cannot have skipped it. What is left is this node's runtime bound, which
+        // a second implementation is free to differ on — and holding the fake to
+        // the real one's is the point.
+        StopGracePeriod.of(gracePeriod.period).getOrElse {
+            throw IllegalArgumentException("the fake node holds the real node to its contract: ${it.message}", it)
+        }
         check(NodeOperation.STOP)
-        stops += handle to gracePeriod
+        // Recorded as the duration that reached the runtime, which is what every
+        // assertion about a stop is about. [StopGrace] carries nothing else.
+        stops += handle to gracePeriod.period
         val present = workload as? WorkloadObservation.Present ?: return
         workload = onStop(present)
     }

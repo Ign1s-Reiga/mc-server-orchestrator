@@ -30,15 +30,40 @@ public data class OrchestratorConfig(
     val volumeRoot: Path,
     /** Container logs live here. */
     val logRoot: Path,
+    /**
+     * Where the deployment put the artefacts this orchestrator mounts into
+     * containers — today just the Velocity control plugin JAR, under the name
+     * [mcorch.core.WorkloadAsset.VELOCITY_CONTROL_PLUGIN] expects.
+     *
+     * Separate from [dataDirectory] as a matter of what it is: state belongs to
+     * the deployment, artefacts belong to the *build* that produced this
+     * process, and the two have different lifetimes on upgrade. It is still
+     * defaulted underneath the data directory, because a single-host install has
+     * one place to put things and a missing artefact is refused loudly at create
+     * time rather than producing a proxy with no control endpoint.
+     */
+    val assetRoot: Path,
     val sandboxNamespace: String = DEFAULT_SANDBOX_NAMESPACE,
     /** See [LocalNodeConfig.cgroupParent]: its shape depends on the runtime's cgroup driver. */
     val cgroupParent: String? = LocalNodeConfig.DEFAULT_CGROUP_PARENT,
+    /**
+     * The Velocity build every proxy is pinned to, or null for the one this
+     * orchestrator ships against.
+     *
+     * The operator's lever on a spec-hash input that otherwise lives in orchestrator
+     * source. See [mcorch.core.ReconcilerConfig.velocityBuild] for what setting it
+     * is for and what leaving it unset means; it is here because a value nobody can
+     * set is not a lever, and this is the layer an operator configures.
+     */
+    val velocityBuild: String? = null,
 ) {
     public companion object {
         public const val ENDPOINT_VARIABLE: String = "MCORCH_CRI_ENDPOINT"
         public const val DATA_VARIABLE: String = "MCORCH_DATA_DIR"
         public const val NODE_VARIABLE: String = "MCORCH_NODE_NAME"
         public const val CGROUP_VARIABLE: String = "MCORCH_CGROUP_PARENT"
+        public const val ASSET_VARIABLE: String = "MCORCH_ASSET_DIR"
+        public const val VELOCITY_BUILD_VARIABLE: String = "MCORCH_VELOCITY_BUILD"
 
         public const val DEFAULT_SANDBOX_NAMESPACE: String = "mcorch"
         public const val DEFAULT_NODE_NAME: String = "local"
@@ -73,9 +98,16 @@ public data class OrchestratorConfig(
                 dataDirectory = data,
                 volumeRoot = data.resolve("volumes"),
                 logRoot = data.resolve("logs"),
+                assetRoot =
+                    environment[ASSET_VARIABLE]?.takeIf { it.isNotBlank() }?.let { Path.of(it) }
+                        ?: data.resolve("assets"),
                 cgroupParent =
                     environment[CGROUP_VARIABLE]?.takeIf { it.isNotBlank() }
                         ?: LocalNodeConfig.DEFAULT_CGROUP_PARENT,
+                // Blank reads as unset, like every other optional variable here. A
+                // blank pin would otherwise be a spec-hash input of "", which is a
+                // fleet-wide recreate spelled as a typo.
+                velocityBuild = environment[VELOCITY_BUILD_VARIABLE]?.takeIf { it.isNotBlank() },
             )
         }
     }

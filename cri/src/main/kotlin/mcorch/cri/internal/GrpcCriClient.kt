@@ -235,18 +235,93 @@ internal class GrpcCriClient private constructor(
         id: ContainerId,
         gracePeriod: StopGracePeriod,
     ) {
-        // The transport deadline must outlast the grace period, or the RPC gives
-        // up before containerd's kill fires and the caller cannot tell whether
-        // the container stopped.
-        val deadline = gracePeriod.duration + timeouts.deadlineSlack
-        runtimeCall(CriOperation.STOP_CONTAINER, deadline, target = id.value) { stub ->
-            stub.stopContainer(
-                stopContainerRequest {
-                    containerId = id.value
-                    timeout = gracePeriod.seconds
-                },
-            )
+        // The transport deadline outlasts the grace period, so containerd's kill
+        // fires before the RPC gives up and the caller learns the container
+        // actually stopped — up to [CriTimeouts.stopDeadlineCap], past which the
+        // two part company on purpose. The deadline bounds how long this call
+        // may park its caller; the grace period is what containerd is asked to
+        // wait, and one is not the other. See [CriTimeouts.stopDeadlineCap].
+        val capped = gracePeriod.duration > timeouts.stopDeadlineCap
+        val waited = if (capped) timeouts.stopDeadlineCap else gracePeriod.duration
+        val deadline = transportDeadline(waited)
+        val startedAt = System.nanoTime()
+        try {
+            runtimeCall(CriOperation.STOP_CONTAINER, deadline, target = id.value) { stub ->
+                stub.stopContainer(
+                    stopContainerRequest {
+                        containerId = id.value
+                        // The whole grace period, never the capped deadline.
+                        // Shortening what is *sent* would shorten the
+                        // last-resort net a save depends on, and would make the
+                        // caller's own overdue accounting — which measures a
+                        // container against the period the runtime was given —
+                        // call a container late while it was still inside it.
+                        timeout = gracePeriod.seconds
+                    },
+                )
+            }
+        } catch (timedOut: CriException.Timeout) {
+            if (!capped) throw timedOut
+            throw attributeCappedStop(timedOut, gracePeriod, deadline, System.nanoTime() - startedAt)
         }
+    }
+
+    /**
+     * Says what a `StopContainer` timeout means when the deadline was capped
+     * below the grace period, because by default it reads as the opposite.
+     *
+     * An uncapped stop that times out is alarming: the deadline outlasted the
+     * grace period, so containerd should have killed the container and did not
+     * answer. A *capped* one is not. It is the expected end of a stop whose grace
+     * period is longer than one call is allowed to wait, the runtime is not
+     * implicated, and the difference is invisible in the status code — both are
+     * `DEADLINE_EXCEEDED`. Left undistinguished this is the `ExecSync` mistake
+     * again ([attributeExecTimeout]), on the one operation where a healthy node
+     * being reported as a sick one lands in the middle of a drain.
+     *
+     * The measurement is the same one and the same one-sided inequality, read the
+     * other way round: grpc raises a client-side `DEADLINE_EXCEEDED` at or after
+     * the deadline and never before it, so an [elapsedNanos] that reached
+     * [deadline] is this client giving up and the sentence below is true of it.
+     * Anything shorter came back for some other reason and is reported unchanged.
+     *
+     * **That test is not a restatement of `capped`.** `capped` establishes that
+     * the deadline was shortened below the grace period. It says nothing about
+     * *which* clock produced this particular `DEADLINE_EXCEEDED`, and the runtime
+     * has clocks of its own — a shim that stops answering a kill fails one, early,
+     * and comes back with the same status code. On that failure every sentence
+     * below is wrong, the last of them dangerously: it would tell an operator that
+     * nothing here says the runtime is unhealthy, about a runtime that had just
+     * said so. So the elapsed time stays, and no tolerance is wanted on it either:
+     * [deadline] is the deadline the call actually ran under rather than a nominal
+     * one ([transportDeadline]), which is what lets this be an exact inequality.
+     *
+     * [CriException.Timeout.commandTimeout] stays false, which is not an
+     * oversight: it means "the runtime answered, promptly, to report a timeout
+     * the caller asked for", and none of that happened here. This client stopped
+     * waiting.
+     */
+    private fun attributeCappedStop(
+        failure: CriException.Timeout,
+        gracePeriod: StopGracePeriod,
+        deadline: Duration,
+        elapsedNanos: Long,
+    ): CriException.Timeout {
+        if (elapsedNanos.nanoseconds < deadline) return failure
+        return CriException.Timeout(
+            operation = CriOperation.STOP_CONTAINER,
+            description =
+                "gave up after $deadline while the ${gracePeriod.seconds}s grace period this stop asked for was " +
+                    "still running: a stop may wait at most ${timeouts.stopDeadlineCap} for the runtime, and this " +
+                    "grace period is longer than that. The runtime was asked for the whole ${gracePeriod.seconds}s " +
+                    "and nothing shortened it — it has the stop signal, and it will not escalate to a kill for a " +
+                    "call that has already given up. Nothing here says the runtime is unhealthy. Re-issue the stop, " +
+                    "which is idempotent, or read the container's state to see where it got to. A re-issue does not " +
+                    "send the stop signal a second time — the runtime records that it already sent one — but it " +
+                    "does reach the kill, if its own grace period runs out before its own deadline does. " +
+                    "It said: " + failure.description,
+            cause = failure.cause,
+        )
     }
 
     override suspend fun removeContainer(id: ContainerId) {
@@ -292,15 +367,19 @@ internal class GrpcCriClient private constructor(
         timeout: Duration,
     ): ExecResult {
         require(command.isNotEmpty()) { "exec command must not be empty" }
-        require(timeout.isPositive()) {
-            "execSync timeout must be positive; CRI treats 0 as 'run forever', which would let a stuck " +
-                "command pin the reconcile loop on a call that never returns"
+        // Finiteness is checked for the reason CriTimeouts checks it: an infinite
+        // timeout is not "no command timeout", it is a deadline about 292 million
+        // years out on a call that still looks like it has one.
+        require(timeout.isPositive() && timeout.isFinite()) {
+            "execSync timeout must be a positive, finite duration; CRI treats 0 as 'run forever', which would " +
+                "let a stuck command pin the reconcile loop on a call that never returns, and an infinite one " +
+                "removes this call's deadline while leaving it looking deadlined. Got: $timeout"
         }
         // CRI carries the command timeout as whole seconds. Give the transport
         // strictly more room, so a command that outruns its own timeout is
         // reported by containerd rather than cut off as a transport deadline.
         val commandSeconds = timeout.roundUpToWholeSeconds()
-        val deadline = commandSeconds.seconds + timeouts.deadlineSlack
+        val deadline = transportDeadline(commandSeconds.seconds)
         val startedAt = System.nanoTime()
         return try {
             runtimeCall(CriOperation.EXEC_SYNC, deadline, target = id.value) { stub ->
@@ -338,6 +417,14 @@ internal class GrpcCriClient private constructor(
      * The inequality is deliberately one-sided: when the two are too close to
      * separate — a [CriTimeouts.deadlineSlack] configured down to nothing — this
      * reports the ordinary transport timeout, which is the cautious answer.
+     *
+     * It is one-sided in the direction that costs least when it is wrong, and
+     * that is why [deadline] has to be the deadline the call *ran under* rather
+     * than a nominal one ([transportDeadline]). Compared against a bound even
+     * slightly longer than the installed one, this client giving up would fall
+     * on the wrong side and be reported as the runtime answering promptly with a
+     * slow command — a healthy verdict on a runtime that said nothing at all,
+     * which is worse than the mistake this whole function exists to undo.
      */
     private fun attributeExecTimeout(
         failure: CriException.Timeout,
@@ -411,6 +498,20 @@ internal class GrpcCriClient private constructor(
     }
 
     // ── plumbing ─────────────────────────────────────────────────────────────
+
+    /**
+     * The transport deadline for a call whose caller asked to wait [wait].
+     *
+     * Only the two operations that carry a caller's own semantic timeout —
+     * `StopContainer`'s grace period and `ExecSync`'s command timeout — build a
+     * deadline this way; everything else takes one straight from [CriTimeouts].
+     * Those two are also the only ones that later compare an elapsed time against
+     * their deadline, and the comparison is only sound if the number compared is
+     * the number installed, so the rounding happens here rather than at either
+     * call site. See [roundUpToWholeMilliseconds].
+     */
+    private fun transportDeadline(wait: Duration): Duration =
+        (wait + timeouts.deadlineSlack).roundUpToWholeMilliseconds()
 
     private suspend fun <T> runtimeCall(
         operation: CriOperation,

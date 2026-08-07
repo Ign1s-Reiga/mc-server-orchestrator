@@ -1,0 +1,24 @@
+# Expected: spec.control.tokenSecret — is required when spec.control.hostPort is set
+#
+# Unpublished, the control endpoint lives inside the sandbox and needs no
+# credential. Published, it is a control plane that can seal every backend and
+# move every player in the fleet.
+apiVersion: mcorch.dev/v1alpha1
+kind: VelocityProxy
+metadata:
+  name: proxy-01
+spec:
+  image: docker.io/itzg/mc-proxy:2026.6.1
+  resources:
+    memory: 1Gi
+  control:
+    port: 8375
+    hostPort: 18375
+  forwarding:
+    secret:
+      name: fleet-forwarding
+      key: modern-forwarding
+  backends:
+    selector:
+      matchLabels:
+        mcorch.dev/fleet: main

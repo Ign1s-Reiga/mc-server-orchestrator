@@ -190,6 +190,38 @@ internal class DocumentWriter {
         DocumentScope(this, prefix).block()
     }
 
+    /**
+     * An ordered list, as a count plus one key per element.
+     *
+     * The shape `conditions` already used, promoted to a helper now that a second
+     * and a third list exist. A count key rather than "read indices until one is
+     * missing", because absence has to stay unambiguous: without it a list whose
+     * last element was somehow dropped would decode one short and say nothing.
+     *
+     * Written even when [values] is empty, so an empty list is distinguishable
+     * from no list at all — [DocumentReader.list] returns nothing for a missing
+     * count and an empty list for a zero one. Rendering sorts keys as text, so
+     * element 10 lands before element 2 in the file; that is presentation only,
+     * because the reader indexes explicitly rather than reading in file order.
+     */
+    fun putList(
+        key: String,
+        values: List<String>,
+    ) {
+        put("$key.count", values.size)
+        values.forEachIndexed { index, value -> put("$key.$index", value) }
+    }
+
+    /** [putList] for lists of objects: the count, then [element] once per index under `key.<i>`. */
+    fun putListOf(
+        key: String,
+        size: Int,
+        element: (Int) -> Unit,
+    ) {
+        put("$key.count", size)
+        repeat(size) { element(it) }
+    }
+
     fun render(): String =
         fields.entries.joinToString("\n") { (key, value) ->
             "${PropertyDocument.escape(key)}=${PropertyDocument.escape(value)}"
@@ -242,6 +274,17 @@ internal class DocumentScope(
         suffix: String,
         block: DocumentScope.() -> Unit,
     ): Unit = writer.scope(key(suffix), block)
+
+    fun putList(
+        suffix: String,
+        values: List<String>,
+    ): Unit = writer.putList(key(suffix), values)
+
+    fun putListOf(
+        suffix: String,
+        size: Int,
+        element: (Int) -> Unit,
+    ): Unit = writer.putListOf(key(suffix), size, element)
 }
 
 /**
@@ -329,6 +372,28 @@ internal class DocumentReader(
         key: String,
         parse: (String) -> Result<T>,
     ): T = value(key, parse) ?: missing(key)
+
+    /**
+     * The element keys of a list written by [DocumentWriter.putList], in order.
+     *
+     * Empty for a list that is absent *and* for one stored as empty — the two are
+     * told apart by whether the object holding the list is present at all, which
+     * is the same presence rule every nested object here uses. Returning keys
+     * rather than values lets a caller read each element with whichever typed
+     * accessor it needs, so a list of records costs no more than a list of
+     * strings.
+     *
+     * No `require` on the count. A negative or absurd one yields no elements
+     * rather than an exception, because this is decoded by `listServers` and a
+     * check here would be one more way for a single hand-edited row to abort a
+     * fleet read. A count that disagrees with the elements present shows up as a
+     * missing required key on the element itself, which is already corruption
+     * scoped to this row.
+     */
+    fun list(key: String): List<String> {
+        val count = int("$key.count") ?: return emptyList()
+        return (0 until count).map { "$key.$it" }
+    }
 
     fun missing(key: String): Nothing =
         throw StoreException.Corrupt("$what: encoded document is missing the required key `$key`")

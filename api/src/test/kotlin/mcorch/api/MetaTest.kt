@@ -1,12 +1,15 @@
 package mcorch.api
 
 import io.kotest.matchers.shouldBe
+import mcorch.schema.BackendRegistration
 import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
+import mcorch.schema.DrainBlockReason
 import mcorch.schema.DrainPolicy
 import mcorch.schema.DrainState
 import mcorch.schema.FailureClass
 import mcorch.schema.FailureReason
+import mcorch.schema.ForwardingMode
 import mcorch.schema.SchemaVersion
 import mcorch.schema.ServerKind
 import mcorch.schema.ServerPhase
@@ -49,8 +52,10 @@ class MetaTest {
         enums["conditionStatus"] shouldBe ConditionStatus.entries.map { it.name }
         enums["failureReason"] shouldBe FailureReason.entries.map { it.name }
         enums["failureClass"] shouldBe FailureClass.entries.map { it.name }
+        enums["drainBlockReason"] shouldBe DrainBlockReason.entries.map { it.name }
         enums["displayState"] shouldBe ServerJsonStates.all()
         enums["statePart"] shouldBe StatePart.entries.map { it.name }
+        enums["backendRegistration"] shouldBe BackendRegistration.entries.map { it.name }
     }
 
     @Test
@@ -63,6 +68,11 @@ class MetaTest {
         enums["storageMode"] shouldBe StorageMode.supported()
         enums["storageMode"] shouldBe listOf("persistent", "ephemeral")
         enums["drainPolicy"] shouldBe DrainPolicy.supported()
+        // The proxy kind's one forwarding mode, by wire value: it goes back
+        // into a definition, and `modern` is the only value this orchestrator
+        // will run.
+        enums["forwardingMode"] shouldBe ForwardingMode.supported()
+        enums["forwardingMode"] shouldBe listOf("modern")
         enums["drainPolicy"] shouldBe listOf("waitForZeroPlayers")
     }
 
@@ -96,10 +106,13 @@ class MetaTest {
                 "conditionStatus",
                 "failureReason",
                 "failureClass",
+                "drainBlockReason",
                 "displayState",
                 "statePart",
+                "backendRegistration",
                 "storageMode",
                 "drainPolicy",
+                "forwardingMode",
             )
     }
 }

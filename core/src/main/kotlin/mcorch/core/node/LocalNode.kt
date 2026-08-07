@@ -1,5 +1,9 @@
 package mcorch.core.node
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import mcorch.core.EndpointRequest
+import mcorch.core.EndpointResponse
 import mcorch.core.ExecOutcome
 import mcorch.core.ExecRequest
 import mcorch.core.ImageAvailability
@@ -9,6 +13,7 @@ import mcorch.core.NodeCapacity
 import mcorch.core.NodeException
 import mcorch.core.NodeOperation
 import mcorch.core.NodeStatus
+import mcorch.core.StopGrace
 import mcorch.core.StorageRequest
 import mcorch.core.WorkloadHandle
 import mcorch.core.WorkloadObservation
@@ -43,9 +48,17 @@ import mcorch.schema.SecretRef
 import mcorch.store.SecretStore
 import mcorch.store.StoreException
 import org.slf4j.LoggerFactory
+import java.io.IOException
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.net.http.HttpTimeoutException
+import java.nio.charset.StandardCharsets
 import java.nio.file.Path
 import kotlin.coroutines.cancellation.CancellationException
 import kotlin.time.Duration
+import kotlin.time.toJavaDuration
 
 /**
  * The [Node] that runs containers through a containerd on one host.
@@ -74,6 +87,15 @@ import kotlin.time.Duration
  * A [StorageRequest.Persistent] volume becomes a host directory under
  * [volumeRoot], created if it is not there and **never removed by this class**.
  * That is what makes the world survive the container (CLAUDE.md invariant 2).
+ *
+ * ## Assets
+ *
+ * [mcorch.core.AssetMount] is where an artefact this orchestrator ships becomes
+ * a path: **this class is the only thing that knows one**, and it knows it
+ * because [LocalNodeConfig.assetRoot] told it. A caller asks for
+ * [mcorch.core.WorkloadAsset.VELOCITY_CONTROL_PLUGIN] and never learns where the
+ * file is; a distributed node would answer the same request out of its own
+ * store.
  */
 public class LocalNode internal constructor(
     override val name: NodeName,
@@ -81,10 +103,28 @@ public class LocalNode internal constructor(
     private val secrets: SecretStore,
     private val volumeRoot: Path,
     private val logRoot: Path,
+    private val assetRoot: Path,
     private val sandboxNamespace: String,
     private val cgroupParent: String?,
 ) : Node,
     AutoCloseable {
+    /**
+     * One client for this node's lifetime, for [callEndpoint].
+     *
+     * Redirects are **never** followed: a control plane that can seal every
+     * backend in a fleet is not something to chase a `Location` header for, and
+     * the plugin never sends one. HTTP/1.1 rather than the default negotiation,
+     * because the plugin serves a `com.sun.net.httpserver` socket and an upgrade
+     * attempt against it is a round trip that can only fail.
+     */
+    private val httpClient: HttpClient =
+        HttpClient
+            .newBuilder()
+            .version(HttpClient.Version.HTTP_1_1)
+            .followRedirects(HttpClient.Redirect.NEVER)
+            .connectTimeout(java.time.Duration.ofSeconds(CONNECT_TIMEOUT_SECONDS))
+            .build()
+
     // ── health ───────────────────────────────────────────────────────────────
 
     override suspend fun status(): NodeStatus =
@@ -226,6 +266,84 @@ public class LocalNode internal constructor(
 
     // ── workload lifecycle ───────────────────────────────────────────────────
 
+    /**
+     * The create's own container derivation, run and thrown away.
+     *
+     * Deliberately [containerSpecFor] rather than a list of the things it checks:
+     * a re-implementation here would be a second enforcement point, which is the
+     * thing the twenty-fourth audit asked not to add while asking for the question
+     * to be asked earlier. So the promise is exact and it is also **bounded**, and
+     * the bound is written here rather than left to be discovered:
+     *
+     * > Every refusal [containerSpecFor] can produce, this call produces too. The
+     * > steps of [ensureWorkload] that are *not* that derivation are outside it.
+     *
+     * ## What is outside, named
+     *
+     * [prepareHostPaths] — `HostPaths.prepare`, which creates the log directory and,
+     * for persistent storage, the volume directory. It throws
+     * [NodeException.Rejected] (permanent) on an `IOException` or a
+     * `SecurityException`: a volume or log root that has been unmounted, remounted
+     * read-only, or had its ownership changed. A replacement can therefore still
+     * pass this call, drain, save, stop, remove, and meet a create that refuses.
+     *
+     * The twenty-sixth audit's third warning, and the reason it is a narrowed
+     * sentence rather than a new check: whether `createDirectories` will succeed
+     * cannot be established without attempting it, and an approximation — "are the
+     * two roots writable" — is a *different* derivation that can refuse a create the
+     * real one would accept, which would freeze every replacement on a host whose
+     * roots are read-only but whose per-workload directories already exist. That is
+     * the second enforcement point this call exists not to be. Closing it properly
+     * means letting a pre-flight create the directories it is checking, which
+     * [Node.checkWorkload] forbids on purpose; the day that trade looks right, it is
+     * an interface change and not a quiet one here.
+     *
+     * `sandboxSpecFor` is also outside and needs no argument: it is field copying
+     * and cannot refuse anything.
+     *
+     * ## It used to be [mountsFor], and that was one of two
+     *
+     * The twenty-fifth audit's second warning. `containerSpecFor` can refuse a
+     * workload in two ways — a mount it cannot build, and a secret reference that
+     * resolves to nothing — and this ran only the first. So an operator who
+     * repointed `spec.control.tokenSecret` (or `forwarding.secret`) at a secret not
+     * yet staged moved the spec hash, passed the pre-flight, and had the running
+     * proxy sealed, drained to zero, stopped and removed before the create asked
+     * the question that refuses permanently. Calling the *whole* derivation is what
+     * makes the sentence above true, and it is what makes a third refusal added to
+     * `containerSpecFor` tomorrow pre-flighted without anybody remembering to come
+     * back here.
+     *
+     * ## Presence, not material
+     *
+     * [SecretAccess.PRESENCE_ONLY] asks the secret store whether each reference
+     * resolves and never materialises a value. `SecretStore.resolve` is documented
+     * as a use-time call — "do not resolve early and carry the result around" — and
+     * a pre-flight has nothing to hand the material to, so materialising here would
+     * create copies of forwarding secrets for no purpose (CLAUDE.md invariant 4).
+     * The two arms refuse the same condition with the same message; the difference
+     * between them is a value nobody reads, and a reference that stops resolving
+     * between this call and the create is refused by the create exactly as before.
+     *
+     * One consequence, since "the same derivation" is doing work above: the arms
+     * differ in the *shape* of what they build, not only in the value. `PRESENCE_ONLY`
+     * contributes no entries, so the [ContainerSpec] built here has no secret
+     * environment variables in it and `ContainerSpec`'s own `require` on blank
+     * environment keys is blind to a blank `secretEnv` key. Unreachable today — every
+     * such key is a compile-time constant in a planner — and if it ever were not, the
+     * `IllegalArgumentException` would reach the create as a permanent `Rejected`
+     * *after* a teardown. It is a second entry on the bounded list above rather than
+     * a defect to fix now.
+     *
+     * `translating` for the same reason every other entry point uses it: a caller
+     * of [Node] sees nothing but a [NodeException].
+     */
+    override suspend fun checkWorkload(spec: WorkloadSpec) {
+        translating(NodeOperation.CREATE) {
+            containerSpecFor(spec, SecretAccess.PRESENCE_ONLY)
+        }
+    }
+
     override suspend fun ensureWorkload(spec: WorkloadSpec): WorkloadObservation.Present =
         translating(NodeOperation.CREATE) {
             val sandboxSpec = sandboxSpecFor(spec)
@@ -235,6 +353,14 @@ public class LocalNode internal constructor(
                 if (existing != null) {
                     val status = client.sandboxStatus(existing)
                     val adopted = observationOf(spec.server, status)
+                    // `hadContainer` is the reconcile loop's fact and there is
+                    // none of it at this layer: it is a container id *the loop*
+                    // recorded, and a node is the thing being asked rather than
+                    // the thing that remembers. What this reads is the sandbox
+                    // status fetched on the line above, in this same call, so
+                    // "no container in it" is this call's own observation rather
+                    // than a claim about history — and both answers build the
+                    // container the caller asked for. Nothing here ends one.
                     if (adopted.state != WorkloadState.SANDBOX_ONLY) {
                         // Already built. Adopting it is the whole reason a
                         // second pass is not a second container.
@@ -276,6 +402,13 @@ public class LocalNode internal constructor(
                 } catch (collision: CriException) {
                     if (!collision.isNameCollision()) throw collision
                     val adopted = observationOf(spec.server, client.sandboxStatus(sandboxId))
+                    // The same reading as the adoption above, and `hadContainer`
+                    // is as absent here for the same reason. This asks only
+                    // whether the collision left something to adopt: the sandbox
+                    // was just re-read, a container that is there is the one the
+                    // create raced with, and one that is not means the object
+                    // exists under a name this build cannot see. Refusing is the
+                    // whole of the answer — nothing is stopped or removed on it.
                     if (adopted.state == WorkloadState.SANDBOX_ONLY) {
                         throw unadoptable(NodeOperation.CREATE, "container for `${spec.server}`", collision)
                     }
@@ -354,10 +487,130 @@ public class LocalNode internal constructor(
     ): ExecOutcome {
         val containerId = handle.requireContainer(NodeOperation.EXEC)
         return translating(NodeOperation.EXEC) {
-            val result = client.execSync(containerId, request.command, request.timeout)
+            // Already bounded: [ExecTimeout] is the only thing [ExecRequest] accepts
+            // and its factory applies [ExecTimeoutCeiling]. This is the value
+            // `GrpcCriClient.execSync` turns into the call's gRPC deadline, which is
+            // why the bound is on the type rather than asked for here.
+            val result = client.execSync(containerId, request.command, request.timeout.period)
             ExecOutcome(exitCode = result.exitCode, stdout = result.stdout, stderr = result.stderr)
         }
     }
+
+    /**
+     * Reaches a port inside the sandbox over HTTP.
+     *
+     * ## The one place "inside the sandbox" is a routable address
+     *
+     * A remote node would forward this to its own agent and never expose an
+     * address at all; on this host the sandbox has a CNI address and the
+     * orchestrator process can open a socket to it directly. That difference is
+     * the whole reason [Node.callEndpoint] exists as an interface method — a
+     * caller that resolved an address itself would have hard-coded the single-host
+     * deployment (CLAUDE.md invariant 7).
+     *
+     * The address is read fresh on every call rather than cached on the handle. A
+     * sandbox that is recreated gets a new one, and a control request aimed at the
+     * previous occupant of an address is a request that seals somebody else's
+     * backend.
+     *
+     * ## What is not logged
+     *
+     * The address, ever. `SandboxStatus` redacts `ips` from its own `toString`
+     * for the same reason, and CLAUDE.md forbids addresses in log lines. Failures
+     * name the port and the path, which are declared configuration.
+     */
+    override suspend fun callEndpoint(
+        handle: WorkloadHandle,
+        request: EndpointRequest,
+    ): EndpointResponse {
+        val sandboxId = SandboxId(handle.sandboxId)
+        return translating(NodeOperation.ENDPOINT) {
+            val status = client.sandboxStatus(sandboxId)
+            val address =
+                status.ips.firstOrNull()
+                    ?: throw NodeException.Busy(
+                        name,
+                        NodeOperation.ENDPOINT,
+                        "the runtime reports no address for sandbox ${handle.sandboxId} yet, so port " +
+                            "${request.port} cannot be reached. A sandbox gets one when its network is " +
+                            "attached, so this is a wait rather than a misconfiguration",
+                    )
+            // Coordinates in, material out, and the material never leaves this
+            // function: `Authorization` is built here and the header map is
+            // discarded with the request.
+            val token = request.bearerToken?.let { resolveToken(it) }
+            send(address, request, token)
+        }
+    }
+
+    private suspend fun resolveToken(ref: SecretRef): String {
+        val secret =
+            secrets.resolve(ref) ?: throw NodeException.Rejected(
+                name,
+                NodeOperation.ENDPOINT,
+                "the control-endpoint token `${ref.name}/${ref.key}` is not in the secret store",
+            )
+        return try {
+            secret.use { material -> String(material) }
+        } finally {
+            secret.destroy()
+        }
+    }
+
+    /**
+     * The blocking half, on the IO dispatcher.
+     *
+     * `HttpClient.send` blocks a thread, so it cannot run on the loop's
+     * dispatcher — and the timeout is set on the request rather than relied on
+     * from cancellation, because a blocking call is not interruptible by a
+     * cancelled coroutine. Both halves are needed: the request timeout bounds the
+     * wait, and [translating] turns whatever comes out of it into a
+     * [NodeException].
+     */
+    private suspend fun send(
+        address: String,
+        request: EndpointRequest,
+        token: String?,
+    ): EndpointResponse =
+        withContext(Dispatchers.IO) {
+            val host = if (address.contains(':')) "[$address]" else address
+            val builder =
+                HttpRequest
+                    .newBuilder(URI.create("http://$host:${request.port}${request.path}"))
+                    .timeout(request.timeout.period.toJavaDuration())
+            val publisher =
+                request.body?.let { HttpRequest.BodyPublishers.ofString(it, StandardCharsets.UTF_8) }
+                    ?: HttpRequest.BodyPublishers.noBody()
+            builder.method(request.verb.name, publisher)
+            request.contentType?.let { builder.header("Content-Type", it) }
+            token?.let { builder.header("Authorization", "Bearer $it") }
+            val response =
+                try {
+                    httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8))
+                } catch (timeout: HttpTimeoutException) {
+                    throw NodeException.Timeout(
+                        name,
+                        NodeOperation.ENDPOINT,
+                        "port ${request.port} did not answer ${request.verb} ${request.path} within " +
+                            "${request.timeout.period.inWholeSeconds}s",
+                        timeout,
+                        // The *call* ran out of time, not a command the caller
+                        // asked the node to run. `commandTimeout` is reserved for
+                        // the latter; claiming it here would tell a caller the
+                        // node is healthy when it may not be.
+                        commandTimeout = false,
+                    )
+                } catch (failure: IOException) {
+                    throw NodeException.Unreachable(
+                        name,
+                        NodeOperation.ENDPOINT,
+                        "port ${request.port} refused or dropped ${request.verb} ${request.path}: " +
+                            "${failure::class.simpleName}",
+                        failure,
+                    )
+                }
+            EndpointResponse(status = response.statusCode(), body = response.body().orEmpty())
+        }
 
     /**
      * Stops the container, and nothing else.
@@ -368,29 +621,65 @@ public class LocalNode internal constructor(
      */
     override suspend fun stopWorkload(
         handle: WorkloadHandle,
-        gracePeriod: Duration,
+        gracePeriod: StopGrace,
     ) {
-        if (!gracePeriod.isPositive()) {
-            // Refused rather than asserted: [Node] promises callers see nothing
-            // but a [NodeException], and an `IllegalArgumentException` from here
-            // would be the one thing a caller cannot classify. The refusal is
-            // just as absolute — no stop is issued either way.
-            throw NodeException.Rejected(
-                name,
-                NodeOperation.STOP,
-                "the stop grace period must be positive; it comes from spec.lifecycle.stopGracePeriod, which " +
-                    "the schema already guarantees exceeds the save timeout",
-            )
-        }
+        // One rule, asked once, of the type that owns it. This used to be a
+        // local `isPositive()` check standing in front of a `StopGracePeriod.of`
+        // that enforced strictly more — so `Duration.INFINITE` cleared the guard
+        // here and failed inside [translating] instead, where the catch-all for
+        // unclassified `RuntimeException`s turns it into a *non-retryable*
+        // rejection: a permanent drain abort produced by an argument, with no
+        // container runtime involved. Two guards that disagree about the same
+        // value is the defect; a second, better-informed local guard would be
+        // the same defect again.
+        //
+        // `of` rounds up to whole seconds, so a grace period is never silently
+        // shortened, and it refuses anything containerd's own arithmetic would
+        // wrap — see [StopGracePeriod.MAX_SECONDS], where a very long grace
+        // period becomes a very short one. That is **this runtime's** bound and it
+        // stays here for that reason.
+        //
+        // The interface's own bound is not applied here at all any more, and that
+        // is the thirtieth audit's ruling on the seam: it is carried by the
+        // argument's type. [StopGrace] can only be built by [StopGrace.of], which
+        // applies [StopGraceCeiling] — so the property "no `Node` holds a stop open
+        // past the operational ceiling" belongs to every implementation of the
+        // interface rather than to this one remembering. It also cannot be applied
+        // here correctly: the ceiling has a floor derived from the workload's save
+        // timeout, and a node cannot see the other half of that pair.
+        val grace =
+            StopGracePeriod.of(gracePeriod.period).getOrElse { rejection ->
+                // Refused rather than thrown on: [Node] promises callers see
+                // nothing but a [NodeException], and an
+                // `IllegalArgumentException` from here would be the one thing a
+                // caller cannot classify. The refusal is just as absolute — no
+                // stop is issued either way.
+                throw NodeException.Rejected(
+                    name,
+                    NodeOperation.STOP,
+                    "${rejection.message}. It comes from spec.lifecycle.stopGracePeriod, which the schema " +
+                        "validates at parse time — for a Paper server, to exceed that server's save timeout; " +
+                        "a Velocity proxy holds no world and has no such rule",
+                )
+            }
         val containerId =
-            handle.containerId?.let(::ContainerId) ?: run {
+            handle.containerId ?: run {
                 LOG.debug("nothing to stop for sandbox {}: no container was ever created", handle.sandboxId)
                 return
             }
         translating(NodeOperation.STOP) {
-            // `StopGracePeriod.of` rounds up to whole seconds, so a grace
-            // period is never silently shortened.
-            client.stopContainer(containerId, StopGracePeriod.of(gracePeriod))
+            // `ContainerId` is constructed *inside* [translating] because it can
+            // reject. A blank id built outside would leave here as a raw
+            // `IllegalArgumentException` — not a [NodeException], so it would
+            // slip past the `catch (failure: NodeException)` in
+            // `DrainController.stop` that exists to compensate the routing table.
+            //
+            // Nothing can currently reach that: [WorkloadHandle] already requires
+            // a set `containerId` to be non-blank, so the value here is either
+            // null (handled above) or valid. This is not a fix for an observed
+            // failure — it is so that the argument for safety is "the failure is
+            // classified" rather than "the invariant one type away still holds".
+            client.stopContainer(ContainerId(containerId), grace)
         }
     }
 
@@ -505,11 +794,28 @@ public class LocalNode internal constructor(
             linux = LinuxSandboxSpec(cgroupParent = cgroupParent),
         )
 
-    private suspend fun containerSpecFor(spec: WorkloadSpec): ContainerSpec =
+    /**
+     * Whether a derivation needs the secret **values** or only the answer to
+     * whether they are there.
+     *
+     * An enum rather than a boolean because the two arms differ in what they do
+     * with material, and a `true` at a call site would say nothing about which is
+     * which. The create needs [MATERIALISE]; a pre-flight that discards the result
+     * would be making copies of a forwarding secret for nothing.
+     */
+    private enum class SecretAccess {
+        MATERIALISE,
+        PRESENCE_ONLY,
+    }
+
+    private suspend fun containerSpecFor(
+        spec: WorkloadSpec,
+        secretAccess: SecretAccess = SecretAccess.MATERIALISE,
+    ): ContainerSpec =
         ContainerSpec(
             name = spec.server.value,
             image = ImageName(spec.image.canonical),
-            env = spec.env + resolveSecrets(spec.secretEnv),
+            env = spec.env + secretsFor(spec.secretEnv, secretAccess),
             command = spec.command,
             args = spec.args,
             mounts = mountsFor(spec),
@@ -529,21 +835,22 @@ public class LocalNode internal constructor(
                 ),
         )
 
+    /**
+     * The workload's mounts, as CRI wants them.
+     *
+     * A field copy and nothing else. Every decision — which storage gets a
+     * directory, where an asset comes from, whether a missing one is a failure —
+     * belongs to [HostPaths.mounts], which is in this module's own types and can
+     * therefore be tested. This function is where those decisions used to live,
+     * and where one of them was silently dropped.
+     */
     private fun mountsFor(spec: WorkloadSpec): List<VolumeMount> =
-        when (val storage = spec.storage) {
-            is StorageRequest.Persistent -> {
-                listOf(
-                    VolumeMount(
-                        containerPath = storage.mountPath,
-                        hostPath = volumePathFor(storage.volume).toString(),
-                    ),
-                )
-            }
-
-            // The one case with no mount, and the only one that may skip it.
-            is StorageRequest.Ephemeral -> {
-                emptyList()
-            }
+        HostPaths.mounts(name, volumeRoot, assetRoot, spec).map { mount ->
+            VolumeMount(
+                containerPath = mount.containerPath,
+                hostPath = mount.hostPath,
+                readOnly = mount.readOnly,
+            )
         }
 
     /**
@@ -564,12 +871,7 @@ public class LocalNode internal constructor(
     private suspend fun resolveSecrets(refs: Map<String, SecretRef>): Map<String, String> {
         if (refs.isEmpty()) return emptyMap()
         return refs.mapValues { (variable, ref) ->
-            val secret =
-                secrets.resolve(ref) ?: throw NodeException.Rejected(
-                    name,
-                    NodeOperation.CREATE,
-                    "the secret `${ref.name}/${ref.key}` needed for `$variable` is not in the secret store",
-                )
+            val secret = secrets.resolve(ref) ?: throw missingSecret(variable, ref)
             try {
                 secret.use { material -> String(material) }
             } finally {
@@ -577,6 +879,49 @@ public class LocalNode internal constructor(
             }
         }
     }
+
+    /**
+     * The environment contribution of [refs], with or without their values.
+     *
+     * Both arms refuse the same condition through [missingSecret], so the
+     * pre-flight and the create cannot come to different conclusions about a
+     * reference or word the refusal differently. What they differ in is whether
+     * material exists in this process at all.
+     */
+    private suspend fun secretsFor(
+        refs: Map<String, SecretRef>,
+        access: SecretAccess,
+    ): Map<String, String> =
+        when (access) {
+            SecretAccess.MATERIALISE -> {
+                resolveSecrets(refs)
+            }
+
+            SecretAccess.PRESENCE_ONLY -> {
+                for ((variable, ref) in refs) {
+                    if (!secrets.contains(ref)) throw missingSecret(variable, ref)
+                }
+                emptyMap()
+            }
+        }
+
+    /**
+     * One definition of "this workload names a secret that is not there", so the
+     * create's refusal and the pre-flight's are the same refusal.
+     *
+     * [NodeOperation.CREATE] in both cases, because that is the operation being
+     * refused: the pre-flight is the create's question asked earlier and reports
+     * nothing else. Names the coordinates and the variable, never the material.
+     */
+    private fun missingSecret(
+        variable: String,
+        ref: SecretRef,
+    ): NodeException.Rejected =
+        NodeException.Rejected(
+            name,
+            NodeOperation.CREATE,
+            "the secret `${ref.name}/${ref.key}` needed for `$variable` is not in the secret store",
+        )
 
     /**
      * Creates the host directories the runtime needs.
@@ -592,7 +937,11 @@ public class LocalNode internal constructor(
         HostPaths.prepare(name, volumeRoot, logRoot, spec)
     }
 
-    private fun volumePathFor(volume: ResourceName): Path = HostPaths.volumePath(volumeRoot, volume)
+    // There is deliberately no `volumePathFor` here any more. It existed for the
+    // mount derivation that used to live in this file, and leaving a
+    // volume-root-to-path helper lying about is an invitation to rebuild that
+    // derivation beside the one in `HostPaths` — which is exactly the shape the
+    // dropped plugin mount was written in.
 
     private fun logDirectoryFor(server: ResourceName): Path = HostPaths.logDirectory(logRoot, server)
 
@@ -720,6 +1069,15 @@ public class LocalNode internal constructor(
         private const val MILLICORES_PER_CORE = 1000L
 
         /**
+         * How long a TCP connect to a sandbox address may take.
+         *
+         * Short and separate from the caller's per-request timeout, which bounds
+         * the *answer*. Connecting to a port on the same host either succeeds
+         * immediately or the listener is not there.
+         */
+        private const val CONNECT_TIMEOUT_SECONDS = 5L
+
+        /**
          * Opens a node against a containerd on this host.
          *
          * Takes a [LocalNodeConfig] rather than a CRI configuration so the
@@ -741,6 +1099,7 @@ public class LocalNode internal constructor(
                 secrets = secrets,
                 volumeRoot = config.volumeRoot,
                 logRoot = config.logRoot,
+                assetRoot = config.assetRoot,
                 sandboxNamespace = config.sandboxNamespace,
                 cgroupParent = config.cgroupParent,
             )
@@ -762,6 +1121,18 @@ public data class LocalNodeConfig(
     val volumeRoot: Path,
     /** Root of the container log directories. */
     val logRoot: Path,
+    /**
+     * Where this host keeps the artefacts the orchestrator ships into
+     * containers, by [mcorch.core.WorkloadAsset.fileName].
+     *
+     * Deliberately has no default, and deliberately is not derived from
+     * anything. It is a deployment fact — where the install put the plugin JAR —
+     * and a default would be a guess that reads as working right up until a
+     * proxy comes up without its control plugin. A workload that asks for an
+     * asset which is not here is refused at create time rather than started
+     * without it.
+     */
+    val assetRoot: Path,
     /** Groups this orchestrator's sandboxes. Not a Kubernetes namespace; nothing resolves it anywhere. */
     val sandboxNamespace: String = "mcorch",
     /**

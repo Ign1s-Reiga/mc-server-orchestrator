@@ -96,3 +96,56 @@ dependencies {
     // `./gradlew build` stays runnable with no container runtime present.
     testImplementation(libs.grpc.inprocess)
 }
+
+// Integration tests for the CRI boundary itself, against a real local
+// containerd. NOT wired into `check`, for the same reason `:app`'s are not:
+// `./gradlew build` has to stay runnable with no container runtime present.
+//
+// They live here rather than in `:app` because `:app` deliberately cannot name a
+// CRI type — see the note at the top of app/build.gradle.kts. What these cover is
+// the handful of claims about *containerd's own behaviour* that the wrapper is
+// built on and that a fake server cannot check, because a fake would just agree
+// with whatever the wrapper believes.
+val integrationTest =
+    sourceSets.create("integrationTest") {
+        compileClasspath += sourceSets["main"].output
+        runtimeClasspath += sourceSets["main"].output
+    }
+
+// The standard implementation -> testImplementation -> integrationTestImplementation
+// chain, so these get grpc, netty and the epoll native transport the same way
+// the module itself does. Nothing extra is declared: an integration test that
+// needed a dependency `:cri` does not have would be testing something else.
+configurations["integrationTestImplementation"]
+    .extendsFrom(configurations["testImplementation"])
+configurations["integrationTestRuntimeOnly"]
+    .extendsFrom(configurations["testRuntimeOnly"])
+
+// Compiled by `check`, and so by `build`, without being *run* by it.
+//
+// A run needs a containerd nobody has in CI or in an agent's worktree; a compile
+// needs nothing, and it is the only thing that tells a change to a shared type
+// that it has broken this source set. Without it a signature change survives
+// every green build and fails for whoever next has a runtime to point at.
+//
+// That is not hypothetical: `EndpointRequest.timeout` became a value class and
+// this source set stopped compiling, invisibly, for a whole round while the
+// suite reported green over code that excluded it.
+tasks.named("check") { dependsOn("compileIntegrationTestKotlin") }
+
+tasks.register<Test>("integrationTest") {
+    group = "verification"
+    description = "Runs CRI-boundary tests against a real local containerd (see scripts/dev/containerd-up.sh)."
+    testClassesDirs = integrationTest.output.classesDirs
+    classpath = integrationTest.runtimeClasspath
+    useJUnitPlatform()
+    shouldRunAfter(tasks.named("test"))
+    // A run takes minutes against a real runtime and prints the timings it
+    // measured, which are the whole point of it — Gradle swallows a test's
+    // output unless asked.
+    testLogging {
+        showStandardStreams = true
+        events("failed")
+        exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+    }
+}

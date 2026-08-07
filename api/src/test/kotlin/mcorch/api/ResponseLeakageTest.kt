@@ -5,8 +5,12 @@ import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.string.shouldNotContain
+import mcorch.schema.BackendRegistration
+import mcorch.schema.BackendRoutingStatus
+import mcorch.schema.BackendStatus
 import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
+import mcorch.schema.ControlEndpointStatus
 import mcorch.schema.DrainState
 import mcorch.schema.DrainStatus
 import mcorch.schema.FailureClass
@@ -20,11 +24,14 @@ import mcorch.schema.PaperServerStatus
 import mcorch.schema.PlayerOccupancy
 import mcorch.schema.RconSpec
 import mcorch.schema.ResourceName
+import mcorch.schema.SecretRef
 import mcorch.schema.ServerDefinition
 import mcorch.schema.ServerEndpoint
 import mcorch.schema.ServerPhase
 import mcorch.schema.StatusCondition
 import mcorch.schema.StorageStatus
+import mcorch.schema.VelocityProxyDefinition
+import mcorch.schema.VelocityProxyStatus
 import mcorch.schema.fixtures.ExampleDefinitions
 import mcorch.schema.getOrThrow
 import mcorch.schema.yaml.ServerDefinitionParser
@@ -220,6 +227,135 @@ class ResponseLeakageTest {
         status.keys.map { it.toString() } shouldContainAll declared
     }
 
+    @Test
+    fun `no response carries the forwarding secret or the control token`() {
+        // The kind that finally carries a forwarding secret, and CLAUDE.md's
+        // fourth invariant is the most explicitly written rule in this repository:
+        // the value travels through the secret store and nowhere else — not a
+        // definition, not a log line, not a response. `proxy-full.yaml` names two
+        // references, and both are exercised because they take different paths
+        // through the renderer.
+        val definition =
+            ServerDefinitionParser.parse(ExampleDefinitions.valid("proxy-full.yaml"), "test").getOrThrow().proxy()
+        val forwarding = definition.spec.forwarding.secret
+        val forwardingValue = SecretValue.random(48)
+        val forwardingMaterial = reveal(forwardingValue)
+
+        // The control token is optional and `proxy-full.yaml` leaves it out — an
+        // unpublished endpoint needs none — so it is stored under its own
+        // coordinates and asserted on the same terms.
+        val token = SecretRef.of("proxy-02-control", "token").getOrThrow()
+        val tokenValue = SecretValue.random(48)
+        val tokenMaterial = reveal(tokenValue)
+
+        kotlinx.coroutines.runBlocking {
+            api.secrets.put(forwarding, forwardingValue)
+            api.secrets.put(token, tokenValue)
+        }
+
+        val bodies = everyProxyResponse()
+        val haystack = bodies.joinToString("\n")
+
+        // Control 1: both are really stored, so there was something to leak.
+        kotlinx.coroutines.runBlocking {
+            reveal(api.secrets.resolve(forwarding).shouldNotBeNull()) shouldBe forwardingMaterial
+            reveal(api.secrets.resolve(token).shouldNotBeNull()) shouldBe tokenMaterial
+        }
+        // Control 2: the responses really do describe the forwarding secret — its
+        // coordinates come back, which is exactly what an API may serve — so the
+        // search below looked at the right documents.
+        haystack shouldContain forwarding.name.value
+        haystack shouldContain forwarding.key
+        // Control 3: the matcher can find a needle in a haystack of this size.
+        (haystack + forwardingMaterial) shouldContain forwardingMaterial
+
+        haystack shouldNotContain forwardingMaterial
+        haystack shouldNotContain tokenMaterial
+    }
+
+    /** Every response an operator can obtain for a proxy that has been observed. */
+    private fun everyProxyResponse(): List<String> =
+        buildList {
+            add(api.call("POST", "/api/v1/servers", ExampleDefinitions.valid("proxy-full.yaml")).body)
+            observeProxy()
+            add(api.call("GET", "/api/v1/servers").body)
+            add(api.call("GET", "/api/v1/servers/proxy-02").body)
+            add(api.call("GET", "/api/v1/servers/proxy-02/status").body)
+            add(api.call("POST", "/api/v1/validate", ExampleDefinitions.valid("proxy-full.yaml")).body)
+            add(api.call("GET", "/api/v1/secrets").body)
+            add(api.call("GET", "/api/v1/meta").body)
+            // Failure paths carry messages, and a message is where content leaks.
+            add(api.call("POST", "/api/v1/servers", ExampleDefinitions.valid("proxy-full.yaml")).body)
+            add(api.call("PUT", "/api/v1/servers/proxy-02", ExampleDefinitions.valid("proxy-full.yaml")).body)
+            add(api.call("DELETE", "/api/v1/servers/proxy-02").body)
+            addAll(api.stream(limit = 2).map { it.data })
+        }
+
+    /** A fully populated proxy observation, so every proxy renderer is exercised. */
+    private fun observeProxy() {
+        val at = Instant.parse("2026-08-05T10:20:00Z")
+        val name = ResourceName.of("proxy-02").getOrThrow()
+        val status =
+            VelocityProxyStatus(
+                name = name,
+                observedGeneration = 1,
+                phase = ServerPhase.RUNNING,
+                observedAt = at,
+                lastTransitionAt = at,
+                ready = true,
+                players = PlayerOccupancy(online = 40, max = 2000, observedAt = at),
+                backends =
+                    BackendRoutingStatus(
+                        observedAt = at,
+                        backends =
+                            listOf(
+                                BackendStatus(
+                                    server = ResourceName.of("survival-01").getOrThrow(),
+                                    registration = BackendRegistration.REGISTERED,
+                                    players = PlayerOccupancy(online = 12, max = 60, observedAt = at),
+                                    lastTransitionAt = at,
+                                ),
+                            ),
+                    ),
+                control =
+                    ControlEndpointStatus(
+                        reachable = true,
+                        pluginApiVersion = "1",
+                        compatible = true,
+                        lastContactAt = at,
+                    ),
+                conditions =
+                    listOf(
+                        StatusCondition(ConditionType.BACKENDS_RESOLVED, ConditionStatus.TRUE, "", at),
+                        StatusCondition(ConditionType.CONTROL_ENDPOINT_READY, ConditionStatus.TRUE, "", at),
+                    ),
+            )
+        kotlinx.coroutines.runBlocking { api.store.putStatus(status).getOrThrow() }
+    }
+
+    @Test
+    fun `a proxy status renders every field the schema defines`() {
+        // A proxy sees every player in the fleet, so a field dropped silently here
+        // is the one that matters most. Total rendering is what makes "no identity
+        // anywhere" checkable rather than promised.
+        api.call("POST", "/api/v1/servers", ExampleDefinitions.valid("proxy-full.yaml")).status shouldBe 201
+        observeProxy()
+
+        val status = api.call("GET", "/api/v1/servers/proxy-02").json()["status"] as Map<*, *>
+        val declared =
+            VelocityProxyStatus::class.java.declaredFields
+                .filterNot { it.isSynthetic }
+                .map { it.name }
+                .filterNot { it == "Companion" }
+        status.keys.map { it.toString() } shouldContainAll declared
+
+        @Suppress("UNCHECKED_CAST")
+        val backends = (status["backends"] as Map<*, *>)["backends"] as List<Map<String, Any?>>
+        // Counts only, on the backend as well as on the proxy.
+        (backends.single()["players"] as Map<*, *>).keys.map { it.toString() }.sorted() shouldBe
+            listOf("max", "observedAt", "online")
+    }
+
     /** Writes one fully populated observation, the way the reconcile loop would. */
     private fun observe() {
         val at = Instant.parse("2026-07-28T10:20:00Z")
@@ -283,3 +419,6 @@ class ResponseLeakageTest {
 
 /** The one kind there is today. A cast rather than a helper in `:schema`: this is a test's problem. */
 private fun ServerDefinition.paper(): PaperServerDefinition = this as PaperServerDefinition
+
+/** The proxy kind. A cast rather than a helper in `:schema`: this is a test's problem. */
+private fun ServerDefinition.proxy(): VelocityProxyDefinition = this as VelocityProxyDefinition

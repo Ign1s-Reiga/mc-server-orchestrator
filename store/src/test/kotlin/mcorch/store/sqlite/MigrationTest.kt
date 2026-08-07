@@ -5,14 +5,22 @@ import io.kotest.matchers.nulls.shouldBeNull
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
+import io.kotest.matchers.string.shouldNotContain
 import io.kotest.matchers.types.shouldBeInstanceOf
 import kotlinx.coroutines.test.runTest
+import mcorch.schema.ConditionStatus
+import mcorch.schema.ConditionType
+import mcorch.schema.DrainBlockReason
 import mcorch.schema.DrainState
+import mcorch.schema.FailureClass
+import mcorch.schema.FailureReason
 import mcorch.schema.PaperServerDefinition
+import mcorch.schema.PaperServerSpec
 import mcorch.schema.PaperServerStatus
 import mcorch.schema.SchemaVersion
 import mcorch.schema.ServerKind
 import mcorch.schema.ServerPhase
+import mcorch.schema.SpecBounds
 import mcorch.store.ChangeFeed
 import mcorch.store.ChangeKind
 import mcorch.store.Fixtures
@@ -22,11 +30,14 @@ import mcorch.store.codec.PropertyDocument
 import mcorch.store.codec.StatusCodec
 import mcorch.store.getOrThrow
 import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.DynamicTest
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.TestFactory
 import java.nio.file.Path
 import java.sql.Connection
 import java.sql.DriverManager
 import java.time.Instant
+import kotlin.time.Duration.Companion.hours
 
 /**
  * The on-disk schema moves forward without losing anything.
@@ -71,7 +82,7 @@ class MigrationTest {
             appliedVersions(directory) shouldBe listOf(1)
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
 
                 val servers = migrated.state.listServers().associateBy { it.name.value }
                 servers.keys shouldBe setOf("survival-a", "survival-b", "survival-c")
@@ -176,10 +187,176 @@ class MigrationTest {
             }
 
             stores.open(directory).use { second ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
                 second.state.listServers().map { it.name.value } shouldBe listOf("survival-a")
             }
         }
+
+    /**
+     * A row that was already out of range when the upgrade found it.
+     *
+     * Deadlines on a stored spec are bounded on the way *out*
+     * ([mcorch.schema.SpecBounds]), and nothing on the way in rewrites them. That
+     * is the answer to "what happens to an existing row that is out of range", and
+     * it is deliberate on both halves:
+     *
+     * *No migration rewrites the value.* Capping it on disk would discard the
+     * number the operator declared, and a migration must not lose data. The bound
+     * needs no on-disk change to reach an old row — the decode applies it whatever
+     * version wrote the row — so a migration here would spend a version number to
+     * destroy information.
+     *
+     * *No migration refuses the store either.* A store that will not open is worse
+     * than one that opens with one server's timeout shortened, and the row is not
+     * corrupt: it satisfies the schema, it just declares a wait this build will not
+     * perform.
+     *
+     * So this asserts the upgrade path end to end: written at version 1, migrated
+     * through every version, still on disk unchanged, and served bounded.
+     */
+    @Test
+    fun `a deadline already out of range at version 1 survives the migration and is bounded on read`() =
+        runTest {
+            val directory = stores.directory()
+            val grace = 30.hours
+            val save = 20.hours
+            val running = Fixtures.unboundedDefinition("survival-a", stopGracePeriod = grace, saveTimeout = save)
+            val terminating = Fixtures.unboundedDefinition("survival-b", stopGracePeriod = grace, saveTimeout = save)
+            val deletedAt = Instant.parse("2026-07-20T09:00:00Z")
+
+            writeVersion1Database(directory) { legacy ->
+                legacy.definition(running, generation = 1L, revision = 1L)
+                legacy.definition(terminating, generation = 1L, revision = 2L, deletedAt = deletedAt)
+                legacy.status(Fixtures.fullStatus("survival-b", drainState = DrainState.SAVING), revision = 3L)
+            }
+            appliedVersions(directory) shouldBe listOf(1)
+
+            stores.open(directory).use { migrated ->
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
+
+                val spec =
+                    migrated.state
+                        .getServer(Fixtures.resourceName("survival-a"))
+                        .shouldNotBeNull()
+                        .definition.definition.spec
+                        .shouldBeInstanceOf<PaperServerSpec>()
+                spec.lifecycle.stopGracePeriod shouldBe SpecBounds.MAX_STOP_GRACE_PERIOD
+                spec.lifecycle.drain.saveTimeout shouldBe SpecBounds.MAX_SAVE_TIMEOUT
+                // Not bounded, and this is the half a "tidy it up" change would break:
+                // these two are compared against a wall clock, never waited on.
+                spec.lifecycle.startupTimeout shouldBe running.spec.lifecycle.startupTimeout
+                spec.lifecycle.drain.playerTransferTimeout shouldBe
+                    running.spec.lifecycle.drain.playerTransferTimeout
+
+                // The tombstoned one is still deletable, which is the point of a clamp
+                // rather than a refusal: the drain it is in the middle of has a spec to
+                // work from, and the purge that ends it goes through.
+                val tombstoned = migrated.state.getServer(Fixtures.resourceName("survival-b")).shouldNotBeNull()
+                tombstoned.definition.terminating shouldBe true
+                tombstoned.definition.deletedAt shouldBe deletedAt
+                migrated.state.deleteDefinition(Fixtures.resourceName("survival-b")).getOrThrow()
+                migrated.state.purge(Fixtures.resourceName("survival-b")).getOrThrow()
+            }
+
+            // No data loss: the declared values are on disk exactly as version 1 wrote
+            // them, after five migrations and a read that served them bounded.
+            val document = specDocumentOf(directory, "survival-a")
+            document shouldContain "lifecycle.stopGracePeriod=${grace.inWholeNanoseconds}"
+            document shouldContain "lifecycle.drain.saveTimeout=${save.inWholeNanoseconds}"
+        }
+
+    /**
+     * A drain that was mid-stop when the field recording the stop was introduced.
+     *
+     * `DrainStatus.stopDispatchedAt` lives inside the status document rather than in
+     * a column, so no on-disk version moved when it was added and none of V1..V5
+     * backfills it. The answer is the same shape as the deadline case above — the
+     * record is restored on the way *out*
+     * ([mcorch.schema.StatusReconstruction]) — and it is deliberate on both halves
+     * for one reason each of its own:
+     *
+     * *No migration writes the stamp.* The row is not wrong; it was exactly right
+     * for the build that wrote it. Writing an instant no process observed into
+     * storage makes an inference indistinguishable from an observation for ever
+     * after, and the reconcile loop persists the reconstruction itself on the first
+     * pass that acts on it — so a migration would spend a version number on work
+     * that happens one pass later anyway.
+     *
+     * *No migration refuses the store either.* An orchestrator that will not open is
+     * every drain stalled, and the document satisfies the schema in full.
+     *
+     * So this asserts the upgrade path end to end: written at version 1, migrated
+     * through every version, still keyless on disk, and served with the record.
+     */
+    @Test
+    fun `a drain stopping since before the dispatch field survives the migration and is served the record`() =
+        runTest {
+            val directory = stores.directory()
+            val running = Fixtures.definitionNamed("survival-a")
+            val terminating = Fixtures.definitionNamed("survival-b")
+            val deletedAt = Instant.parse("2026-07-20T09:00:00Z")
+
+            writeVersion1Database(directory) { legacy ->
+                legacy.definition(running, generation = 1L, revision = 1L)
+                legacy.definition(terminating, generation = 1L, revision = 2L, deletedAt = deletedAt)
+                legacy.status(stoppingBeforeTheField("survival-a"), revision = 3L)
+                legacy.status(stoppingBeforeTheField("survival-b"), revision = 4L)
+            }
+            appliedVersions(directory) shouldBe listOf(1)
+            // The fixture's premise, asserted rather than assumed: these documents
+            // are built by the current encoder from a null, which is byte-identical
+            // to what a build with no such field wrote. An encoder that started
+            // emitting the key for a null would leave this test passing while it
+            // stopped testing anything.
+            statusDocument(directory, "survival-a") shouldNotContain "drain.stopDispatchedAt"
+
+            stores.open(directory).use { migrated ->
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
+
+                val drain =
+                    migrated.state
+                        .getServer(Fixtures.resourceName("survival-a"))
+                        .shouldNotBeNull()
+                        .status
+                        .shouldNotBeNull()
+                        .status
+                        .shouldBeInstanceOf<PaperServerStatus>()
+                        .drain
+                        .shouldNotBeNull()
+                drain.state shouldBe DrainState.STOPPING
+                drain.stopDispatchedAt shouldBe drain.enteredStateAt
+                // The projection the migrations built is keyed on the drain state,
+                // which the reconstruction does not touch, so a resumed drain is
+                // still found by the query that finds it.
+                migrated.state.listByDrainState(setOf(DrainState.STOPPING)).map { it.name.value } shouldBe
+                    listOf("survival-a", "survival-b")
+
+                // The tombstoned one still goes. Reporting a dispatch that may not
+                // have happened is the safe direction for routing and the dangerous
+                // one for a lifecycle: a rule that made a populated, world-holding
+                // server undeletable is what ends in a manual `crictl stop`.
+                val tombstoned = migrated.state.getServer(Fixtures.resourceName("survival-b")).shouldNotBeNull()
+                tombstoned.definition.terminating shouldBe true
+                tombstoned.definition.deletedAt shouldBe deletedAt
+                migrated.state.deleteDefinition(Fixtures.resourceName("survival-b")).getOrThrow()
+                migrated.state.purge(Fixtures.resourceName("survival-b")).getOrThrow()
+                migrated.state.getServer(Fixtures.resourceName("survival-b")).shouldBeNull()
+            }
+
+            // No data loss and no data invented: the document is what version 1 held,
+            // after five migrations and a read that served the record.
+            statusDocument(directory, "survival-a") shouldBe
+                StatusCodec.encode(stoppingBeforeTheField("survival-a"))
+        }
+
+    /**
+     * A `STOPPING` drain recorded the way a build with no `stopDispatchedAt` field
+     * recorded one: every other key, and that key absent.
+     */
+    private fun stoppingBeforeTheField(name: String): PaperServerStatus {
+        val status = Fixtures.fullStatus(name, drainState = DrainState.STOPPING)
+        return status.copy(drain = status.drain?.copy(stopDispatchedAt = null))
+    }
 
     // ------------------------------------------------------------------ version 4
 
@@ -208,7 +385,7 @@ class MigrationTest {
             appliedVersions(directory) shouldBe listOf(1, 2, 3)
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
 
                 // Nothing was dropped, renamed or cascaded away.
                 val server = migrated.state.getServer(definition.metadata.name).shouldNotBeNull()
@@ -281,7 +458,7 @@ class MigrationTest {
             }
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
 
                 val listing = migrated.state.listAll()
                 listing.servers.map { it.name.value } shouldBe listOf("survival-a")
@@ -384,7 +561,7 @@ class MigrationTest {
             appliedVersions(directory) shouldBe listOf(1, 2)
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
 
                 val confirmed = drainOf(migrated, "survival-a")
                 confirmed.worldSavedAt shouldBe confirmedAt
@@ -465,7 +642,7 @@ class MigrationTest {
             appliedVersions(directory) shouldBe listOf(1, 2)
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
                 val drain = drainOf(migrated, "survival-a")
 
                 // Undated evidence is no evidence. Nothing may appear here.
@@ -574,6 +751,367 @@ class MigrationTest {
         appliedVersions(directory) shouldBe listOf(1, 2)
     }
 
+    /**
+     * The change of meaning version 5 exists to absorb.
+     *
+     * Before it, a drain waiting for players to log off recorded
+     * `drain.failure.reason=DRAIN_NO_DESTINATION`. That reason now means
+     * something else — *the search ran and the fleet had no capacity* — which
+     * escalates once it is older than `drainAttentionAfter`. So the same bytes,
+     * read by the new code, turn every drain that was quietly waiting out a busy
+     * evening into a call for a human, and the operator is sent to look at a
+     * server where people are simply playing. That is the alert fatigue this whole
+     * change removes, delivered by the upgrade that removes it.
+     *
+     * `survival-b` carries `DRAIN_AWAITING_ZERO_PLAYERS`, which no released build
+     * wrote but a dev store opened against one commit of the branch could hold.
+     * Its failure mode is louder — the value is not in the enum any more, so the
+     * row would not decode at all — and covering it costs one entry in a set.
+     */
+    @Test
+    fun `a drain blocked on players before version 5 comes back blocked, not failed`() =
+        runTest {
+            val directory = stores.directory()
+            val blockedSince = Instant.parse("2026-07-20T08:05:00Z")
+            val message = "blocked: no drain destination. 3 of 20 player slots are in use"
+
+            writeVersion4Database(directory) { legacy ->
+                legacy.definition(Fixtures.definitionNamed("survival-a"), generation = 1L, revision = 1L)
+                legacy.definition(Fixtures.definitionNamed("survival-b"), generation = 1L, revision = 2L)
+                legacy.blockedLegacyStatus(
+                    name = "survival-a",
+                    revision = 3L,
+                    reason = "DRAIN_NO_DESTINATION",
+                    occurredAt = blockedSince,
+                    attempts = 37,
+                    message = message,
+                )
+                legacy.blockedLegacyStatus(
+                    name = "survival-b",
+                    revision = 4L,
+                    reason = "DRAIN_AWAITING_ZERO_PLAYERS",
+                    occurredAt = blockedSince,
+                    attempts = 4,
+                    message = message,
+                )
+            }
+            appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
+
+            stores.open(directory).use { migrated ->
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
+
+                for (name in listOf("survival-a", "survival-b")) {
+                    val status =
+                        migrated.state
+                            .getServer(Fixtures.resourceName(name))
+                            .shouldNotBeNull()
+                            .status
+                            .shouldNotBeNull()
+                            .status
+                            .shouldBeInstanceOf<PaperServerStatus>()
+                    val drain = status.drain.shouldNotBeNull()
+
+                    val blocked = drain.blocked.shouldNotBeNull()
+                    blocked.reason shouldBe DrainBlockReason.AWAITING_ZERO_PLAYERS
+                    // A rename, not a re-derivation. "Waiting since" must not jump
+                    // to the moment of the upgrade.
+                    blocked.since shouldBe blockedSince
+                    blocked.message shouldBe message
+                    // The assertions the migration exists for.
+                    drain.failure.shouldBeNull()
+                    // The reconciler mirrors a drain's failure one level up, so
+                    // the same fact was on disk twice and both copies have to go.
+                    status.failure.shouldBeNull()
+                }
+
+                // The count carries across as the number of times the loop has
+                // looked, so it does not restart at one.
+                drainOf(migrated, "survival-a").blocked.shouldNotBeNull().observations shouldBe 37
+                drainOf(migrated, "survival-b").blocked.shouldNotBeNull().observations shouldBe 4
+
+                // No data loss: everything the hand-written document carried that
+                // has nothing to do with the failure is still there. A rewrite
+                // that dropped unrelated keys would otherwise be silent.
+                val status =
+                    migrated.state
+                        .getServer(Fixtures.resourceName("survival-a"))
+                        .shouldNotBeNull()
+                        .status
+                        .shouldNotBeNull()
+                        .status
+                        .shouldBeInstanceOf<PaperServerStatus>()
+                status.phase shouldBe ServerPhase.RUNNING
+                status.ready shouldBe true
+                status.players.shouldNotBeNull().online shouldBe 3
+                status.players.shouldNotBeNull().max shouldBe 20
+                status.storage.shouldNotBeNull().lastSaveConfirmedAt shouldBe LEGACY_SEAL_REQUESTED_AT
+                status.storage
+                    .shouldNotBeNull()
+                    .volumeName
+                    .shouldNotBeNull()
+                    .value shouldBe "survival-a-world"
+                status.conditions.single().type shouldBe ConditionType.DRAINING
+                status.conditions.single().lastTransitionAt shouldBe LEGACY_DRAIN_ENTERED_AT
+
+                val drain = status.drain.shouldNotBeNull()
+                // Still parked. `DRAIN_FAILED` means *not advancing*, and only the
+                // record beside it says whether that is bad news — so the state and
+                // the projection column keep their value.
+                drain.state shouldBe DrainState.DRAIN_FAILED
+                drain.startedAt shouldBe LEGACY_DRAIN_STARTED_AT
+                drain.enteredStateAt shouldBe LEGACY_DRAIN_ENTERED_AT
+                drain.sealRequestedAt shouldBe LEGACY_SEAL_REQUESTED_AT
+                drain.playersEvacuated shouldBe false
+                drain.transferAttempts shouldBe 0
+            }
+        }
+
+    /**
+     * The control, and it is what makes the test above a test of the *reason*
+     * rather than of "version 5 deletes failures".
+     *
+     * A drain that genuinely failed keeps its failure, its class, its attempt
+     * count and its first-occurrence time. Nothing about it is a block.
+     */
+    @Test
+    fun `version 5 leaves a drain failure it was not written about completely alone`() =
+        runTest {
+            val directory = stores.directory()
+            val occurredAt = Instant.parse("2026-07-20T08:05:00Z")
+            writeVersion4Database(directory) { legacy ->
+                legacy.definition(Fixtures.definitionNamed("survival-a"), generation = 1L, revision = 1L)
+                legacy.blockedLegacyStatus(
+                    name = "survival-a",
+                    revision = 2L,
+                    reason = FailureReason.DRAIN_SAVE_TIMEOUT.name,
+                    occurredAt = occurredAt,
+                    attempts = 9,
+                    message = "save completion not confirmed within the save timeout",
+                )
+            }
+
+            stores.open(directory).use { migrated ->
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
+
+                val status =
+                    migrated.state
+                        .getServer(Fixtures.resourceName("survival-a"))
+                        .shouldNotBeNull()
+                        .status
+                        .shouldNotBeNull()
+                        .status
+                        .shouldBeInstanceOf<PaperServerStatus>()
+                val failure =
+                    status.drain
+                        .shouldNotBeNull()
+                        .failure
+                        .shouldNotBeNull()
+                failure.reason shouldBe FailureReason.DRAIN_SAVE_TIMEOUT
+                failure.failureClass shouldBe FailureClass.RETRYABLE
+                failure.occurredAt shouldBe occurredAt
+                failure.attempts shouldBe 9
+                status.drain
+                    .shouldNotBeNull()
+                    .blocked
+                    .shouldBeNull()
+                // And the mirrored copy, which is only dropped for a retired reason.
+                status.failure.shouldNotBeNull().reason shouldBe FailureReason.DRAIN_SAVE_TIMEOUT
+            }
+        }
+
+    /**
+     * The same refusal version 3 makes, for the same reason.
+     *
+     * A row at an encoding this migration was not written against is refused
+     * before anything is written. Skipping it would leave that drain's healthy
+     * wait reading as a fleet-capacity failure — the change of meaning version 5
+     * exists to absorb, reintroduced quietly for the rows it understood least.
+     */
+    @Test
+    fun `a status document at an encoding version 5 does not understand is refused, and nothing is rewritten`() {
+        val directory = stores.directory()
+        writeVersion4Database(directory) { legacy ->
+            legacy.definition(Fixtures.definitionNamed("survival-a"), generation = 1L, revision = 1L)
+            legacy.blockedLegacyStatus(
+                name = "survival-a",
+                revision = 2L,
+                reason = "DRAIN_NO_DESTINATION",
+                occurredAt = Instant.parse("2026-07-20T08:05:00Z"),
+                attempts = 2,
+                message = "3 of 20 player slots are in use",
+                encoding = UNREADABLE_ENCODING,
+            )
+        }
+
+        val failure =
+            runCatching { stores.open(directory) }
+                .exceptionOrNull()
+                .shouldBeInstanceOf<StoreException.MigrationFailed>()
+
+        failure.retryable shouldBe false
+        failure.cause
+            .shouldBeInstanceOf<StoreException.Corrupt>()
+            .message
+            .shouldNotBeNull()
+            .shouldContain("survival-a")
+
+        // One transaction per migration, so the store is still at version 4 with
+        // the row exactly as it was and the operator can downgrade and reopen.
+        appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
+        statusDocument(directory, "survival-a") shouldContain "drain.failure.reason=DRAIN_NO_DESTINATION"
+    }
+
+    /**
+     * A row that already carries a whole `drain.blocked` record *and* a retired
+     * failure. The copy loop keeps the former and the rewrite would write the
+     * latter on top, so the two would collide.
+     *
+     * The refusal is the point: nothing that wrote these documents could produce
+     * both, so the row was edited by hand and the migration cannot tell which of
+     * the two the operator meant. Refusing in the store's own vocabulary is what
+     * lets `:core` classify it — a bare `IllegalArgumentException` from the
+     * document writer crosses the store boundary as a type nothing above it
+     * knows how to read.
+     */
+    @Test
+    fun `a hand-edited row that is both blocked and failed fails as a store error`() {
+        val directory = stores.directory()
+        writeVersion4Database(directory) { legacy ->
+            legacy.definition(Fixtures.definitionNamed("survival-a"), generation = 1L, revision = 1L)
+            legacy.blockedLegacyStatus(
+                name = "survival-a",
+                revision = 2L,
+                reason = "DRAIN_NO_DESTINATION",
+                occurredAt = Instant.parse("2026-07-20T08:05:00Z"),
+                attempts = 2,
+                message = "3 of 20 player slots are in use",
+                extra =
+                    listOf(
+                        "drain.blocked.reason" to "AWAITING_ZERO_PLAYERS",
+                        "drain.blocked.message" to "hand-written",
+                        "drain.blocked.since" to "2026-07-19T08:05:00Z",
+                        "drain.blocked.observations" to "1",
+                    ),
+            )
+        }
+
+        expectRefusedAtVersion4(directory)
+    }
+
+    /**
+     * The same collision reached through *any* of the four keys, not just the one
+     * the guard used to name.
+     *
+     * The eleventh drain audit found the guard asked `has("drain.blocked.reason")`
+     * while the rewrite writes four keys. A row carrying only, say,
+     * `drain.blocked.message` slipped past it and collided inside
+     * `DocumentWriter`, throwing `IllegalArgumentException` — precisely the
+     * outcome the guard's own comment says it exists to prevent, and the second
+     * time this shape has been found in a migration.
+     *
+     * Every key is exercised, because a guard that names a subset is exactly the
+     * defect: `reason` alone is what shipped, and the next partial set would slip
+     * through again.
+     */
+    @TestFactory
+    fun `a hand-edited row carrying any part of a blocked record fails as a store error`() =
+        listOf(
+            "drain.blocked.reason" to "AWAITING_ZERO_PLAYERS",
+            "drain.blocked.message" to "hand-written",
+            "drain.blocked.since" to "2026-07-19T08:05:00Z",
+            "drain.blocked.observations" to "1",
+        ).map { (key, value) ->
+            DynamicTest.dynamicTest("$key alone") {
+                val directory = stores.directory()
+                writeVersion4Database(directory) { legacy ->
+                    legacy.definition(Fixtures.definitionNamed("survival-a"), generation = 1L, revision = 1L)
+                    legacy.blockedLegacyStatus(
+                        name = "survival-a",
+                        revision = 2L,
+                        reason = "DRAIN_NO_DESTINATION",
+                        occurredAt = Instant.parse("2026-07-20T08:05:00Z"),
+                        attempts = 2,
+                        message = "3 of 20 player slots are in use",
+                        extra = listOf(key to value),
+                    )
+                }
+
+                expectRefusedAtVersion4(directory)
+            }
+        }
+
+    /**
+     * Refused in the store's vocabulary, and refused *before* anything is
+     * written: one transaction per migration, so the row is still exactly as it
+     * was and an operator can downgrade, repair it and reopen.
+     */
+    private fun expectRefusedAtVersion4(directory: Path) {
+        val failure =
+            runCatching { stores.open(directory) }
+                .exceptionOrNull()
+                .shouldBeInstanceOf<StoreException.MigrationFailed>()
+
+        failure.retryable shouldBe false
+        val corrupt =
+            failure.cause
+                .shouldBeInstanceOf<StoreException.Corrupt>()
+                .message
+                .shouldNotBeNull()
+        // Enough to find the row and to know which two records disagree.
+        corrupt shouldContain "survival-a"
+        corrupt shouldContain "drain.blocked"
+        corrupt shouldContain "drain.failure"
+
+        appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
+        statusDocument(directory, "survival-a") shouldContain "drain.failure.reason=DRAIN_NO_DESTINATION"
+    }
+
+    /**
+     * A store that predates the proxy kind holds one with no migration.
+     *
+     * The claim handed over with this work was "no on-disk migration is needed —
+     * the `kind` column is plain TEXT with no CHECK". This is that claim tested
+     * rather than taken: a database written at version 1, migrated up, and then
+     * asked to hold a kind that did not exist when it was created. If the column
+     * ever grows a constraint, a foreign key or an index that enumerates kinds,
+     * this fails and the migration that was said to be unnecessary becomes
+     * necessary.
+     */
+    @Test
+    fun `a database written before the proxy kind existed can hold one after migrating`() =
+        runTest {
+            val directory = stores.directory()
+            val existing = Fixtures.definitionNamed("survival-a")
+            writeVersion1Database(directory) { legacy ->
+                legacy.definition(existing, generation = 1L, revision = 1L)
+                legacy.status(Fixtures.fullStatus("survival-a", drainState = DrainState.SAVING), revision = 2L)
+            }
+            appliedVersions(directory) shouldBe listOf(1)
+
+            val proxy = Fixtures.proxyDefinitionNamed("edge-01")
+            val proxyStatus = Fixtures.fullProxyStatus("edge-01", drainState = DrainState.SEALED)
+            stores.open(directory).use { migrated ->
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5)
+
+                migrated.state.putDefinition(proxy).getOrThrow()
+                migrated.state.putStatus(proxyStatus).getOrThrow()
+            }
+
+            // Reopened, so the assertions are about what reached the disk.
+            stores.open(directory).use { reopened ->
+                val stored = reopened.state.getServer(proxy.metadata.name).shouldNotBeNull()
+                stored.definition.definition shouldBe proxy
+                stored.status.shouldNotBeNull().status shouldBe proxyStatus
+                // The pre-existing server is untouched, and one drain query finds both
+                // kinds — the projection column does not care which wrote it.
+                reopened.state.getServer(existing.metadata.name).shouldNotBeNull()
+                reopened.state
+                    .listByDrainState(setOf(DrainState.SAVING, DrainState.SEALED))
+                    .map { it.name.value }
+                    .shouldContainExactly(listOf("edge-01", "survival-a"))
+            }
+        }
+
     private suspend fun drainOf(
         store: EmbeddedStore,
         name: String,
@@ -627,6 +1165,25 @@ class MigrationTest {
     ) {
         rawConnection(directory).use { connection ->
             Migrations.migrate(connection, stores.clock, upTo = 3)
+            val writer = LegacyWriter(connection, hasDrainStateColumn = true)
+            block(writer)
+            writer.finish()
+            connection.commit()
+        }
+    }
+
+    /**
+     * A database stopped at version 4, for the version-5 cases.
+     *
+     * Versions 3 and 5 change documents and version 4 adds triggers, so the row
+     * shapes are still version 2's and the same writer serves this too.
+     */
+    private fun writeVersion4Database(
+        directory: Path,
+        block: (LegacyWriter) -> Unit,
+    ) {
+        rawConnection(directory).use { connection ->
+            Migrations.migrate(connection, stores.clock, upTo = 4)
             val writer = LegacyWriter(connection, hasDrainStateColumn = true)
             block(writer)
             writer.finish()
@@ -796,6 +1353,100 @@ class MigrationTest {
             highest = maxOf(highest, revision)
         }
 
+        /**
+         * A status document written key by key, the way version 4 wrote a drain
+         * that was blocked on players: a `FailureStatus` under `drain.failure`,
+         * mirrored onto the status by the reconciler.
+         *
+         * Deliberately not `StatusCodec.encode`. The current encoder writes
+         * `drain.blocked` and no failure at all for this case, so a test built on
+         * it would migrate a document that never needed migrating and would pass
+         * whatever version 5 did.
+         *
+         * The unrelated keys are not padding. A rewrite that dropped them would
+         * otherwise be silent, and losing `storage.lastSaveConfirmedAt` or a
+         * condition's `lastTransitionAt` is data an operator reads.
+         *
+         * [extra] carries keys no released build wrote — a hand-edited row. It is
+         * the only way to reach version 5's refusals, which by construction
+         * nothing that wrote these documents could produce.
+         */
+        @Suppress("LongParameterList")
+        fun blockedLegacyStatus(
+            name: String,
+            revision: Long,
+            reason: String,
+            occurredAt: Instant,
+            attempts: Int,
+            message: String,
+            mirrorOnStatus: Boolean = true,
+            encoding: Int = PropertyDocument.ENCODING_VERSION,
+            extra: List<Pair<String, String>> = emptyList(),
+        ) {
+            val fields =
+                buildList {
+                    addAll(extra)
+                    add("apiVersion" to SchemaVersion.CURRENT.wireValue)
+                    add("kind" to ServerKind.PAPER_SERVER.wireValue)
+                    add("name" to name)
+                    add("observedGeneration" to "1")
+                    // A blocked drain leaves the server running and joinable, and
+                    // that is what version 4 recorded too.
+                    add("phase" to ServerPhase.RUNNING.name)
+                    add("observedAt" to CREATED_AT.toString())
+                    add("lastTransitionAt" to CREATED_AT.toString())
+                    add("ready" to "true")
+                    add("players.online" to "3")
+                    add("players.max" to "20")
+                    add("players.observedAt" to CREATED_AT.toString())
+                    add("storage.persistent" to "true")
+                    add("storage.volumeName" to "$name-world")
+                    add("storage.bound" to "true")
+                    add("storage.lastSaveConfirmedAt" to LEGACY_SEAL_REQUESTED_AT.toString())
+                    add("drain.state" to DrainState.DRAIN_FAILED.name)
+                    add("drain.startedAt" to LEGACY_DRAIN_STARTED_AT.toString())
+                    add("drain.enteredStateAt" to LEGACY_DRAIN_ENTERED_AT.toString())
+                    add("drain.playersEvacuated" to "false")
+                    add("drain.sealRequestedAt" to LEGACY_SEAL_REQUESTED_AT.toString())
+                    add("drain.transferAttempts" to "0")
+                    add("drain.failure.reason" to reason)
+                    add("drain.failure.failureClass" to FailureClass.RETRYABLE.name)
+                    add("drain.failure.message" to message)
+                    add("drain.failure.occurredAt" to occurredAt.toString())
+                    add("drain.failure.attempts" to attempts.toString())
+                    if (mirrorOnStatus) {
+                        add("failure.reason" to reason)
+                        add("failure.failureClass" to FailureClass.RETRYABLE.name)
+                        add("failure.message" to message)
+                        add("failure.occurredAt" to occurredAt.toString())
+                        add("failure.attempts" to attempts.toString())
+                    }
+                    add("conditions.count" to "1")
+                    add("conditions.0.type" to ConditionType.DRAINING.name)
+                    add("conditions.0.status" to ConditionStatus.FALSE.name)
+                    add("conditions.0.message" to "drain state DRAIN_FAILED")
+                    add("conditions.0.lastTransitionAt" to LEGACY_DRAIN_ENTERED_AT.toString())
+                }
+            val document = fields.sortedBy { it.first }.joinToString("\n") { "${it.first}=${it.second}" }
+            connection.update(
+                """
+                INSERT INTO server_status (
+                    name, api_version, kind, resource_version, recorded_at, status_doc, doc_encoding, drain_state
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """.trimIndent(),
+            ) {
+                setString(1, name)
+                setString(2, SchemaVersion.CURRENT.wireValue)
+                setString(3, ServerKind.PAPER_SERVER.wireValue)
+                setLong(4, revision)
+                setString(5, CREATED_AT.toString())
+                setString(6, document)
+                setInt(7, encoding)
+                setString(8, DrainState.DRAIN_FAILED.name)
+            }
+            highest = maxOf(highest, revision)
+        }
+
         fun finish() {
             connection.update("UPDATE store_sequence SET next_revision = ? WHERE id = 0") { setLong(1, highest) }
         }
@@ -809,6 +1460,17 @@ class MigrationTest {
         DriverManager.getConnection(jdbcUrl(directory)).also { connection ->
             connection.createStatement().use { it.execute("PRAGMA foreign_keys = ON") }
             connection.autoCommit = false
+        }
+
+    private fun specDocumentOf(
+        directory: Path,
+        name: String,
+    ): String =
+        rawConnection(directory).use { connection ->
+            connection.query("SELECT spec_doc FROM server_definition WHERE name = ?", { setString(1, name) }) { rows ->
+                require(rows.next()) { "no definition row for `$name`" }
+                rows.getString("spec_doc")
+            }
         }
 
     private fun appliedVersions(directory: Path): List<Int> =

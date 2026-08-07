@@ -1,0 +1,23 @@
+# Expected: spec.backends.fallback[1] — must be lowercase
+#
+# Each entry is reported on its own index so the violation can be counted down
+# against the file, and a bad entry does not stop the rest being checked.
+apiVersion: mcorch.dev/v1alpha1
+kind: VelocityProxy
+metadata:
+  name: proxy-01
+spec:
+  image: docker.io/itzg/mc-proxy:2026.6.1
+  resources:
+    memory: 1Gi
+  forwarding:
+    secret:
+      name: fleet-forwarding
+      key: modern-forwarding
+  backends:
+    selector:
+      matchLabels:
+        mcorch.dev/fleet: main
+    fallback:
+      - lobby-01
+      - Lobby-02

@@ -2,6 +2,8 @@ package mcorch.app
 
 import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.string.shouldContain
+import io.kotest.matchers.string.shouldNotContain
 import kotlinx.coroutines.runBlocking
 import mcorch.api.ApiConfig
 import mcorch.api.ApiServer
@@ -9,7 +11,11 @@ import mcorch.api.OperatorToken
 import mcorch.core.Reconciler
 import mcorch.core.SingleNodeScheduler
 import mcorch.core.StaticNodeRegistry
+import mcorch.schema.DrainStatus
+import mcorch.schema.PaperServerStatus
 import mcorch.schema.RconSpec
+import mcorch.schema.ResourceName
+import mcorch.schema.StorageSpec
 import mcorch.store.getOrThrow
 import mcorch.store.sqlite.EmbeddedStore
 import mcorch.store.sqlite.EmbeddedStoreConfig
@@ -47,11 +53,11 @@ import java.time.Duration as JavaDuration
  * real [EmbeddedStore] that a real [Reconciler] wrote, because the defect was
  * found in the rendered JSON and that is the artefact worth pinning.
  *
- * ## The property
+ * ## The properties
  *
- * **If the badge says `TERMINATING` or `DRAINING` while the server is still
- * reported joinable, then either the drain is making progress or
- * `needsAttention` is true.**
+ * **1. If the badge says `TERMINATING` or `DRAINING` while the server is still
+ * reported joinable, then either the drain is making progress, or it is blocked,
+ * or `needsAttention` is true.**
  *
  * The badge ranks `TERMINATING` above everything on purpose — a server showing
  * `READY` while its name is being reclaimed is the one wrong answer that
@@ -59,6 +65,16 @@ import java.time.Duration as JavaDuration
  * has players on it, renders as though it were on its way out. The flag is what
  * stops that reading being a lie, and this asserts the two cannot drift apart
  * again.
+ *
+ * **2. A server carrying a `PERMANENT` failure is flagged. No badge, no phase, no
+ * drain is exempt.**
+ *
+ * The first property is scoped to two badges and to `ready`, so it structurally
+ * cannot see the case that motivated the second: a refused `storage.mode` edit
+ * leaves the phase at `RUNNING` with no drain at all, and the loop then stops
+ * observing that server entirely. The badge lie points the *opposite* way from
+ * the one above — `TERMINATING` at least makes somebody look; `RUNNING` makes
+ * them look away — and it is the worse of the two for that reason.
  */
 class DisplayConformanceTest {
     private val directories = mutableListOf<Path>()
@@ -71,6 +87,18 @@ class DisplayConformanceTest {
 
     private fun directory(): Path = Files.createTempDirectory("mcorch-display").also { directories.add(it) }
 
+    /** The drain the loop last wrote, read back out of the real store. */
+    private suspend fun drainOf(
+        embedded: EmbeddedStore,
+        name: ResourceName,
+    ): DrainStatus? =
+        (
+            embedded.state
+                .getServer(name)
+                ?.status
+                ?.status as? PaperServerStatus
+        )?.drain
+
     /**
      * The invariant, applied to one rendered server.
      *
@@ -79,30 +107,32 @@ class DisplayConformanceTest {
      * where it is vacuously true. A rule that only holds for the case it was
      * written against is not the rule.
      *
-     * ## Why "no players online" is part of the antecedent
+     * ## Why "blocked" is one of the arms
      *
      * The property was first written as *progressing or flagged*, and the
-     * players-online case failed it: that drain sits in `DRAIN_FAILED` — it
-     * aborted — is not progressing, and is deliberately never flagged. It is also
+     * players-online case failed it: that drain sits in `DRAIN_FAILED` — it is
+     * parked — is not progressing, and is deliberately never flagged. It is also
      * completely fine. It is waiting for people to log off, which is the protocol
      * working, and alarming on it every backoff interval is how operators learn
      * the signal means nothing.
      *
      * So `DRAIN_FAILED` is not a usable proxy for *stuck*. What separates the two
-     * from the dashboard's side is whether anybody is on the server, and
-     * `playersOnline` is rendered, so the consumer can tell them apart without
-     * being told the failure reason. A server showing players is self-evidently
-     * not abandoned; one showing none, with a drain that has given up and a badge
-     * saying it is on its way out, is the case an operator will walk past.
+     * used to be inferred here from `playersOnline`, which was a guess about
+     * *why* a drain was parked, and only correct as long as the one block reason
+     * happened to be about players. It is now a rendered fact: `drainBlocked` is
+     * derived from the drain's own record, and using it means this property is
+     * red if `:core` records a stuck drain as a healthy wait — which the player
+     * count could not have caught, since a stuck drain usually has players on it
+     * too.
      */
     private fun assertNothingIsSilentlyStuck(display: Map<*, *>) {
         val state = display["state"]
         val ready = display["ready"] == true
         if (state !in setOf("TERMINATING", "DRAINING") || !ready) return
         val progressing = display["drainState"] != "DRAIN_FAILED"
-        val waitingOnPlayers = (display["playersOnline"] as? Int ?: 0) > 0
+        val blocked = display["drainBlocked"] == true
         val flagged = display["needsAttention"] == true
-        withClue(display) { (progressing || waitingOnPlayers || flagged) shouldBe true }
+        withClue(display) { (progressing || blocked || flagged) shouldBe true }
     }
 
     private fun withClue(
@@ -119,6 +149,29 @@ class DisplayConformanceTest {
                 failure,
             )
         }
+    }
+
+    /**
+     * The second property, applied to a rendered server whatever state it is in.
+     *
+     * Reads `status.failure` rather than a badge, because the whole point is that
+     * no badge distinguishes these servers. A `PERMANENT` failure means the loop
+     * has stopped acting: it will not probe, will not observe and will not record
+     * anything further until a person changes something. There is no phase, no
+     * drain and no badge for which that is a state to leave unflagged.
+     */
+    private fun assertPermanentFailureIsFlagged(
+        status: Map<*, *>?,
+        display: Map<*, *>,
+    ) {
+        val failure = status?.get("failure") as? Map<*, *> ?: return
+        if (failure["failureClass"] != "PERMANENT") return
+        if (display["needsAttention"] == true) return
+        throw AssertionError(
+            "a server carries a permanent failure — the loop has stopped acting on it and only a person can " +
+                "move it — and it is rendered with no attention flag. Its badge is " +
+                "\"${display["state"]}\", which an operator reads as an ordinary server: $display / $failure",
+        )
     }
 
     @Test
@@ -151,6 +204,26 @@ class DisplayConformanceTest {
                 display["drainState"] shouldBe "DRAIN_FAILED"
                 display["needsAttention"] shouldBe true
 
+                // The identity this case exists to guard, asserted in the
+                // direction that can actually break.
+                //
+                // `Reconciler.drain` writes `status.failure = progress.drain.failure`
+                // as a *copy*, and three consumers discriminate "this failure is the
+                // drain's own" by comparing the two values. `:api`'s `detail()` is
+                // one of them: it ranks a *pass* failure above the drain's, so the
+                // moment that assignment becomes a `?.copy(...)` the two stop being
+                // equal, every aborted drain routes through the pass arm, and this
+                // sentence silently becomes "the loop cannot complete a pass". Every
+                // other assertion above still passes — `needsAttention` is true
+                // either way, the badge is unchanged, and the phase is unchanged.
+                //
+                // `DrainBlockRenderingTest` asserts the negative half against a
+                // hand-built status (`shouldNotContain` on a blocked drain), which
+                // cannot see this: it never runs `Reconciler`, so it cannot observe
+                // the assignment that makes the positive half true.
+                (display["detail"] as String) shouldContain "the drain aborted"
+
+                assertPermanentFailureIsFlagged(api.status("stuck-01"), display)
                 assertNothingIsSilentlyStuck(display)
             }
 
@@ -164,6 +237,73 @@ class DisplayConformanceTest {
             // surface as a 404 from the purge, which reads as broken plumbing
             // rather than as a container with an unsaved world being stopped.
             node.stops.shouldBeEmpty()
+        }
+    }
+
+    /**
+     * A drain that aborted, resumed and got its next step done still renders as
+     * broken — and that is the direction to keep.
+     *
+     * `DrainController.settleRecords` does not let the resuming pass clear the
+     * failure however much work it did, because a drain parked on a refused stop
+     * re-saves for real on every resume and clearing on that reset `attempts` and
+     * restamped `occurredAt` every cycle: a stop refused for six hours reported
+     * three attempts and never reached the escalation threshold. The price is what
+     * this test renders — `status.failure` is non-null while the drain is in
+     * `STOPPING`, so the dashboard says "the drain aborted; the server is still
+     * running" about a drain that is, right now, progressing.
+     *
+     * It over-states brokenness, which is the safe direction, and it is pinned here
+     * because the obvious tidy-up — clear the failure so the sentence reads nicely —
+     * silently deletes the hysteresis and takes the escalation with it. Anyone
+     * changing this sentence has to change [mcorch.core.DrainController] first, and
+     * this test is where that conversation happens.
+     */
+    @Test
+    fun `a drain that is progressing again still reads as broken, and that is the safe direction`() {
+        val directory = directory()
+        val node = StubNode(savesCleanly = true, refuseFirstStop = true)
+        EmbeddedStore.open(EmbeddedStoreConfig(directory = directory)).use { embedded ->
+            val registry = StaticNodeRegistry(listOf(node))
+            val reconciler = Reconciler(embedded.state, registry, SingleNodeScheduler(registry))
+
+            val definition = paperServer(name = "recovering-01")
+            val name = definition.metadata.name
+            val abortedAt =
+                runBlocking {
+                    embedded.state.putDefinition(definition).getOrThrow()
+                    repeat(4) { reconciler.reconcile(name) }
+                    embedded.state.deleteDefinition(name).getOrThrow()
+                    // Passes until the drain records something, which is the
+                    // refused stop: counted rather than guessed, so the test does
+                    // not quietly stop reaching the state it is about when a step
+                    // is added to the protocol.
+                    (1..12).firstNotNullOfOrNull {
+                        reconciler.reconcile(name)
+                        drainOf(embedded, name)?.failure?.occurredAt
+                    }
+                }
+            (abortedAt != null) shouldBe true
+
+            // One more pass: the resume issues the stop, the runtime takes it, and
+            // the drain is in `STOPPING` with the failure still on it. Exactly one,
+            // because the pass after this observes an exited container and tears
+            // the whole record down.
+            runBlocking { reconciler.reconcile(name) }
+
+            serving(embedded) { api ->
+                val display = api.display("recovering-01")
+                val drain = api.drain("recovering-01")
+
+                drain["state"] shouldBe "STOPPING"
+                // The same failure, not a new one: the record survived the pass
+                // that did the work, which is the whole of the hysteresis.
+                (drain["failure"] as Map<*, *>)["occurredAt"] shouldBe abortedAt.toString()
+                (display["detail"] as String) shouldContain "the drain aborted"
+
+                assertPermanentFailureIsFlagged(api.status("recovering-01"), display)
+                assertNothingIsSilentlyStuck(display)
+            }
         }
     }
 
@@ -195,23 +335,30 @@ class DisplayConformanceTest {
 
                 display["state"] shouldBe "READY"
                 display["needsAttention"] shouldBe false
+                assertPermanentFailureIsFlagged(api.status("healthy-01"), display)
                 assertNothingIsSilentlyStuck(display)
             }
         }
     }
 
     /**
-     * A drain that is getting on with it satisfies the property by the *other*
-     * arm — progressing rather than flagged.
+     * A drain that is waiting for people to log off satisfies the property by the
+     * *blocked* arm — neither progressing nor flagged, and correct.
      *
      * Without this the rule could be met by flagging every draining server, which
-     * is the failure mode the exclusion for players-online exists to prevent.
+     * is the failure mode the whole blocked/failed split exists to prevent.
+     *
+     * The assertions go end to end on purpose. A real `Reconciler` drives a real
+     * drain into the block, writes it through a real `EmbeddedStore`, and a real
+     * `ApiServer` renders it over a socket — so `drainBlocked` being true here is
+     * evidence that the rule in `:core`, the codec in `:store` and the derivation
+     * in `:api` agree. Nothing inside any one module can say that.
      */
     @Test
-    fun `a drain that is progressing is not flagged`() {
+    fun `a drain waiting for players is shown as blocked rather than as needing a human`() {
         val directory = directory()
-        // Players online: the drain has nowhere to send them, so it blocks —
-        // retryably, and by design this is never escalated.
+        // Players online: the drain has nowhere to send them, so it blocks. It
+        // records no failure at all, and by design it is never escalated.
         val node = StubNode(online = 3)
         EmbeddedStore.open(EmbeddedStoreConfig(directory = directory)).use { embedded ->
             val registry = StaticNodeRegistry(listOf(node))
@@ -227,12 +374,26 @@ class DisplayConformanceTest {
 
             serving(embedded) { api ->
                 val display = api.display("busy-01")
+                val drain = api.drain("busy-01")
 
                 display["state"] shouldBe "TERMINATING"
                 // People are playing. That is the protocol working, and calling
                 // a human about it every backoff interval is how the signal
                 // stops meaning anything.
                 display["needsAttention"] shouldBe false
+                // The fact that replaced the guess. The dashboard is told *why*
+                // this drain is parked rather than being left to infer it from a
+                // player count.
+                display["drainBlocked"] shouldBe true
+                (display["detail"] as String) shouldContain "waiting, not stuck"
+
+                // Nothing anywhere in the record calls this a failure — the
+                // property the whole change turns on, checked on the bytes that
+                // actually left the process.
+                (drain["blocked"] as Map<*, *>)["reason"] shouldBe "AWAITING_ZERO_PLAYERS"
+                drain["failure"] shouldBe null
+
+                assertPermanentFailureIsFlagged(api.status("busy-01"), display)
                 assertNothingIsSilentlyStuck(display)
             }
 
@@ -240,6 +401,134 @@ class DisplayConformanceTest {
             // There is no proxy to move them through, so the drain blocks — and
             // the one thing that must never happen is the loop stopping the
             // container to make progress (`failure-modes.md` item 4).
+            node.stops.shouldBeEmpty()
+        }
+    }
+
+    /**
+     * The case the first property structurally cannot see, and the reason the flag
+     * stopped being a drain flag.
+     *
+     * A persistent server is running, holding a world, and somebody edits
+     * `storage.mode` to `ephemeral`. Applying that edit means draining and
+     * replacing the container that is holding the world right now, so
+     * `Reconciler.forbiddenTransition` refuses it: a **permanent** failure, no
+     * drain, phase `RUNNING`. From that pass on the loop does not observe this
+     * server again — no probe, no occupancy, nothing — until somebody reverts the
+     * edit.
+     *
+     * The badge is `RUNNING` and it is not going to change, so an operator's own
+     * eyes are not going to find this one. The flag is the only thing that does.
+     */
+    @Test
+    fun `a server whose definition edit was refused is flagged even though its badge says running`() {
+        val directory = directory()
+        val node = StubNode()
+        EmbeddedStore.open(EmbeddedStoreConfig(directory = directory)).use { embedded ->
+            val registry = StaticNodeRegistry(listOf(node))
+            val reconciler = Reconciler(embedded.state, registry, SingleNodeScheduler(registry))
+
+            val definition = paperServer(name = "frozen-01")
+            val name = definition.metadata.name
+            runBlocking {
+                embedded.state.putDefinition(definition).getOrThrow()
+                repeat(5) { reconciler.reconcile(name) }
+                // The refused edit. `storage.mode` is in the spec hash, so it asks
+                // for a recreate, and the recreate would drain the container that
+                // holds the world.
+                embedded.state
+                    .putDefinition(paperServer(name = "frozen-01", storage = StorageSpec.Ephemeral()))
+                    .getOrThrow()
+                repeat(3) { reconciler.reconcile(name) }
+            }
+
+            serving(embedded) { api ->
+                val display = api.display("frozen-01")
+                val status = api.status("frozen-01")
+
+                // An ordinary running server, as far as every badge goes.
+                display["state"] shouldBe "RUNNING"
+                display["drainState"] shouldBe null
+                // And the loop has stopped.
+                display["needsAttention"] shouldBe true
+
+                // The discriminator agreement, which is the whole reason this is
+                // an `:app` test. `:core` decided this failure is the *pass*'s
+                // rather than a drain's and worded its condition accordingly;
+                // `:api` asks the identical question to choose its sentence. Two
+                // derivations of one fact in modules with no shared dependency.
+                (display["detail"] as String) shouldContain "refusing to change storage.mode"
+
+                assertPermanentFailureIsFlagged(status, display)
+                assertNothingIsSilentlyStuck(display)
+            }
+
+            // The refusal exists to stop a container being drained under rules it
+            // never ran under. If it ever starts stopping the thing it is
+            // protecting, this is what says so.
+            node.stops.shouldBeEmpty()
+        }
+    }
+
+    /**
+     * A drain that is waiting on players, on a node that has stopped answering.
+     *
+     * Both facts are true and neither may be reported as the other. The server
+     * needs a human, because nothing moves until the node comes back; the *drain*
+     * has nothing wrong with it and is still shown as blocked.
+     *
+     * This is the case that ends "`drainBlocked` and `needsAttention` are never
+     * both true". They were only ever disjoint because the attention flag could
+     * not see a failure that was not the drain's — which is precisely the blind
+     * spot that got fixed. `API.md` still documents the old claim; the `:api`
+     * change to withdraw it is called out in the change's report.
+     */
+    @Test
+    fun `a blocked drain on a node that stopped answering is flagged and still shown as blocked`() {
+        val directory = directory()
+        val node = StubNode(online = 3)
+        EmbeddedStore.open(EmbeddedStoreConfig(directory = directory)).use { embedded ->
+            val registry = StaticNodeRegistry(listOf(node))
+            val reconciler = Reconciler(embedded.state, registry, SingleNodeScheduler(registry))
+            val definition = paperServer(name = "marooned-01")
+            val name = definition.metadata.name
+            runBlocking {
+                embedded.state.putDefinition(definition).getOrThrow()
+                repeat(4) { reconciler.reconcile(name) }
+                embedded.state.deleteDefinition(name).getOrThrow()
+                repeat(3) { reconciler.reconcile(name) }
+                node.stopAnswering()
+                reconciler.reconcile(name)
+            }
+
+            serving(embedded) { api ->
+                val display = api.display("marooned-01")
+                val status = api.status("marooned-01")
+
+                // The drain is still parked on players and still says so.
+                display["drainBlocked"] shouldBe true
+                // And somebody has to act, because the loop cannot get to the node
+                // that would let the drain finish.
+                display["needsAttention"] shouldBe true
+
+                // The condition about the *drain* must not have been worded from
+                // the widened flag: this drain is waiting, not failing.
+                val draining =
+                    (status?.get("conditions") as? List<*>)
+                        .orEmpty()
+                        .filterIsInstance<Map<*, *>>()
+                        .single { it["type"] == "DRAINING" }
+                (draining["message"] as String) shouldNotContain "not recovering on its own"
+
+                // The drain record itself still carries no failure at all.
+                api.drain("marooned-01")["failure"] shouldBe null
+
+                assertPermanentFailureIsFlagged(status, display)
+                assertNothingIsSilentlyStuck(display)
+            }
+
+            // Three people are playing on a server somebody asked to delete, on a
+            // node the loop cannot reach. Nothing in that may produce a stop.
             node.stops.shouldBeEmpty()
         }
     }
@@ -270,7 +559,22 @@ class DisplayConformanceTest {
         private val client: HttpClient =
             HttpClient.newBuilder().connectTimeout(JavaDuration.ofSeconds(5)).build()
 
-        fun display(name: String): Map<*, *> {
+        fun display(name: String): Map<*, *> =
+            // A sibling of `status`, not a field inside it: the badge fuses the
+            // status, the drain and the tombstone, and the tombstone is not part
+            // of observed state.
+            server(name)["display"] as? Map<*, *> ?: error("no display for $name")
+
+        /** The drain record as it left the process, for the assertions the badge cannot carry. */
+        fun drain(name: String): Map<*, *> {
+            val status = server(name)["status"] as? Map<*, *> ?: error("no status for $name")
+            return status["drain"] as? Map<*, *> ?: error("no drain for $name")
+        }
+
+        /** Observed status, for the property that is about a failure rather than a badge. */
+        fun status(name: String): Map<*, *>? = server(name)["status"] as? Map<*, *>
+
+        private fun server(name: String): Map<*, *> {
             val request =
                 HttpRequest
                     .newBuilder(URI.create("$base/api/v1/servers/$name"))
@@ -280,11 +584,7 @@ class DisplayConformanceTest {
                     .build()
             val response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8))
             check(response.statusCode() == 200) { "GET $name returned ${response.statusCode()}: ${response.body()}" }
-            val document = Load(LoadSettings.builder().build()).loadFromString(response.body()) as Map<*, *>
-            // A sibling of `status`, not a field inside it: the badge fuses the
-            // status, the drain and the tombstone, and the tombstone is not part
-            // of observed state.
-            return document["display"] as? Map<*, *> ?: error("no display in $document")
+            return Load(LoadSettings.builder().build()).loadFromString(response.body()) as Map<*, *>
         }
     }
 }

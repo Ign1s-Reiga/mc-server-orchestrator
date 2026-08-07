@@ -140,6 +140,23 @@ class SpecValidationTest {
     fun `client timeouts must all be positive`() {
         shouldThrow<IllegalArgumentException> { CriTimeouts(query = kotlin.time.Duration.ZERO) }
         shouldThrow<IllegalArgumentException> { CriTimeouts(deadlineSlack = kotlin.time.Duration.ZERO) }
+        shouldThrow<IllegalArgumentException> { CriTimeouts(stopDeadlineCap = kotlin.time.Duration.ZERO) }
+    }
+
+    /**
+     * `Duration.INFINITE` is the one value that would pass a positivity check and
+     * still remove the deadline it was configuring: it becomes `Long.MAX_VALUE`
+     * milliseconds, which grpc saturates into a deadline 292 million years out.
+     * A configuration that reads as "no timeout" is exactly the hole this
+     * module's [CriTimeouts.stopDeadlineCap] exists to close, so it must not be
+     * reopenable by setting the cap itself.
+     */
+    @Test
+    fun `an infinite timeout is not a configuration option`() {
+        shouldThrow<IllegalArgumentException> { CriTimeouts(stopDeadlineCap = kotlin.time.Duration.INFINITE) }
+        shouldThrow<IllegalArgumentException> { CriTimeouts(deadlineSlack = kotlin.time.Duration.INFINITE) }
+        shouldThrow<IllegalArgumentException> { CriTimeouts(query = kotlin.time.Duration.INFINITE) }
+        shouldThrow<IllegalArgumentException> { CriTimeouts(imagePull = kotlin.time.Duration.INFINITE) }
     }
 
     @Test

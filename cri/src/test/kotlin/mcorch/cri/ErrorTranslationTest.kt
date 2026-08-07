@@ -187,7 +187,7 @@ class ErrorTranslationTest {
                 shouldThrow<CriException> { client.startContainer(ContainerId("c")) }.operation shouldBe
                     CriOperation.START_CONTAINER
                 shouldThrow<CriException> {
-                    client.stopContainer(ContainerId("c"), StopGracePeriod.ofSeconds(1))
+                    client.stopContainer(ContainerId("c"), StopGracePeriod.ofSeconds(1).getOrThrow())
                 }.operation shouldBe CriOperation.STOP_CONTAINER
                 shouldThrow<CriException> { client.removeContainer(ContainerId("c")) }.operation shouldBe
                     CriOperation.REMOVE_CONTAINER

@@ -7,6 +7,9 @@ import mcorch.schema.PaperServerStatus
 import mcorch.schema.ResourceName
 import mcorch.schema.ServerDefinition
 import mcorch.schema.ServerStatus
+import mcorch.schema.SpecBounds
+import mcorch.schema.StatusReconstruction
+import mcorch.schema.VelocityProxyStatus
 import java.time.Clock
 import java.time.Instant
 
@@ -94,13 +97,13 @@ internal class InMemoryStore(
                 definitions[name]
                     ?: return@guarded WriteOutcome.Conflict(name, ConflictReason.NOT_FOUND, null)
             checkPrecondition(name, precondition, existing.resourceVersion)?.let { return@guarded it }
-            if (existing.deletedAt != null) return@guarded WriteOutcome.Applied(existing)
+            if (existing.deletedAt != null) return@guarded WriteOutcome.Applied(existing.bounded())
 
             val now = clock.instant()
             val stored = existing.copy(resourceVersion = nextVersion(), updatedAt = now, deletedAt = now)
             definitions[name] = stored
             record(name, ChangeKind.DELETED, stored.resourceVersion, now)
-            WriteOutcome.Applied(stored)
+            WriteOutcome.Applied(stored.bounded())
         }
 
     override suspend fun purge(
@@ -156,11 +159,13 @@ internal class InMemoryStore(
         }
 
     override suspend fun getServer(name: ResourceName): StoredServer? =
-        guarded { definitions[name]?.let { StoredServer(it, statuses[name]) } }
+        guarded { definitions[name]?.let { StoredServer(it.bounded(), statuses[name].reconstructed()) } }
 
     override suspend fun listServers(): List<StoredServer> =
         guarded {
-            definitions.values.sortedBy { it.name.value }.map { StoredServer(it, statuses[it.name]) }
+            definitions.values.sortedBy { it.name.value }.map {
+                StoredServer(it.bounded(), statuses[it.name].reconstructed())
+            }
         }
 
     override suspend fun listByDrainState(states: Set<DrainState>): List<StoredServer> {
@@ -170,7 +175,14 @@ internal class InMemoryStore(
                 .sortedBy { it.name.value }
                 .mapNotNull { definition ->
                     val status = statuses[definition.name] ?: return@mapNotNull null
-                    if (drainStateOf(status.status) in states) StoredServer(definition, status) else null
+                    // Selected on the *stored* state, served reconstructed. The
+                    // projection a store filters on is the drain state, which no
+                    // reconstruction here touches, so the two cannot disagree.
+                    if (drainStateOf(status.status) in states) {
+                        StoredServer(definition.bounded(), status.reconstructed())
+                    } else {
+                        null
+                    }
                 }
         }
     }
@@ -209,6 +221,38 @@ internal class InMemoryStore(
         return mutex.withLock { block() }
     }
 
+    /**
+     * The bound [Store] promises on every definition it hands back.
+     *
+     * This store keeps objects rather than documents, so it has no decode to hang
+     * the bound on — which is exactly why it is worth doing here. The guarantee
+     * belongs to the interface, not to a codec, and an implementation that reached
+     * it by accident of its encoding would be evidence of nothing. Applied where a
+     * definition *leaves* the store, matching the embedded one: a write echoes its
+     * argument, a read is bounded.
+     */
+    private fun StoredDefinition.bounded(): StoredDefinition {
+        val bounded = SpecBounds.bound(definition)
+        return if (bounded.wasClamped) copy(definition = bounded.definition) else this
+    }
+
+    /**
+     * The side-effect records [Store] promises on every observation it hands back.
+     *
+     * [bounded]'s argument, for the other read-side guarantee. This store keeps
+     * `DrainStatus` objects rather than documents, so "the key is absent" and "the
+     * field is null" are the same thing here — which is the point. The rule is
+     * stated on the decoded record and not on a document key, so an implementation
+     * that never encodes anything owes it just as much as one that does, and a
+     * suite that only asked the SQLite store would be testing a codec instead of
+     * the interface.
+     */
+    private fun StoredStatus?.reconstructed(): StoredStatus? {
+        val stored = this ?: return null
+        val reconstructed = StatusReconstruction.reconstruct(stored.status)
+        return if (reconstructed.wasReconstructed) stored.copy(status = reconstructed.status) else stored
+    }
+
     private fun nextVersion(): ResourceVersion {
         revision += 1
         return ResourceVersion(revision.toString())
@@ -226,6 +270,7 @@ internal class InMemoryStore(
     private fun drainStateOf(status: ServerStatus): DrainState? =
         when (status) {
             is PaperServerStatus -> status.drain?.state
+            is VelocityProxyStatus -> status.drain?.state
         }
 
     private fun checkPrecondition(

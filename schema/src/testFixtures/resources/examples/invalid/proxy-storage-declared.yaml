@@ -1,0 +1,24 @@
+# Expected: spec.storage — unknown field
+#
+# A proxy has no world. There is no storage block on this kind, and the absence
+# is load-bearing rather than an omission: a proxy that could be declared
+# persistent would be one the drain protocol has to flush before stopping, and
+# it has no save to confirm — so it could never be stopped at all.
+apiVersion: mcorch.dev/v1alpha1
+kind: VelocityProxy
+metadata:
+  name: proxy-01
+spec:
+  image: docker.io/itzg/mc-proxy:2026.6.1
+  resources:
+    memory: 1Gi
+  storage:
+    mode: persistent
+  forwarding:
+    secret:
+      name: fleet-forwarding
+      key: modern-forwarding
+  backends:
+    selector:
+      matchLabels:
+        mcorch.dev/fleet: main
