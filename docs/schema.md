@@ -85,7 +85,7 @@ within it — but the HTTP API takes **one document per request**.
 | Path | Type | Notes |
 |---|---|---|
 | `spec.image` | image ref | Must be pinned to a tag or digest. `latest` is rejected. |
-| `spec.paper.minecraftVersion` | string | `"1.21.8"` — quote it, or YAML reads it as a number. Snapshots are not expressible. |
+| `spec.paper.minecraftVersion` | string | `"1.21.8"`. Snapshots are not expressible. Quoting is a style convention here, not a requirement — this parser reads the raw source text and never consults YAML's resolved type — but keep the habit for tools that do coerce. |
 | `spec.eulaAccepted` | bool | Must be `true`. |
 | `spec.resources.memory` | memory | 1Gi … 1Ti |
 
@@ -123,8 +123,14 @@ below the container limit — 20% clamped to between 512Mi and 2Gi. So `memory:
 Setting the heap *to* the container limit is rejected, not clamped:
 
 > must leave headroom below the container memory limit: with
-> `spec.resources.memory=4Gi` the largest heap is 3276Mi, found 4Gi. A heap sized
-> at the container limit is OOM-killed mid-tick with the world unsaved
+> `spec.resources.memory=4Gi` the largest heap is 3435973856, found 4Gi. A heap
+> sized at the container limit is OOM-killed mid-tick with the world unsaved
+
+Those are two different numbers on purpose. `3435973856` is the *ceiling* —
+exactly `4Gi` minus the headroom, which is not a whole MiB and so prints as a
+byte count. `3276Mi` is the *default*, the same quantity rounded down to a whole
+MiB. The default therefore sits just under the ceiling, which is where you want
+it.
 
 That is the whole reason the rule exists. The JVM is not the only thing in the
 container, and the process that gets killed for the difference is the one holding
@@ -140,8 +146,11 @@ either by hand, keep the relation:
 > least 3m30s, found 1m. A grace period shorter than the save timeout kills the
 > container part-way through the save
 
-The two are a validated **pair**. Nothing in the system will shorten one without
-the other, and that is deliberate — see [operating.md](operating.md) note 3.
+The two are a validated **pair**. A stored value that is over the ceiling can be
+clamped on either half independently, but the ceilings are chosen so that
+clamping can never *invert* the pair — that is enforced where the constants are
+declared, not by the two moving together. See [operating.md](operating.md)
+note 3.
 
 ### RCON does nothing until you enable it
 
@@ -187,15 +196,17 @@ Declaring a `volume` alongside it is an error rather than an ignored field.
 | `spec.backends.drain.sealTimeout` | `10s` | 1s … 1h |
 | `spec.backends.drain.destinationTimeout` | `30s` | 1s … 1h |
 | `spec.backends.drain.deregisterTimeout` | `10s` | 1s … 1h |
-| `spec.control.port` | `8375` | must differ from `network.port` |
-| `spec.control.hostPort` | unpublished | must differ from `network.hostPort` |
+| `spec.control.port` | `8375` | 1 … 65535, must differ from `network.port` |
+| `spec.control.hostPort` | unpublished | 1 … 65535, must differ from `network.hostPort` |
 | `spec.control.tokenSecret` | — | **required** when `control.hostPort` is set |
 | `spec.maxPlayers` | `500` | 1 … 100000 |
 | `spec.network.port` | `25577` | **must be exactly 25577** |
 | `spec.network.hostPort` | unpublished | this is the port players type |
+| `spec.lifecycle.drain.policy` | `waitForZeroPlayers` | only value |
 | `spec.lifecycle.drain.sealTimeout` | `10s` | 1s … 1h |
 | `spec.lifecycle.stopGracePeriod` | `60s` | 1s … **1h** |
 | `spec.lifecycle.startupTimeout` | `2m` | 1s … 1h |
+| `spec.placement.node` | scheduler chooses | |
 
 A proxy has no `spec.storage`, no `spec.paper`, no `spec.eulaAccepted` and no
 RCON. Writing `spec.storage` on one is an unknown-field error, and that absence
@@ -207,8 +218,11 @@ On a proxy, `spec.network.port` is a claim about where Velocity listens inside
 its sandbox, and 25577 is the only legal value. **To choose the port players
 connect to, set `spec.network.hostPort`.**
 
-Getting this wrong on a *running* proxy is worse than a rejected file: it changes
-the container's shape, which starts a replacement drain that then cannot finish.
+Any other value is rejected outright, and that rejection is the point: it is why
+you cannot do this by accident. The reason it is guarded so firmly is what
+accepting another value used to cost — the change alters the container's shape,
+which starts a replacement drain that then cannot finish. The only way to reach
+that state now is a stored row that never went through a reader.
 
 ### There are two `sealTimeout`s and they are not the same
 
@@ -255,9 +269,15 @@ name looks secret-like — `password`, `token`, `secret`, `forwardingSecret`,
 > secret store and reference it by coordinates — `{name: <secret name>, key: <key
 > within it>}` — the way `network.rcon.passwordSecret` and `forwarding.secret` do
 
-The message deliberately never echoes the value you wrote, so a secret pasted
-into a definition does not then get copied into a log or an API response. It is
-still burned: rotate it.
+That particular message deliberately never echoes what you wrote. **Do not rely
+on that in general.** Other validation messages do quote the offending scalar —
+notably when a mapping was expected and a string was given, which is exactly what
+`spec.forwarding: "<the secret>"` produces — and those messages reach logs and
+API responses.
+
+So: if you ever paste a secret into a definition, treat it as disclosed and
+rotate it. Reference it by coordinates and the value never enters the system at
+all.
 
 The forwarding secret in particular is only ever handed to backends by the
 reconciler. A `PaperServer` never names it, and never names the proxy.
@@ -289,22 +309,44 @@ Parsing does not stop at the first problem. One pass reports **every** violation
 each with a field path, an explanation, and a `line:column` into your file:
 
 ```
-spec.resources.heap.max:1:  must leave headroom below the container memory limit: …
-spec.lifecycle.stopGracePeriod:  must exceed spec.lifecycle.drain.saveTimeout (3m) by …
+spec.lifecycle.stopGracePeriod: must exceed spec.lifecycle.drain.saveTimeout (3m) by at least 30s, so at least 3m30s, found 1m. A grace period shorter than the save timeout kills the container part-way through the save (at <document>:18:23)
 ```
+
+Over the API the same violation arrives structured rather than rendered — see
+`api/API.md` — with the field path, the problem and the source position as
+separate members.
+
+Duplicate keys are a violation too, reported at the offending key. YAML's usual
+last-one-wins does **not** apply here:
+
+> is declared more than once
 
 Unknown fields are rejected rather than ignored, with a spelling suggestion:
 
-> unknown field. did you mean `storage`? known fields here: `image`, `paper`, …
+> unknown field. did you mean `storage`? known fields here: `eulaAccepted`,
+> `image`, … *(alphabetical)*
 
 An explicitly-null field is also an error, because `storage:` with nothing under
 it usually means someone deleted a block and meant to delete the key:
 
 > must not be null; omit the field entirely to use its default
 
-Validation happens entirely at parse time. An invalid definition never reaches
-the reconcile loop, so there is no state in which a bad definition is "accepted
-but failing".
+Parse-time validation is complete for everything a single document can be
+checked against, so a definition with a bad field never reaches the reconcile
+loop.
+
+It cannot check facts that live outside the document. A definition that parses
+cleanly can still be refused by the loop, and it is reported as a `PERMANENT`
+failure on the server's status rather than as a parse error:
+
+- `spec.placement.node` naming a node the orchestrator has never heard of
+- a `VelocityProxy` selector that matches nothing — the most likely reason
+  nobody can join a new proxy. It shows up as `BACKENDS_RESOLVED = False`, not
+  as a validation message
+- two proxies whose selectors both match the same backend
+
+If a definition was accepted and nothing is happening, read `status.failure` and
+the conditions.
 
 ---
 
@@ -385,7 +427,7 @@ the test suite parses, so they cannot drift from the code.
 | `proxy-minimal.yaml` | the smallest `VelocityProxy` |
 | `proxy-full.yaml` | every `VelocityProxy` field written out |
 
-**`invalid/`** — 29 files, each headed by a comment naming the violation it is
+**`invalid/`** — 30 files, each headed by a comment naming the violation it is
 there to produce. Worth reading before writing your first definition: they are
 the mistakes people actually make, including `inline-secret.yaml`,
 `grace-below-save-timeout.yaml`, `heap-exceeds-memory.yaml`,
