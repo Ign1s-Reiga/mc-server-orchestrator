@@ -99,7 +99,6 @@ public class Reconciler(
             clock = clock,
             evidenceGap = config.saveEvidenceMaxGap,
             attentionAfter = config.drainAttentionAfter,
-            attentionLedger = config.drainAttentionLedger,
         )
 
     /**

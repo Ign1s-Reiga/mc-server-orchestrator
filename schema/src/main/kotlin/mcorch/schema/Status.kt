@@ -587,12 +587,20 @@ public data class DrainStatus(
      * difference is worth being exact about because the loose version has been
      * written here before. Above half the drift is upward and the threshold is
      * reached quickly. At or below half there is no upward drift — but the walk is
-     * not absorbed at zero either, it is reflected there, so it still reaches any
-     * threshold almost surely, just slowly: on the order of `(q/p)^N` passes below
-     * half, and `N(N+1)` passes at exactly half. **Nothing here is a guarantee of
-     * silence.** What the rate buys is how long it takes, over a range wide enough
-     * that a healthy-ish drain finishes or is torn down long first. The one case
-     * that genuinely never arrives is a perfect metronome, which nothing real is.
+     * not absorbed at zero, it is reflected there, so the count alone still reaches
+     * any threshold almost surely: on the order of `(q/p)^N` passes below half and
+     * `N(N+1)` at exactly half. **Nothing here is a guarantee of silence.**
+     *
+     * Those two figures are about **this counter and not about the flag**, and the
+     * distinction is the whole of why no wall-clock number is quoted for the flag
+     * anywhere. The escalation is a conjunction: the count has to reach the
+     * threshold *and* stay above zero for `drainAttentionAfter`. A recovering pass
+     * reports progress, `WorkQueue` clears the attempt count, and the retry delay
+     * drops back to its base — so that duration is a long unbroken run of passes,
+     * and below half the probability of an excursion surviving one decays
+     * exponentially in its length. The count's hitting time is therefore a floor
+     * under the flag's, and a loose one. `docs/operating.md` states the consequence
+     * qualitatively and says why it offers no figure; do not put one back.
      *
      * ## One scalar, and the question it has nowhere to put
      *

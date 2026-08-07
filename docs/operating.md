@@ -150,14 +150,23 @@ The arithmetic is the whole rule and it is meant to be checkable in your head:
 **the total only grows while the drain is failing more often than it is
 working.**
 
-The surprise worth stating: **how fast the flag arrives depends on the fault
-rate, and below about half it can take most of a day.** That is the crossover
-doing its job, not a bug — the total drifts upward only above half. It is not a
-promise of silence: below half the total still wanders up to six eventually
-(hours at 40%, most of a day at 30%), and at exactly half it takes about forty
-passes. The one case that never arrives is a perfect metronome, which nothing
-real is. If you need a faster signal for a specific fault, alert on the logs for
-it rather than on this flag.
+The surprise worth stating: **this flag is reliable when a drain is failing more
+often than it is working, and increasingly unlikely to fire below that.** It is
+not a promise of silence — below half the total can still wander up to six — but
+the flag also needs the total to *stay* above zero for the whole fifteen minutes,
+and a recovering pass resets the retry delay to about a second, so fifteen
+minutes is a long unbroken run of passes. Below half, the chance of a run both
+long enough and unbroken enough falls away quickly as the run gets longer.
+
+**No figure is given for how long that takes, deliberately.** It is not a
+property of the orchestrator: it depends on the pattern of the underlying fault
+and on how the loop happens to be scheduling that server, and any number quoted
+here would be a number for a model rather than for your fleet. Earlier drafts of
+this note carried two, and both were wrong by a wide margin.
+
+What to take from it: **silence on this flag is not evidence of health for a
+fault that is intermittent enough.** If you have a specific fault in mind and
+want a faster signal, alert on the log line for it rather than on this flag.
 
 Neither case stops anything. The container keeps running and the loop keeps
 retrying in both, which is what makes the flag safe to alert on.

@@ -19,8 +19,18 @@ import mcorch.schema.ServerPhase
 import mcorch.schema.StatusCondition
 import mcorch.schema.StorageStatus
 import mcorch.schema.VelocityProxyStatus
+import org.slf4j.LoggerFactory
 import java.time.Instant
 import kotlin.time.Duration
+
+/**
+ * Structured logging for the one condition an operator alerts on.
+ *
+ * A derivation file is an odd place for a logger and it earns it: the escalation's
+ * only channel outside the dashboard is a log line, and the *edge* it has to fire
+ * on is a condition transition, which is computed here and nowhere else.
+ */
+private val LOG = LoggerFactory.getLogger("mcorch.core.StatusDrafting")
 
 /**
  * Builds the observation a pass will record, carrying forward everything it did
@@ -101,6 +111,7 @@ internal fun draftStatus(
                 failure = failure,
                 attentionAfter = attentionAfter,
                 attentionLedger = attentionLedger,
+                name = name,
             ),
     )
 }
@@ -170,6 +181,7 @@ internal fun draftProxyStatus(
                 failure = failure,
                 attentionAfter = attentionAfter,
                 attentionLedger = attentionLedger,
+                name = name,
                 proxy =
                     ProxyConditions(
                         backends = backends,
@@ -196,6 +208,7 @@ internal class ProxyConditions(
 @Suppress("LongParameterList")
 private fun deriveConditions(
     previous: List<StatusCondition>,
+    name: ResourceName,
     now: Instant,
     phase: ServerPhase,
     ready: Boolean,
@@ -328,6 +341,32 @@ private fun deriveConditions(
                 worldSavedMessage(storage, drain),
             ),
         ) + proxyEntries(proxy)
+    // **The escalation's only channel outside the dashboard, and it is logged here
+    // rather than where the ledger is written.** `settleLedger` cannot see this
+    // edge: it compares the arm's answer before and after its own arithmetic at one
+    // `now`, which detects the *count* moving. The age gate makes the arm raise on a
+    // pass where nothing moved at all — the count reached the threshold in half a
+    // minute, the fifteen minutes elapsed a quarter of an hour later, and both
+    // operands are identical across that pass. The flag went TRUE in silence,
+    // exactly where the new gate does its work.
+    //
+    // A condition transition is the honest edge and it is already computed below;
+    // this asks the same question the merge does, once, for the one arm whose
+    // wording is a count rather than a fault.
+    if (drainAttentionByLedger &&
+        previous.firstOrNull { it.type == ConditionType.NEEDS_ATTENTION }?.status != ConditionStatus.TRUE
+    ) {
+        LOG.warn(
+            "server={} needs attention: its drain has failed more often than it has recovered. ledger={} " +
+                "threshold={} since={}. Nothing is stopped and the loop keeps retrying; this is reported by " +
+                "count because a fault that clears between passes never stands long enough to be reported by " +
+                "its age",
+            name,
+            drain?.faultLedger,
+            attentionLedger,
+            drain?.faultLedgerSince,
+        )
+    }
     return entries.map { entry ->
         val before = previous.firstOrNull { it.type == entry.first }
         // The transition time is when the condition *became* what it is, not

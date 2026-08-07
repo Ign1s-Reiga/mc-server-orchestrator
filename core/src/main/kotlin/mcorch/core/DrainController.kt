@@ -159,17 +159,6 @@ internal class DrainController(
      */
     private val evidenceGap: Duration = DEFAULT_EVIDENCE_GAP,
     private val attentionAfter: Duration = DEFAULT_ATTENTION_AFTER,
-    /**
-     * The net fault count at which a drain is reported however long each
-     * individual fault lasted. See `ReconcilerConfig.drainAttentionLedger`, which
-     * is where the number is derived, and [settleLedger], which is what moves it.
-     *
-     * Held here only so the crossing can be logged where it happens. The *flag* is
-     * derived in `StatusDrafting` from the same threshold, through
-     * [DrainStatus.escalated] — one rule, asked in two places for two different
-     * outputs, rather than two rules.
-     */
-    private val attentionLedger: Int = DEFAULT_ATTENTION_LEDGER,
 ) {
     /**
      * Advances the drain by at most one step, performing at most one side
@@ -416,7 +405,7 @@ internal class DrainController(
                     "the runtime reports no container in sandbox ${observation.handle.sandboxId} for a server " +
                         "that has had one. Nothing is stopped or removed on the strength of that: an " +
                         "unreported container is not an absent one, and the process may still be serving players",
-            ).settleLedger(drain, subject.server, now)
+            ).settleLedger(drain, now)
         }
 
         // Occupancy is re-read on every pass of a running server, not once at the
@@ -507,7 +496,7 @@ internal class DrainController(
         // step cannot be asked about it afterwards: the resume has already moved the
         // drain out of `DRAIN_FAILED` by the time its progress comes back.
         return step(pass, observed)
-            .settleLedger(observed, subject.server, now)
+            .settleLedger(observed, now)
             .settleRecords(resuming = observed.state == DrainState.DRAIN_FAILED)
     }
 
@@ -561,7 +550,6 @@ internal class DrainController(
      */
     private fun DrainProgress.settleLedger(
         observed: DrainStatus,
-        server: ResourceName,
         now: Instant,
     ): DrainProgress {
         val faulted = drain.failure != null && drain.failure != observed.failure
@@ -580,26 +568,17 @@ internal class DrainController(
         // never advance one.
         val since = if (ledger == 0) null else (observed.faultLedgerSince ?: now)
         val settled = drain.copy(faultLedger = ledger, faultLedgerSince = since)
-        // On the edge where the *arm* raises, not where the count crosses. The two
-        // are different instants now that the age gate exists, and a line saying
-        // "this is being reported" on a pass where the condition is still false is
-        // the log disagreeing with the dashboard about the one thing an operator
-        // greps for afterwards.
-        if (settled.failingTooOften(now, attentionAfter, attentionLedger) &&
-            !observed.failingTooOften(now, attentionAfter, attentionLedger)
-        ) {
-            LOG.warn(
-                "drain for server={} has failed more often than it has recovered: ledger={} threshold={} " +
-                    "since={} state={}. Nothing is stopped and the loop keeps retrying; this is reported " +
-                    "because a fault that clears between passes never stands long enough to be reported by " +
-                    "its age",
-                server,
-                ledger,
-                attentionLedger,
-                since,
-                drain.state,
-            )
-        }
+        // **No log line here, and the absence is the point.** One lived here and
+        // compared the arm's answer before and after this arithmetic — which detects
+        // the *count* moving, not the arm raising. Since the age gate exists those
+        // are different instants: the count can reach the threshold in half a minute
+        // and the arm raise a quarter of an hour later, on a pass where neither
+        // operand changed and both readings agree. The line was therefore silent on
+        // exactly the passes the gate was added for, while its own comment claimed
+        // otherwise.
+        //
+        // The honest edge is the `NEEDS_ATTENTION` transition, which `StatusDrafting`
+        // already computes from the previous status. It is logged there.
         return copy(drain = settled)
     }
 
@@ -3860,9 +3839,6 @@ internal class DrainController(
          * a node restarting — never trips it.
          */
         private val DEFAULT_ATTENTION_AFTER = 15.minutes
-
-        /** Mirrors `ReconcilerConfig.drainAttentionLedger`, which carries the derivation. */
-        private const val DEFAULT_ATTENTION_LEDGER = 6
 
         /**
          * The default evidence gap. Comfortably longer than the interval

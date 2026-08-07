@@ -4,7 +4,11 @@ import io.kotest.assertions.withClue
 import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.collections.shouldContainExactly
 import io.kotest.matchers.collections.shouldNotBeEmpty
+import io.kotest.matchers.nulls.shouldBeNull
+import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.string.shouldContain
+import io.kotest.matchers.types.shouldBeInstanceOf
 import mcorch.schema.DrainBlock
 import mcorch.schema.DrainBlockReason
 import mcorch.schema.DrainState
@@ -277,14 +281,18 @@ class LegacyDrainRowTest {
                 "DrainStatus.faultLedgerSince" to
                     Reads(
                         why =
-                            "null means the ledger's age is not established, and the escalation's second arm " +
-                                "stays quiet without it — so a row that predates the field under-reports " +
-                                "rather than firing on evidence whose age nothing knows. The next pass " +
-                                "re-dates it from itself, which delays a report by one threshold and can " +
-                                "never advance one. It is read strictly, unlike the count beside it: an " +
-                                "unparsable instant is a refusal, because absence here is a *meaningful* " +
-                                "value and answering null for a corrupt one would silently re-date a live " +
-                                "ledger",
+                            "null means the ledger's age is not established, and the escalation's second " +
+                                "arm stays quiet without it — so a row that predates the field under-" +
+                                "reports rather than firing on evidence whose age nothing knows. The next " +
+                                "pass re-dates it from itself, which delays a report by one threshold and " +
+                                "can never advance one.\n\n" +
+                                "The earlier version of this entry went on to call the *other* half — an " +
+                                "instant surviving beside a count of zero — an accepted reading and 'the " +
+                                "safe direction for a flag'. It is the one thing it is not: the funnel " +
+                                "computes the new count before consulting the instant, so the first fault " +
+                                "after such a load carries an anchor from before it and the age gate is " +
+                                "satisfied by history. `readDrain` now reads the pair jointly, so that " +
+                                "half cannot be produced and there is no reading of it to declare",
                         expected = { it.copy(faultLedgerSince = null) },
                     ),
                 "DrainStatus.faultLedger" to
@@ -297,8 +305,12 @@ class LegacyDrainRowTest {
                                 "the explicit zero afterwards so that later absences mean something. What " +
                                 "is lost is evidence: a drain that came back at zero has to re-earn a " +
                                 "pattern that takes hours to build, and it under-reports, which is the " +
-                                "safe direction for a flag",
-                        expected = { it.copy(faultLedger = 0) },
+                                "safe direction for a flag.\n\n" +
+                                "It takes `faultLedgerSince` with it, and that is the joint read rather " +
+                                "than a second rule: the two are a biconditional the reconciler maintains " +
+                                "at one funnel, and a decode that produced a *dated* ledger of zero would " +
+                                "hand the next fault an anchor from before that fault existed",
+                        expected = { it.copy(faultLedger = 0, faultLedgerSince = null) },
                     ),
                 // --------------------------------------------------------- DrainBlock
                 "DrainBlock.reason" to
@@ -423,6 +435,56 @@ class LegacyDrainRowTest {
                 }
             }
         }
+
+    /**
+     * **The forty-third audit's must-fix: the decoder is a second producer of the
+     * pair, and it used to build the two halves independently.**
+     *
+     * `DrainController` maintains
+     * `(faultLedger > 0) == (faultLedgerSince != null)` by construction at one
+     * funnel, and every argument about the age gate rests on it. The decode was the
+     * other way in. A hand-edited count that will not parse read as zero while the
+     * instant beside it read fine, giving `(0, <old instant>)` — and the funnel
+     * *adopts* that rather than repairing it, because it computes the new count
+     * first: the very next fault produces a count of one carrying an anchor from
+     * hours earlier, and six faults at the real backoff — about half a minute —
+     * then satisfy the age gate against history. That is the defect the gate was
+     * added to close, arriving through the store.
+     *
+     * Both halves are asserted, in both directions, because the joint read is what
+     * makes the biconditional total over *both* producers rather than over one.
+     *
+     * The surviving pair `(positive, null)` is the safe one and is deliberately
+     * still reachable: the funnel dates it from the pass that notices, which delays
+     * a report by one threshold and can never advance one.
+     */
+    @Test
+    fun `a corrupt half of the ledger pair cannot leave the other half standing`() {
+        val encoded = StatusCodec.encode(status)
+
+        // The premise: the probe really does carry both halves, so the cases below
+        // are about the decode and not about a document that never had them.
+        encoded shouldContain "drain.faultLedger=7"
+        encoded shouldContain "drain.faultLedgerSince="
+
+        // A count that will not parse takes the instant with it. Without the joint
+        // read this decoded to (0, an hour ago).
+        val badCount = decode(encoded.replace("drain.faultLedger=7", "drain.faultLedger=x")).status
+        val fromBadCount = badCount.shouldBeInstanceOf<PaperServerStatus>().drain.shouldNotBeNull()
+        fromBadCount.faultLedger shouldBe 0
+        fromBadCount.faultLedgerSince.shouldBeNull()
+
+        // And an instant that will not parse leaves the count, which is the pair the
+        // funnel repairs. It must not refuse the row: the store would mark the
+        // status unreadable and the loop's resync would hold that server out of
+        // reconciliation until a human edited it, which is wildly out of proportion
+        // to a fault counter.
+        val stamped = encoded.lineSequence().first { it.startsWith("drain.faultLedgerSince=") }
+        val badInstant = decode(encoded.replace(stamped, "drain.faultLedgerSince=not-an-instant")).status
+        val fromBadInstant = badInstant.shouldBeInstanceOf<PaperServerStatus>().drain.shouldNotBeNull()
+        fromBadInstant.faultLedger shouldBe 7
+        fromBadInstant.faultLedgerSince.shouldBeNull()
+    }
 
     private fun decode(encoded: String) =
         StatusCodec.decode(

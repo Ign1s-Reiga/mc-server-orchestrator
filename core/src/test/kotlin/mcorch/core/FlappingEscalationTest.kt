@@ -324,10 +324,16 @@ internal class FlappingEscalationTest {
             val name = drainingServer(harness)
             harness.node.failAlways(NodeOperation.EXEC, harness.node.unreachable(NodeOperation.EXEC))
 
-            // 1s, 2s, 4s, 8s, 16s — `Backoff`'s first five delays, jitter aside.
-            listOf(1, 2, 4, 8, 16).forEach { seconds ->
-                step(harness, name, seconds.seconds)
-            }
+            // Derived from `Backoff` rather than written down. A hard-coded
+            // 1s/2s/4s/8s/16s was what round 42's defect was made of — a rule
+            // counting passes and a test choosing its own spacing — so the scenario
+            // asks the scheduler the loop asks. Jitter off, because jitter only ever
+            // shortens a delay and this test wants the *slowest* schedule the real
+            // loop can produce: anything faster reaches the count sooner and makes
+            // the assertion easier, so the number chosen here is the conservative one
+            // in the direction that matters.
+            val backoff = Backoff(jitter = 0.0)
+            (1..5).forEach { attempt -> step(harness, name, backoff.delayFor(attempt)) }
             step(harness, name, 1.seconds)
 
             val status = harness.status(name).shouldNotBeNull()
@@ -379,7 +385,8 @@ internal class FlappingEscalationTest {
             healthy.faultLedgerSince.shouldBeNull()
 
             harness.node.failAlways(NodeOperation.EXEC, harness.node.unreachable(NodeOperation.EXEC))
-            listOf(1, 2, 4, 8, 16).forEach { seconds -> step(harness, name, seconds.seconds) }
+            val backoff = Backoff(jitter = 0.0)
+            (1..5).forEach { attempt -> step(harness, name, backoff.delayFor(attempt)) }
             step(harness, name, 1.seconds)
 
             val status = harness.status(name).shouldNotBeNull()

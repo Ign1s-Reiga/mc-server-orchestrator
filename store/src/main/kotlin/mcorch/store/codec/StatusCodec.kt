@@ -29,6 +29,8 @@ import mcorch.schema.StatusCondition
 import mcorch.schema.StatusReconstruction
 import mcorch.schema.StorageStatus
 import mcorch.schema.VelocityProxyStatus
+import java.time.Instant
+import java.time.format.DateTimeParseException
 
 /**
  * Encodes and decodes observed state.
@@ -498,6 +500,26 @@ internal object StatusCodec {
         prefix: String,
     ): DrainStatus? {
         if (!reader.has("$prefix.state")) return null
+        // Read as text and parsed here rather than through `int`, and read *before*
+        // the constructor because the instant below is a function of it.
+        //
+        // Neither half of this pair is strict, and the reason is not the one an
+        // earlier version of this comment gave. It said a decode refusal here "takes
+        // `listServers` down and with it the loop's whole view of the fleet" — the
+        // behaviour before round 10 made the read tolerant, and restating a retired
+        // premise in new code is how the wrong conclusion gets defended. What
+        // actually happens is `SqliteStore.readRow` catching a non-retryable
+        // `StoreException` from the status half and answering `unreadable` for that
+        // one row; `servers()` re-raises only for an unreadable *definition*.
+        //
+        // The real trade is still decisive, and larger than the one the old sentence
+        // described: `ReconcileLoop.resync` partitions an unreadable server out of
+        // reconciliation entirely until a human edits the row. Loud and safe —
+        // nothing is stopped — but a server the loop will not touch is an enormous
+        // price for a fault counter, and under the age gate it is the *instant* that
+        // would be carrying it. So both halves read tolerantly and land on the pair
+        // that cannot escalate.
+        val ledger = (reader.string("$prefix.faultLedger")?.toIntOrNull() ?: 0).coerceAtLeast(0)
         return DrainStatus(
             state = reader.requireEnum<DrainState>("$prefix.state"),
             startedAt = reader.requireInstant("$prefix.startedAt"),
@@ -514,29 +536,46 @@ internal object StatusCodec {
             destination = reader.value("$prefix.destination", ResourceName::of),
             blocked = readBlock(reader, "$prefix.blocked"),
             failure = readFailure(reader, "$prefix.failure"),
-            // Read as text and parsed here rather than through `int`, which is the
-            // only way the tolerance below is actually total.
+            faultLedger = ledger,
+            // **Read jointly with the count, because this is a *second producer* of
+            // a pair `DrainController` maintains as a biconditional.** Inside
+            // `:core` the invariant `(faultLedger > 0) == (faultLedgerSince != null)`
+            // holds by construction at one funnel; a decode that built the two halves
+            // from independently-read keys was the other way in, and it landed on the
+            // dangerous side. `faultLedger=x` beside a parsable instant read as
+            // `(0, <old instant>)`, and the funnel *adopts* rather than repairs that:
+            // it computes the new count first, so the first fault after the load gave
+            // a count of 1 carrying an hours-old anchor, and six faults at the real
+            // backoff — half a minute — then satisfied the age gate. That is exactly
+            // the defect the gate was added to close, restored through the store.
             //
-            // The argument is that no hand edit of *this* field should be able to
-            // abort a fleet read: a decode-time refusal here is not charged to one
-            // server, it takes `listServers` down and with it the loop's whole view
-            // of the fleet, and a fault counter is worth nothing beside that. `int`
-            // delivers two thirds of that — absent and negative — and throws
-            // `StoreException.Corrupt` on `faultLedger=x`, which is exactly the
-            // shape a hand edit produces. `toIntOrNull` closes the third.
-            //
-            // Every unreadable value lands on zero, which is the answer that cannot
-            // escalate, so the tolerance errs quiet rather than loud.
-            faultLedger = (reader.string("$prefix.faultLedger")?.toIntOrNull() ?: 0).coerceAtLeast(0),
-            // Deliberately *not* given the same treatment. An unparsable instant is
-            // read by `instant` as a refusal, and that is right here: this field's
-            // absence is meaningful — it means the count is zero — so a value that
-            // cannot be read is not the same as one that is not there, and silently
-            // answering null would date a live ledger from the pass that noticed
-            // while telling nobody. The count above has no such second reading.
-            faultLedgerSince = reader.instant("$prefix.faultLedgerSince"),
+            // `takeIf` makes the biconditional total over both producers. The only
+            // pair it can now produce is (positive, null), which the funnel dates
+            // from the pass that noticed: a delay of one threshold, never an advance.
+            faultLedgerSince = instantOrNull(reader.string("$prefix.faultLedgerSince"))?.takeIf { ledger > 0 },
         )
     }
+
+    /**
+     * An instant that answers null rather than refusing the row.
+     *
+     * Used for one field, and named rather than inlined so the exception to
+     * `DocumentReader.instant` is visible: every other instant on a status is
+     * strict, because losing one silently changes what the loop believes about a
+     * side effect it issued. This one dates a fault counter, and the cost of a
+     * refusal — `SqliteStore` marking the row unreadable and `ReconcileLoop.resync`
+     * partitioning that server out of reconciliation until a human edits it — is
+     * out of all proportion to the value. Null is also the half of the pair that
+     * cannot escalate, so it errs quiet.
+     */
+    private fun instantOrNull(raw: String?): Instant? =
+        raw?.let {
+            try {
+                Instant.parse(it)
+            } catch (invalid: DateTimeParseException) {
+                null
+            }
+        }
 
     // ------------------------------------------------------------------------ block
 
