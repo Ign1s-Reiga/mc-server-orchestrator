@@ -3163,6 +3163,25 @@ internal class DrainController(
      * an `Occupied` reading blocks and voids the evidence, and both stop sites re-check
      * `mayStop` — so no path here stops a container with players on it. What the
      * restore did was **refill a container the drain was part-way through stopping**.
+     *
+     * ## The stamp over-reports, and [mcorch.core.NodeDispatch] is now what would fix it
+     *
+     * Danger pattern 142, unchanged by this note. The stamp is written *before* the
+     * call, so it says "a call was attempted" rather than "a request left this
+     * process", and `LocalNode.stopWorkload` has a path that attempts nothing: a
+     * `stopGracePeriod` its own rule refuses — a negative pair decodes, clears
+     * `LifecycleSpec.init`, and is refused inside the node. The drain then carries a
+     * `stopDispatchedAt` for a `SIGTERM` nobody sent and this function declines to
+     * re-register, so the backend is out of the routing table until an operator
+     * repairs the row.
+     *
+     * That failure now answers [NodeDispatch.NOTHING_SENT], so the repair is
+     * available: [stop]'s catch could drop the stamp it just wrote when the node says
+     * nothing was sent. **It is not made here.** The ordering this stamp encodes is
+     * the whole of `DrainStatus.stopDispatchedAt`'s safety argument, an un-stamp is a
+     * second writer on it, and the direction the mistake would go — a stop that *was*
+     * dispatched recorded as one that was not — costs a player's session. It goes
+     * through `drain-auditor`.
      */
     private suspend fun restoreRegistration(
         subject: DrainSubject,

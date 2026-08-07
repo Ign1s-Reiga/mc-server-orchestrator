@@ -10,6 +10,7 @@ import mcorch.core.ImageAvailability
 import mcorch.core.Labels
 import mcorch.core.Node
 import mcorch.core.NodeCapacity
+import mcorch.core.NodeDispatch
 import mcorch.core.NodeException
 import mcorch.core.NodeOperation
 import mcorch.core.NodeStatus
@@ -536,6 +537,11 @@ public class LocalNode internal constructor(
                         "the runtime reports no address for sandbox ${handle.sandboxId} yet, so port " +
                             "${request.port} cannot be reached. A sandbox gets one when its network is " +
                             "attached, so this is a wait rather than a misconfiguration",
+                        // The sandbox status above is a read and costs the far side
+                        // nothing; there is no address, so no HTTP request was
+                        // built. A retryable failure that sent nothing — which is
+                        // why the two questions are separate properties.
+                        dispatch = NodeDispatch.NOTHING_SENT,
                     )
             // Coordinates in, material out, and the material never leaves this
             // function: `Authorization` is built here and the header map is
@@ -551,6 +557,10 @@ public class LocalNode internal constructor(
                 name,
                 NodeOperation.ENDPOINT,
                 "the control-endpoint token `${ref.name}/${ref.key}` is not in the secret store",
+                // Resolved to build the `Authorization` header, so the refusal is
+                // above `send` and the proxy is never called. A drain step 2/4/6
+                // that fails here asked the proxy for nothing.
+                dispatch = NodeDispatch.NOTHING_SENT,
             )
         return try {
             secret.use { material -> String(material) }
@@ -662,6 +672,15 @@ public class LocalNode internal constructor(
                     "${rejection.message}. It comes from spec.lifecycle.stopGracePeriod, which the schema " +
                         "validates at parse time — for a Paper server, to exceed that server's save timeout; " +
                         "a Velocity proxy holds no world and has no such rule",
+                    // No `SIGTERM`, and provably: the argument is refused above
+                    // every call this method makes. That is the fact
+                    // `DrainController.restoreRegistration` needs and could not
+                    // ask for — its `stopDispatchedAt` stamp is written before the
+                    // call, so on this path it records a stop that does not exist
+                    // and the backend stays out of the routing table until an
+                    // operator repairs the row. The record is deliberately not
+                    // changed here; see this commit's report.
+                    dispatch = NodeDispatch.NOTHING_SENT,
                 )
             }
         val containerId =
@@ -1058,6 +1077,13 @@ public class LocalNode internal constructor(
                 name,
                 operation,
                 "sandbox $sandboxId has no container yet",
+                // Both callers ask this above their `translating` block, so no
+                // request has been built, let alone sent. It matters most for
+                // `EXEC`: that is the operation a world save travels on, and
+                // "nothing reached the server" is the premise
+                // `PaperServerAgent.requestSave` needs before it may let a save
+                // be re-sent.
+                dispatch = NodeDispatch.NOTHING_SENT,
             )
 
     override fun close() {

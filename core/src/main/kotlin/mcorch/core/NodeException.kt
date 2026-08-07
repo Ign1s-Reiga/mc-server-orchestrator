@@ -18,6 +18,58 @@ public enum class NodeOperation {
 }
 
 /**
+ * Whether a failed [Node] call put anything on the wire.
+ *
+ * The second question every audit of this loop has had to ask about a node
+ * failure, after "may I retry it". A drain compensates for side effects that
+ * outlive the call that made them — a `SIGTERM` already delivered, a
+ * `save-all flush` the server may have accepted — so what a caller needs to know
+ * is whether the operation *happened at all*. [NodeException.retryable] does not
+ * answer that and was never meant to: the two are independent, and a permanent
+ * failure can follow a delivered request exactly as a retryable one can precede
+ * an undelivered one.
+ *
+ * Before this existed the answer was re-derived at each call site from whatever
+ * happened to correlate there — `DrainStatus.stopDispatchedAt` for the stop path,
+ * `failure is NodeException.Timeout` for the save path — and each derivation was
+ * right at the site it was written for and wrong at the next one. The taxonomy is
+ * the node's to state, because the node is the only thing that knows.
+ *
+ * There is deliberately no `SENT`. A caller that must not repeat a side effect
+ * needs *proof of absence*, and every other case — the request left and the
+ * runtime never answered, the runtime answered with an error that says nothing
+ * about what it had already done, a failure this node could not classify — is the
+ * same case from that caller's point of view. Splitting [UNKNOWN] would invite a
+ * branch that treats a probable send differently from a certain one, which is the
+ * reasoning this type exists to stop.
+ */
+public enum class NodeDispatch {
+    /**
+     * The node refused before issuing anything that could change anything.
+     *
+     * A caller may act as though the operation had never been attempted: no
+     * request left this process for the runtime or the workload, so there is
+     * nothing to compensate for and nothing that makes a second attempt a
+     * repeat. Only an implementation may claim this, and only where it is
+     * provable by construction — an argument refused before the call, a
+     * precondition checked at the top of the method. A read that costs the far
+     * side nothing does not disqualify it; a write of any kind does.
+     */
+    NOTHING_SENT,
+
+    /**
+     * The node cannot say, so a caller must assume the request landed.
+     *
+     * The default, and the safe direction on every path that has been examined:
+     * re-sending a `save-all flush` costs one idempotent flush, while assuming a
+     * dispatched stop was never dispatched re-admits players to a container in
+     * shutdown. Anything an implementation has not deliberately classified
+     * arrives here.
+     */
+    UNKNOWN,
+}
+
+/**
  * Every failure crossing the [Node] boundary.
  *
  * This type exists so the reconcile loop never sees a `mcorch.cri` exception. A
@@ -33,12 +85,35 @@ public enum class NodeOperation {
  *   the runtime is busy. Nothing about the desired state is wrong.
  * - `false` — surface on the server's observed status and stop retrying. The
  *   request as written cannot succeed.
+ *
+ * And on [dispatch] for the *other* question — whether anything was sent. The two
+ * are orthogonal by design and neither may be derived from the other; see
+ * [NodeDispatch].
  */
 public sealed class NodeException(
     public val node: NodeName,
     public val operation: NodeOperation,
     message: String,
     cause: Throwable? = null,
+    /**
+     * Whether this failure left anything on the wire. See [NodeDispatch].
+     *
+     * A constructor parameter rather than an abstract member, because it is a
+     * property of the *call* and not of the kind of failure: the same [Rejected]
+     * is undispatched when it comes from an argument check and dispatched when
+     * the runtime refuses one, so no subclass can answer it for itself.
+     *
+     * **No default here.** Each subclass defaults it to [NodeDispatch.UNKNOWN] and
+     * this parameter is required, so those five defaults are the whole of the
+     * rule and a base-class default cannot sit behind them saying something
+     * different. That is not tidiness: a default here would be unreachable — every
+     * subclass passes the parameter on — so it would be a line stating the safe
+     * direction that could be edited to state the unsafe one with nothing
+     * observing the change. The mutation that has to be visible is a *subclass*
+     * default flipped to [NodeDispatch.NOTHING_SENT], and `NodeDispatchTest` sees
+     * exactly that.
+     */
+    public val dispatch: NodeDispatch,
 ) : RuntimeException(message, cause) {
     public abstract val retryable: Boolean
 
@@ -48,7 +123,8 @@ public sealed class NodeException(
         operation: NodeOperation,
         message: String,
         cause: Throwable? = null,
-    ) : NodeException(node, operation, message, cause) {
+        dispatch: NodeDispatch = NodeDispatch.UNKNOWN,
+    ) : NodeException(node, operation, message, cause, dispatch) {
         override val retryable: Boolean get() = true
     }
 
@@ -87,7 +163,8 @@ public sealed class NodeException(
          * command its agent ran overrunning.
          */
         public val commandTimeout: Boolean = false,
-    ) : NodeException(node, operation, message, cause) {
+        dispatch: NodeDispatch = NodeDispatch.UNKNOWN,
+    ) : NodeException(node, operation, message, cause, dispatch) {
         override val retryable: Boolean get() = true
     }
 
@@ -100,7 +177,8 @@ public sealed class NodeException(
         operation: NodeOperation,
         message: String,
         cause: Throwable? = null,
-    ) : NodeException(node, operation, message, cause) {
+        dispatch: NodeDispatch = NodeDispatch.UNKNOWN,
+    ) : NodeException(node, operation, message, cause, dispatch) {
         override val retryable: Boolean get() = true
     }
 
@@ -114,7 +192,8 @@ public sealed class NodeException(
         operation: NodeOperation,
         message: String,
         cause: Throwable? = null,
-    ) : NodeException(node, operation, message, cause) {
+        dispatch: NodeDispatch = NodeDispatch.UNKNOWN,
+    ) : NodeException(node, operation, message, cause, dispatch) {
         override val retryable: Boolean get() = false
     }
 
@@ -129,7 +208,8 @@ public sealed class NodeException(
         operation: NodeOperation,
         message: String,
         cause: Throwable? = null,
-    ) : NodeException(node, operation, message, cause) {
+        dispatch: NodeDispatch = NodeDispatch.UNKNOWN,
+    ) : NodeException(node, operation, message, cause, dispatch) {
         override val retryable: Boolean get() = false
     }
 

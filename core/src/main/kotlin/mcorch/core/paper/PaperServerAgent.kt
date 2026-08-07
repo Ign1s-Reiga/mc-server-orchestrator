@@ -252,6 +252,29 @@ internal class PaperServerAgent(
                         SaveOutcome.Unconfirmed("the save did not report completion within the save timeout")
                     }
 
+                    // **This branch is the site [NodeDispatch] was written for, and
+                    // it is deliberately not wired to it yet.**
+                    //
+                    // `NotDelivered` leaves `saveRequestedAt` unset, which is what
+                    // permits a later pass to send a second `save-all flush`. The
+                    // justification is *"no exec was dispatched, so nothing reached
+                    // the server"* — and what is actually being asked is the
+                    // subclass. That is right for the refusals `LocalNode` raises
+                    // above its own call (`requireContainer`, an unbuildable
+                    // request) and it is an assumption for the rest: a
+                    // `CriException.RuntimeFailure` on an `ExecSync` arrives as
+                    // `Busy` and says nothing about whether the command ran, and a
+                    // `Cancelled` arrives as `Rejected` after the exec left this
+                    // process.
+                    //
+                    // `failure.dispatch` answers it, and the change it would make is
+                    // to move the `UNKNOWN` cases into `Unconfirmed` — the bucket
+                    // that is never re-sent. That is a **drain guard**, so it goes
+                    // through `drain-auditor` rather than riding along with the
+                    // taxonomy that makes it expressible: the same edit also decides
+                    // what a `DRAIN_SAVE_TIMEOUT` wedge costs a server whose RCON
+                    // hiccuped once, which is the trade item 3 of the danger
+                    // patterns is about and is not this change's to take.
                     else -> {
                         SaveOutcome.NotDelivered(
                             detail = failure.message,

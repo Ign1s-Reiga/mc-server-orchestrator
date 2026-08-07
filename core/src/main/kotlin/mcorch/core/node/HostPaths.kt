@@ -1,6 +1,7 @@
 package mcorch.core.node
 
 import mcorch.core.AssetMount
+import mcorch.core.NodeDispatch
 import mcorch.core.NodeException
 import mcorch.core.NodeOperation
 import mcorch.core.StorageRequest
@@ -232,6 +233,20 @@ internal object HostPaths {
      * Nothing this loop does will empty a disk or make a read-only mount
      * writable, and a retryable classification would show `RETRYABLE` on the
      * dashboard for ever while never asking anybody to look at the host.
+     *
+     * ## …and nothing was sent
+     *
+     * [prepare]'s one call site is `LocalNode.ensureWorkload`, in the branch that
+     * found no sandbox, on the line above `runSandbox`. So a create refused here
+     * asked the runtime for nothing and left nothing behind but host directories,
+     * which are idempotent to re-create.
+     *
+     * That does **not** extend to the other refusals in this file.
+     * [checkMountPlan] and [missingAsset] are reached through
+     * [mounts] → `containerSpecFor`, which `ensureWorkload` calls *after* the
+     * sandbox exists — adopted or just created — so a create refused there has
+     * already put a sandbox on the node. They keep the default answer, which is
+     * the whole point of the default being the cautious one.
      */
     private fun rejected(
         node: NodeName,
@@ -246,6 +261,7 @@ internal object HostPaths {
             "the host directories for `${spec.server}` could not be prepared under `$volumeRoot` and " +
                 "`$logRoot`: ${cause::class.simpleName}: ${cause.message}",
             cause,
+            dispatch = NodeDispatch.NOTHING_SENT,
         )
 }
 
