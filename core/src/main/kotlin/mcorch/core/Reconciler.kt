@@ -99,6 +99,7 @@ public class Reconciler(
             clock = clock,
             evidenceGap = config.saveEvidenceMaxGap,
             attentionAfter = config.drainAttentionAfter,
+            attentionLedger = config.drainAttentionLedger,
         )
 
     /**
@@ -249,6 +250,7 @@ public class Reconciler(
                 now = now,
                 phase = if (previous?.runtime == null) ServerPhase.PENDING else ServerPhase.RUNNING,
                 attentionAfter = config.drainAttentionAfter,
+                attentionLedger = config.drainAttentionLedger,
                 failure =
                     recordFailure(
                         reason = FailureReason.FORWARDING_SECRET_UNAVAILABLE,
@@ -1361,6 +1363,7 @@ public class Reconciler(
                 now = now,
                 phase = ServerPhase.FAILED,
                 attentionAfter = config.drainAttentionAfter,
+                attentionLedger = config.drainAttentionLedger,
                 failure =
                     recordFailure(
                         reason = FailureReason.CONTAINER_CREATE_FAILED,
@@ -1543,6 +1546,7 @@ public class Reconciler(
                 now = now,
                 phase = phase,
                 attentionAfter = config.drainAttentionAfter,
+                attentionLedger = config.drainAttentionLedger,
                 ready = ready,
                 image = image,
                 runtime = runtime,
@@ -1620,6 +1624,7 @@ public class Reconciler(
                 now = now,
                 phase = ServerPhase.FAILED,
                 attentionAfter = config.drainAttentionAfter,
+                attentionLedger = config.drainAttentionLedger,
                 failure =
                     recordFailure(
                         reason = FailureReason.CONTAINER_CREATE_FAILED,
@@ -2936,6 +2941,7 @@ public class Reconciler(
                 now = now,
                 phase = phase,
                 attentionAfter = config.drainAttentionAfter,
+                attentionLedger = config.drainAttentionLedger,
                 ready = ready,
                 image = image,
                 runtime = runtime,
@@ -3040,6 +3046,52 @@ public data class ReconcilerConfig(
      */
     val drainAttentionAfter: Duration = 15.minutes,
     /**
+     * How far a drain's faults may exceed its recoveries before it is *reported*
+     * as needing a human — the second, independent arm of the same flag.
+     *
+     * [drainAttentionAfter] measures **how long one fault has stood**, and it can
+     * only fire on a fault that is still standing when the threshold passes. A
+     * control endpoint that fails on one pass and behaves on the next never
+     * presents one: the recovery deletes the record, the anchor restarts, and four
+     * hours of a fault present half the time raised nothing at all. That is what
+     * [mcorch.schema.DrainStatus.faultLedger] counts and this is where it is
+     * judged.
+     *
+     * ## Where six comes from
+     *
+     * Derived from [drainAttentionAfter], not chosen. The two arms have to be
+     * ordered so that a drain which is failing *continuously* is still reported by
+     * the arm calibrated for it — otherwise this number quietly becomes the
+     * escalation rule and the fifteen minutes above stop meaning anything.
+     *
+     * The comparison has to be made in passes, and the loop's cadence is a backoff
+     * rather than an interval, so it has two ends. Both a fault (`Retry`) and a
+     * healthy block (`Retry`) leave `WorkQueue`'s attempt counter alone, so a drain
+     * in this state climbs `Backoff`'s 1s → 5min curve and settles at the **cap**:
+     * one pass per five minutes. At that cadence [drainAttentionAfter] is **three
+     * consecutive faulting passes**. Six is double that, so:
+     *
+     * - a continuously failing drain always trips the time arm first, at every
+     *   cadence — six consecutive faults cannot happen before three;
+     * - an intermittent fault, which the time arm cannot report at all, is reported
+     *   here once the evidence is twice what the time arm settles for.
+     *
+     * What six costs in wall-clock depends on how intermittent the fault is,
+     * because the ledger moves by the *net* of faults over recoveries. At the cap:
+     * a fault on three passes in four reaches six in twelve passes, about an hour;
+     * two in three, in eighteen passes, about ninety minutes; anything at or below
+     * one in two never reaches it, which is the policy. Early in a drain, before
+     * the backoff has climbed, the same counts take seconds to minutes — and that
+     * is a floor rather than a schedule: a saturated loop is slower, and nothing
+     * here assumes otherwise.
+     *
+     * Raising it makes an intermittent fault take proportionally longer to report
+     * and never makes anything quieter that is loud today. Lowering it below three
+     * is the one change that would be wrong for a reason arithmetic rather than
+     * taste: this arm would start pre-empting the time arm on continuous faults.
+     */
+    val drainAttentionLedger: Int = 6,
+    /**
      * The Velocity build every proxy this orchestrator creates is pinned to, or
      * null for the one it ships against
      * ([mcorch.core.proxy.VelocityWorkloadPlanner.VELOCITY_BUILD]).
@@ -3070,5 +3122,11 @@ public data class ReconcilerConfig(
         require(containerPollInterval.isPositive()) { "containerPollInterval must be positive" }
         require(saveEvidenceMaxGap.isPositive()) { "saveEvidenceMaxGap must be positive" }
         require(drainAttentionAfter.isPositive()) { "drainAttentionAfter must be positive" }
+        // Zero would raise the flag on every drain that has ever existed, including
+        // one that has never failed — the ledger starts at zero and `>=` is the
+        // test. Negative is the same thing further out.
+        require(drainAttentionLedger > 0) {
+            "drainAttentionLedger is a net fault count and must be positive; zero flags every drain at rest"
+        }
     }
 }

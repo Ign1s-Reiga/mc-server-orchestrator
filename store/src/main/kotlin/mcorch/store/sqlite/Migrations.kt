@@ -44,10 +44,10 @@ internal data class MigrationReport(
 /**
  * The ordered migration list and the runner that applies it.
  *
- * ## Adding version 6
+ * ## Adding version 7
  *
- * 1. Write a `V6Something : Migration` below with `version = 6`.
- * 2. Append it to [ALL]. Do not renumber, do not reorder, do not touch V1 to V5.
+ * 1. Write a `V7Something : Migration` below with `version = 7`.
+ * 2. Append it to [ALL]. Do not renumber, do not reorder, do not touch V1 to V6.
  * 3. If it reads a stored document, it must check `doc_encoding` against a frozen
  *    literal and refuse anything else, rather than parse whatever is on disk.
  *    [V3SplitWorldSavedInstant] is the worked example, down to why the literal is
@@ -85,6 +85,7 @@ internal object Migrations {
             V3SplitWorldSavedInstant,
             V4RejectUnnamedRows,
             V5BlockedDrainIsNotAFailure,
+            V6DrainFaultLedger,
         )
 
     val latest: Int = ALL.maxOf { it.version }
@@ -670,6 +671,98 @@ private object V5BlockedDrainIsNotAFailure : Migration {
             writer.put("$DRAIN_BLOCK.since", document.string("$DRAIN_FAILURE.occurredAt"))
             writer.put("$DRAIN_BLOCK.observations", document.string("$DRAIN_FAILURE.attempts"))
         }
+        return writer.render()
+    }
+}
+
+/**
+ * Gives every stored drain an explicit fault ledger of zero.
+ *
+ * **The decode does not need this, and that is the point.** `StatusCodec` reads
+ * `drain.faultLedger` optionally and answers zero for a document that has no such
+ * key, because a decode-time refusal on a field this cheap would abort
+ * `listServers` and take the loop's whole view of the fleet with it. So this
+ * migration changes no behaviour whatsoever: a row it has rewritten and a row it
+ * has not decode to the same [mcorch.schema.DrainStatus].
+ *
+ * It is here so that *silence stops being ambiguous*. Once every document written
+ * before the field carries an explicit `0`, a missing key means one thing only —
+ * a document this build has never written — and the tolerant read above becomes a
+ * guard against a case that should not occur rather than the normal path for half
+ * the rows on disk. The next writer of that field is spared having to ask which
+ * kind of absence they are looking at, which is the question that made
+ * [V3SplitWorldSavedInstant] necessary.
+ *
+ * Zero rather than anything derived, and there is nothing to derive it from: the
+ * ledger is a history of faults and recoveries, and a stored status keeps only the
+ * one fault standing at the instant it was written. Inventing a number from
+ * `drain.failure.attempts` would be worse than useless — that counter is reset by
+ * every recovery, which is the whole reason this field exists — and it would hand
+ * a drain that had been retrying honestly a head start toward an escalation
+ * nobody observed. Zero is also the value that cannot escalate, so an upgrade
+ * cannot page anybody.
+ *
+ * Works at the key level and never builds a `:schema` object, like V2, V3 and V5,
+ * and pins the document encoding it was written against for the reason set out on
+ * [V3SplitWorldSavedInstant.ENCODING_WRITTEN_AGAINST].
+ */
+private object V6DrainFaultLedger : Migration {
+    override val version: Int = 6
+    override val description: String = "give every stored drain an explicit fault ledger of zero"
+
+    private const val LEDGER = "drain.faultLedger"
+
+    /** The key whose presence means the row carries a drain at all. */
+    private const val DRAIN_STATE = "drain.state"
+
+    /** See [V3SplitWorldSavedInstant.ENCODING_WRITTEN_AGAINST]: pinned, never read from the live constant. */
+    private const val ENCODING_WRITTEN_AGAINST = 1
+
+    override fun apply(connection: Connection) {
+        val rewritten = mutableListOf<Pair<String, String>>()
+        connection.query("SELECT name, status_doc, doc_encoding FROM server_status") { rows ->
+            while (rows.next()) {
+                val name = rows.getString("name")
+                val encoding = rows.getInt("doc_encoding")
+                val what = "status of `$name`"
+                if (encoding != ENCODING_WRITTEN_AGAINST) {
+                    throw StoreException.Corrupt(
+                        "$what is encoded at version $encoding, but this migration only understands " +
+                            "$ENCODING_WRITTEN_AGAINST",
+                    )
+                }
+                val document = PropertyDocument.parse(rows.getString("status_doc"), what)
+                // A status with no drain on it gets nothing: there is no record to
+                // put a ledger on, and writing `drain.faultLedger` beside no
+                // `drain.state` would make `readDrain` — which decides a drain
+                // exists by looking for `drain.state` — answer null for a document
+                // that now has drain keys in it. A future reader would have every
+                // reason to call that corrupt.
+                if (!document.has(DRAIN_STATE)) continue
+                // Idempotent by construction, and it has to be: `DocumentWriter.put`
+                // refuses a repeat with an `IllegalArgumentException`, which is not a
+                // `StoreException` and would cross the store boundary as a type
+                // `:core` cannot classify. Nothing should have written this key at
+                // version 5 — but "should" is what the guard is for, and a migration
+                // re-run against a partially-migrated disk is exactly when it bites.
+                if (document.has(LEDGER)) continue
+                rewritten += name to rewrite(document)
+            }
+        }
+        for ((name, document) in rewritten) {
+            connection.update("UPDATE server_status SET status_doc = ? WHERE name = ?") {
+                setString(1, document)
+                setString(2, name)
+            }
+        }
+    }
+
+    private fun rewrite(document: DocumentReader): String {
+        val writer = DocumentWriter()
+        for (key in document.keys()) {
+            writer.put(key, document.string(key))
+        }
+        writer.put(LEDGER, "0")
         return writer.render()
     }
 }

@@ -159,6 +159,17 @@ internal class DrainController(
      */
     private val evidenceGap: Duration = DEFAULT_EVIDENCE_GAP,
     private val attentionAfter: Duration = DEFAULT_ATTENTION_AFTER,
+    /**
+     * The net fault count at which a drain is reported however long each
+     * individual fault lasted. See `ReconcilerConfig.drainAttentionLedger`, which
+     * is where the number is derived, and [settleLedger], which is what moves it.
+     *
+     * Held here only so the crossing can be logged where it happens. The *flag* is
+     * derived in `StatusDrafting` from the same threshold, through
+     * [DrainStatus.escalated] — one rule, asked in two places for two different
+     * outputs, rather than two rules.
+     */
+    private val attentionLedger: Int = DEFAULT_ATTENTION_LEDGER,
 ) {
     /**
      * Advances the drain by at most one step, performing at most one side
@@ -486,7 +497,88 @@ internal class DrainController(
         // recorded state, and it is one of the two inputs [settleRecords] needs. A
         // step cannot be asked about it afterwards: the resume has already moved the
         // drain out of `DRAIN_FAILED` by the time its progress comes back.
-        return step(pass, observed).settleRecords(resuming = observed.state == DrainState.DRAIN_FAILED)
+        return step(pass, observed)
+            .settleLedger(observed, subject.server)
+            .settleRecords(resuming = observed.state == DrainState.DRAIN_FAILED)
+    }
+
+    /**
+     * Moves [mcorch.schema.DrainStatus.faultLedger] by what this pass established,
+     * and by nothing else.
+     *
+     * ## Why it is here and not at the sites
+     *
+     * `+1` belongs to every site that records a fault and `-1` to every site that
+     * proves one is over, and there are a dozen of each. Written at the sites, the
+     * rule would be a dozen lines that have to be remembered by whoever adds the
+     * thirteenth — which is how [DrainStatus.stopDispatchedAt] came to need three
+     * separate audit rounds. This is the one funnel every stepped pass goes
+     * through, and both facts are readable here by comparing what the step
+     * returned against what it was given.
+     *
+     * It runs **before** [settleRecords], because that function returns early for a
+     * drain parked in `DRAIN_FAILED` — which is exactly where an abort and a block
+     * leave one, and those are the two passes with something to say.
+     *
+     * ## The three answers, and why "did not fail" is not one of them
+     *
+     * - **A fault was recorded.** The step wrote a [mcorch.schema.FailureStatus]
+     *   that is not the one it was handed: `recordFailure` always produces a fresh
+     *   value, bumping `attempts` when the reason repeats and restamping
+     *   `occurredAt` when it does not, so structural inequality is exactly the
+     *   question *"did this pass record a fault"* with no flag for a future abort
+     *   site to forget to set. `+1`.
+     * - **Health was established.** Either the pass did work — a request left this
+     *   process and came back with what it needed — or it recorded a block, which
+     *   means it got all the way to its gate, its probe answered, and the only
+     *   thing in the way is players. Both are positive observations. `-1`, floored
+     *   at zero.
+     * - **Neither.** Everything else, and it is deliberately the default rather
+     *   than the leftover. A pass waiting on a container the runtime will not
+     *   describe, or on one that has not finished exiting, has not failed *and has
+     *   not established anything either*; letting "did not fail" pay down the
+     *   ledger would let a drain sitting in `STOPPING` erase an hour of real faults
+     *   at the poll interval. The two predicates are not the same and this is the
+     *   whole of the difference between them.
+     *
+     * ## Idempotency
+     *
+     * Repeating a pass against unchanged state does not accumulate: a fault pass
+     * repeated is a genuinely repeated fault, which is the thing being counted; a
+     * healthy pass repeated walks the ledger down to zero and then stops moving it,
+     * so the status stops changing and `Reconciler`'s write-skip takes over. There
+     * is no state in which repeating a pass moves this without bound in the
+     * direction that raises an alert.
+     */
+    private fun DrainProgress.settleLedger(
+        observed: DrainStatus,
+        server: ResourceName,
+    ): DrainProgress {
+        val faulted = drain.failure != null && drain.failure != observed.failure
+        val recovered = drain.blocked != null && drain.blocked != observed.blocked
+        val ledger =
+            when {
+                faulted -> observed.faultLedger + 1
+                workDone || recovered -> (observed.faultLedger - 1).coerceAtLeast(0)
+                else -> observed.faultLedger
+            }
+        if (ledger >= attentionLedger && observed.faultLedger < attentionLedger) {
+            // On the crossing only. A line per pass for the whole time a drain is
+            // over the threshold is the log-level version of the alert this arm
+            // exists to make meaningful, and the condition is what a dashboard
+            // reads — this is for whoever is grepping afterwards for when it
+            // started.
+            LOG.warn(
+                "drain for server={} has failed more often than it has recovered: ledger={} threshold={} " +
+                    "state={}. Nothing is stopped and the loop keeps retrying; this is reported because a " +
+                    "fault that clears between passes never stands long enough to be reported by its age",
+                server,
+                ledger,
+                attentionLedger,
+                drain.state,
+            )
+        }
+        return copy(drain = drain.copy(faultLedger = ledger))
     }
 
     /**
@@ -3736,6 +3828,9 @@ internal class DrainController(
          */
         private val DEFAULT_ATTENTION_AFTER = 15.minutes
 
+        /** Mirrors `ReconcilerConfig.drainAttentionLedger`, which carries the derivation. */
+        private const val DEFAULT_ATTENTION_LEDGER = 6
+
         /**
          * The default evidence gap. Comfortably longer than the interval
          * between passes of a drain that is getting anywhere, and far shorter
@@ -3878,6 +3973,38 @@ internal fun escalates(
  * mean the dashboard stops asking for help while the server is still stuck.
  */
 internal fun DrainStatus.escalated(
+    now: Instant,
+    after: Duration,
+    ledgerThreshold: Int,
+): Boolean = failingTooLong(now, after) || failingTooOften(ledgerThreshold)
+
+/**
+ * The second arm: this drain has failed more often than it has recovered, by
+ * [ledgerThreshold].
+ *
+ * **A disjunct, and it must stay one.** The arm above is untouched by this — same
+ * anchor, same threshold, same answer for every drain that has a standing failure
+ * — so nothing that is reported today is reported later than it was. That
+ * property is the whole reason the shape is `a || b` rather than one combined
+ * rule, and it is not an implementation detail to tidy away: fold the two into a
+ * single predicate and the first thing to go is the guarantee that adding this
+ * arm cannot delay an existing alert. If a combined rule ever looks tempting,
+ * write down first what it does to a drain that has been failing continuously for
+ * fourteen minutes.
+ *
+ * **It does not require a standing [failure], and that is the point.** The case
+ * this exists for is a fault that is absent at most instants a reader looks —
+ * present on one pass, gone on the next, with the record deleted in between. An
+ * arm that asked for a failure would fire only on the failing passes, which is to
+ * say only where the arm above could already have fired.
+ *
+ * See [mcorch.schema.DrainStatus.faultLedger] for what makes the number move and
+ * `ReconcilerConfig.drainAttentionLedger` for where the threshold comes from.
+ */
+internal fun DrainStatus.failingTooOften(ledgerThreshold: Int): Boolean = faultLedger >= ledgerThreshold
+
+/** The original arm, unchanged, named so the disjunct above reads as two questions. */
+internal fun DrainStatus.failingTooLong(
     now: Instant,
     after: Duration,
 ): Boolean =

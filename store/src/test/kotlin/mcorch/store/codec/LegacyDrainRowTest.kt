@@ -130,6 +130,12 @@ class LegacyDrainRowTest {
             destination = name("lobby-01"),
             blocked = block,
             failure = failure,
+            // Non-zero, and above the default escalation threshold on purpose. Zero
+            // is what a stripped row reads, so a probe carrying zero would make the
+            // case below pass against a codec that does not persist the field at
+            // all — and the value being one that *escalates* is what makes the
+            // stripped reading a visible loss rather than a cosmetic one.
+            faultLedger = 7,
         )
 
     private val status =
@@ -262,6 +268,19 @@ class LegacyDrainRowTest {
                                 "is. It loses the record telling an operator the world may not have been " +
                                 "flushed, which is why the loop carries it forward rather than re-deriving",
                         expected = { it.copy(failure = null) },
+                    ),
+                "DrainStatus.faultLedger" to
+                    Reads(
+                        why =
+                            "zero means no fault has yet outlasted a recovery, which is the value that " +
+                                "cannot escalate. It is the one field here whose absence is *expected* " +
+                                "rather than tolerated — every document written before it existed has no " +
+                                "such key — so a refusal would make an upgrade unreadable, and V6 stamps " +
+                                "the explicit zero afterwards so that later absences mean something. What " +
+                                "is lost is evidence: a drain that came back at zero has to re-earn a " +
+                                "pattern that takes hours to build, and it under-reports, which is the " +
+                                "safe direction for a flag",
+                        expected = { it.copy(faultLedger = 0) },
                     ),
                 // --------------------------------------------------------- DrainBlock
                 "DrainBlock.reason" to

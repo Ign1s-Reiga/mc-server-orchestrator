@@ -479,6 +479,14 @@ internal object StatusCodec {
         // `V5BlockedDrainIsNotAFailure`.
         drain.blocked?.let { block -> scope.scope("blocked") { writeBlock(this, block) } }
         drain.failure?.let { failure -> scope.scope("failure") { writeFailure(this, failure) } }
+        // How far this drain's faults exceed its recoveries. Unlike everything
+        // above it this is not a record of a side effect, and losing it costs
+        // neither a repeat nor a reversal — it costs *evidence*: a drain that came
+        // back at zero has to re-establish a pattern that takes hours to build, and
+        // the flapping fault it exists to catch is precisely the one that survives a
+        // restart. Written unconditionally, including the zero, so a row's silence
+        // means "written before this field" and nothing else.
+        scope.put("faultLedger", drain.faultLedger)
     }
 
     private fun readDrain(
@@ -502,6 +510,20 @@ internal object StatusCodec {
             destination = reader.value("$prefix.destination", ResourceName::of),
             blocked = readBlock(reader, "$prefix.blocked"),
             failure = readFailure(reader, "$prefix.failure"),
+            // Optional and clamped, where `transferAttempts` beside it is
+            // `requireInt`. Two deliberate differences from its neighbour:
+            //
+            // A missing key reads zero rather than failing the row. V6 stamps every
+            // existing document, so absence should not happen — but a decode-time
+            // refusal on this type is not charged to one server, it aborts
+            // `listServers` and with it the loop's whole view of the fleet, and this
+            // field is worth nothing beside that. Zero is also the answer that
+            // cannot escalate, so the tolerant read errs quiet rather than loud.
+            //
+            // A negative is clamped for the same reason rather than refused. Nothing
+            // that writes these rows can produce one; a hand edit can, and the value
+            // it should take is not in doubt.
+            faultLedger = (reader.int("$prefix.faultLedger") ?: 0).coerceAtLeast(0),
         )
     }
 

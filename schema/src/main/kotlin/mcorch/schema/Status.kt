@@ -558,6 +558,55 @@ public data class DrainStatus(
     /** Parked, and nothing is wrong. Null unless the drain is waiting on something. See the note above. */
     val blocked: DrainBlock? = null,
     val failure: FailureStatus? = null,
+    /**
+     * How far this drain's faults exceed its recoveries — a **ledger**, not a
+     * count.
+     *
+     * [failure] answers *"is something wrong right now"* and its `occurredAt`
+     * answers *"since when"*. Neither can answer *"has this been going wrong and
+     * right, over and over"*, because a recovery deletes the record: a control
+     * endpoint that fails on one pass and behaves on the next has no standing
+     * failure at any instant a reader might look, and every anchor it might be
+     * measured from is reset by the pass in between. Four hours of that used to
+     * raise nothing at all.
+     *
+     * So this one is not reset by a recovery, it is **paid down** by one. A pass
+     * that records a fault adds 1; a pass that positively establishes health —
+     * work that came back with what it asked for, or a drain that reached its
+     * gate and found only players in the way — subtracts 1, with a floor at zero.
+     * A pass that establishes *neither*, such as one waiting on a container the
+     * runtime will not describe, leaves it alone: "did not fail" and "was found
+     * healthy" are different facts, and spending the second on the first turns a
+     * quiet loop into a slow eraser of real faults.
+     *
+     * The arithmetic is the specification and it is meant to be checkable in a
+     * sentence: **the ledger grows only while a drain is failing more often than
+     * it recovers.** A fault rate below half trends to the floor and never
+     * escalates; above half it grows without bound and always does; at exactly
+     * half it is driftless, so a perfectly alternating fault does not escalate and
+     * a real one — which is never perfectly alternating — eventually does, because
+     * the floor at zero reflects the walk upward.
+     *
+     * ## Why an `Int` here rather than a derived thing
+     *
+     * It has to survive a restart. Every alternative is a function of history the
+     * status does not keep: `FailureStatus.attempts` is reset by the recovery, and
+     * a list of past faults would be a log, on a type every consumer reads every
+     * pass. One integer, monotone in the fact it reports, comparable by `equals`
+     * so the reconciler's write-skip still works, and carrying nothing about who
+     * was connected.
+     *
+     * **Not `require`d non-negative, deliberately.** A decode-time refusal on this
+     * type is charged to the whole fleet read, and a hand-edited negative is worth
+     * far less than a store that opens: the decode clamps to zero instead, which
+     * is the value that cannot escalate. The floor that matters is enforced where
+     * the subtraction happens.
+     *
+     * A row written before this field existed reads zero — the safe side, since a
+     * drain cannot escalate on an arm it has no history for, and it starts
+     * accumulating on its next fault.
+     */
+    val faultLedger: Int = 0,
 ) {
     /**
      * Whether a completed save has been confirmed for this drain.
