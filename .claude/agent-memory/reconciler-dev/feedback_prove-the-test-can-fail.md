@@ -520,6 +520,20 @@ in exactly the scenario where it outlived its container. Ask of any fixture: *do
 the value I am handing this exist in the field, and does anything about it differ
 between the two cases I am claiming to tell apart?*
 
+**Two more of mine, both green under the sabotage written for them.** An
+idempotency assertion — *"a second pass records the same storage"* — could not see
+a record re-stamped with `now` on every pass, because `Harness` runs on a clock
+that only advances when a test advances it: the same `now` twice compares equal.
+Advancing past `statusHeartbeat` between the passes fixed it and does a second
+job, because an unchanged status **inside** the heartbeat is not written at all,
+so the comparison had been one row read twice rather than two rows written. And a
+fixture injected the volume name `survival-01-world` to prove a refusal *carries*
+the record — which is exactly what the definition derives (`metadata.name` plus
+`-world`), so the assertion held whether the pass carried it or re-derived it,
+under the very defect it was written for. **A fixture value must differ from the
+value the defect would produce, and a comparability test must move the clock**;
+"equal" is the cheapest possible green.
+
 **A KDoc that spells out a block-comment terminator ends the KDoc there.** Writing
 the delimiters out while documenting a comment stripper closed the doc four lines
 early and the rest of the prose compiled as Kotlin — twenty unresolved-reference
