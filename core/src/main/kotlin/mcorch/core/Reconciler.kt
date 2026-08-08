@@ -10,6 +10,7 @@ import mcorch.core.proxy.ControlOutcome
 import mcorch.core.proxy.ProxySelfLink
 import mcorch.core.proxy.VelocityProxyAgent
 import mcorch.core.proxy.VelocityWorkloadPlanner
+import mcorch.core.proxy.credentialVerdict
 import mcorch.schema.BackendRegistration
 import mcorch.schema.BackendRoutingStatus
 import mcorch.schema.BackendStatus
@@ -766,7 +767,7 @@ public class Reconciler(
         blocker: FailureStatus? = null,
     ): ReconcileOutcome {
         val channel = pass.channel(node, observation.handle)
-        val control = readControl(pass, channel)
+        val control = readControl(pass, channel, observation.handle.containerId)
         val probe = pass.agent.probe(node, observation.handle)
         val endpoint =
             ServerEndpoint(
@@ -860,12 +861,40 @@ public class Reconciler(
         }
     }
 
-    /** The handshake, turned into the observation a dashboard reads. */
+    /**
+     * The handshake, turned into the observation a dashboard reads.
+     *
+     * ## The credential is carried in, not started fresh
+     *
+     * This asks `GET /v1/version`, which needs no token, so **no branch here can
+     * establish a credential verdict** — and a record built from scratch every
+     * pass would therefore erase one. That is not hypothetical: the branch above
+     * that handles a proxy whose player port stops answering never reaches
+     * `assertBackends`, so a proxy recorded `REJECTED` would come back `UNTESTED`
+     * on the first unanswered ping, flipping `usable` false→true and
+     * `CONTROL_ENDPOINT_READY` FALSE→TRUE on exactly the surface the field was
+     * added to stop lighting. The pass learned nothing about the credential, so
+     * it says nothing about it: the previous verdict is seeded in and only a
+     * later authenticated call replaces it, by the same rule `lastContactAt`
+     * already follows.
+     *
+     * **Gated on the container being the same one.** A verdict is about the token
+     * inside a particular container, so a replacement must not inherit the
+     * refusal its predecessor earned. The gate fires only when both ids are known
+     * and differ — an unreported container id is not a new container, and
+     * resetting on one would restore the erasure this seeding exists to stop.
+     */
     private suspend fun readControl(
         pass: ProxyPass,
         channel: ControlChannel,
-    ): ControlEndpointStatus =
-        when (val outcome = channel.version()) {
+        containerId: String?,
+    ): ControlEndpointStatus {
+        val previous = pass.previous?.control
+        val recordedContainerId = pass.previous?.runtime?.containerId
+        val recreated = containerId != null && recordedContainerId != null && recordedContainerId != containerId
+        val credential =
+            if (recreated) ControlCredential.UNTESTED else previous?.credential ?: ControlCredential.UNTESTED
+        return when (val outcome = channel.version()) {
             is ControlOutcome.Answered -> {
                 ControlEndpointStatus(
                     reachable = true,
@@ -875,21 +904,29 @@ public class Reconciler(
                     // arrow is that this build cannot hold a stale copy.
                     compatible = outcome.value.compatible,
                     lastContactAt = pass.now,
+                    credential = credential,
                 )
             }
 
             is ControlOutcome.Refused -> {
-                ControlEndpointStatus(reachable = true, compatible = false, lastContactAt = pass.now)
+                ControlEndpointStatus(
+                    reachable = true,
+                    compatible = false,
+                    lastContactAt = pass.now,
+                    credential = credential,
+                )
             }
 
             is ControlOutcome.Unavailable -> {
                 ControlEndpointStatus(
                     reachable = false,
                     compatible = false,
-                    lastContactAt = pass.previous?.control?.lastContactAt,
+                    lastContactAt = previous?.lastContactAt,
+                    credential = credential,
                 )
             }
         }
+    }
 
     /**
      * Asserts the routing table, every pass, from the fleet.
@@ -969,17 +1006,25 @@ public class Reconciler(
         // would turn that absence into an outbound `DELETE` against a live backend.
         val listing = store.listAll()
         val matched = pass.backends(listing)
-        // The verdict of this pass's authenticated calls, and it starts at
-        // "nothing established". Every branch below that learns something writes
-        // it; the ones that learn nothing — an endpoint that stopped answering
-        // between the handshake and this call, a refusal with some other code —
-        // leave it alone rather than guessing, because `UNTESTED` is the value
-        // that claims nothing.
-        var credential = ControlCredential.UNTESTED
+        // What this pass's authenticated calls established, seeded with what the
+        // handshake carried in. **Every** `ControlOutcome` below goes through
+        // `noting`, rather than a test per site: the justification for reading the
+        // verdict off the backend `PUT` as well as off `state()` — a verdict only
+        // one call site can write is one that goes missing the day the order
+        // changes — applies verbatim to the deregistration sweep and to the
+        // proxy's own admission assertion, and writing it three times is how the
+        // fourth site gets forgotten. `ControlCredential.refinedBy` is the rule:
+        // an outcome that establishes nothing leaves the verdict alone.
+        var credential = control.credential
+
+        fun <T> noting(outcome: ControlOutcome<T>): ControlOutcome<T> {
+            credential = credential.refinedBy(outcome.credentialVerdict())
+            return outcome
+        }
+
         val registered =
-            when (val state = channel.state()) {
+            when (val state = noting(channel.state())) {
                 is ControlOutcome.Answered -> {
-                    credential = ControlCredential.ACCEPTED
                     state.value
                 }
 
@@ -1018,7 +1063,11 @@ public class Reconciler(
                             "until the token they share is the same one again"
                     LOG.error("proxy={} is refusing this orchestrator's control token: {}", pass.name, message)
                     return ProxyRouting(
-                        control = control.copy(credential = ControlCredential.REJECTED),
+                        // `credential`, which the funnel has already set to
+                        // `REJECTED` from this very outcome. Naming the value here
+                        // again would be a second derivation of the verdict, one
+                        // `when` arm away from the one that decides it.
+                        control = control.copy(credential = credential),
                         status = pass.previous?.backends,
                         failure =
                             recordFailure(
@@ -1064,7 +1113,7 @@ public class Reconciler(
             // has parked out of routing for ever — the running, invisible,
             // unreachable server this level trigger exists to repair.
             val admits = !backend.sealed
-            when (val outcome = channel.assertBackend(backend.server, address, admits)) {
+            when (val outcome = noting(channel.assertBackend(backend.server, address, admits))) {
                 is ControlOutcome.Answered -> {
                     statuses +=
                         BackendStatus(
@@ -1092,15 +1141,6 @@ public class Reconciler(
 
                 is ControlOutcome.Refused -> {
                     problem = problem ?: "`${backend.server}` could not be registered (${outcome.code})"
-                    // The same fact the `state()` branch above records, arriving by
-                    // the other door. It cannot happen while that call is made first
-                    // and 401s first — but that is an ordering, not a guarantee, and
-                    // a token rotated *between* the two calls lands here alone. A
-                    // credential verdict that only one call site can write is a
-                    // verdict that goes missing the day the order changes.
-                    if (outcome.code == ControlErrorCode.UNAUTHENTICATED) {
-                        credential = ControlCredential.REJECTED
-                    }
                     statuses +=
                         BackendStatus(
                             server = backend.server,
@@ -1143,7 +1183,7 @@ public class Reconciler(
                 listing.unreadable.mapNotNull { it.name?.lowercase() }.toSet()
         registered?.backends?.filter { it.name.lowercase() !in wanted }?.forEach { stale ->
             ResourceName.of(stale.name).getOrNull()?.let { name ->
-                when (val outcome = channel.deregister(name)) {
+                when (val outcome = noting(channel.deregister(name))) {
                     is ControlOutcome.Answered -> {
                         LOG.info(
                             "deregistered `{}` from proxy={}: no definition matches its backend selector any more",
@@ -1179,7 +1219,13 @@ public class Reconciler(
                 ?.state
                 ?.sealsBackend() == true
         val anyAdmitting = matched.any { !it.sealed }
-        channel.assertProxyAdmission(admits = !proxyDraining && anyAdmitting)
+        // Through the funnel like every other call. Its outcome was discarded
+        // outright, which was survivable while nothing read it — and became
+        // load-bearing the moment a credential verdict existed, because this is
+        // the proxy's **own login seal** and a 401 here is the fleet's front door
+        // refusing the orchestrator in silence. The result is still not branched
+        // on: what the sweep does about a refused proxy admission is unchanged.
+        noting(channel.assertProxyAdmission(admits = !proxyDraining && anyAdmitting))
 
         val routing = BackendRoutingStatus(observedAt = pass.now, backends = statuses)
         return ProxyRouting(
@@ -1267,6 +1313,12 @@ public class Reconciler(
                         ?.let { pass.identity(it) }
                         ?: pass.previous?.runtime,
                 players = progress.occupancy ?: pass.previous?.players,
+                // What the seal's own authenticated calls just learned. This path
+                // never reaches `assertBackends`, so without this the record would
+                // freeze at whatever the last converging pass wrote — and a proxy
+                // whose replacement drain parks on a 401 seal would render a usable
+                // control endpoint beside a failure saying the seal was refused.
+                control = drainedControl(pass, seal),
                 drain = progress.drain,
                 // A copy, and it must stay one — see the note on `Reconciler.drain`.
                 failure = progress.drain.failure,
@@ -1275,6 +1327,38 @@ public class Reconciler(
             return write(pass, status, mustRecord = progress.sideEffectIssued) { progress.outcome }
         }
         return teardownProxy(pass, node, observation, status, cause)
+    }
+
+    /**
+     * The control record a drain pass writes, refreshed from the calls the seal
+     * made on this pass.
+     *
+     * Only ever a refinement of the record already held: a seal call proves the
+     * endpoint answered and, on a 401, that it refuses this build — but it asks
+     * `PUT /v1/proxy` and never the handshake, so it establishes nothing about
+     * the *protocol version* and must not be allowed to invent a record where
+     * there is none. A proxy with no control observation yet keeps having none;
+     * `compatible` would otherwise default to `false` and claim an incompatible
+     * plugin this pass never spoke to.
+     *
+     * [ControlCredential.refinedBy] is the same merge rule the routing sweep
+     * uses, so a drain and a converge cannot disagree about what a verdict-less
+     * call means.
+     */
+    private fun drainedControl(
+        pass: ProxyPass,
+        seal: ProxySelfLink?,
+    ): ControlEndpointStatus? {
+        val previous = pass.previous?.control ?: return null
+        if (seal == null) return previous
+        return previous.copy(
+            // Contact, in the same sense `readControl` records it: an answer,
+            // refusal included. An unreachable endpoint leaves the stamp alone
+            // rather than moving it, or the freshness it reports is this loop's
+            // liveness rather than the proxy's.
+            lastContactAt = if (seal.answered) pass.now else previous.lastContactAt,
+            credential = previous.credential.refinedBy(seal.observed),
+        )
     }
 
     private suspend fun teardownProxy(
@@ -1438,6 +1522,22 @@ public class Reconciler(
         }
     }
 
+    /**
+     * The proxy's status write, with the same unchanged-status skip a server's
+     * has — and **the skip does not fire on a running proxy.**
+     *
+     * Recorded because it is the sort of thing an argument gets built on. The
+     * comparison below is sound, but a converging proxy's draft stamps
+     * `control.lastContactAt`, `backends.observedAt` and `players.observedAt` all
+     * to this pass's `now`, so the drafted status differs from the previous one on
+     * every pass whatever the fleet is doing: a running proxy rewrites its row
+     * each time, and did before the credential field existed. Invariant 5 holds —
+     * idempotence is about side effects, and nothing game-side repeats — but
+     * *"an unchanged pass does not rewrite"* is **not available as an argument on
+     * the proxy path**, for status churn, for store load, or for anything that
+     * infers quiescence from a resourceVersion that stopped moving. Anything
+     * resting on it needs a different support.
+     */
     private suspend fun writeProxyStatus(
         pass: ProxyPass,
         status: VelocityProxyStatus,

@@ -1013,6 +1013,23 @@ public enum class ControlCredential {
      * remedy is re-aligning the token, and it needs no definition edit.
      */
     REJECTED,
+    ;
+
+    /**
+     * This verdict updated by a later one taken in the same pass.
+     *
+     * The whole rule is that [UNTESTED] is *no evidence* and therefore never
+     * overwrites evidence: a call that established nothing — an endpoint that
+     * stopped answering, a refusal carrying some other code — leaves what the
+     * pass already learned alone, and anything else replaces it. Last verdict
+     * wins among the calls that had one.
+     *
+     * It lives here rather than at either caller because a pass refines this in
+     * two modules' worth of places — the routing sweep's authenticated calls and
+     * the proxy drain's own admission assertions — and two copies of a merge rule
+     * drift at whichever branch is added last. One rule, one home, one test.
+     */
+    public fun refinedBy(later: ControlCredential): ControlCredential = if (later == UNTESTED) this else later
 }
 
 /**
@@ -1042,24 +1059,33 @@ public data class ControlEndpointStatus(
     val credential: ControlCredential = ControlCredential.UNTESTED,
 ) {
     /**
-     * Whether the drain protocol can be conducted through this endpoint, as far
-     * as this record knows.
+     * **A presentation predicate. Never a gate.**
      *
-     * The one derivation of the three fields, so `:core`'s condition and `:api`'s
-     * rendering cannot drift apart by asking slightly different questions.
+     * What it answers is "should a reader be told something is wrong with this
+     * endpoint", and its only permitted consumers are the
+     * `CONTROL_ENDPOINT_READY` condition and `:api`'s renderers. A structural
+     * test pins that list, because the sentence this KDoc used to lead with —
+     * *"whether the drain protocol can be conducted through this endpoint"* — is
+     * a standing invitation to write `if (control.usable)` before starting a
+     * drain or choosing a destination, and under **that** caller the rule below
+     * becomes "proceed on a fact nobody established".
      *
      * [ControlCredential.UNTESTED] counts as *not refused* rather than as *not
-     * accepted*, which is the asymmetry worth reading twice. Requiring
-     * [ControlCredential.ACCEPTED] would report a broken control endpoint for
-     * every starting proxy and every pass that had no reason to authenticate,
-     * and a flag that is false while nothing is wrong is the one that stops being
-     * read. Refusing only on [ControlCredential.REJECTED] means this can only
-     * become false where something was actually observed to fail.
+     * accepted*. That asymmetry is right for a badge — requiring
+     * [ControlCredential.ACCEPTED] would light a red lamp on every starting proxy
+     * and every pass that had no reason to authenticate, and a flag that is false
+     * while nothing is wrong is the one that stops being read — and it is wrong
+     * for a gate, which must require [ControlCredential.ACCEPTED] and read the
+     * enum itself. The alarm-fatigue argument does not license the leniency; the
+     * *narrowness of the consumer list* does, which is why the list is enforced
+     * rather than described.
      *
-     * Derived rather than stored, so it cannot disagree with the fields it is
-     * computed from, and so it stays out of `equals` — the loop's write-skip
-     * compares statuses structurally and a derived property must not be able to
-     * make two equal records unequal.
+     * The one derivation of the three fields, so the condition and the rendering
+     * cannot drift apart by asking slightly different questions. Derived rather
+     * than stored, so it cannot disagree with the fields it is computed from, and
+     * so it stays out of `equals` — the loop's write-skip compares statuses
+     * structurally and a derived property must not be able to make two equal
+     * records unequal.
      */
     public val usable: Boolean
         get() = reachable && compatible && credential != ControlCredential.REJECTED

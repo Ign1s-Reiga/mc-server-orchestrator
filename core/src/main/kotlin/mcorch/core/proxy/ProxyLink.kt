@@ -8,6 +8,7 @@ import mcorch.core.DrainSeal
 import mcorch.core.Scheduler
 import mcorch.core.SealOutcome
 import mcorch.core.TransferReport
+import mcorch.schema.ControlCredential
 import mcorch.schema.ResourceName
 import mcorch.velocity.control.ControlErrorCode
 
@@ -218,13 +219,82 @@ internal class BackendLink(
 internal class ProxySelfLink(
     private val channel: ControlChannel,
 ) : DrainSeal {
+    /**
+     * What the authenticated calls made *through this link* established about the
+     * endpoint's acceptance of this orchestrator's credential.
+     *
+     * The drain path writes the proxy's own status and never calls
+     * `Reconciler.assertBackends`, so without this the one path whose
+     * authenticated calls matter most — a replacement drain sealing the fleet's
+     * front door — would render `credential = ACCEPTED, usable = true` beside a
+     * `status.failure` saying the seal was refused. Two surfaces disagreeing
+     * about one endpoint, on the path where a stop is pending.
+     *
+     * Recorded here rather than threaded out of [DrainController] through
+     * [SealOutcome] and [DrainProgress]: this object is built by the pass that
+     * drafts the status, one frame away from it, so the evidence needs no new
+     * field in the drain's own vocabulary — which is shared with backend seals
+     * that write a *different* server's status — and the state machine keeps the
+     * exit shape a red-proofed structural test is written against.
+     *
+     * Lifetime is one pass, by construction: `drainProxy` builds a link per pass.
+     * Nothing here is stale, and nothing carries across a container replacement.
+     */
+    var observed: ControlCredential = ControlCredential.UNTESTED
+        private set
+
+    /** Whether any call through this link was answered at all, refusal included. */
+    var answered: Boolean = false
+        private set
+
     override suspend fun assertAdmission(admits: Boolean): SealOutcome =
-        when (val outcome = channel.assertProxyAdmission(admits)) {
+        when (val outcome = note(channel.assertProxyAdmission(admits))) {
             is ControlOutcome.Answered -> SealOutcome.Asserted(outcome.value.admitsNewPlayers)
             is ControlOutcome.Refused -> outcome.asSealOutcome("asserting the proxy's own admission")
             is ControlOutcome.Unavailable -> outcome.asSealOutcome()
         }
+
+    private fun <T> note(outcome: ControlOutcome<T>): ControlOutcome<T> {
+        observed = observed.refinedBy(outcome.credentialVerdict())
+        if (outcome !is ControlOutcome.Unavailable) answered = true
+        return outcome
+    }
 }
+
+/**
+ * What one control outcome establishes about the endpoint's acceptance of this
+ * orchestrator's credential.
+ *
+ * The single mapping from the wire's vocabulary to the status's, used by the
+ * routing sweep and by the proxy's own drain link. Two things it deliberately
+ * does **not** claim:
+ *
+ * - A refusal carrying any code other than `UNAUTHENTICATED` says nothing. The
+ *   plugin does authorise before routing, so in practice such a refusal *was*
+ *   authenticated — but that ordering is a property of the plugin, and reading a
+ *   credential verdict out of a `NOT_READY` would put a claim about the token in
+ *   a place that only knows the request reached a handler.
+ * - An unreachable endpoint says nothing, which is the whole reason
+ *   [ControlCredential.UNTESTED] exists rather than a boolean.
+ */
+internal fun ControlOutcome<*>.credentialVerdict(): ControlCredential =
+    when (this) {
+        is ControlOutcome.Answered -> {
+            ControlCredential.ACCEPTED
+        }
+
+        is ControlOutcome.Refused -> {
+            if (code == ControlErrorCode.UNAUTHENTICATED) {
+                ControlCredential.REJECTED
+            } else {
+                ControlCredential.UNTESTED
+            }
+        }
+
+        is ControlOutcome.Unavailable -> {
+            ControlCredential.UNTESTED
+        }
+    }
 
 private fun ControlOutcome.Refused.asSealOutcome(what: String): SealOutcome =
     SealOutcome.Refused(

@@ -191,6 +191,18 @@ In order:
    secret behind `spec.control.tokenSecret` does **not** recreate the container:
    only its coordinates are in the spec hash, deliberately, so a rotation cannot
    restart the fleet's front door on its own.
+   **Putting the old token back is the remedy that always works**, and it is worth
+   knowing why the other one is conditional. Getting the container onto a *new*
+   token means recreating it; the only orchestrator-driven recreate is a
+   spec-hash change; and the replacement drain that starts has to seal the proxy
+   through the endpoint that is refusing. With players connected that seal is a
+   precondition, so the drain parks at step 2 — the front door keeps serving,
+   nothing is lost, and reverting the secret releases it. On a proxy the loop has
+   just pinged as **empty**, the seal is waived and the replacement goes through
+   to the stop. So a deliberate rotation (a leaked token) either waits for an
+   empty window, or restores the old value first to get control back and is
+   rotated from there. What does not work is editing the definition and hoping:
+   with players on, that is a parked drain until the secret goes back.
    If the message says the drain *keeps failing and recovering*, `status.failure`
    may be empty or may hold a fault that has already cleared — see note 6. Look
    at the logs for the whole period rather than at the one failure on the status.
