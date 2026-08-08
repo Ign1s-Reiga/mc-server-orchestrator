@@ -213,6 +213,14 @@
 #            be swept rather than renamed, so these two are re-anchored one level in,
 #            on the producer and on its absence branch, and the class that judges them
 #            is the one that holds a status field's provenance.
+#   D76..D78 the same field at its other two ends. D76 writes the volume label for a
+#            workload that mounts nothing, which is the sentinel spelling the
+#            omission exists to avoid. D77 folds a label into the hash input — the
+#            edit the `canonicalSpec` extraction exists to catch, and one that no
+#            comparison of two digests can see, because no definition edit adds a
+#            label without also changing a hashed field. D78 makes the label's parse
+#            strict, so a value written by another build or by hand stops a server
+#            converging instead of saying nothing.
 #   D74..D75 the volume half of that record, which had no producer at all until a
 #            `mcorch.dev/volume` label gave it one. D74 answers it from the
 #            definition — D61S one field over. D75 is the one the design turns on:
@@ -329,6 +337,12 @@ PLANNER=core/src/main/kotlin/mcorch/core/proxy/VelocityWorkloadPlanner.kt
 # D45..D51.
 CHANNEL=core/src/main/kotlin/mcorch/core/proxy/ControlChannel.kt
 PAPER_AGENT=core/src/main/kotlin/mcorch/core/paper/PaperServerAgent.kt
+# The Paper workload builder: the labels a container is created with, and the list
+# the spec hash digests. Both halves of "is this fact safe to record as a label".
+PAPER_WORKLOAD=core/src/main/kotlin/mcorch/core/paper/PaperWorkload.kt
+# Where a label is *read* off a workload, including the lenient parse that keeps an
+# unreadable one from failing a pass.
+LABELS=core/src/main/kotlin/mcorch/core/Labels.kt
 PROXY_AGENT=core/src/main/kotlin/mcorch/core/proxy/VelocityProxyAgent.kt
 FLEET=core/src/main/kotlin/mcorch/core/ProxyFleet.kt
 
@@ -343,6 +357,7 @@ PLANNING=mcorch.core.proxy.VelocityWorkloadPlannerTest
 STOP_GRACE=mcorch.core.node.StopGraceGuardTest
 UNBUILDABLE=mcorch.core.UnbuildableRequestTest
 STORAGE=mcorch.core.StorageObservationTest
+PAPER_PLAN=mcorch.core.paper.PaperWorkloadTest
 
 # The test cases, by name. A mutation names the ones it must redden and no others.
 EXIT='nothing leaves advance that has not been through the record-level rule'
@@ -454,6 +469,9 @@ PREDATING_ROW='a status row that predates the storage field is not given a false
 OBSERVED_PRODUCER='an edit does not move the record until the container it describes is replaced'
 OBSERVED_ABSENCE='a row with nothing observed and nothing to carry says nothing'
 OBSERVED_VOLUME='a settled server records the volume its container mounts'
+LABEL_OMITTED='a persistent workload names its volume and an ephemeral one carries no such label'
+HASH_TAKES_NO_LABEL='the spec hash lists definition fields, and no label the planner writes is one of them'
+UNREADABLE_LABEL='an unreadable volume label says nothing rather than failing a pass'
 VOLUME_FOLLOWS_CONTAINER='a volume rename does not move the record until the container it names is replaced'
 VOLUME_SURVIVES_EPHEMERAL='a workload that stops mounting a volume keeps the name of the one that holds the world'
 VOLUME_PREDATING_CONTAINER='a container that predates the volume label does not clear the recorded name'
@@ -888,6 +906,25 @@ STORAGE_FROM_DEFINITION='            val heldWorldData: Boolean? = definition.sp
 VOLUME_OBSERVED='            val volumeName = labels?.let { Labels.volumeValue(it) } ?: carried?.volumeName'
 VOLUME_FROM_DEFINITION='            val volumeName = (definition.spec.storage as? StorageSpec.Persistent)?.volume?.name'
 VOLUME_NOT_CARRIED='            val volumeName = labels?.let { Labels.volumeValue(it) }'
+# The label written for a workload that mounts nothing. Omitting it is what makes
+# absence mean "the previous record stands"; a sentinel spelling is one careless
+# parse away from clearing a name nothing else remembers.
+VOLUME_OMITTED='                        if (storage is StorageRequest.Persistent) {
+                            put(Labels.VOLUME, storage.volume.value)
+                        }'
+VOLUME_ALWAYS_WRITTEN='                        put(Labels.VOLUME, (storage as? StorageRequest.Persistent)?.volume?.value.orEmpty())'
+# A label folded into the hash input. This is the whole reason `canonicalSpec` was
+# extracted: the property "adding a label recreates nothing" cannot be shown by
+# comparing two digests, because no definition edit adds a label without also
+# changing a hashed field. Membership is the only instrument that sees it.
+HASH_LAST_ENTRY='            add("maxPlayers=${spec.maxPlayers}")'
+HASH_TAKES_A_LABEL='            add("maxPlayers=${spec.maxPlayers}")
+            add("label.worldData=${Labels.WORLD_DATA}")'
+# The lenient parse, made strict. A label value is whatever the runtime hands back —
+# another build`'"'"'s, or a hand-written one — and throwing on it stops a server
+# converging for a reason that has nothing to do with it.
+VOLUME_PARSE_LENIENT='        labels[VOLUME]?.let { ResourceName.of(it).getOrNull() }'
+VOLUME_PARSE_STRICT='        labels[VOLUME]?.let { ResourceName.of(it).getOrThrow() }'
 # The same erasure through a fallback, which is the shape a fix for the above keeps
 # growing back: "stop deriving X from the wrong source" followed by "and when there
 # is nothing to carry forward, derive X from the wrong source". It reaches only the
@@ -1426,8 +1463,21 @@ MUTATIONS=(
     # mounting a volume. D75 is the more valuable of the two, because "observed"
     # sounds like an unqualified improvement until it deletes a fleet's recovery
     # information on upgrade.
-    "D74@@$RECONCILER@@$STORAGE@@$OBSERVED_VOLUME;$VOLUME_FOLLOWS_CONTAINER;$VOLUME_SURVIVES_EPHEMERAL@@$VOLUME_OBSERVED@@$VOLUME_FROM_DEFINITION"
+    # D74 does *not* redden `$OBSERVED_VOLUME`, and the reason is worth keeping:
+    # on a settled server the definition and the container agree, so a
+    # definition-derived name equals the observed one. Only a *disagreement*
+    # separates the two sources — a rename mid-replacement, or a workload that has
+    # stopped mounting a volume. The same is true of D61S and the `persistent`
+    # half. A settled server can only be red-proofed by the whole-file revert,
+    # which removes the producer rather than pointing it at the wrong source.
+    "D74@@$RECONCILER@@$STORAGE@@$VOLUME_FOLLOWS_CONTAINER;$VOLUME_SURVIVES_EPHEMERAL@@$VOLUME_OBSERVED@@$VOLUME_FROM_DEFINITION"
     "D75@@$RECONCILER@@$STORAGE@@$VOLUME_SURVIVES_EPHEMERAL;$VOLUME_PREDATING_CONTAINER@@$VOLUME_OBSERVED@@$VOLUME_NOT_CARRIED"
+    # The producer side of the same decision, and the instrument it rests on.
+    "D76@@$PAPER_WORKLOAD@@$PAPER_PLAN@@$LABEL_OMITTED@@$VOLUME_OMITTED@@$VOLUME_ALWAYS_WRITTEN"
+    "D77@@$PAPER_WORKLOAD@@$PAPER_PLAN@@$HASH_TAKES_NO_LABEL@@$HASH_LAST_ENTRY@@$HASH_TAKES_A_LABEL"
+    # And the read, which is the one place a value written by something that is not
+    # this build reaches the loop.
+    "D78@@$LABELS@@$PAPER_PLAN@@$UNREADABLE_LABEL@@$VOLUME_PARSE_LENIENT@@$VOLUME_PARSE_STRICT"
     # The round's instrument, proved on the shape it exists for: a classification of a
     # workload state that decides `SANDBOX_ONLY` with neither the fact nor a word about
     # doing without it. D62A is the same arm with a comment that explains the branch
@@ -1501,6 +1551,8 @@ restore() {
             VelocityWorkloadPlanner.kt) cp -- "$backup" "$REPO_ROOT/$PLANNER" ;;
             ControlChannel.kt) cp -- "$backup" "$REPO_ROOT/$CHANNEL" ;;
             PaperServerAgent.kt) cp -- "$backup" "$REPO_ROOT/$PAPER_AGENT" ;;
+            PaperWorkload.kt) cp -- "$backup" "$REPO_ROOT/$PAPER_WORKLOAD" ;;
+            Labels.kt) cp -- "$backup" "$REPO_ROOT/$LABELS" ;;
             VelocityProxyAgent.kt) cp -- "$backup" "$REPO_ROOT/$PROXY_AGENT" ;;
             ProxyFleet.kt) cp -- "$backup" "$REPO_ROOT/$FLEET" ;;
         esac
@@ -1543,6 +1595,8 @@ cp -- "$REPO_ROOT/$NODE" "$BACKUP_DIR/Node.kt"
 cp -- "$REPO_ROOT/$PLANNER" "$BACKUP_DIR/VelocityWorkloadPlanner.kt"
 cp -- "$REPO_ROOT/$CHANNEL" "$BACKUP_DIR/ControlChannel.kt"
 cp -- "$REPO_ROOT/$PAPER_AGENT" "$BACKUP_DIR/PaperServerAgent.kt"
+cp -- "$REPO_ROOT/$PAPER_WORKLOAD" "$BACKUP_DIR/PaperWorkload.kt"
+cp -- "$REPO_ROOT/$LABELS" "$BACKUP_DIR/Labels.kt"
 cp -- "$REPO_ROOT/$PROXY_AGENT" "$BACKUP_DIR/VelocityProxyAgent.kt"
 cp -- "$REPO_ROOT/$FLEET" "$BACKUP_DIR/ProxyFleet.kt"
 
