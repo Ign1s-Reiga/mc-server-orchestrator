@@ -605,10 +605,17 @@ internal class ProxyReconcileTest {
                     .shouldNotBeNull()
                     .containerId
 
-            // The container comes back accepting the token it was created with,
-            // and a hash-bearing edit replaces it. `maxPlayers` is in the proxy's
-            // spec hash.
-            harness.plugin.rejectsCredential = false
+            // **The endpoint goes dark before the replacement**, and that is what
+            // makes this test able to see the gate at all. Left answering, the
+            // sweep on the new container authenticates and writes `ACCEPTED` — so
+            // the assertion would hold whether the old verdict was carried across
+            // or not, and would be measuring the refinement rather than the seed.
+            // With no authenticated call possible, the only thing that can decide
+            // the field is what the seed did with it.
+            //
+            // Zero players, so the replacement drain's seal is waived and the
+            // container is genuinely replaced despite the dead endpoint.
+            harness.plugin.unreachable = true
             harness.declare(proxyDefinition(maxPlayers = 300))
             repeat(12) {
                 harness.pass(name)
@@ -617,11 +624,65 @@ internal class ProxyReconcileTest {
 
             val status = harness.proxyStatus().shouldNotBeNull()
             status.runtime.shouldNotBeNull().containerId shouldNotBe replaced
-            // Not `UNTESTED`: the sweep on the new container authenticated
-            // successfully. The point is that nothing carried the old refusal over
-            // — which a seed with no identity gate would have done until the first
-            // authenticated call, and for ever on a proxy whose port was down.
-            status.control.shouldNotBeNull().credential shouldBe ControlCredential.ACCEPTED
+            val control = status.control.shouldNotBeNull()
+            control.reachable.shouldBeFalse()
+            // `UNTESTED`, not the predecessor's `REJECTED`: this container has
+            // never been asked. A seed with no identity gate reports a credential
+            // fault here — on a proxy that may hold a perfectly good token — and
+            // nothing can clear it while the endpoint stays down.
+            control.credential shouldBe ControlCredential.UNTESTED
+        }
+
+    /**
+     * A drain pass that cannot reach the endpoint keeps the verdict rather than
+     * dropping it.
+     *
+     * The same rule as the converging path, applied where the drain writes the
+     * record: `refinedBy` treats a call that established nothing as no evidence,
+     * so an endpoint that refused the credential and then went down stays
+     * `REJECTED`. Dropping it here is worse than on a converge, because a drain
+     * that parks on a refused seal would then park with a record saying nothing is
+     * wrong with the endpoint it could not use.
+     *
+     * This is the behavioural half of the merge rule — `ControlCredentialTest`
+     * asserts the rule on the type, and this is a consumer that can see it break.
+     */
+    @Test
+    fun `a drain pass that cannot reach the endpoint keeps the refusal it recorded`() =
+        coreTest {
+            val harness = ProxyHarness()
+            val name = harness.proxyDefinition.metadata.name
+            harness.bringUp()
+            harness.proxyNode.online = 2
+            harness.plugin.rejectsCredential = true
+            harness.sweep()
+            val refused =
+                harness
+                    .proxyStatus()
+                    .shouldNotBeNull()
+                    .control
+                    .shouldNotBeNull()
+            refused.credential shouldBe ControlCredential.REJECTED
+            val contactedAt = refused.lastContactAt
+
+            // The endpoint stops answering entirely, and a hash-bearing edit puts
+            // the proxy on the drain path — where every seal call is now
+            // unanswerable and establishes nothing.
+            harness.plugin.unreachable = true
+            harness.declare(proxyDefinition(maxPlayers = 300))
+            harness.pass(name)
+            harness.clock.advance(2.seconds)
+            harness.pass(name)
+
+            val status = harness.proxyStatus().shouldNotBeNull()
+            status.drain.shouldNotBeNull()
+            val control = status.control.shouldNotBeNull()
+            control.credential shouldBe ControlCredential.REJECTED
+            control.usable.shouldBeFalse()
+            // And nothing claimed contact that did not happen: an unanswered call
+            // leaves the stamp where it was, or the freshness it reports is this
+            // loop's liveness rather than the proxy's.
+            control.lastContactAt shouldBe contactedAt
         }
 
     /**

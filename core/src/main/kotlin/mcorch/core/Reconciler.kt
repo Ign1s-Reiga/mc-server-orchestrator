@@ -610,6 +610,12 @@ public class Reconciler(
                         // that no longer existed. It dies where the replacement is
                         // built — see [clearedDrainRecord].
                         drain = clearedDrainRecord(pass.previous?.drain, observation, pass.hadContainer),
+                        // And the same rule for the control record, which is *also*
+                        // about the container rather than about the definition:
+                        // whether the endpoint answered, which protocol it spoke and
+                        // whether it accepted this build's token are three facts
+                        // about the process that was running. See [controlOfCreated].
+                        control = controlOfCreated(pass, created),
                     ),
                 ) {
                     ReconcileOutcome.Progressed("proxy workload created")
@@ -634,8 +640,9 @@ public class Reconciler(
                                 ServerPhase.CREATING,
                                 image = image,
                                 runtime = pass.identity(created),
-                                // The other create, and the same rule.
+                                // The other create, and the same two rules.
                                 drain = clearedDrainRecord(pass.previous?.drain, observation, pass.hadContainer),
+                                control = controlOfCreated(pass, created),
                                 failure = blocker,
                             ),
                         ) { ReconcileOutcome.Progressed("proxy container created in the existing sandbox") }
@@ -767,7 +774,7 @@ public class Reconciler(
         blocker: FailureStatus? = null,
     ): ReconcileOutcome {
         val channel = pass.channel(node, observation.handle)
-        val control = readControl(pass, channel, observation.handle.containerId)
+        val control = readControl(pass, channel)
         val probe = pass.agent.probe(node, observation.handle)
         val endpoint =
             ServerEndpoint(
@@ -878,22 +885,24 @@ public class Reconciler(
      * later authenticated call replaces it, by the same rule `lastContactAt`
      * already follows.
      *
-     * **Gated on the container being the same one.** A verdict is about the token
-     * inside a particular container, so a replacement must not inherit the
-     * refusal its predecessor earned. The gate fires only when both ids are known
-     * and differ — an unreported container id is not a new container, and
-     * resetting on one would restore the erasure this seeding exists to stop.
+     * ## Where "is this the same container" is answered, and why not here
+     *
+     * A verdict is about the token inside a particular container, so a
+     * replacement must not inherit the refusal its predecessor earned — and this
+     * is **the wrong place to ask**, which was found by mutation rather than by
+     * reading. A gate here comparing the observed container id against
+     * `previous.runtime.containerId` is dead code: the create pass writes the new
+     * id into `runtime` two passes before anything calls this, so by the time the
+     * comparison runs the two always agree. The question is answered at
+     * [controlOfCreated], on the pass that builds the container, where the
+     * recorded id is still the old one.
      */
     private suspend fun readControl(
         pass: ProxyPass,
         channel: ControlChannel,
-        containerId: String?,
     ): ControlEndpointStatus {
         val previous = pass.previous?.control
-        val recordedContainerId = pass.previous?.runtime?.containerId
-        val recreated = containerId != null && recordedContainerId != null && recordedContainerId != containerId
-        val credential =
-            if (recreated) ControlCredential.UNTESTED else previous?.credential ?: ControlCredential.UNTESTED
+        val credential = previous?.credential ?: ControlCredential.UNTESTED
         return when (val outcome = channel.version()) {
             is ControlOutcome.Answered -> {
                 ControlEndpointStatus(
@@ -1327,6 +1336,44 @@ public class Reconciler(
             return write(pass, status, mustRecord = progress.sideEffectIssued) { progress.outcome }
         }
         return teardownProxy(pass, node, observation, status, cause)
+    }
+
+    /**
+     * The control record a newly built workload starts with: **none of the
+     * previous one's, when the container is not the previous one.**
+     *
+     * Every field of [ControlEndpointStatus] is a fact about a process: whether
+     * it answered, which protocol it spoke, when it last did, and whether it
+     * accepted this build's token. A replacement inherits none of them. The
+     * credential is the sharpest — a refusal earned by the container being
+     * replaced would be reported against its successor, which was created from
+     * whatever the secret store holds now — but `reachable = true` beside a
+     * container nothing has ever contacted is the same lie in a quieter field.
+     *
+     * This is the site because it is the last one where `previous.runtime` still
+     * names the **old** container: the draft here writes the new id, so every
+     * later pass compares the new id against itself. The replacement path never
+     * passes through the teardown's `control = null` — converge builds the
+     * successor on the pass that first observes the workload absent — so without
+     * this the stale record survives the whole replacement.
+     *
+     * Adoption keeps its record: an `ensureWorkload` that found the container
+     * already there returns the same id, so the guard does not fire and a pass
+     * that created nothing throws nothing away.
+     */
+    private fun controlOfCreated(
+        pass: ProxyPass,
+        created: WorkloadObservation.Present,
+    ): ControlEndpointStatus? {
+        val previous = pass.previous ?: return null
+        val recorded = previous.runtime?.containerId
+        val observed = created.handle.containerId
+        // Both known and different is the only evidence of a *new* container. An
+        // unreported id is not a new one, and clearing on silence would throw
+        // away a verdict a later pass has no way to re-establish while the
+        // endpoint is down.
+        if (observed != null && recorded != null && observed != recorded) return null
+        return previous.control
     }
 
     /**
