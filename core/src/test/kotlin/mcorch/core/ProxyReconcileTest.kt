@@ -634,6 +634,57 @@ internal class ProxyReconcileTest {
         }
 
     /**
+     * The other create, and the same rule — reached the way it happens in
+     * practice: the container is gone and its sandbox is not.
+     *
+     * `convergeProxy` builds a container into the surviving sandbox, so this is a
+     * second site where the record of the *previous* process must not be handed
+     * to the new one. It exists because a mutation proved it uncovered: the
+     * replacement test above goes through the `Absent` branch, and a clear
+     * deleted from this branch alone changed nothing that any test could see.
+     * Both creates now have one.
+     */
+    @Test
+    fun `a container rebuilt into a surviving sandbox starts with no control record`() =
+        coreTest {
+            val harness = ProxyHarness()
+            val name = harness.proxyDefinition.metadata.name
+            harness.bringUp()
+            harness.plugin.rejectsCredential = true
+            harness.sweep()
+            harness
+                .proxyStatus()
+                .shouldNotBeNull()
+                .control
+                .shouldNotBeNull()
+                .credential shouldBe
+                ControlCredential.REJECTED
+
+            // The container disappears from under the loop; the sandbox stays.
+            val present = harness.proxyNode.workload.shouldBeInstanceOf<WorkloadObservation.Present>()
+            harness.proxyNode.workload =
+                present.copy(
+                    handle = present.handle.copy(containerId = null),
+                    state = WorkloadState.SANDBOX_ONLY,
+                )
+            // …and the endpoint is down, so nothing can re-establish a verdict and
+            // the assertion below is about the create rather than about the sweep.
+            harness.plugin.unreachable = true
+
+            repeat(4) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+
+            val status = harness.proxyStatus().shouldNotBeNull()
+            status.runtime.shouldNotBeNull().containerId shouldNotBe present.handle.containerId
+            // Either cleared outright or re-observed as untested — never the
+            // predecessor's refusal, which is what this container would be
+            // reported with on a record inherited across the create.
+            status.control?.credential shouldNotBe ControlCredential.REJECTED
+        }
+
+    /**
      * A drain pass that cannot reach the endpoint keeps the verdict rather than
      * dropping it.
      *
