@@ -2468,10 +2468,16 @@ internal class DrainTest {
             // and never rewritten, and a server brought up under this build carries
             // null. The claim under test is about what a refusal does to a name that
             // *is* there, and a fixture with none cannot make it.
+            //
+            // The name is deliberately one the definition cannot produce. It defaults
+            // to `metadata.name` plus `-world`, so a fixture using that would compare
+            // equal whether the pass carried the record or re-derived it from
+            // `spec.storage` — the assertion would hold under the very defect it is
+            // here to catch.
             val settled = harness.status(name).shouldNotBeNull()
             harness.store
                 .putStatus(
-                    settled.copy(storage = settled.storage?.copy(volumeName = resourceName("survival-01-world"))),
+                    settled.copy(storage = settled.storage?.copy(volumeName = resourceName("archived-world-07"))),
                 ).getOrThrow()
 
             // A container that takes the stop and does not exit, which is what every
@@ -2525,7 +2531,7 @@ internal class DrainTest {
             // and carries the name rather than re-deriving it.
             val storage = refused.storage.shouldNotBeNull()
             storage.persistent.shouldBeTrue()
-            storage.volumeName shouldBe resourceName("survival-01-world")
+            storage.volumeName shouldBe resourceName("archived-world-07")
 
             // The lever: reverting the transition is what lifts the refusal, and the
             // drain then finishes the container it had already signalled and applies

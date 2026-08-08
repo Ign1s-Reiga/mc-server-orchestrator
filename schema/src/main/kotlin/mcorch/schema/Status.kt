@@ -332,15 +332,19 @@ public data class PlayerOccupancy(
  *   rather than what the definition says today (see [ServerSpec.holdsWorldData],
  *   which states the same rule for the drain). A workload carrying no such
  *   label says nothing, and the previous record stands.
- * - [volumeName] — **carried forward, not observed yet.** It is the last value
- *   this loop recorded, kept across passes and never rewritten from the
- *   definition. Reading the volume a container actually has mounted needs the
+ * - [volumeName] — **carried forward, and nothing writes it today.** It is the
+ *   last value this loop recorded, kept across passes and never rewritten from
+ *   the definition. Reading the volume a container actually has mounted needs the
  *   runtime's mount list plumbed out through the node abstraction, which is a
- *   separate change; until then a name here is *the last one recorded for this
- *   server* and may be older than the workload beside it. It is deliberately
- *   kept even when [persistent] goes false, because it is the only record of
- *   which volume holds a world that a replacement has stopped mounting, and
- *   that name is what a recovery starts from.
+ *   separate change — so until it lands there is **no producer at all**: a server
+ *   brought up by this build carries null here for ever, and a name that is
+ *   present came from a row an earlier build wrote and may be older than the
+ *   workload beside it. State the consequence rather than let a reader infer the
+ *   wrong one: *null here does not mean the server has no volume*, and the
+ *   definition's `spec.storage` is where that question is answered until this
+ *   field has something behind it. It is deliberately kept even when [persistent]
+ *   goes false, because a name recorded before a replacement stopped mounting it
+ *   is the only record of which volume still holds the world.
  * - [bound] — **observed.** The node reported a workload for this server on
  *   the pass that wrote this record.
  * - [lastSaveConfirmedAt] — **observed.** Set when a save *completion* was

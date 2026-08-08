@@ -6,6 +6,7 @@ import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.nulls.shouldBeNull
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.types.shouldBeInstanceOf
 import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
@@ -13,6 +14,7 @@ import mcorch.schema.FailureClass
 import mcorch.schema.StorageSpec
 import mcorch.store.getOrThrow
 import org.junit.jupiter.api.Test
+import kotlin.time.Duration.Companion.seconds
 
 /**
  * `StorageStatus` is what the loop **observed**, not what the definition asked
@@ -358,6 +360,15 @@ internal class StorageObservationTest {
      * was written from is the shape that flaps, and comparability is what lets the
      * loop decide "nothing changed, do nothing" — so the record has to be equal, not
      * merely equivalent.
+     *
+     * **The clock moves past `statusHeartbeat` between the two passes, and that is
+     * load-bearing rather than tidy.** `Harness` runs on a clock that only advances
+     * when a test advances it, so a record stamped `now` on every pass is stamped the
+     * *same* `now` twice and compares equal: sabotaging the producer to re-stamp the
+     * record left this green until the advance was added. The advance also guarantees
+     * a store write happens at all — an equal status inside the heartbeat is not
+     * written, and a comparison against a row nothing rewrote is a value compared
+     * with itself.
      */
     @Test
     fun `a second pass over the same state records the same storage and issues nothing`() =
@@ -368,20 +379,23 @@ internal class StorageObservationTest {
             harness.declare(definition)
             harness.settle(name)
 
-            val first =
-                harness
-                    .status(name)
-                    .shouldNotBeNull()
-                    .storage
-                    .shouldNotBeNull()
+            val settled = harness.status(name).shouldNotBeNull()
+            val before = settled.observedAt
+            val first = settled.storage.shouldNotBeNull()
             val creates = harness.node.creates.size
             val stops = harness.node.stops.size
             val saves = harness.node.saves.size
             val pulls = harness.node.pulls.size
 
+            harness.clock.advance(ReconcilerConfig().statusHeartbeat + 1.seconds)
             harness.pass(name)
 
-            harness.status(name).shouldNotBeNull().storage shouldBe first
+            val second = harness.status(name).shouldNotBeNull()
+            // The pass really did re-record — `observedAt` has moved — so the
+            // comparison below is between two written rows rather than one row read
+            // twice.
+            second.observedAt shouldNotBe before
+            second.storage shouldBe first
             harness.node.creates shouldHaveSize creates
             harness.node.stops shouldHaveSize stops
             harness.node.saves shouldHaveSize saves
