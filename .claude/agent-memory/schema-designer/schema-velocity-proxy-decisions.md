@@ -65,6 +65,21 @@ implements the proxy side of the drain protocol, and most of them are arguments 
   REJECTED`) lives on the type so `:core`'s condition and `:api`'s badge cannot drift; it treats
   `UNTESTED` as *not refused* rather than *not accepted*, so it can only go false where something was
   observed to fail. Populated from calls the pass already makes — no wire change, no extra round trip.
+  `usable` is a **presentation predicate**, not a gate: its leniency is licensed by the narrowness of
+  its consumer list (the condition and `:api`'s renderers), which a scan enforces, and any gate must
+  require `ACCEPTED`. `ControlCredential.refinedBy` holds the merge rule — `UNTESTED` never overwrites
+  evidence — in `:schema` because the routing sweep and the proxy drain both apply it.
+- **A three-valued status field needs a *seed* rule and a *retirement* rule, and they live at
+  different sites** (round 44). Seed: the fact is carried into every record the loop builds, because
+  a pass that establishes nothing must not erase what an earlier pass established — a fresh record
+  each pass turned one broken thing (the player port) into the clearing of an unrelated alarm.
+  Retirement: the fact dies where the **container** it describes dies, which for a proxy is
+  `convergeProxy`'s two create branches, beside the drain record's clear and for the same stated
+  reason. What does *not* work is gating the seed on container identity at the read site: the create
+  pass writes the new id into `runtime` first, so the comparison always finds them equal. That gate
+  was written, was dead, and only a mutation found it — the test covering it was measuring the sweep
+  that re-establishes the verdict. Whenever a status field is *about the process rather than the
+  definition*, ask both questions separately and write the answers at the two sites.
 - **Deliberately left out of the proxy:** any Velocity/Minecraft version field (the image is already
   pinned and a proxy speaks all protocols — unlike Paper, whose launcher image downloads a build per
   version), forced hosts, motd, compression, a plugin list (the reconciler mounts the shipped plugin),

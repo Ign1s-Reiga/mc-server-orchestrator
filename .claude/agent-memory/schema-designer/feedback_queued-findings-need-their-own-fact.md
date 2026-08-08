@@ -35,6 +35,14 @@ memory file rather than a summary: the human's own brief described one item's
 direction backwards, having been read from a compressed note rather than the
 code.
 
+**Confirmed at round 44**, with a sharper reason than the one above: the audit
+found that the condition's `!reachable` arm is tested *before* `!compatible`, so
+an unreadable answer is reported as "did not answer" and the one remedy that
+applies — upgrade the image — is suppressed. Declining to mark it closed was
+right, and the stale notes asserting "the same field" (mine, and the KDoc in
+`ControlChannel.unbuildable`) were corrected in the same change so the next
+reader is not sent to a field that cannot answer the question.
+
 **How to apply:** when a brief says "two findings are queued behind this field",
 find each finding's own record (`.claude/agent-memory/*/`, and the KDoc at the
 site — they disagree), state the *fact* each one needs in one sentence, and hold
