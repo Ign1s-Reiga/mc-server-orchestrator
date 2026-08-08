@@ -2185,3 +2185,63 @@ Related: [[standalone-paper-drain-shape]]
      understates the flag by orders of magnitude. Direction is quiet, so it is a
      doc finding — but it is the sentence an operator reads to decide whether
      silence means health.
+
+## Round 44: the verdict written on one path and read on all of them
+
+182. **A per-pass observation drafted from a fresh record erases the last pass's
+     verdict on every path that does not re-establish it.** `readControl` builds a
+     brand-new `ControlEndpointStatus` each pass, so `credential` starts `UNTESTED`
+     and only `assertBackends` refines it. Two proxy paths draft a status without
+     ever reaching `assertBackends` — `awaitProxyReady`'s non-joinable branch
+     (drafts the raw handshake record) and `drainProxy` (carries `previous.control`
+     forward untouched, while `ProxySelfLink` makes the authenticated calls that
+     would prove the verdict). The first *resets* a `REJECTED` to `UNTESTED` and
+     flips the derived `usable` green; the second freezes an `ACCEPTED` beside a
+     drain parked on the 401 that record is about. Both are exactly the "two
+     surfaces disagree about one endpoint" the field was added to end, reproduced
+     on the paths where the drain lives. Whenever a field is introduced as "the
+     verdict of this pass's calls", enumerate the passes that make no such call and
+     ask whether they *carry*, *reset*, or *freeze* it — three different answers,
+     and only carry-with-a-freshness-test is right.
+183. **A three-valued observation whose third value is the safe default is only
+     safe while nothing branches on the derived flag.** `usable =
+     reachable && compatible && credential != REJECTED` makes `UNTESTED` count as
+     not-refused. Correct for this field *because* its only consumers are
+     `deriveConditions`' `CONTROL_ENDPOINT_READY` and `:api`'s badge — the drain
+     re-establishes the credential per call through `ControlChannel` and classifies
+     a 401 as a retryable seal failure that parks, so no stop is ever authorised by
+     the flag. The KDoc headline ("whether the drain protocol can be conducted
+     through this endpoint") is a standing invitation to the first control-flow
+     consumer, and that consumer would be proceeding on an unobserved assumption.
+     Rule: a default-to-optimistic derived flag must be typed or documented as a
+     *presentation* predicate; any gate must require the positive verdict
+     (`ACCEPTED`), never `!= REJECTED`.
+184. **The remedy a message names has to work for both ways the fault is reached.**
+     A rotated control token is repairable by putting the old value back — but an
+     operator who rotated *deliberately* (leak response) must recreate the proxy
+     container, and the only orchestrator-driven recreate is a spec-hash change,
+     which starts a proxy replacement drain whose step 2 seal goes through the very
+     channel that is 401ing. So the documented remedy covers the accidental case
+     and the obvious alternative is a drain that cannot complete. Safe direction
+     (players keep playing, nothing stops, the edit is revertible) but it is the
+     shape that ends with somebody reaching for `crictl` on the front door. For
+     every operator-facing remedy, ask which *cause* of the fault it assumes.
+185. **The proxy status write-skip does not exist, and never did.**
+     `writeProxyStatus` compares `status.copy(observedAt = previous.observedAt) ==
+     previous`, while a running proxy's draft carries `control.lastContactAt`,
+     `backends.observedAt` and `players.observedAt` all set to `pass.now`. Every
+     pass writes. Do not accept "an unchanged pass does not rewrite the status" as
+     an argument for a proxy-side field's cost or safety — check the three moving
+     timestamps first. (`credential` itself is properly in `equals` and `usable`
+     properly out of it, being a body `val`.)
+186. **Still open, confirmed round 44:** `readControl`'s `ControlOutcome.Unavailable`
+     branch flattens *never attempted*, *no answer* and *answered unreadably* into
+     `reachable = false, compatible = false`. The malformed-body case is the wrong
+     one — `ControlChannel` builds `Unavailable(retryable = false)` for a body this
+     build cannot parse, i.e. an endpoint that demonstrably answered — and the
+     condition's `!reachable` arm outranks the `!compatible` arm, so the message
+     says "did not answer" and suppresses the only remedy that applies (upgrade the
+     image). `ControlCredential` does not touch this: all three cases stop the pass
+     before any authenticated call, so all three are honestly `UNTESTED`. What it
+     needs is a reason enum on the non-contact, not a credential verdict. Do not
+     mark it closed by the credential change.
