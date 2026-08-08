@@ -2461,25 +2461,6 @@ internal class DrainTest {
             harness.settle(name)
             harness.node.volumes shouldHaveSize 1
 
-            // A row that carries a volume name, injected because that is the only
-            // population which has one. Nothing observes a volume yet — reading the
-            // mount a container actually holds needs `ContainerStatus.mounts` out
-            // through the node abstraction — so `StorageStatus.volumeName` is carried
-            // and never rewritten, and a server brought up under this build carries
-            // null. The claim under test is about what a refusal does to a name that
-            // *is* there, and a fixture with none cannot make it.
-            //
-            // The name is deliberately one the definition cannot produce. It defaults
-            // to `metadata.name` plus `-world`, so a fixture using that would compare
-            // equal whether the pass carried the record or re-derived it from
-            // `spec.storage` — the assertion would hold under the very defect it is
-            // here to catch.
-            val settled = harness.status(name).shouldNotBeNull()
-            harness.store
-                .putStatus(
-                    settled.copy(storage = settled.storage?.copy(volumeName = resourceName("archived-world-07"))),
-                ).getOrThrow()
-
             // A container that takes the stop and does not exit, which is what every
             // container looks like for the length of its grace period.
             harness.node.onStop = { present -> present }
@@ -2526,12 +2507,13 @@ internal class DrainTest {
             // world. `storageStatus` used to derive from the *definition*, so a
             // refusal that drafted it reported `persistent = false, volumeName = null`
             // for a server it is refusing to make ephemeral — leaving recovery to
-            // depend on the operator remembering the name. It reads the container's
-            // own `WORLD_DATA` label now, which is `true` throughout this scenario,
-            // and carries the name rather than re-deriving it.
+            // depend on the operator remembering the name. Both halves are read off
+            // the container's own labels now, and both discriminate here precisely
+            // because the definition disagrees with them: it says `ephemeral`, so a
+            // record derived from it is `persistent = false, volumeName = null`.
             val storage = refused.storage.shouldNotBeNull()
             storage.persistent.shouldBeTrue()
-            storage.volumeName shouldBe resourceName("archived-world-07")
+            storage.volumeName shouldBe resourceName("survival-01-world")
 
             // The lever: reverting the transition is what lifts the refusal, and the
             // drain then finishes the container it had already signalled and applies
@@ -2571,13 +2553,13 @@ internal class DrainTest {
      *
      * ## What changed, and why the claim is stronger rather than retired
      *
-     * `Pass.storageStatus` reads `Labels.WORLD_DATA` off the workload now instead of
+     * `Pass.storageStatus` reads the workload's own labels now instead of
      * `spec.storage`, so this row is no longer left with nothing: the container the
-     * refusal is *about* says `world-data=true`, and that is an observation, so the
-     * row gets `persistent = true`. Absence still stays absence where there is nothing
-     * to observe — [StorageObservationTest] holds that half — and what must never
-     * appear here is the edit's answer. `volumeName` stays null because nothing
-     * observes a volume yet and this row has none to carry.
+     * refusal is *about* says `world-data=true` and names the volume it mounts, and
+     * both are observations, so the row gets them. Absence still stays absence where
+     * there is nothing to observe — [StorageObservationTest] holds that half — and
+     * what must never appear here is the edit's answer, which for this row would be
+     * `persistent = false, volumeName = null`.
      *
      * The failure assertion is the positive control: it is what proves the refusal
      * fired in this scenario at all, without which the assertions below are satisfied
@@ -2603,14 +2585,14 @@ internal class DrainTest {
 
             val refused = harness.status(name).shouldNotBeNull()
             refused.failure.shouldNotBeNull().message shouldContain "storage.mode"
-            // The container's answer, which is the opposite of the edit's. A record
-            // derived from the definition here reads `persistent = false`.
+            // The container's answers, both of which are the opposite of the edit's:
+            // a record derived from the definition here reads `persistent = false,
+            // volumeName = null`. The row started with no storage block at all, so
+            // neither value can have been carried — they came from the container or
+            // from nowhere.
             val storage = refused.storage.shouldNotBeNull()
             storage.persistent.shouldBeTrue()
-            // Nothing has observed a volume and this row never carried one. A name
-            // appearing here could only have come from the definition being read
-            // again, which is the whole of what this change removed.
-            storage.volumeName.shouldBeNull()
+            storage.volumeName shouldBe resourceName("survival-01-world")
             // …and the sentences an operator reads say nothing about a world that is
             // not there. Both are derived from `storage.persistent == false`, which is
             // what the fallback used to write.

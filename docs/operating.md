@@ -189,15 +189,22 @@ A server the loop has not yet seen a workload for has no `storage` at all, and
 tell you to stop looking for a world. `False` on `VOLUME_BOUND` means the loop
 looked and there is nothing bound; `Unknown` means it has not looked yet.
 
-**`volumeName` is empty on every server created by this build, and that is not a
-missing volume.** Nothing observes the volume a container has mounted yet —
-reading it needs the runtime's mount list plumbed out through the node
-abstraction, which is a change that has not been made — so the field is only ever
-*carried forward*, and a server that has never had one recorded never gets one.
-The name is not lost: it is `spec.storage.volume.name` in your definition, which
-defaults to `metadata.name`. What you must not conclude from an empty
-`volumeName` is that the server is running without a volume; check
-`spec.storage.mode` for that.
+**`volumeName` fills in as containers are replaced, not when you upgrade.** It is
+read off a label the orchestrator puts on a container when it creates it, so a
+container that was already running before this version carries none — and it is
+*not* recreated to gain one, because labels are not part of the fingerprint that
+decides a replacement. Nothing restarts on the upgrade; the field simply arrives
+for each server the next time it is replaced for some reason of its own.
+
+So an empty `volumeName` on a long-running server is expected and is **not** a
+missing volume. The name is in your definition as `spec.storage.volume.name`,
+defaulting to `metadata.name`, and `spec.storage.mode` is what answers "does this
+server have a volume at all".
+
+One deliberate asymmetry worth knowing: a server switched to `ephemeral` **keeps**
+the last volume name it reported. That is not staleness, it is the point — it is
+the only record of which volume still holds the world the replacement stopped
+mounting, and it is where recovery starts.
 
 ---
 

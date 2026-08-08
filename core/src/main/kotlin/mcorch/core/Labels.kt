@@ -55,6 +55,57 @@ public object Labels {
      */
     public const val SAVE_CONFIRMABLE: String = "mcorch.dev/save-confirmable"
 
+    /**
+     * The persistent volume this workload was created to mount.
+     *
+     * Same reasoning as [WORLD_DATA] — a fact about *this* container, recorded on
+     * it, because the definition beside it may have been edited since — and the
+     * same "absent says nothing" convention. It is the name a recovery starts
+     * from, and until this label existed it was recorded nowhere the loop could
+     * read back: observed status carried whatever the definition said at the
+     * moment it was drafted, which is not a memory of anything.
+     *
+     * **Written only when there is a volume, and absent rather than empty when
+     * there is not.** Absent covers both "this workload has no volume" and "this
+     * workload predates the label", and both have to mean *the previous record
+     * stands* — because a workload that mounts nothing must not clear the record
+     * of which volume still holds the world it stopped mounting, and that record
+     * is the whole reason this exists.
+     *
+     * An empty value would be a value that says nothing, which is noise rather
+     * than a claim: [volumeValue] rejects it along with anything else that is not
+     * a resource name, so writing one would be defused by the reader rather than
+     * by the writer. That is not a reason to write it. A sentinel spelling — an
+     * empty string, `none` — is one careless parse away from becoming a positive
+     * claim that clears a carried name, and the omission costs nothing.
+     *
+     * ## It is outside the spec hash, and that is what made it safe to add
+     *
+     * See the note at `PaperWorkloadPlanner.plan`'s label construction. Adding a
+     * label does not recreate a single running container; what it does mean is
+     * that containers created before it carry none, so the field it feeds
+     * converges as the fleet turns over rather than at upgrade.
+     *
+     * ## What supersedes it, and what retiring it would cost
+     *
+     * `ContainerStatus.mounts` plumbed out through `ContainerView` and
+     * `WorkloadObservation.Present` would answer this from the runtime's own view
+     * of what is mounted, which is strictly better: it survives a container this
+     * orchestrator did not create, and it cannot disagree with reality. Whoever
+     * lands that should delete this label rather than keep both — two producers of
+     * one fact is the shape this project has been bitten by repeatedly.
+     *
+     * The trade was weighed rather than assumed. Against: it is a third label the
+     * drain-adjacent code reads, and the mounts plumbing would leave it redundant.
+     * For: the retire cost is exactly one label and one read, [WORLD_DATA] has the
+     * same character and is load-bearing, and the alternative was a field that no
+     * pass could ever populate. The value cannot go stale while it is here because
+     * `spec.storage.volume` is *in* the spec hash — renaming a volume already
+     * recreates the container — so the label and the container it sits on cannot
+     * disagree.
+     */
+    public const val VOLUME: String = "mcorch.dev/volume"
+
     /** Reads a boolean fact off a workload's labels. Null means the workload does not carry it. */
     public fun booleanValue(
         labels: Map<String, String>,
@@ -65,6 +116,21 @@ public object Labels {
             FALSE -> false
             else -> null
         }
+
+    /**
+     * Reads [VOLUME] off a workload's labels. Null means the workload does not
+     * carry it, **or** carries something that is not a resource name.
+     *
+     * The two are answered the same way on purpose. A value the runtime hands
+     * back is not this build's to trust — it may have been written by another
+     * build, or by hand — and the caller's response to "says nothing" is to keep
+     * the record it already has, which is the right response to a name that
+     * cannot be parsed too. The alternative is an exception thrown inside a
+     * reconcile pass over a label, which would stop a server converging for a
+     * reason that has nothing to do with it.
+     */
+    public fun volumeValue(labels: Map<String, String>): ResourceName? =
+        labels[VOLUME]?.let { ResourceName.of(it).getOrNull() }
 
     /** Renders a boolean fact for a label value. */
     public fun booleanLabel(value: Boolean): String = if (value) TRUE else FALSE

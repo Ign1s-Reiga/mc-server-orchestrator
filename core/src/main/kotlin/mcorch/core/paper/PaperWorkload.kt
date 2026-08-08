@@ -106,15 +106,39 @@ internal object PaperWorkloadPlanner {
             env = environment + PaperImageContract.forwarding(forwardingSecret != null),
             secretEnv = secretEnvironment,
             ports = ports,
+            // **Labels are not in [specHash], and adding one recreates nothing.**
+            // The question "will adding a label restart the fleet" has been asked
+            // once and should not need re-deriving from two planners and every call
+            // site, so: [canonicalSpec] is an explicit list of *definition* fields
+            // and this map is not among them; `LocalNode` appends
+            // `Labels.SPEC_HASH` to the labels, which is the only direction that
+            // exists; replacement is decided by comparing that one hash string
+            // (`Reconciler.replacementCause`, both kinds) and nothing anywhere
+            // compares label maps wholesale — every read is a single-key lookup.
+            // `PaperWorkloadTest` asserts the membership, because the property this
+            // rests on used to be true only by reading this function.
+            //
+            // The consequence that is *not* free: a container created before a new
+            // label carries none of it, and is not replaced to gain it. A fact
+            // recorded this way converges as the fleet turns over.
             labels =
                 Labels.forServer(name, definition.kind) +
-                    mapOf(
+                    buildMap {
                         // What a later drain has to know about *this* container,
                         // recorded on the container itself. A definition that
                         // changes underneath it does not change these.
-                        Labels.WORLD_DATA to Labels.booleanLabel(storage is StorageRequest.Persistent),
-                        Labels.SAVE_CONFIRMABLE to Labels.booleanLabel(spec.network.rcon is RconSpec.Enabled),
-                    ),
+                        put(Labels.WORLD_DATA, Labels.booleanLabel(storage is StorageRequest.Persistent))
+                        put(Labels.SAVE_CONFIRMABLE, Labels.booleanLabel(spec.network.rcon is RconSpec.Enabled))
+                        // Absent rather than empty when there is no volume, and
+                        // [Labels.VOLUME] says why at length: absence has to read
+                        // as "the previous record stands", because an ephemeral
+                        // workload must not erase the record of the volume it
+                        // stopped mounting. A sentinel spelling is one careless
+                        // parse away from clearing it.
+                        if (storage is StorageRequest.Persistent) {
+                            put(Labels.VOLUME, storage.volume.value)
+                        }
+                    },
         )
     }
 
@@ -137,51 +161,74 @@ internal object PaperWorkloadPlanner {
         definition: PaperServerDefinition,
         forwardingSecret: SecretRef? = null,
     ): String {
-        val spec = definition.spec
-        val rcon = spec.network.rcon
-        val canonical =
-            buildList {
-                add("kind=${definition.kind.wireValue}")
-                add("image=${spec.image.canonical}")
-                add("paper.version=${spec.paper.minecraftVersion}")
-                add("paper.build=${spec.paper.build ?: "latest"}")
-                add("memory=${spec.resources.memory.bytes}")
-                add("cpu=${spec.resources.cpu?.millicores ?: "unset"}")
-                add("heap.max=${spec.resources.heap.max.bytes}")
-                add("heap.min=${spec.resources.heap.min.bytes}")
-                add("storage.mode=${spec.storage.mode.wireValue}")
-                add("storage.mountPath=${spec.storage.mountPath}")
-                add(
-                    "storage.volume=" +
-                        when (val storage = spec.storage) {
-                            is StorageSpec.Persistent -> storage.volume.name.value
-                            is StorageSpec.Ephemeral -> "none"
-                        },
-                )
-                add("network.port=${spec.network.port}")
-                add("network.hostPort=${spec.network.hostPort ?: "none"}")
-                when (rcon) {
-                    is RconSpec.Enabled -> {
-                        add("rcon.port=${rcon.port}")
-                        add("rcon.secret=${rcon.passwordSecret.name}/${rcon.passwordSecret.key}")
-                    }
-
-                    RconSpec.Disabled -> {
-                        add("rcon=disabled")
-                    }
-                }
-                add("maxPlayers=${spec.maxPlayers}")
-                // Absent rather than "none" when nothing claims this server, so a
-                // fleet with no proxy in it hashes exactly as it did before this
-                // field existed. Adding the proxy kind must not recreate every
-                // container that has nothing to do with one.
-                forwardingSecret?.let { add("forwarding.secret=${it.name}/${it.key}") }
-            }.joinToString("\n")
-
+        val canonical = canonicalSpec(definition, forwardingSecret)
         val digest = MessageDigest.getInstance("SHA-256").digest(canonical.toByteArray(Charsets.UTF_8))
         // Half a SHA-256 is 128 bits, which is plenty to tell two definitions
         // apart, and it fits inside a runtime label value with room to spare.
         return digest.take(HASH_BYTES).joinToString("") { "%02x".format(it) }
+    }
+
+    /**
+     * What [specHash] digests, before it is digested.
+     *
+     * Separate so a test can assert **membership** rather than only that two
+     * hashes differ, which the proxy planner has had for longer and this one
+     * went without. Two claims need it and neither can be made by varying a
+     * definition field:
+     *
+     * - A constant has nothing to vary. `plugin.protocol` on the proxy side is
+     *   the example; here it is the *shape* of the `storage.volume` entry, whose
+     *   `none` spelling for an ephemeral server is what keeps a lobby hashing the
+     *   way it always did.
+     * - **An input that is absent cannot be shown absent by a hash comparison.**
+     *   `plan` writes a label map, and the whole "adding a label does not restart
+     *   the fleet" argument is that this list does not read it. Asserting that
+     *   from outside means reading the list, not diffing two digests — there is no
+     *   definition edit that adds a label without also changing a hashed field.
+     */
+    fun canonicalSpec(
+        definition: PaperServerDefinition,
+        forwardingSecret: SecretRef? = null,
+    ): String {
+        val spec = definition.spec
+        val rcon = spec.network.rcon
+        return buildList {
+            add("kind=${definition.kind.wireValue}")
+            add("image=${spec.image.canonical}")
+            add("paper.version=${spec.paper.minecraftVersion}")
+            add("paper.build=${spec.paper.build ?: "latest"}")
+            add("memory=${spec.resources.memory.bytes}")
+            add("cpu=${spec.resources.cpu?.millicores ?: "unset"}")
+            add("heap.max=${spec.resources.heap.max.bytes}")
+            add("heap.min=${spec.resources.heap.min.bytes}")
+            add("storage.mode=${spec.storage.mode.wireValue}")
+            add("storage.mountPath=${spec.storage.mountPath}")
+            add(
+                "storage.volume=" +
+                    when (val storage = spec.storage) {
+                        is StorageSpec.Persistent -> storage.volume.name.value
+                        is StorageSpec.Ephemeral -> "none"
+                    },
+            )
+            add("network.port=${spec.network.port}")
+            add("network.hostPort=${spec.network.hostPort ?: "none"}")
+            when (rcon) {
+                is RconSpec.Enabled -> {
+                    add("rcon.port=${rcon.port}")
+                    add("rcon.secret=${rcon.passwordSecret.name}/${rcon.passwordSecret.key}")
+                }
+
+                RconSpec.Disabled -> {
+                    add("rcon=disabled")
+                }
+            }
+            add("maxPlayers=${spec.maxPlayers}")
+            // Absent rather than "none" when nothing claims this server, so a
+            // fleet with no proxy in it hashes exactly as it did before this
+            // field existed. Adding the proxy kind must not recreate every
+            // container that has nothing to do with one.
+            forwardingSecret?.let { add("forwarding.secret=${it.name}/${it.key}") }
+        }.joinToString("\n")
     }
 
     private const val HASH_BYTES = 16

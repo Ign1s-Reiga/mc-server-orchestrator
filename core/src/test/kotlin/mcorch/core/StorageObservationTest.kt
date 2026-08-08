@@ -12,6 +12,7 @@ import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
 import mcorch.schema.FailureClass
 import mcorch.schema.StorageSpec
+import mcorch.schema.VolumeSpec
 import mcorch.store.getOrThrow
 import org.junit.jupiter.api.Test
 import kotlin.time.Duration.Companion.seconds
@@ -44,17 +45,15 @@ import kotlin.time.Duration.Companion.seconds
  * - Idempotency, because a status that is re-derived from a *different* source is
  *   exactly the kind of field that starts flapping between two answers.
  *
- * ## What is deliberately not asserted, and would be a lie if it were
+ * ## `volumeName` is observed the same way, and its absence is not symmetrical
  *
- * `StorageStatus.volumeName`. Nothing observes it — reading the volume a container
- * actually has mounted needs `ContainerStatus.mounts` plumbed out through
- * `ContainerView`/`WorkloadObservation.Present`, which is a `:cri`→`Node` change —
- * so it is carried forward and never rewritten. The consequence, which is a cost
- * of the split and not an oversight: **a server brought up under this build never
- * records a volume name at all**, because there is no pass on which anything could
- * write one. Only rows an earlier build left behind carry one, and the claim that
- * a refusal does not erase *those* is held in `DrainTest`, on a fixture that
- * injects one for precisely that reason.
+ * It is read off `Labels.VOLUME`, written by the planner only when there *is* a
+ * volume. That asymmetry with `WORLD_DATA` — which writes `false` — is the point:
+ * a workload that mounts nothing must not clear the record of which volume still
+ * holds the world it stopped mounting, so absence means "the previous record
+ * stands" rather than "there is no volume". A container created before the label
+ * carries none and is not recreated to gain one (labels are outside the spec
+ * hash), so the field converges as the fleet turns over.
  */
 internal class StorageObservationTest {
     /**
@@ -91,6 +90,147 @@ internal class StorageObservationTest {
                 .shouldNotBeNull()
                 .persistent
                 .shouldBeFalse()
+        }
+
+    /**
+     * The volume its container was created to mount, read back off the container.
+     *
+     * Before `Labels.VOLUME` existed this was unassertable: the field was drafted
+     * from `spec.storage` every pass, so it reported the definition, and removing
+     * that left it with no producer at all.
+     */
+    @Test
+    fun `a settled server records the volume its container mounts`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            harness.declare(definition)
+            harness.settle(definition.metadata.name)
+
+            harness
+                .status(definition.metadata.name)
+                .shouldNotBeNull()
+                .storage
+                .shouldNotBeNull()
+                .volumeName shouldBe resourceName("survival-01-world")
+        }
+
+    /**
+     * Renaming a volume does not move the record until the container it names has
+     * been replaced.
+     *
+     * `spec.storage.volume` is in the spec hash, so the edit asks for a recreate
+     * and the loop drains and rebuilds. Between the edit and that rebuild the
+     * container on the node is still mounting the **old** volume, and the record
+     * has to say so — which is the entire difference between an observation and a
+     * copy of the definition. The second half is what proves it is not merely
+     * stuck.
+     */
+    @Test
+    fun `a volume rename does not move the record until the container it names is replaced`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+
+            harness.store.putDefinition(
+                paperDefinition(storage = StorageSpec.Persistent(VolumeSpec(resourceName("survival-01-world-b")))),
+            )
+            harness.pass(name)
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .storage
+                .shouldNotBeNull()
+                .volumeName shouldBe resourceName("survival-01-world")
+
+            harness.settle(name, limit = 20)
+            harness.node.creates shouldHaveSize 2
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .storage
+                .shouldNotBeNull()
+                .volumeName shouldBe resourceName("survival-01-world-b")
+        }
+
+    /**
+     * A workload that stops mounting a volume keeps the record of which volume
+     * held the world.
+     *
+     * The asymmetry the label's absence buys, driven end to end: an ephemeral edit
+     * lands in the window with no container, nothing refuses it, and the created
+     * container reports `persistent = false` with no `Labels.VOLUME`. `persistent`
+     * follows the new container; the name does **not**, because it is the only
+     * record of where the world that container is no longer mounting still lives,
+     * and `docs/operating.md` tells an operator to start a recovery from it.
+     *
+     * A label written as an empty value instead of omitted would clear it here.
+     */
+    @Test
+    fun `a workload that stops mounting a volume keeps the name of the one that holds the world`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            val volume =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .storage
+                    .shouldNotBeNull()
+                    .volumeName
+                    .shouldNotBeNull()
+
+            harness.node.workload = WorkloadObservation.Absent
+            harness.store.putDefinition(paperDefinition(storage = StorageSpec.Ephemeral()))
+            harness.settle(name, limit = 20)
+
+            val observed =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .storage
+                    .shouldNotBeNull()
+            // The new container's own answer, so the positive half moved…
+            observed.persistent.shouldBeFalse()
+            // …and the name it says nothing about did not.
+            observed.volumeName shouldBe volume
+        }
+
+    /**
+     * A container created before the label leaves the carried name standing.
+     *
+     * The population that exists on every upgrade: labels are outside the spec
+     * hash, so nothing is recreated to gain one, and a running container simply
+     * carries none until it is replaced for a reason of its own. Absent must mean
+     * "the previous record stands" — reading it as "no volume" would empty the
+     * field for the whole fleet at the moment the label was introduced.
+     */
+    @Test
+    fun `a container that predates the volume label does not clear the recorded name`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+
+            val present = harness.node.workload.shouldBeInstanceOf<WorkloadObservation.Present>()
+            harness.node.workload = present.copy(labels = present.labels - Labels.VOLUME)
+            harness.clock.advance(ReconcilerConfig().statusHeartbeat + 1.seconds)
+            harness.pass(name)
+
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .storage
+                .shouldNotBeNull()
+                .volumeName shouldBe resourceName("survival-01-world")
         }
 
     /**

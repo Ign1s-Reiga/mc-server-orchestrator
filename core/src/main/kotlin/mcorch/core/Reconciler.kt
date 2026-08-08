@@ -3198,29 +3198,49 @@ public class Reconciler(
          * [StatusDrafting] renders a *false* `persistent` as "there is no world to
          * save".
          *
-         * [StorageStatus.volumeName] is carried and never rewritten. Nothing
-         * observes it yet — that needs the runtime's mount list plumbed through
-         * the node abstraction — so it is the last name this loop recorded, kept
-         * even past a workload that has stopped mounting it, because it is the
-         * only record of which volume holds the world.
+         * [StorageStatus.volumeName] is read the same way, off `Labels.VOLUME`,
+         * and carried when the workload does not carry one. It is deliberately
+         * **not** cleared by a workload that says it holds no world: a name
+         * recorded before a replacement stopped mounting a volume is the only
+         * record of which volume still holds that world, and clearing it is the
+         * loss the round-34 finding was about. `Labels.VOLUME` is therefore absent
+         * rather than empty on an ephemeral workload — an empty value would be a
+         * positive claim, and a positive claim replaces the carried name.
          */
         fun storageStatus(observation: WorkloadObservation): StorageStatus? {
             val carried = previous?.storage
             // Not a claim about the volume: it is the node reporting a workload
             // for this server on this pass, which is what it has always meant.
             val bound = observation is WorkloadObservation.Present
-            // Null on every branch that has nothing to read — no workload at all,
-            // a workload whose labels are not its container's, or a container
-            // carrying no such label — and the three are one answer here because
-            // the response to all of them is the same: leave the record alone.
-            val heldWorldData =
+            // The container's own labels, or null when there are none to read —
+            // no workload at all, or a workload whose labels are the sandbox's.
+            // Both answer the same way, because the response to both is to leave
+            // the record alone.
+            val labels =
                 (observation as? WorkloadObservation.Present)
                     ?.takeIf { labelsDescribeItsContainer(it.state) }
-                    ?.let { Labels.booleanValue(it.labels, Labels.WORLD_DATA) }
-            if (heldWorldData == null) return carried?.copy(bound = bound)
+                    ?.labels
+            val heldWorldData = labels?.let { Labels.booleanValue(it, Labels.WORLD_DATA) }
+            // **This elvis is the carry-forward, not the banned one.** The rule is
+            // that absence must never be answered from `spec.storage`; answering
+            // it from the record this loop last wrote is the whole design. A
+            // workload carrying no `Labels.VOLUME` says nothing — it may mount
+            // nothing, or predate the label — and either way the previous name
+            // stands, because it is the only record of which volume holds a world
+            // that a replacement has stopped mounting.
+            val volumeName = labels?.let { Labels.volumeValue(it) } ?: carried?.volumeName
+            if (heldWorldData == null) {
+                // Nothing observed about what this workload holds. `volumeName`
+                // is still threaded through rather than dropped, and it discards
+                // nothing: `PaperWorkloadPlanner` writes `VOLUME` only beside
+                // `WORLD_DATA`, so a container carrying the first carries the
+                // second, and this branch is reached with `volumeName` already
+                // equal to the carried one for everything this loop created.
+                return carried?.copy(bound = bound, volumeName = volumeName)
+            }
             return StorageStatus(
                 persistent = heldWorldData,
-                volumeName = carried?.volumeName,
+                volumeName = volumeName,
                 bound = bound,
                 lastSaveConfirmedAt = carried?.lastSaveConfirmedAt,
             )

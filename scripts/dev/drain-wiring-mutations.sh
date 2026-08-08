@@ -213,6 +213,14 @@
 #            be swept rather than renamed, so these two are re-anchored one level in,
 #            on the producer and on its absence branch, and the class that judges them
 #            is the one that holds a status field's provenance.
+#   D74..D75 the volume half of that record, which had no producer at all until a
+#            `mcorch.dev/volume` label gave it one. D74 answers it from the
+#            definition — D61S one field over. D75 is the one the design turns on:
+#            read off the label and then *not* carried when there is no label, which
+#            erases the name for every container created before the label and for
+#            every workload that has stopped mounting a volume. "Observed" reads as
+#            an unqualified improvement right up until it deletes a fleet's recovery
+#            information on upgrade, and D75 is what says so.
 #   D73      the forty-fourth audit's own entry: the `SANDBOX_ONLY` window answered
 #            from the *sandbox's* labels. `WorkloadView` reports those alone when no
 #            container exists, so a sandbox built after a `storage.mode` edit carries
@@ -445,6 +453,10 @@ PREDATING_ROW='a status row that predates the storage field is not given a false
 # labels it is willing to hear.
 OBSERVED_PRODUCER='an edit does not move the record until the container it describes is replaced'
 OBSERVED_ABSENCE='a row with nothing observed and nothing to carry says nothing'
+OBSERVED_VOLUME='a settled server records the volume its container mounts'
+VOLUME_FOLLOWS_CONTAINER='a volume rename does not move the record until the container it names is replaced'
+VOLUME_SURVIVES_EPHEMERAL='a workload that stops mounting a volume keeps the name of the one that holds the world'
+VOLUME_PREDATING_CONTAINER='a container that predates the volume label does not clear the recorded name'
 SANDBOX_WINDOW="a sandbox labelled by the edit does not overwrite the container's own answer"
 NO_WORKLOAD_WINDOW='an ephemeral edit landing with no workload at all does not rewrite what was observed'
 UNLABELLED_WORKLOAD='an unlabelled workload leaves the last observation standing'
@@ -866,26 +878,29 @@ TRANSITION_RUNNING_ONLY='                WorkloadState.RUNNING -> true
 # off the workload now, so that mutation has become the fix — the refusal calls it,
 # and the two entries below sabotage the producer instead. The hazard is unchanged
 # and one level in: a storage record that answers from the definition.
-STORAGE_OBSERVED='            val heldWorldData =
-                (observation as? WorkloadObservation.Present)
-                    ?.takeIf { labelsDescribeItsContainer(it.state) }
-                    ?.let { Labels.booleanValue(it.labels, Labels.WORLD_DATA) }'
+STORAGE_OBSERVED='            val heldWorldData = labels?.let { Labels.booleanValue(it, Labels.WORLD_DATA) }'
 STORAGE_FROM_DEFINITION='            val heldWorldData: Boolean? = definition.spec.storage is StorageSpec.Persistent'
+# The other half of the same record, and its own two ways of going wrong: read
+# from the definition, or read from the label and then not carried when the label
+# says nothing. The second is the one the design turns on — a workload that mounts
+# nothing carries no such label, and clearing the name there erases the only record
+# of which volume still holds the world it stopped mounting.
+VOLUME_OBSERVED='            val volumeName = labels?.let { Labels.volumeValue(it) } ?: carried?.volumeName'
+VOLUME_FROM_DEFINITION='            val volumeName = (definition.spec.storage as? StorageSpec.Persistent)?.volume?.name'
+VOLUME_NOT_CARRIED='            val volumeName = labels?.let { Labels.volumeValue(it) }'
 # The same erasure through a fallback, which is the shape a fix for the above keeps
 # growing back: "stop deriving X from the wrong source" followed by "and when there
 # is nothing to carry forward, derive X from the wrong source". It reaches only the
 # rows with no storage record at all — every row written before the field existed —
 # so a scenario whose row carries one stays green under it, which is why that
 # population needs a case of its own.
-STORAGE_ABSENCE='            if (heldWorldData == null) return carried?.copy(bound = bound)'
-STORAGE_ABSENCE_FALLBACK='            if (heldWorldData == null) {
-                return carried?.copy(bound = bound)
+STORAGE_ABSENCE='                return carried?.copy(bound = bound, volumeName = volumeName)'
+STORAGE_ABSENCE_FALLBACK='                return carried?.copy(bound = bound, volumeName = volumeName)
                     ?: StorageStatus(
                         persistent = definition.spec.storage is StorageSpec.Persistent,
                         volumeName = (definition.spec.storage as? StorageSpec.Persistent)?.volume?.name,
                         bound = bound,
-                    )
-            }'
+                    )'
 # A sandbox read as though its labels were the container'"'"'s. `WorkloadView` reports
 # the sandbox'"'"'s alone when no container exists, and a sandbox built after a
 # `storage.mode` edit carries that edit — so this is the definition laundered back
@@ -1403,6 +1418,16 @@ MUTATIONS=(
     # reads the wrong object's labels, so a scan that could not tell those apart would
     # have scored this as covered by D61S.
     "D73@@$RECONCILER@@$STORAGE@@$SANDBOX_WINDOW@@$CONTAINERS_OWN_LABELS@@$SANDBOXES_LABELS"
+    # The volume half of the same record, once it had a producer at all. D74 is the
+    # same defect as D61S one field over — answered from `spec.storage` rather than
+    # from the label — and D75 is the one the design turns on: the name read off the
+    # label and then *not* carried when there is no label, which erases it for every
+    # container that predates the label and for every workload that has stopped
+    # mounting a volume. D75 is the more valuable of the two, because "observed"
+    # sounds like an unqualified improvement until it deletes a fleet's recovery
+    # information on upgrade.
+    "D74@@$RECONCILER@@$STORAGE@@$OBSERVED_VOLUME;$VOLUME_FOLLOWS_CONTAINER;$VOLUME_SURVIVES_EPHEMERAL@@$VOLUME_OBSERVED@@$VOLUME_FROM_DEFINITION"
+    "D75@@$RECONCILER@@$STORAGE@@$VOLUME_SURVIVES_EPHEMERAL;$VOLUME_PREDATING_CONTAINER@@$VOLUME_OBSERVED@@$VOLUME_NOT_CARRIED"
     # The round's instrument, proved on the shape it exists for: a classification of a
     # workload state that decides `SANDBOX_ONLY` with neither the fact nor a word about
     # doing without it. D62A is the same arm with a comment that explains the branch
