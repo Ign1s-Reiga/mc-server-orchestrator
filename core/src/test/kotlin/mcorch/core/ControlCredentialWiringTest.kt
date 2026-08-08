@@ -1,5 +1,6 @@
 package mcorch.core
 
+import io.kotest.assertions.withClue
 import io.kotest.matchers.collections.shouldContainExactly
 import io.kotest.matchers.shouldBe
 import org.junit.jupiter.api.Test
@@ -23,35 +24,71 @@ import java.io.File
  * what makes the sentence enforcement rather than decoration.
  */
 internal class ControlCredentialWiringTest {
+    /**
+     * **Both** collection points, and the alphabet read off the channel rather
+     * than written here.
+     *
+     * There are two places that turn control outcomes into a credential verdict —
+     * the routing sweep's `noting` and `ProxySelfLink.note` — and a scan covering
+     * one of them is the funnel argument applied to half the funnels: a proxy
+     * drain growing a second control call would drop its verdict with nothing
+     * noticing, which is the "fourth site gets forgotten" shape one level up.
+     *
+     * The call names come from `ControlChannel`'s own declarations, so a method
+     * added there joins the alphabet without anybody remembering to add it here.
+     * Keying on the receiver being spelled `channel.` instead would let a renamed
+     * local walk straight past a scan whose entire value is against the site that
+     * does not exist yet.
+     */
     @Test
-    fun `every control call in the routing sweep goes through the credential funnel`() {
-        val body = functionBody(reconciler(), "private suspend fun assertBackends(")
-        val calls = body.filter { CHANNEL_CALL.containsMatchIn(codeOf(it)) }
+    fun `every control call in either funnel goes through it`() {
+        val alphabet = channelCalls()
+        (alphabet.size >= 6) shouldBe true
 
-        // The scan is worth nothing if it found no calls to check.
-        (calls.size >= 4) shouldBe true
-        val unfunnelled = calls.filterNot { codeOf(it).contains("noting(") }
-        unfunnelled.map { it.trim() } shouldContainExactly emptyList()
+        val scopes =
+            listOf(
+                "noting" to bodyOf(reconciler(), "private suspend fun assertBackends("),
+                // The **class**, not its one method. A proxy drain that grows a
+                // second control call is the case this exists for, and scoping to
+                // `assertAdmission` would miss it by construction. Scoped to
+                // `ProxySelfLink` rather than to the file, because `BackendLink`'s
+                // calls in the same file are a *backend* sealing through the same
+                // endpoint: their verdict cannot be recorded here, since this pass
+                // writes the backend's row and not the proxy's — the residual
+                // named in `credentialVerdict`.
+                "note" to bodyOf(proxyLink(), "internal class ProxySelfLink("),
+            )
+        for ((funnel, body) in scopes) {
+            val calls = body.filter { line -> alphabet.any { codeOf(line).contains("$it(") } }
+            withClue("$funnel: the scan found no calls to check") { calls.isNotEmpty() shouldBe true }
+            val unfunnelled = calls.filterNot { codeOf(it).contains("$funnel(") }
+            withClue(funnel) { unfunnelled.map { it.trim() } shouldContainExactly emptyList() }
+        }
     }
 
     /**
-     * The negative control: the matcher fires on the shape it is meant to catch.
+     * The negative control: the matcher fires on the shape it is meant to catch,
+     * including the renamed-receiver one the alphabet exists to survive.
      *
-     * Without this, a regex that matched nothing would report every site as
+     * Without this, a matcher that matched nothing would report every site as
      * funnelled and the assertion above would pass against a build with no funnel
      * at all.
      */
     @Test
-    fun `the funnel scan sees an unfunnelled call`() {
-        val funnelled = "            when (val outcome = noting(channel.deregister(name))) {"
-        val raw = "            when (val outcome = channel.deregister(name)) {"
-        CHANNEL_CALL.containsMatchIn(codeOf(raw)) shouldBe true
-        codeOf(raw).contains("noting(") shouldBe false
-        CHANNEL_CALL.containsMatchIn(codeOf(funnelled)) shouldBe true
-        codeOf(funnelled).contains("noting(") shouldBe true
-        // …and it is not fooled by prose about a call.
-        CHANNEL_CALL.containsMatchIn(codeOf("        // channel.deregister(name) is what the sweep does")) shouldBe
-            false
+    fun `the funnel scan sees an unfunnelled call whatever the receiver is called`() {
+        val alphabet = channelCalls()
+        fun calls(line: String): Boolean = alphabet.any { codeOf(line).contains("$it(") }
+
+        calls("            when (val outcome = channel.deregister(name)) {") shouldBe true
+        // The rename that a receiver-keyed scan would miss.
+        calls("            when (val outcome = link.deregister(name)) {") shouldBe true
+        codeOf("            when (val outcome = noting(channel.deregister(name))) {").contains("noting(") shouldBe true
+        // Prose about a call is not a call.
+        calls("        // channel.deregister(name) is what the sweep does") shouldBe false
+        // A method this build's channel does not declare is not in the alphabet,
+        // which is what makes the list a reading of `ControlChannel` rather than
+        // a match on anything with brackets.
+        calls("            channel.rebootTheProxy(name)") shouldBe false
     }
 
     /**
@@ -67,57 +104,124 @@ internal class ControlCredentialWiringTest {
     @Test
     fun `usable is read only by the condition and the renderers`() {
         val readers =
-            (mainSources(File("src/main/kotlin")) + mainSources(apiSources()))
-                .filter { file -> file.readLines().any { USABLE.containsMatchIn(codeOf(it)) } }
-                .map { it.name }
+            everyModuleSource()
+                .filter { readsUsable(it.readLines()) }
+                .map { it.invariantSeparatorsPath }
                 .sorted()
 
-        readers shouldContainExactly listOf("ServerJson.kt", "StatusDrafting.kt")
+        readers shouldContainExactly
+            listOf(
+                "../api/src/main/kotlin/mcorch/api/render/ServerJson.kt",
+                "../core/src/main/kotlin/mcorch/core/StatusDrafting.kt",
+            )
     }
 
     /**
-     * The vacuity control for the scan above, in both halves: the reader set is
-     * non-empty *and* the tree it walked is the real one.
+     * The vacuity controls for the scan above: it walks every module, it compares
+     * whole paths, and it catches the spellings a gate could use.
      *
      * A path that resolved to nothing would make the assertion above pass with an
      * empty list against any build, including one where the reconciler gates a
-     * drain on the flag.
+     * drain on the flag. Comparing `File.name` would have let a second
+     * `StatusDrafting.kt` anywhere in the tree pass as the allowed one.
+     *
+     * The token is matched on both word boundaries — so a receiverless read in a
+     * `with` block and a `::usable` reference count, not only `.usable` — and the
+     * false positives that widening buys are excluded by requiring the file to
+     * know about the record at all. `HostPaths` has a local named `usable` and no
+     * notion of a control endpoint; a gate necessarily has both.
      */
     @Test
-    fun `the usable scan walks both trees and finds real references`() {
-        val core = mainSources(File("src/main/kotlin"))
-        val api = mainSources(apiSources())
-        (core.size > 20) shouldBe true
-        (api.size > 5) shouldBe true
-        core.any { it.name == "Reconciler.kt" } shouldBe true
-        api.any { it.name == "ServerJson.kt" } shouldBe true
+    fun `the usable scan walks every module, compares paths and catches each spelling`() {
+        val all = everyModuleSource()
+        val modules = MODULES.associateWith { module -> all.count { it.invariantSeparatorsPath.contains("/$module/") } }
+        withClue("modules with no sources walked: $modules") { modules.values.all { it > 0 } shouldBe true }
+        all.any { it.invariantSeparatorsPath.endsWith("mcorch/core/Reconciler.kt") } shouldBe true
+        all.any { it.invariantSeparatorsPath.endsWith("mcorch/store/codec/StatusCodec.kt") } shouldBe true
 
-        USABLE.containsMatchIn(codeOf("            put(\"usable\", control.usable)")) shouldBe true
+        // Each spelling of a read, in a file that knows what it is reading.
+        readsUsable(listOf("val c: ControlEndpointStatus", "put(\"usable\", c.usable)")) shouldBe true
+        readsUsable(listOf("val c: ControlEndpointStatus", "with(c) { if (usable) drain() }")) shouldBe true
+        readsUsable(listOf("val c: ControlEndpointStatus", "val gate = ControlEndpointStatus::usable")) shouldBe true
         // A quoted key is not a read, or the renderer's own JSON name would count
         // as one and the scan would pass on a file that never touches the value.
-        USABLE.containsMatchIn(codeOf("            put(\"usable\", true)")) shouldBe false
+        readsUsable(listOf("val c: ControlEndpointStatus", "put(\"usable\", true)")) shouldBe false
+        // Nor is the camel-cased field that carries it to a client.
+        readsUsable(listOf("val c: ControlEndpointStatus", "put(x, status.controlUsable)")) shouldBe false
         // Prose is not a read either.
-        USABLE.containsMatchIn(codeOf("     * `usable` is the one derivation")) shouldBe false
+        readsUsable(listOf("val c: ControlEndpointStatus", " * `usable` is the one derivation")) shouldBe false
+        // And the token alone, in a file with no control record in it, is somebody
+        // else's local variable — the exclusion that lets the token be matched
+        // widely without an exception list.
+        readsUsable(listOf("val usable = mounts.all { it.readable }", "if (!usable) refuse()")) shouldBe false
     }
 
     private fun reconciler(): List<String> = File(RECONCILER).readLines()
 
-    private fun apiSources(): File = File("../api/src/main/kotlin")
+    private fun proxyLink(): List<String> = File(PROXY_LINK).readLines()
 
     /**
-     * Every `.kt` file under [root].
+     * The names `ControlChannel` declares, which is the alphabet of calls that can
+     * carry a credential verdict.
      *
-     * Resolved through [require] rather than a tolerant walk: a scan that cannot
-     * find its sources must fail loudly, because passing with nothing read is
-     * indistinguishable from passing with everything read.
+     * Read from the source rather than listed here so that a method added to the
+     * channel is covered by the funnel scan on the day it is added — the scan's
+     * whole value being against the call site nobody has written yet.
      */
-    private fun mainSources(root: File): List<File> {
-        require(root.isDirectory) {
-            "no sources at ${root.absolutePath}. This scan enumerates the readers of a schema property " +
-                "across two modules; an empty walk would report no readers at all and pass against any build."
-        }
-        return root.walkTopDown().filter { it.isFile && it.extension == "kt" }.toList()
+    private fun channelCalls(): List<String> {
+        val names =
+            File(CONTROL_CHANNEL)
+                .readLines()
+                .mapNotNull { DECLARATION.find(codeOf(it))?.groupValues?.get(1) }
+                .distinct()
+        require(names.isNotEmpty()) { "no `suspend fun` declarations found in $CONTROL_CHANNEL" }
+        return names
     }
+
+    /**
+     * Every `.kt` main source in every module, as paths relative to this one.
+     *
+     * All of them, not `:core` and `:api`: a gate on the flag is no less a gate
+     * for being written in `:app` or `:store`, and the scan's claim is about the
+     * repository rather than about the two modules that happen to read it today.
+     * `:schema`'s own declaration file is the single exclusion, named by path,
+     * because the property is declared and documented there.
+     */
+    /**
+     * Whether these lines *read* the derived flag.
+     *
+     * Two conditions, and the second is what lets the first be wide. The token is
+     * matched on both word boundaries so that `with(control) { usable }` and
+     * `::usable` count — and the file must also name the record the property
+     * belongs to, which excludes an unrelated local of the same name without an
+     * exception list that would have to grow.
+     *
+     * The residual, stated rather than closed: a read written in a file that
+     * names neither [mcorch.schema.ControlEndpointStatus] nor a `control`
+     * receiver. Reaching the value at all needs one of the two, short of passing
+     * it through a `Boolean` parameter — at which point what is being gated on is
+     * no longer identifiable as this property by any scan.
+     */
+    private fun readsUsable(lines: List<String>): Boolean {
+        val code = lines.map(::codeOf)
+        val knowsTheRecord = code.any { it.contains("ControlEndpointStatus") || CONTROL_RECEIVER.containsMatchIn(it) }
+        return knowsTheRecord && code.any { USABLE.containsMatchIn(it) }
+    }
+
+    private fun everyModuleSource(): List<File> =
+        MODULES.flatMap { module ->
+            val root = File("../$module/src/main/kotlin")
+            require(root.isDirectory) {
+                "no sources for `$module` at ${root.absolutePath}. This scan enumerates the readers of a " +
+                    "schema property across every module; an empty walk would report no readers and pass " +
+                    "against any build, including one that gates a drain on the flag."
+            }
+            root
+                .walkTopDown()
+                .filter { it.isFile && it.extension == "kt" }
+                .filterNot { it.invariantSeparatorsPath.endsWith(DECLARATION_SITE) }
+                .toList()
+        }
 
     /** A line with its string literals and its trailing comment removed. */
     private fun codeOf(line: String): String {
@@ -127,7 +231,7 @@ internal class ControlCredentialWiringTest {
     }
 
     /** The lines between the declaration starting with [declaration] and its closing brace. */
-    private fun functionBody(
+    private fun bodyOf(
         lines: List<String>,
         declaration: String,
     ): List<String> {
@@ -145,12 +249,31 @@ internal class ControlCredentialWiringTest {
     private companion object {
         const val RECONCILER: String = "src/main/kotlin/mcorch/core/Reconciler.kt"
 
+        const val PROXY_LINK: String = "src/main/kotlin/mcorch/core/proxy/ProxyLink.kt"
+
+        const val CONTROL_CHANNEL: String = "src/main/kotlin/mcorch/core/proxy/ControlChannel.kt"
+
+        /** Where the property is declared and documented, so a mention there is not a read. */
+        const val DECLARATION_SITE: String = "mcorch/schema/Status.kt"
+
+        /** Every module with Kotlin main sources. `:core` is this one, hence the relative walk. */
+        val MODULES: List<String> = listOf("schema", "cri", "core", "store", "api", "app", "velocity-plugin")
+
         val STRING: Regex = Regex("\"(\\\\.|[^\"\\\\])*\"")
 
-        /** A call made on the pass's control channel, which is what carries a verdict. */
-        val CHANNEL_CALL: Regex = Regex("\\bchannel\\.[A-Za-z]+\\(")
+        /** A `suspend fun` declaration, which is how `ControlChannel` spells every call it offers. */
+        val DECLARATION: Regex = Regex("\\bsuspend fun ([A-Za-z][A-Za-z0-9]*)\\(")
 
-        /** A read of the derived flag, rather than the string that names it on the wire. */
-        val USABLE: Regex = Regex("[.?]usable\\b")
+        /**
+         * A read of the derived flag.
+         *
+         * `\b` on both sides rather than a leading `.`, so a receiverless read
+         * inside a `with` block and a `::usable` reference both count. The string
+         * that names it on the wire does not: literals are stripped first.
+         */
+        val USABLE: Regex = Regex("\\busable\\b")
+
+        /** A file that handles the record the property belongs to. */
+        val CONTROL_RECEIVER: Regex = Regex("\\bcontrol[.?]|\\.control\\b")
     }
 }

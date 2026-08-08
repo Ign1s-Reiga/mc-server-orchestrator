@@ -2245,3 +2245,55 @@ Related: [[standalone-paper-drain-shape]]
      before any authenticated call, so all three are honestly `UNTESTED`. What it
      needs is a reason enum on the non-contact, not a credential verdict. Do not
      mark it closed by the credential change.
+
+## Round 45: where the "same container?" question is answerable
+
+187. **A carry-forward guarded on container identity is dead code anywhere except
+     the pass that creates the container.** The create pass writes the new
+     container id into `runtime`, so every later pass compares the new id against
+     itself and the guard never fires. Round 44 prescribed the gate inside
+     `readControl`; it would have been inert there, and a mutation forcing it off
+     stayed green. The only sites where `previous.runtime.containerId` still names
+     the *old* container are the two `node.ensureWorkload` call sites in
+     `convergeProxy` (`Absent` and `SANDBOX_ONLY`). When asking "is this record
+     about the container in front of me", first ask which pass still holds the
+     predecessor's id.
+188. **The proxy replacement path never reaches its own teardown's clear.**
+     `teardownProxy`'s `control = null` / `runtime = null` block is only reached
+     with the workload observed `Absent` *and* a drain cause still standing —
+     which for a `REPLACEMENT` never happens, because after the removal the next
+     pass sees `Absent`, `outstandingStopCause` answers null (it needs a `Present`
+     observation) and `convergeProxy` builds the successor immediately. So every
+     per-container record must be cleared at the *create*, not at the teardown.
+     The same is true of the drain record, which is why `clearedDrainRecord` sits
+     at both create sites.
+189. **`recorded == null` is not the same silence as `observed == null`.**
+     `teardownProxy`'s partial-removal branch deliberately writes
+     `runtime.containerId = null` to record *"this loop removed the container, the
+     sandbox survived"*. A create-time guard of the shape `if (observed != null &&
+     recorded != null && observed != recorded) clear()` therefore **keeps** the
+     dead container's record on exactly that path — the sandbox survives, the
+     `SANDBOX_ONLY` create runs, and the successor inherits its predecessor's
+     record. `identity()` never nulls the id by accident (it falls back to the
+     previous one), so a null `recorded` is always a positive statement that no
+     container is known. Clear on it.
+190. **Scans that key on a receiver spelling.** `\bchannel\.[A-Za-z]+\(` catches
+     `channel.state()` and misses `pass.channel(node, h).state()` or any renamed
+     local. And a funnel scan scoped to one function does not cover the *other*
+     funnel: `ProxySelfLink.note` is a second, unscanned collection point, so a
+     second control call added to the proxy's own drain link drops its verdict
+     silently. When a rule has two enforcement points, the scan has to name both.
+191. **A reader-list scan that collects file *names* over a subset of modules.**
+     `usable`'s consumer list is pinned to `ServerJson.kt` + `StatusDrafting.kt`
+     by walking `:core` and `:api` only and comparing `File.name`. A gate in
+     `:store`, `:app` or `:schema`, or a second file with either name, passes. The
+     vacuity controls (file counts, positive and negative matcher probes,
+     `require(root.isDirectory)`) are genuine — the gap is scope, not vacuity.
+192. **Round 44's own W5 was wrong and the code is right: an empty proxy with a
+     refused credential *is* replaceable.** `sealIsPrecondition(router, reading)`
+     = `router != null || reading !is Empty`, `ProxyDrainSubject.router` is a
+     `get() = null`, and a proxy has no transfer and no deregister step, so on a
+     fresh zero-player reading the seal is waived and the replacement runs to the
+     stop. The park-for-ever framing holds only with players connected. Do not
+     repeat "a proxy that cannot seal can never be replaced" without checking the
+     player reading.

@@ -237,8 +237,15 @@ internal class ProxySelfLink(
      * that write a *different* server's status — and the state machine keeps the
      * exit shape a red-proofed structural test is written against.
      *
-     * Lifetime is one pass, by construction: `drainProxy` builds a link per pass.
-     * Nothing here is stale, and nothing carries across a container replacement.
+     * Lifetime is one pass — `drainProxy` builds a link per pass, reads this
+     * after `advance` returns, and drops it — so nothing here is stale and
+     * nothing carries across a container replacement. **That is an argument, not
+     * an enforcement.** Cache a link across passes, or hand one to anything that
+     * outlives the pass, and this reports contact that did not happen on the pass
+     * that reads it: `answered` is a latch and `observed` is last-verdict-wins,
+     * neither of which means anything once the two are read at a different time
+     * from when they were written. Anything holding a link has to reset them, or
+     * take a fresh link.
      */
     var observed: ControlCredential = ControlCredential.UNTESTED
         private set
@@ -276,6 +283,18 @@ internal class ProxySelfLink(
  *   a place that only knows the request reached a handler.
  * - An unreachable endpoint says nothing, which is the whole reason
  *   [ControlCredential.UNTESTED] exists rather than a boolean.
+ *
+ * ## What no caller of this refines, and why that is left alone
+ *
+ * A 401 met by [BackendLink] — a *backend* sealing, transferring or
+ * deregistering through the proxy's endpoint — is the same fact about the same
+ * endpoint, and it does not reach the proxy's own credential record. It cannot:
+ * that pass writes the **backend's** status, and a pass may not write another
+ * server's row. The proxy's own converge pass establishes the verdict
+ * independently and within one interval, so the gap closes itself — except while
+ * the proxy's passes are frozen by a permanent failure, where the whole status is
+ * stale and the credential is not the field an operator is missing. Recorded
+ * rather than fixed: routing it would mean one pass writing two rows.
  */
 internal fun ControlOutcome<*>.credentialVerdict(): ControlCredential =
     when (this) {

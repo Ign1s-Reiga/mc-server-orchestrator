@@ -634,6 +634,71 @@ internal class ProxyReconcileTest {
         }
 
     /**
+     * The state that defeated the first version of this guard: a **partial
+     * removal**.
+     *
+     * `teardownProxy` nulls `runtime.containerId` deliberately when the container
+     * went and the sandbox did not — that field is how the loop records *this
+     * removal happened*. The guard was written as "clear when both ids are known
+     * and differ", so on the pass that finally creates the replacement the
+     * recorded id was null, the condition was false, and the new container
+     * inherited the removed one's `reachable`, `compatible`, `pluginApiVersion`
+     * and credential. Two different nulls had been lumped together: an
+     * under-reporting runtime, and the loop's own statement that it took the
+     * container away.
+     *
+     * Driven through `WorkloadRemoval(containerRemoved = true, sandboxRemoved =
+     * false)` rather than by assigning the node's workload, which is the reason
+     * the sibling test below did not catch it: mutating the observation leaves the
+     * *status* carrying the old id, so the case never arises.
+     */
+    @Test
+    fun `a replacement after a partial removal does not inherit the removed container's record`() =
+        coreTest {
+            val harness = ProxyHarness()
+            val name = harness.proxyDefinition.metadata.name
+            harness.bringUp()
+            harness.plugin.rejectsCredential = true
+            harness.sweep()
+            val refused = harness.proxyStatus().shouldNotBeNull()
+            refused.control.shouldNotBeNull().credential shouldBe ControlCredential.REJECTED
+            val replaced =
+                refused.runtime
+                    .shouldNotBeNull()
+                    .containerId
+                    .shouldNotBeNull()
+
+            // The endpoint goes dark, so nothing can re-establish a verdict and the
+            // assertion is about what the create did with the old record.
+            harness.plugin.unreachable = true
+            // The container goes; the sandbox teardown fails. This is the shape
+            // that writes `runtime.containerId = null` into the status.
+            harness.proxyNode.sandboxRemovalFails = true
+            harness.declare(proxyDefinition(maxPlayers = 300))
+
+            var partialRemovalRecorded = false
+            repeat(20) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+                val status = harness.proxyStatus()
+                if (!partialRemovalRecorded && status?.runtime != null && status.runtime?.containerId == null) {
+                    partialRemovalRecorded = true
+                    // …and the retry gets the sandbox, so the replacement is built.
+                    harness.proxyNode.sandboxRemovalFails = false
+                }
+            }
+
+            // The scenario really happened: without this the assertions below hold
+            // for a run that never partially removed anything.
+            partialRemovalRecorded.shouldBeTrue()
+            harness.proxyNode.containerRemovals.shouldNotBeEmpty()
+
+            val status = harness.proxyStatus().shouldNotBeNull()
+            status.runtime.shouldNotBeNull().containerId shouldNotBe replaced
+            status.control?.credential shouldNotBe ControlCredential.REJECTED
+        }
+
+    /**
      * The other create, and the same rule — reached the way it happens in
      * practice: the container is gone and its sandbox is not.
      *

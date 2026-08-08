@@ -896,6 +896,16 @@ public class Reconciler(
      * comparison runs the two always agree. The question is answered at
      * [controlOfCreated], on the pass that builds the container, where the
      * recorded id is still the old one.
+     *
+     * ## A new field on [ControlEndpointStatus] inherits the erasing default
+     *
+     * Every branch below **constructs** the record rather than copying the
+     * previous one, so a field added to the type and not named here is reset on
+     * every pass — which is the defect the seed above exists to fix, waiting for
+     * the next field, and nothing scans for it. Whoever adds one decides
+     * explicitly whether the *handshake* establishes it: if it does not, seed it
+     * from `previous` the way [ControlEndpointStatus.credential] and
+     * `lastContactAt` are.
      */
     private suspend fun readControl(
         pass: ProxyPass,
@@ -981,9 +991,12 @@ public class Reconciler(
                         "build does not. No backend behind it can complete a drain"
                 }
             return ProxyRouting(
-                // Unrefined: this pass stopped before authenticating, so the
-                // credential is untested and saying anything else would be an
-                // answer to a question nobody asked.
+                // Carried forward, not refined: this pass stopped before
+                // authenticating, so it says nothing about the credential. **Not
+                // `UNTESTED`** — that is the erasure `readControl` was fixed to
+                // stop ten lines above, and writing it here would restore it on
+                // this path. `control` already holds whatever the last pass that
+                // did authenticate established.
                 control = control,
                 status = pass.previous?.backends,
                 failure =
@@ -1360,6 +1373,31 @@ public class Reconciler(
      * Adoption keeps its record: an `ensureWorkload` that found the container
      * already there returns the same id, so the guard does not fire and a pass
      * that created nothing throws nothing away.
+     *
+     * ## Kept on *confirmed* identity, never on an absence
+     *
+     * The rule is positive — keep only when both ids are known and equal — and
+     * that is the round-45 correction. It was written as its negation ("clear
+     * when both are known and differ") on the reasoning that an unreported id is
+     * not a new container, which is sound for [readControl]'s seed and does not
+     * transfer here, because the two nulls are not the same null:
+     *
+     * - `observed == null` is the runtime under-reporting, and a create that
+     *   cannot say which container it built is not evidence that the record
+     *   describes it.
+     * - `recorded == null` is **not silence at all**. The one thing that nulls
+     *   `runtime.containerId` is [teardownProxy], deliberately, to record *this
+     *   loop removed the container and the sandbox survived*. So the state the
+     *   negative form failed on is the state that says loudest that the old
+     *   container is gone — a partial removal, after which the successor
+     *   inherited a dead process's `reachable`, `compatible`, `pluginApiVersion`
+     *   and credential.
+     *
+     * What the positive form costs is a record dropped when a create cannot name
+     * its container: the next converging pass re-establishes it from the
+     * handshake and an authenticated call, and until then the status says
+     * nothing rather than something wrong. That is the right way round at a site
+     * whose whole subject is a container that has just come into existence.
      */
     private fun controlOfCreated(
         pass: ProxyPass,
@@ -1368,12 +1406,7 @@ public class Reconciler(
         val previous = pass.previous ?: return null
         val recorded = previous.runtime?.containerId
         val observed = created.handle.containerId
-        // Both known and different is the only evidence of a *new* container. An
-        // unreported id is not a new one, and clearing on silence would throw
-        // away a verdict a later pass has no way to re-establish while the
-        // endpoint is down.
-        if (observed != null && recorded != null && observed != recorded) return null
-        return previous.control
+        return previous.control.takeIf { observed != null && observed == recorded }
     }
 
     /**
