@@ -2,9 +2,12 @@ package mcorch.core.paper
 
 import io.kotest.matchers.booleans.shouldBeFalse
 import io.kotest.matchers.booleans.shouldBeTrue
+import io.kotest.matchers.maps.shouldNotBeEmpty
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
+import io.kotest.matchers.string.shouldContain
+import io.kotest.matchers.string.shouldNotContain
 import io.kotest.matchers.types.shouldBeInstanceOf
 import mcorch.core.Labels
 import mcorch.core.StorageRequest
@@ -44,6 +47,76 @@ internal class PaperWorkloadTest {
         // provoke a recreate of a server with players on it.
         PaperWorkloadPlanner.specHash(paperDefinition(saveTimeout = 9.minutes)) shouldBe base
         PaperWorkloadPlanner.specHash(paperDefinition(startupTimeout = 20.minutes)) shouldBe base
+    }
+
+    /**
+     * The hash is a list of **definition fields**, and no label the planner writes
+     * is among them.
+     *
+     * This is the claim the decision to record a fact as a *label* rests on:
+     * labels are outside the fingerprint, so adding one recreates no container and
+     * drains no fleet.
+     *
+     * ## Read this before extending it, because the obvious instrument cannot work
+     *
+     * **Do not reach for "hash two things and compare".** Every other assertion in
+     * the sibling test does exactly that, and it is the wrong tool here for a
+     * structural reason: what is being asserted is an **absence**, and a digest
+     * comparison can only demonstrate that two inputs *differ*. To show that
+     * labels are not an input you would need a definition edit that adds a label
+     * and changes nothing else hashed — and there is none, because the label
+     * values are themselves derived from fields the hash already reads. So the
+     * input *list* has to be exposed and read. That is the whole reason
+     * [canonicalSpec] exists separately from `specHash`, and until it did, this
+     * property was true by reading the function and by nothing else: folding
+     * `spec.labels` in would have been caught by no test in this repository.
+     *
+     * The same shape shows up whenever a decision rests on something *not* being
+     * consulted. Ask what would have to be exposed before the absence is
+     * assertable at all, rather than assuming the existing instrument reaches it.
+     *
+     * ## Why keys and not values
+     *
+     * The scan is over label **keys**, and that is not a shortcut. One label value
+     * is deliberately in the hash — [Labels.VOLUME] carries the volume name and
+     * `storage.volume` is a hashed field — so a scan over values would be
+     * asserting something false. It is also the reason that label is safe to read
+     * back as an *observation* rather than as a snapshot that goes stale: renaming
+     * a volume already recreates the container, so the label and the container it
+     * sits on cannot come to disagree.
+     *
+     * The positive assertions are not decoration. Without them this is a scan over
+     * a string that a typo in [canonicalSpec]'s name would satisfy by returning
+     * something else entirely.
+     */
+    @Test
+    fun `the spec hash lists definition fields, and no label the planner writes is one of them`() {
+        val definition = paperDefinition()
+        val canonical = PaperWorkloadPlanner.canonicalSpec(definition)
+
+        canonical shouldContain "image=${definition.spec.image.canonical}"
+        canonical shouldContain "storage.mode=persistent"
+        canonical shouldContain "storage.volume=survival-01-world"
+        // The `none` spelling has nothing to vary against, and it is what keeps an
+        // always-ephemeral lobby hashing the way it did before a volume could be
+        // named — a definition edit cannot demonstrate it.
+        PaperWorkloadPlanner.canonicalSpec(paperDefinition(storage = StorageSpec.Ephemeral())) shouldContain
+            "storage.volume=none"
+
+        val labels = PaperWorkloadPlanner.plan(definition).labels
+        // The vacuity guard: a scan over an empty key set asserts nothing.
+        labels.shouldNotBeEmpty()
+        labels.keys.forEach { canonical shouldNotContain it }
+
+        // Label *values* are a different question, and one of them is deliberately
+        // in the hash. `Labels.VOLUME` carries the volume name and `storage.volume`
+        // is a hashed field — which is exactly what makes reading that label an
+        // observation rather than a snapshot that goes stale: renaming a volume
+        // already recreates the container, so the label cannot come to disagree
+        // with the container it sits on.
+        labels[Labels.VOLUME] shouldBe "survival-01-world"
+        PaperWorkloadPlanner.specHash(paperDefinition(storage = persistentVolume("other-world"))) shouldNotBe
+            PaperWorkloadPlanner.specHash(definition)
     }
 
     @Test
@@ -96,6 +169,51 @@ internal class PaperWorkloadTest {
         disposable.labels[Labels.SAVE_CONFIRMABLE] shouldBe "false"
     }
 
+    /**
+     * The volume is recorded on the container, and **absent rather than empty**
+     * when there is none.
+     *
+     * The asymmetry with [Labels.WORLD_DATA] — which writes `false` — is the whole
+     * design. Absent has to mean "the previous record stands", which is right both
+     * for a workload with no volume and for one created before this label existed;
+     * a workload that mounts nothing must not erase the record of the volume that
+     * still holds the world it stopped mounting.
+     *
+     * An empty value would be defused by [Labels.volumeValue] rejecting it, so
+     * this is not the last line of defence — but a sentinel spelling is one
+     * careless parse away from becoming a claim that clears a carried name, and
+     * omitting it costs nothing.
+     */
+    @Test
+    fun `a persistent workload names its volume and an ephemeral one carries no such label`() {
+        PaperWorkloadPlanner.plan(paperDefinition()).labels[Labels.VOLUME] shouldBe "survival-01-world"
+        PaperWorkloadPlanner
+            .plan(paperDefinition(storage = persistentVolume("shared-world")))
+            .labels[Labels.VOLUME] shouldBe "shared-world"
+
+        val disposable = PaperWorkloadPlanner.plan(paperDefinition(storage = StorageSpec.Ephemeral()))
+        disposable.labels.containsKey(Labels.VOLUME).shouldBeFalse()
+    }
+
+    /**
+     * A label value the runtime hands back is not this build's to trust, so an
+     * unreadable one says nothing instead of throwing inside a reconcile pass.
+     *
+     * "Says nothing" and "is not there" are answered identically on purpose: the
+     * caller's response to both is to keep the record it already has. The
+     * alternative is a server that stops converging because something wrote a
+     * label by hand.
+     */
+    @Test
+    fun `an unreadable volume label says nothing rather than failing a pass`() {
+        Labels.volumeValue(mapOf(Labels.VOLUME to "survival-01-world")) shouldBe resourceName("survival-01-world")
+        Labels.volumeValue(emptyMap()) shouldBe null
+        Labels.volumeValue(mapOf(Labels.VOLUME to "Not A Resource Name")) shouldBe null
+        Labels.volumeValue(mapOf(Labels.VOLUME to "")) shouldBe null
+    }
+
+    private fun persistentVolume(name: String) = StorageSpec.Persistent(VolumeSpec(resourceName(name)))
+
     @Test
     fun `a workload that records nothing is read as holding a world, never as the definition says`() {
         val agent = PaperServerAgent(paperDefinition(storage = StorageSpec.Ephemeral()))
@@ -120,10 +238,9 @@ internal class PaperWorkloadTest {
         // With no label there is no second source worth asking. The definition
         // is the thing being edited — this one says `ephemeral`, and the
         // question is being asked *because* it may have just been changed to say
-        // that — and the last observed storage status is computed from the
-        // definition every pass, so it agrees with the edit a pass later. Both
-        // would answer "nothing to save" for a container holding a world, so
-        // neither is consulted: unknown means the safe side, per CLAUDE.md
+        // that. Observed status is no longer a copy of it (it is read off this
+        // same label), so on an unlabelled container it says nothing either.
+        // Neither is consulted: unknown means the safe side, per CLAUDE.md
         // invariant 2.
         agent.contractOf(observationWith(emptyMap())).holdsWorldData.shouldBeTrue()
 

@@ -199,13 +199,50 @@
 #            `RUNNING` — a state the drain itself takes away — so the container exits
 #            and the create applies the very definition the loop spent passes
 #            refusing.
-#   D61E     the fix for that second critical, and its own defect: the fallback it
-#            kept for a status row carrying no storage record derives one from the
-#            *edited* definition, so a row written before the field existed — the
-#            population whose volume name is recorded nowhere else — is told
-#            "ephemeral storage: there is no world to save" by the very pass refusing
-#            to make it ephemeral. It reaches only those rows, which is why D61S's
-#            scenario stays green under it.
+#   D61S     **re-derived twice, and the claim moved the second time.** It scored the
+#   D61E     storage record being written from the *definition* the refusal was
+#            refusing, and D61E the fallback the fix for it kept — a row carrying no
+#            storage record derives one from the edited definition, so a row written
+#            before the field existed is told "ephemeral storage: there is no world to
+#            save" by the very pass refusing to make it ephemeral. Both were anchored
+#            at the refusal, and both named `pass.storageStatus(observation)` as the
+#            *defect*. The forty-fourth audit made that expression the **fix**:
+#            `StorageStatus` is observed state and was drafted from `spec.storage`
+#            everywhere, so the producer was changed to read `Labels.WORLD_DATA` off
+#            the workload and the refusal now simply calls it. A retired claim has to
+#            be swept rather than renamed, so these two are re-anchored one level in,
+#            on the producer and on its absence branch, and the class that judges them
+#            is the one that holds a status field's provenance.
+#   D79      the map all of those reads come from. `WorkloadView` merged the
+#            sandbox's labels under the container's, so a key the *container* lacked
+#            fell through to the sandbox's value inside the state every consumer
+#            treats as the container's own word — and the gate that decides "these
+#            labels describe the container" is scoped by workload state, which
+#            cannot see which map a key came from. It was harmless only by a
+#            conjunction of three unasserted facts; the mutation restores the merge.
+#   D76..D78 the same field at its other two ends. D76 writes the volume label for a
+#            workload that mounts nothing, which is the sentinel spelling the
+#            omission exists to avoid. D77 folds a label into the hash input — the
+#            edit the `canonicalSpec` extraction exists to catch, and one that no
+#            comparison of two digests can see, because no definition edit adds a
+#            label without also changing a hashed field. D78 makes the label's parse
+#            strict, so a value written by another build or by hand stops a server
+#            converging instead of saying nothing.
+#   D74..D75 the volume half of that record, which had no producer at all until a
+#            `mcorch.dev/volume` label gave it one. D74 answers it from the
+#            definition — D61S one field over. D75 is the one the design turns on:
+#            read off the label and then *not* carried when there is no label, which
+#            erases the name for every container created before the label and for
+#            every workload that has stopped mounting a volume. "Observed" reads as
+#            an unqualified improvement right up until it deletes a fleet's recovery
+#            information on upgrade, and D75 is what says so.
+#   D73      the forty-fourth audit's own entry: the `SANDBOX_ONLY` window answered
+#            from the *sandbox's* labels. `WorkloadView` reports those alone when no
+#            container exists, so a sandbox built after a `storage.mode` edit carries
+#            that edit — the same erasure as D61S, arriving through the runtime rather
+#            than through the definition, in the one window where the status record is
+#            the only memory of what the workload held. Its red set is a single case
+#            against D61S's six, which is what makes it a separate claim.
 #   D62..D64 the thirty-fifth audit's instrument, and the first entries here that can
 #            go red for something **nobody wrote**. Rounds 33, 34 and 35 were one
 #            defect three times — a fact modelled exactly in one place, approximated
@@ -291,6 +328,43 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 RESULTS="$REPO_ROOT/core/build/test-results/test"
+
+# Two runs against the same tree are not merely slow, they are **wrong, silently
+# and in the green direction**. Both back the sources up at start, both mutate the
+# same files, and each one's `restore` puts back what the *other* was measuring —
+# so a verdict is scored against source neither run wrote, and the board prints
+# "all N mutations caught" having proved nothing. Every instrument in this file
+# exists to stop exactly that class of result, and the harness itself was open to
+# it; a coordinator hit it with two concurrent runs in one tree.
+#
+# Keyed on [REPO_ROOT], not global: separate worktrees have their own sources and
+# their own `build/`, so they may run at once — that is the normal case for
+# parallel agents and blocking it would be a real cost. Two runs in *one* tree
+# never may.
+#
+# `flock` rather than a lock directory, because this harness is killed: the
+# forty-sixth round's run was cut down mid-mutation under memory pressure. A
+# kernel-held lock is released when the process dies however it dies, while a
+# `mkdir` lock left behind by a `SIGKILL` blocks every later run until somebody
+# removes it by hand — trading a silent-green for a mysterious refusal.
+#
+# Missing `flock` is a hard failure rather than a warning-and-continue. "Run
+# unlocked because the tool is absent" reintroduces the whole defect at exactly
+# the moment nobody is reading the preamble.
+LOCK_FILE="${TMPDIR:-/tmp}/mcorch-drain-wiring-$(printf '%s' "$REPO_ROOT" | cksum | cut -d' ' -f1).lock"
+if ! command -v flock >/dev/null 2>&1; then
+    echo "flock is not installed, and this harness will not run unlocked: two runs against one tree" >&2
+    echo "restore each other's mutations and the board reads green having measured nothing." >&2
+    exit 1
+fi
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo "another run of this harness already holds $LOCK_FILE for $REPO_ROOT." >&2
+    echo "Wait for it to finish: concurrent runs restore each other's mutations, so both verdicts" >&2
+    echo "would be measured against source neither run wrote." >&2
+    exit 1
+fi
+
 BACKUP_DIR="$(mktemp -d -t drain-wiring-XXXXXX)"
 
 CONTROLLER=core/src/main/kotlin/mcorch/core/DrainController.kt
@@ -307,6 +381,15 @@ PLANNER=core/src/main/kotlin/mcorch/core/proxy/VelocityWorkloadPlanner.kt
 # D45..D51.
 CHANNEL=core/src/main/kotlin/mcorch/core/proxy/ControlChannel.kt
 PAPER_AGENT=core/src/main/kotlin/mcorch/core/paper/PaperServerAgent.kt
+# The Paper workload builder: the labels a container is created with, and the list
+# the spec hash digests. Both halves of "is this fact safe to record as a label".
+PAPER_WORKLOAD=core/src/main/kotlin/mcorch/core/paper/PaperWorkload.kt
+# Where a label is *read* off a workload, including the lenient parse that keeps an
+# unreadable one from failing a pass.
+LABELS=core/src/main/kotlin/mcorch/core/Labels.kt
+# Where a sandbox and the container inside it are turned into one observation, and
+# where a label stops being the sandbox's and starts being the container's.
+VIEW=core/src/main/kotlin/mcorch/core/node/WorkloadView.kt
 PROXY_AGENT=core/src/main/kotlin/mcorch/core/proxy/VelocityProxyAgent.kt
 FLEET=core/src/main/kotlin/mcorch/core/ProxyFleet.kt
 
@@ -320,6 +403,9 @@ REPLACEMENT=mcorch.core.ReplacementTest
 PLANNING=mcorch.core.proxy.VelocityWorkloadPlannerTest
 STOP_GRACE=mcorch.core.node.StopGraceGuardTest
 UNBUILDABLE=mcorch.core.UnbuildableRequestTest
+STORAGE=mcorch.core.StorageObservationTest
+PAPER_PLAN=mcorch.core.paper.PaperWorkloadTest
+WORKLOAD_VIEW=mcorch.core.node.WorkloadViewTest
 
 # The test cases, by name. A mutation names the ones it must redden and no others.
 EXIT='nothing leaves advance that has not been through the record-level rule'
@@ -422,6 +508,26 @@ TRANSITION_NOT_APPLIED='a refused storage transition is not applied by the conta
 # rows with no storage record to carry forward — the population the volume name is
 # recorded nowhere else for.
 PREDATING_ROW='a status row that predates the storage field is not given a false one by the refusal'
+# The forty-fourth audit, one field further in. `StorageStatus` is documented as
+# observed and was drafted from `spec.storage` on every pass, so the record a later
+# guard would consult in the window with no container was a rewrite of the very edit
+# it needs protecting from. These three name the producer'"'"'s three claims: what it
+# answers when a container speaks, what it answers when nothing does, and whose
+# labels it is willing to hear.
+OBSERVED_PRODUCER='an edit does not move the record until the container it describes is replaced'
+OBSERVED_ABSENCE='a row with nothing observed and nothing to carry says nothing'
+OBSERVED_VOLUME='a settled server records the volume its container mounts'
+LABEL_OMITTED='a persistent workload names its volume and an ephemeral one carries no such label'
+HASH_TAKES_NO_LABEL='the spec hash lists definition fields, and no label the planner writes is one of them'
+UNREADABLE_LABEL='an unreadable volume label says nothing rather than failing a pass'
+CONTAINERS_OWN_MAP='a key the container does not carry is not answered by the sandbox'
+VOLUME_FOLLOWS_CONTAINER='a volume rename does not move the record until the container it names is replaced'
+VOLUME_SURVIVES_EPHEMERAL='a workload that stops mounting a volume keeps the name of the one that holds the world'
+VOLUME_PREDATING_CONTAINER='a container that predates the volume label does not clear the recorded name'
+SANDBOX_WINDOW="a sandbox labelled by the edit does not overwrite the container's own answer"
+NO_WORKLOAD_WINDOW='an ephemeral edit landing with no workload at all does not rewrite what was observed'
+UNLABELLED_WORKLOAD='an unlabelled workload leaves the last observation standing'
+REFUSAL_RECORDS_CONTAINER="a refused edit surfaces permanently and records the container's storage"
 # ...and the instrument the round was really about. Rounds 33, 34 and 35 were one
 # defect three times, all three of them *omissions*, and this board scores
 # inversions — so the three entries below are the first here that can go red for an
@@ -831,13 +937,69 @@ TRANSITION_RUNNING_ONLY='                WorkloadState.RUNNING -> true
                 WorkloadState.EXITED, WorkloadState.UNKNOWN -> false'
 # ...and the storage record it writes: the definition it is refusing, rather than
 # the container it is about.
-TRANSITION_STORAGE='                storage = pass.previous?.storage?.copy(bound = true),'
-TRANSITION_STORAGE_DERIVED='                storage = pass.storageStatus(observation),'
-# The same erasure through the fallback the thirty-fourth audit'"'"'s fix left behind,
-# which reaches only the rows that have no storage record to carry forward — every
-# row written before the field existed. The scenario with a *recorded* volume stays
-# green under it, which is exactly why it needed a case of its own.
-TRANSITION_STORAGE_FALLBACK='                storage = pass.previous?.storage?.copy(bound = true) ?: pass.storageStatus(observation),'
+#
+# Re-derived for the forty-fourth audit, and the *claim* moved rather than the
+# identifier. `Pass.storageStatus` used to draft the whole block from
+# `definition.spec.storage`, which is why the refusal needed a local expression and
+# why "drafting the shared one here" was the defect. It reads `Labels.WORLD_DATA`
+# off the workload now, so that mutation has become the fix — the refusal calls it,
+# and the two entries below sabotage the producer instead. The hazard is unchanged
+# and one level in: a storage record that answers from the definition.
+STORAGE_OBSERVED='            val heldWorldData = labels?.let { Labels.booleanValue(it, Labels.WORLD_DATA) }'
+STORAGE_FROM_DEFINITION='            val heldWorldData: Boolean? = definition.spec.storage is StorageSpec.Persistent'
+# The other half of the same record, and its own two ways of going wrong: read
+# from the definition, or read from the label and then not carried when the label
+# says nothing. The second is the one the design turns on — a workload that mounts
+# nothing carries no such label, and clearing the name there erases the only record
+# of which volume still holds the world it stopped mounting.
+VOLUME_OBSERVED='            val volumeName = labels?.let { Labels.volumeValue(it) } ?: carried?.volumeName'
+VOLUME_FROM_DEFINITION='            val volumeName = (definition.spec.storage as? StorageSpec.Persistent)?.volume?.name'
+VOLUME_NOT_CARRIED='            val volumeName = labels?.let { Labels.volumeValue(it) }'
+# The label written for a workload that mounts nothing. Omitting it is what makes
+# absence mean "the previous record stands"; a sentinel spelling is one careless
+# parse away from clearing a name nothing else remembers.
+VOLUME_OMITTED='                        if (storage is StorageRequest.Persistent) {
+                            put(Labels.VOLUME, storage.volume.value)
+                        }'
+VOLUME_ALWAYS_WRITTEN='                        put(Labels.VOLUME, (storage as? StorageRequest.Persistent)?.volume?.value.orEmpty())'
+# A label folded into the hash input. This is the whole reason `canonicalSpec` was
+# extracted: the property "adding a label recreates nothing" cannot be shown by
+# comparing two digests, because no definition edit adds a label without also
+# changing a hashed field. Membership is the only instrument that sees it.
+HASH_LAST_ENTRY='            add("maxPlayers=${spec.maxPlayers}")'
+HASH_TAKES_A_LABEL='            add("maxPlayers=${spec.maxPlayers}")
+            add("label.worldData=${Labels.WORLD_DATA}")'
+# The lenient parse, made strict. A label value is whatever the runtime hands back —
+# another build`'"'"'s, or a hand-written one — and throwing on it stops a server
+# converging for a reason that has nothing to do with it.
+VOLUME_PARSE_LENIENT='        labels[VOLUME]?.let { ResourceName.of(it).getOrNull() }'
+VOLUME_PARSE_STRICT='        labels[VOLUME]?.let { ResourceName.of(it).getOrThrow() }'
+# The sandbox answering for the container. `sandboxLabels + mine.labels` reads as
+# "the container wins" and is only half that: a key the container *lacks* falls
+# through to the sandbox`'"'"'s value, inside the state every consumer treats as the
+# container`'"'"'s own word. The forty-sixth audit`'"'"'s third warning.
+CONTAINER_LABELS_ALONE='        val labels = mine?.labels ?: sandboxLabels'
+CONTAINER_LABELS_MERGED='        val labels = if (mine != null) sandboxLabels + mine.labels else sandboxLabels'
+# The same erasure through a fallback, which is the shape a fix for the above keeps
+# growing back: "stop deriving X from the wrong source" followed by "and when there
+# is nothing to carry forward, derive X from the wrong source". It reaches only the
+# rows with no storage record at all — every row written before the field existed —
+# so a scenario whose row carries one stays green under it, which is why that
+# population needs a case of its own.
+STORAGE_ABSENCE='                return carried?.copy(bound = bound, volumeName = volumeName)'
+STORAGE_ABSENCE_FALLBACK='                return carried?.copy(bound = bound, volumeName = volumeName)
+                    ?: StorageStatus(
+                        persistent = definition.spec.storage is StorageSpec.Persistent,
+                        volumeName = (definition.spec.storage as? StorageSpec.Persistent)?.volume?.name,
+                        bound = bound,
+                    )'
+# A sandbox read as though its labels were the container'"'"'s. `WorkloadView` reports
+# the sandbox'"'"'s alone when no container exists, and a sandbox built after a
+# `storage.mode` edit carries that edit — so this is the definition laundered back
+# into an observed record through the runtime, in exactly the window where the record
+# is the only memory there is.
+CONTAINERS_OWN_LABELS='        WorkloadState.SANDBOX_ONLY -> false'
+SANDBOXES_LABELS='        WorkloadState.SANDBOX_ONLY -> true'
 # A sixth classification of a workload state, deciding `SANDBOX_ONLY` with neither
 # the fact that separates its two worlds nor a word about doing without it. This is
 # the *omission* shape, which is the one a board of flips cannot score: there is no
@@ -1327,15 +1489,54 @@ MUTATIONS=(
     # its second half — the refusal writing the storage record of the definition it
     # is refusing, which erases the volume name recovery depends on.
     "D61@@$RECONCILER@@$DRAIN@@$TRANSITION_NOT_APPLIED@@$TRANSITION_STATES@@$TRANSITION_RUNNING_ONLY"
-    # Re-derived for the thirty-fifth audit, and its red set grew with the source:
-    # writing the *definition's* storage is now visible to two cases, the one that has
-    # a record to erase and the one that has none and would be handed a false one.
-    "D61S@@$RECONCILER@@$DRAIN@@$TRANSITION_NOT_APPLIED;$PREDATING_ROW@@$TRANSITION_STORAGE@@$TRANSITION_STORAGE_DERIVED"
-    # The thirty-fifth audit's first item: the fallback the previous round's fix left
-    # behind. It reaches only rows decoded with no storage block, so the scenario with
-    # a recorded volume — the one D61S reddens — stays green under it, which is the
-    # whole reason that case could not carry this claim.
-    "D61E@@$RECONCILER@@$DRAIN@@$PREDATING_ROW@@$TRANSITION_STORAGE@@$TRANSITION_STORAGE_FALLBACK"
+    # Re-derived twice. The thirty-fifth audit grew D61S's red set to two cases; the
+    # forty-fourth moved the claim itself, because `Pass.storageStatus` stopped being
+    # the definition-derived expression and became the observed one — so the mutation
+    # that used to restore the defect now restores the fix. What is sabotaged is the
+    # producer: a storage record answered from `spec.storage` rather than from the
+    # workload's own label. `StorageObservationTest` is the class that holds it,
+    # because the defect is a status field's provenance and not a drain step.
+    "D61S@@$RECONCILER@@$STORAGE@@$OBSERVED_PRODUCER;$OBSERVED_ABSENCE;$SANDBOX_WINDOW;$NO_WORKLOAD_WINDOW;$UNLABELLED_WORKLOAD;$REFUSAL_RECORDS_CONTAINER@@$STORAGE_OBSERVED@@$STORAGE_FROM_DEFINITION"
+    # The thirty-fifth audit's first item, at its new home: the fallback a fix for
+    # D61S keeps growing back. It reaches only rows decoded with no storage block, so
+    # every scenario whose row carries one stays green under it — which is the whole
+    # reason that population needs cases of its own, and why this claims a different
+    # set from D61S rather than a subset of it.
+    "D61E@@$RECONCILER@@$STORAGE@@$OBSERVED_ABSENCE@@$STORAGE_ABSENCE@@$STORAGE_ABSENCE_FALLBACK"
+    # The forty-fourth audit's own entry, and the half neither of the above can see:
+    # the `SANDBOX_ONLY` window answered from the sandbox's labels. It is the *only*
+    # one of the three whose red set is a single case, and that is the point — six
+    # cases move when the producer reads the definition, and exactly one moves when it
+    # reads the wrong object's labels, so a scan that could not tell those apart would
+    # have scored this as covered by D61S.
+    "D73@@$RECONCILER@@$STORAGE@@$SANDBOX_WINDOW@@$CONTAINERS_OWN_LABELS@@$SANDBOXES_LABELS"
+    # The volume half of the same record, once it had a producer at all. D74 is the
+    # same defect as D61S one field over — answered from `spec.storage` rather than
+    # from the label — and D75 is the one the design turns on: the name read off the
+    # label and then *not* carried when there is no label, which erases it for every
+    # container that predates the label and for every workload that has stopped
+    # mounting a volume. D75 is the more valuable of the two, because "observed"
+    # sounds like an unqualified improvement until it deletes a fleet's recovery
+    # information on upgrade.
+    # D74 does *not* redden `$OBSERVED_VOLUME`, and the reason is worth keeping:
+    # on a settled server the definition and the container agree, so a
+    # definition-derived name equals the observed one. Only a *disagreement*
+    # separates the two sources — a rename mid-replacement, or a workload that has
+    # stopped mounting a volume. The same is true of D61S and the `persistent`
+    # half. A settled server can only be red-proofed by the whole-file revert,
+    # which removes the producer rather than pointing it at the wrong source.
+    "D74@@$RECONCILER@@$STORAGE@@$VOLUME_FOLLOWS_CONTAINER;$VOLUME_SURVIVES_EPHEMERAL@@$VOLUME_OBSERVED@@$VOLUME_FROM_DEFINITION"
+    "D75@@$RECONCILER@@$STORAGE@@$VOLUME_SURVIVES_EPHEMERAL;$VOLUME_PREDATING_CONTAINER@@$VOLUME_OBSERVED@@$VOLUME_NOT_CARRIED"
+    # The producer side of the same decision, and the instrument it rests on.
+    "D76@@$PAPER_WORKLOAD@@$PAPER_PLAN@@$LABEL_OMITTED@@$VOLUME_OMITTED@@$VOLUME_ALWAYS_WRITTEN"
+    "D77@@$PAPER_WORKLOAD@@$PAPER_PLAN@@$HASH_TAKES_NO_LABEL@@$HASH_LAST_ENTRY@@$HASH_TAKES_A_LABEL"
+    # And the read, which is the one place a value written by something that is not
+    # this build reaches the loop.
+    "D78@@$LABELS@@$PAPER_PLAN@@$UNREADABLE_LABEL@@$VOLUME_PARSE_LENIENT@@$VOLUME_PARSE_STRICT"
+    # …and the map those reads come from. The merge is the shape that makes the
+    # state-scoped gate a half-truth: it decides *which container* the labels are
+    # about and cannot see that one key came from the sandbox instead.
+    "D79@@$VIEW@@$WORKLOAD_VIEW@@$CONTAINERS_OWN_MAP@@$CONTAINER_LABELS_ALONE@@$CONTAINER_LABELS_MERGED"
     # The round's instrument, proved on the shape it exists for: a classification of a
     # workload state that decides `SANDBOX_ONLY` with neither the fact nor a word about
     # doing without it. D62A is the same arm with a comment that explains the branch
@@ -1409,6 +1610,9 @@ restore() {
             VelocityWorkloadPlanner.kt) cp -- "$backup" "$REPO_ROOT/$PLANNER" ;;
             ControlChannel.kt) cp -- "$backup" "$REPO_ROOT/$CHANNEL" ;;
             PaperServerAgent.kt) cp -- "$backup" "$REPO_ROOT/$PAPER_AGENT" ;;
+            PaperWorkload.kt) cp -- "$backup" "$REPO_ROOT/$PAPER_WORKLOAD" ;;
+            Labels.kt) cp -- "$backup" "$REPO_ROOT/$LABELS" ;;
+            WorkloadView.kt) cp -- "$backup" "$REPO_ROOT/$VIEW" ;;
             VelocityProxyAgent.kt) cp -- "$backup" "$REPO_ROOT/$PROXY_AGENT" ;;
             ProxyFleet.kt) cp -- "$backup" "$REPO_ROOT/$FLEET" ;;
         esac
@@ -1451,6 +1655,9 @@ cp -- "$REPO_ROOT/$NODE" "$BACKUP_DIR/Node.kt"
 cp -- "$REPO_ROOT/$PLANNER" "$BACKUP_DIR/VelocityWorkloadPlanner.kt"
 cp -- "$REPO_ROOT/$CHANNEL" "$BACKUP_DIR/ControlChannel.kt"
 cp -- "$REPO_ROOT/$PAPER_AGENT" "$BACKUP_DIR/PaperServerAgent.kt"
+cp -- "$REPO_ROOT/$PAPER_WORKLOAD" "$BACKUP_DIR/PaperWorkload.kt"
+cp -- "$REPO_ROOT/$LABELS" "$BACKUP_DIR/Labels.kt"
+cp -- "$REPO_ROOT/$VIEW" "$BACKUP_DIR/WorkloadView.kt"
 cp -- "$REPO_ROOT/$PROXY_AGENT" "$BACKUP_DIR/VelocityProxyAgent.kt"
 cp -- "$REPO_ROOT/$FLEET" "$BACKUP_DIR/ProxyFleet.kt"
 

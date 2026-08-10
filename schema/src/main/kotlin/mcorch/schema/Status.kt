@@ -306,9 +306,54 @@ public data class PlayerOccupancy(
 }
 
 /**
- * Observed storage. [lastSaveConfirmedAt] is the evidence for "the world save
- * completed" — it is set when a save *completion* was confirmed, never when a
- * save was merely requested.
+ * Observed storage, and **nothing here is re-read from the definition**.
+ *
+ * The type-level rule at the top of this file says a status is what the loop
+ * observed. This block did not honour it: every field was drafted from
+ * `spec.storage` on every pass, so a server whose definition had just been
+ * edited reported the edit rather than the workload — a volume that does not
+ * exist reported exactly what was asked for. An operator diagnosing a
+ * half-applied storage change read the change back at them.
+ *
+ * The absence of the whole block is the only way this type says *"nothing has
+ * been observed"*. There is no per-field unknown: [persistent] is a `Boolean`
+ * because a tri-state would have to be decoded, migrated and re-answered by
+ * every consumer, and a null block already carries the meaning. So a null
+ * [ServerStatus] storage block claims nothing and gates nothing, and a
+ * consumer must not read it as `persistent = false` — those are the two
+ * sentences *"this row has never said"* and *"there is no world here"*, and
+ * only the second tells somebody to stop looking for a world.
+ *
+ * ## Where each field comes from
+ *
+ * - [persistent] — **observed.** Read back off the workload's own
+ *   `mcorch.dev/world-data` label, which `:core` writes at create time
+ *   precisely so that a later pass can ask what the container *was built with*
+ *   rather than what the definition says today (see [ServerSpec.holdsWorldData],
+ *   which states the same rule for the drain). A workload carrying no such
+ *   label says nothing, and the previous record stands.
+ * - [volumeName] — **observed**, from the workload's own `mcorch.dev/volume`
+ *   label, and carried when it has none. A workload that mounts nothing carries
+ *   no such label, so this is deliberately *not* cleared when [persistent] goes
+ *   false: a name recorded before a replacement stopped mounting a volume is the
+ *   only record of which volume still holds that world, and it is where a
+ *   recovery starts. **Null does not mean the server has no volume** — a
+ *   container created before the label existed carries none, and is not recreated
+ *   to gain one, so this converges as the fleet turns over rather than at
+ *   upgrade. `spec.storage` answers the question for a server that has not been
+ *   replaced since.
+ * - [bound] — **observed.** The node reported a workload for this server on
+ *   the pass that wrote this record.
+ * - [lastSaveConfirmedAt] — **observed.** Set when a save *completion* was
+ *   confirmed, never when a save was merely requested. It is an audit record
+ *   that outlives the drain which earned it; nothing gates on it, and
+ *   [DrainStatus.worldSavedAt] is the evidence a stop is authorised by.
+ *
+ * `:core` also synthesises one of these for a kind that has no storage block at
+ * all — [VelocityProxyStatus] — so that the shared conditions have an answer.
+ * `persistent = false` is sound there because a proxy's
+ * [ServerSpec.holdsWorldData] is `false` by construction rather than by
+ * configuration: it is a property of the kind, not a reading of a definition.
  */
 public data class StorageStatus(
     val persistent: Boolean,

@@ -520,6 +520,39 @@ in exactly the scenario where it outlived its container. Ask of any fixture: *do
 the value I am handing this exist in the field, and does anything about it differ
 between the two cases I am claiming to tell apart?*
 
+**Two more of mine, both green under the sabotage written for them.** An
+idempotency assertion — *"a second pass records the same storage"* — could not see
+a record re-stamped with `now` on every pass, because `Harness` runs on a clock
+that only advances when a test advances it: the same `now` twice compares equal.
+Advancing past `statusHeartbeat` between the passes fixed it and does a second
+job, because an unchanged status **inside** the heartbeat is not written at all,
+so the comparison had been one row read twice rather than two rows written. And a
+fixture injected the volume name `survival-01-world` to prove a refusal *carries*
+the record — which is exactly what the definition derives (`metadata.name` plus
+`-world`), so the assertion held whether the pass carried it or re-derived it,
+under the very defect it was written for. **A fixture value must differ from the
+value the defect would produce, and a comparability test must move the clock**;
+"equal" is the cheapest possible green.
+
+**A mutation that points a producer at the wrong *source* cannot redden a case
+where the two sources agree.** Pointing `storageStatus` back at `spec.storage`
+left "a settled server records what its container mounts" green, because on a
+settled server the definition and the container say the same thing — twice, once
+per field. Only a **disagreement** separates two sources: an edit mid-replacement,
+or a workload that has stopped mounting a volume. A test on the agreeing case is
+red-proofed by the whole-file revert instead, which *removes* the producer rather
+than misdirecting it. Keep both instruments and expect them to cover different
+cases; record at the entry which cases a source-swap cannot reach, or the next
+person reads the smaller red set as a weak test.
+
+**A property of the form "X is not an input" cannot be shown by comparing
+outputs.** "Labels are not in the spec hash" has no definition edit that adds a
+label without also changing a hashed field, so no pair of digests differs in the
+right way. It needed the input *list* exposed (`canonicalSpec`) and asserted by
+membership. Whenever a decision rests on an absence, ask what would have to be
+extracted before the absence is assertable at all — otherwise the property is
+true only by reading the function, which is exactly how it rots.
+
 **A KDoc that spells out a block-comment terminator ends the KDoc there.** Writing
 the delimiters out while documenting a comment stripper closed the doc four lines
 early and the rest of the prose compiled as Kotlin — twenty unresolved-reference

@@ -2157,7 +2157,10 @@ public class Reconciler(
         node: Node,
         observation: WorkloadObservation.Present,
         image: ImageStatus?,
-        storage: StorageStatus,
+        // Nullable because [Pass.storageStatus] answers null when it observed
+        // nothing and had nothing to carry, and that absence has to reach the
+        // stored record intact — see the note there.
+        storage: StorageStatus?,
         blocker: FailureStatus? = null,
     ): ReconcileOutcome {
         val probe = pass.agent.probe(node, observation.handle)
@@ -2398,8 +2401,16 @@ public class Reconciler(
                 // question to answer — see [permanentFailureStopsPasses].
                 permanentFailureStopsPasses = pass.stored.permanentFailureStopsPasses(),
             )
+        // A confirmation is stamped onto the record this pass observed, and onto
+        // nothing when there is no record — a server with no storage block and a
+        // workload carrying no `WORLD_DATA` label has said nothing this could be
+        // attached to, and inventing a block to hold the timestamp would be
+        // claiming `persistent` from the drain's own safe default rather than from
+        // an observation. What is lost there is an audit line, not evidence:
+        // `DrainStatus.worldSavedAt` is what authorises a stop and it carries the
+        // same instant.
         val storage =
-            pass.storageStatus(observation).let { base ->
+            pass.storageStatus(observation)?.let { base ->
                 progress.saveConfirmedAt?.let { base.copy(lastSaveConfirmedAt = it) } ?: base
             }
         val phase =
@@ -2569,14 +2580,26 @@ public class Reconciler(
                 // The pass-through is not free and is not claimed to be: an
                 // ephemeral edit landing in the gap between a replacement drain's
                 // teardown and the next create is refused by nothing, and converges
-                // onto an empty world beside an orphaned volume. It cannot be closed
-                // from here — `StorageStatus` is overwritten from the *desired*
-                // definition by [converge] and by [drain] on every pass, so a pass
-                // later there is no record left to ask — and making it observed in
-                // fact as well as in KDoc is a `:schema`/`:api` change routed
-                // separately. Widening this arm instead would freeze every
-                // replacement of an always-ephemeral lobby on advice that does not
-                // apply to it.
+                // onto an empty world beside an orphaned volume. It still cannot be
+                // closed from here, and the reason has changed: [Pass.storageStatus]
+                // no longer overwrites the record from the desired definition, so
+                // there *is* a record to ask — the last container's own
+                // `WORLD_DATA`, carried across the window where nothing can be
+                // observed.
+                //
+                // **A guard that consults it has to run before `ensureWorkload`,
+                // on the same pass**, and that is a correctness constraint rather
+                // than a preference about where to put it. The memory closes at
+                // `CREATED`, not at the create: once the ephemeral replacement
+                // exists, [labelsDescribeItsContainer] is true of `CREATED`, and
+                // the new container's own `world-data=false` correctly replaces the
+                // carried `true`. A guard placed one pass later therefore reads the
+                // edit's own answer back, laundered through the container the edit
+                // built, and closes item 149 on paper while leaving it open in
+                // fact.
+                //
+                // Widening this arm instead would freeze every replacement of an
+                // always-ephemeral lobby on advice that does not apply to it.
                 WorkloadState.CREATED, WorkloadState.SANDBOX_ONLY -> false
             }
         if (!couldBeTheContainerTheEditIsAbout) return null
@@ -2648,37 +2671,25 @@ public class Reconciler(
                         WorkloadState.CREATED, WorkloadState.SANDBOX_ONLY -> ServerPhase.UNKNOWN
                     },
                 runtime = pass.runtimeIdentity(present),
-                // The container's storage, not the edited definition's.
-                // [Pass.storageStatus] derives from the definition, so drafting it
-                // here records `persistent = false, volumeName = null` for a
-                // workload this pass has just refused to make ephemeral — erasing
-                // the loop's own record of which volume holds the world, which is
-                // the name an operator needs to recover with and the one thing
-                // nothing else in the system remembers. The previous record is the
-                // one the container was created under; `bound` is the only part of
-                // it this observation can still speak to.
+                // The container's storage, not the edited definition's — which is
+                // now what [Pass.storageStatus] answers everywhere, so this site
+                // stopped needing an expression of its own. It used to hold
+                // `pass.previous?.storage?.copy(bound = true)` because drafting the
+                // shared one here recorded `persistent = false, volumeName = null`
+                // for a workload the pass had just refused to make ephemeral,
+                // erasing the loop's record of which volume holds the world. Two
+                // derivations of one fact is what let those two disagree; there is
+                // one now, and re-introducing a local expression here re-opens it.
                 //
-                // **No fallback, and that is the whole of it.** A row decoded with
-                // no storage block at all — `StatusCodec.readStorage` answers null
-                // whenever `storage.persistent` is absent, which is every row
-                // written before the field existed — has *no* record of the volume,
-                // and deriving one from the edited definition here would write the
-                // very claim this refusal exists to prevent: `persistent = false`,
-                // which `StatusDrafting.worldSavedMessage` renders as "ephemeral
-                // storage: there is no world to save" for a server the loop is
-                // refusing to make ephemeral, on exactly the population where the
-                // volume name is recorded nowhere else. Absence stays absence:
-                // this expression is null exactly on the rows that carry no
-                // storage block, and null is the honest record for a row that has
-                // none.
-                //
-                // **Not** because the argument falls back to [draft]'s default. An
-                // explicitly passed null takes no default in Kotlin; it writes
-                // null. That the default here is the same `previous?.storage` is a
-                // coincidence of this one call — the two agree on every row — and
-                // reasoning from it would be wrong the moment either side changed,
-                // which is what the next person to edit this line would act on.
-                storage = pass.previous?.storage?.copy(bound = true),
+                // What reaches this line is stronger than what the carried record
+                // gave: this branch is only reached with a `Present` observation
+                // whose own `WORLD_DATA` label reads **true**, so the record is
+                // `persistent = true` from the container itself even on a row that
+                // has never carried a storage block — the population whose volume
+                // name is recorded nowhere else, which used to get null here and
+                // now at least gets the true half of the answer. `volumeName` stays
+                // whatever was carried, because nothing observes it yet.
+                storage = pass.storageStatus(observation),
                 // Refusing the *edit* is not withdrawing a drain that is already
                 // stopping this container, and this is the third site that would
                 // have deleted the dispatch record to say so: the edit can land
@@ -3171,13 +3182,78 @@ public class Reconciler(
                 failure = failure,
             )
 
-        fun storageStatus(observation: WorkloadObservation): StorageStatus {
-            val storage = definition.spec.storage
+        /**
+         * What this pass **observed** about the workload's storage, or null when
+         * it has nothing to say and nothing to carry.
+         *
+         * `spec.storage` is not read here and must not be. [StorageStatus] is
+         * observed state, and drafting it from the definition made a pass report
+         * the operator's edit back at them: a server whose `storage.mode` had
+         * just been changed reported the change as though a container had been
+         * built that way, on the surface an operator diagnoses a half-applied
+         * edit from. `Labels.WORLD_DATA` is the same fact recorded where a later
+         * pass can actually read it — on the workload — and it is already trusted
+         * for the decision that costs a world, so reading it here costs no query
+         * and no round trip.
+         *
+         * ## Absence stays absence, and there is no fallback
+         *
+         * When there is nothing to read the *previous record stands*, unchanged
+         * except for [StorageStatus.bound], which this pass can still speak to.
+         * There is deliberately no `?:` back to the definition for the case where
+         * there is also no previous record: that fallback is the erasure it
+         * replaces, aimed at exactly the rows least able to afford it — every row
+         * `StatusCodec.readStorage` decodes as null, which is every row written
+         * before the field existed, and every server whose workload predates the
+         * label. Null is the honest answer for a row that has never said, and
+         * [StatusDrafting] renders a *false* `persistent` as "there is no world to
+         * save".
+         *
+         * [StorageStatus.volumeName] is read the same way, off `Labels.VOLUME`,
+         * and carried when the workload does not carry one. It is deliberately
+         * **not** cleared by a workload that says it holds no world: a name
+         * recorded before a replacement stopped mounting a volume is the only
+         * record of which volume still holds that world, and clearing it is the
+         * loss the round-34 finding was about. `Labels.VOLUME` is therefore absent
+         * rather than empty on an ephemeral workload — an empty value would be a
+         * positive claim, and a positive claim replaces the carried name.
+         */
+        fun storageStatus(observation: WorkloadObservation): StorageStatus? {
+            val carried = previous?.storage
+            // Not a claim about the volume: it is the node reporting a workload
+            // for this server on this pass, which is what it has always meant.
+            val bound = observation is WorkloadObservation.Present
+            // The container's own labels, or null when there are none to read —
+            // no workload at all, or a workload whose labels are the sandbox's.
+            // Both answer the same way, because the response to both is to leave
+            // the record alone.
+            val labels =
+                (observation as? WorkloadObservation.Present)
+                    ?.takeIf { labelsDescribeItsContainer(it.state) }
+                    ?.labels
+            val heldWorldData = labels?.let { Labels.booleanValue(it, Labels.WORLD_DATA) }
+            // **This elvis is the carry-forward, not the banned one.** The rule is
+            // that absence must never be answered from `spec.storage`; answering
+            // it from the record this loop last wrote is the whole design. A
+            // workload carrying no `Labels.VOLUME` says nothing — it may mount
+            // nothing, or predate the label — and either way the previous name
+            // stands, because it is the only record of which volume holds a world
+            // that a replacement has stopped mounting.
+            val volumeName = labels?.let { Labels.volumeValue(it) } ?: carried?.volumeName
+            if (heldWorldData == null) {
+                // Nothing observed about what this workload holds. `volumeName`
+                // is still threaded through rather than dropped, and it discards
+                // nothing: `PaperWorkloadPlanner` writes `VOLUME` only beside
+                // `WORLD_DATA`, so a container carrying the first carries the
+                // second, and this branch is reached with `volumeName` already
+                // equal to the carried one for everything this loop created.
+                return carried?.copy(bound = bound, volumeName = volumeName)
+            }
             return StorageStatus(
-                persistent = storage is StorageSpec.Persistent,
-                volumeName = (storage as? StorageSpec.Persistent)?.volume?.name,
-                bound = observation is WorkloadObservation.Present,
-                lastSaveConfirmedAt = previous?.storage?.lastSaveConfirmedAt,
+                persistent = heldWorldData,
+                volumeName = volumeName,
+                bound = bound,
+                lastSaveConfirmedAt = carried?.lastSaveConfirmedAt,
             )
         }
 
@@ -3229,6 +3305,49 @@ public class Reconciler(
  * once.
  */
 private fun StoredServer.permanentFailureStopsPasses(): Boolean = !definition.terminating
+
+/**
+ * Whether [WorkloadObservation.Present.labels] describes the **container** rather
+ * than the sandbox around it.
+ *
+ * `WorkloadView.observe` reports the container's own labels when a container
+ * exists, and the sandbox's alone when one does not — **never the two merged**.
+ * That is the whole of this predicate, and it is a question about *whose* facts
+ * are in hand rather than about what they say. `Labels.SPEC_HASH` is the one
+ * deliberate per-key exception, and it falls through in its own expression rather
+ * than through the map, so it is not reachable from here at all.
+ *
+ * The distinction is load-bearing and this sentence used to get it wrong: it said
+ * the container's labels were laid *over* the sandbox's, which is a merge, and
+ * under a merge a key the container lacks is answered by the sandbox while this
+ * predicate still says `true`. Anyone asking "can a key I read here have come from
+ * the sandbox?" reads this KDoc to find out, so the answer has to be the one the
+ * code gives.
+ *
+ * Asked by [Reconciler.Pass.storageStatus], which records what a workload was
+ * built with. It deliberately answers `CREATED` differently from
+ * [Reconciler.forbiddenTransition]'s `couldBeTheContainerTheEditIsAbout`, which
+ * excludes it: that rule asks whether replacing this container would *discard* a
+ * world, and a container that was never started holds nothing to discard; this one
+ * asks what the container that exists was built with, which its label answers
+ * whether or not it has run. Two rules over one label, answering two questions.
+ * Aligning them would be a change to one of those questions, not a tidy-up.
+ */
+private fun labelsDescribeItsContainer(state: WorkloadState): Boolean =
+    when (state) {
+        WorkloadState.CREATED, WorkloadState.RUNNING, WorkloadState.EXITED, WorkloadState.UNKNOWN -> true
+
+        // Classified without `hadContainer`, and the argument is the same one
+        // `forbiddenTransition` gives at its own arm: the labels here are the
+        // *sandbox's*, so they answer about the wrong object, and knowing a
+        // container once existed says nothing about what it was built with.
+        // Worse than useless here — a sandbox may have been built moments ago from
+        // the very edit whose reader needs protecting from it, which would launder
+        // the definition back into an observed record through the runtime. The
+        // caller carries its previous record forward instead, and this is precisely
+        // the window in which that record is the only memory there is.
+        WorkloadState.SANDBOX_ONLY -> false
+    }
 
 /**
  * Timings the loop uses when it has nothing better to go on.

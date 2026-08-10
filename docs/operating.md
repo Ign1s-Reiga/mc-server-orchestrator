@@ -171,6 +171,41 @@ want a faster signal, alert on the log line for it rather than on this flag.
 Neither case stops anything. The container keeps running and the loop keeps
 retrying in both, which is what makes the flag safe to alert on.
 
+## 7. `status.storage` is what was seen, so it can be absent — and it never names a volume
+
+`status.storage` reports the **container**, not your definition. `persistent` is
+read back off the label the loop put on the workload when it created it, so a
+server whose `spec.storage.mode` you have just edited keeps reporting what the
+container that is actually running was built with, until that container is
+replaced. That is the point: the previous behaviour reported the edit back at
+you, which is useless for telling a half-applied change from a finished one.
+
+Two consequences an operator meets directly.
+
+**The whole block can be missing, and missing means nothing has been observed.**
+A server the loop has not yet seen a workload for has no `storage` at all, and
+`VOLUME_BOUND` reads `Unknown` rather than `False`. Do not read either absence as
+"this server has no volume" — that is a different sentence, and only it would
+tell you to stop looking for a world. `False` on `VOLUME_BOUND` means the loop
+looked and there is nothing bound; `Unknown` means it has not looked yet.
+
+**`volumeName` fills in as containers are replaced, not when you upgrade.** It is
+read off a label the orchestrator puts on a container when it creates it, so a
+container that was already running before this version carries none — and it is
+*not* recreated to gain one, because labels are not part of the fingerprint that
+decides a replacement. Nothing restarts on the upgrade; the field simply arrives
+for each server the next time it is replaced for some reason of its own.
+
+So an empty `volumeName` on a long-running server is expected and is **not** a
+missing volume. The name is in your definition as `spec.storage.volume.name`,
+defaulting to `metadata.name`, and `spec.storage.mode` is what answers "does this
+server have a volume at all".
+
+One deliberate asymmetry worth knowing: a server switched to `ephemeral` **keeps**
+the last volume name it reported. That is not staleness, it is the point — it is
+the only record of which volume still holds the world the replacement stopped
+mounting, and it is where recovery starts.
+
 ---
 
 ## What to do when a drain will not finish

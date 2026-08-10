@@ -67,6 +67,78 @@ internal class WorkloadViewTest {
         observation.labels[Labels.WORLD_DATA] shouldBe "true"
     }
 
+    /**
+     * A key the container does not carry is **not** answered by the sandbox.
+     *
+     * `Present.labels` used to be `sandboxLabels + mine.labels`, which reads like
+     * "the container wins" and is only half that: the container wins for keys it
+     * *has*, and for keys it lacks the sandbox's value survives — inside the state
+     * every consumer treats as the container's own word.
+     * `Reconciler.labelsDescribeItsContainer` gates on the workload state and
+     * cannot see which map a key came from, so a container carrying no
+     * `WORLD_DATA` would have been answered by the sandbox beside it, and the rule
+     * that decides whether a world needs flushing would have read a fact about the
+     * wrong object.
+     *
+     * ## Which assertion is the pin, because it is not the obvious one
+     *
+     * **The `SAVE_CONFIRMABLE` and `volumeValue` nulls are load-bearing. Do not
+     * trim them.** The discriminating property is *a key present on the sandbox
+     * and absent on the container*, and only those two lines have it — the fixture
+     * carries two so that either alone would redden, rather than because the claim
+     * needs both.
+     *
+     * The `WORLD_DATA` assertion **cannot** detect the merge and is not the pin:
+     * the container carries `false` there, and `sandboxLabels + mine.labels` yields
+     * `false` too, so it is green either way. It earns its place as the other half
+     * of the claim — *the container wins where it has an opinion* — which a test
+     * built only from absent keys would leave unasserted.
+     *
+     * The `specHash` line guards against over-reading all of this as "sandbox
+     * labels are never useful". [Labels.SPEC_HASH] is the one key that *does* fall
+     * through, through its own expression rather than through a map merge — the
+     * shape a per-key decision has to have, because it is the only one somebody can
+     * disagree with in review.
+     */
+    @Test
+    fun `a key the container does not carry is not answered by the sandbox`() {
+        val bare =
+            container("mine").copy(
+                labels = mapOf(Labels.SERVER to server.value, Labels.WORLD_DATA to "false"),
+            )
+
+        val observation =
+            WorkloadView.observe(
+                node = node,
+                server = server,
+                sandboxId = "sandbox-1",
+                sandboxLabels =
+                    mapOf(
+                        Labels.SERVER to server.value,
+                        Labels.SPEC_HASH to "abc",
+                        Labels.WORLD_DATA to "true",
+                        Labels.SAVE_CONFIRMABLE to "true",
+                        Labels.VOLUME to "sandbox-world",
+                    ),
+                sandboxCreatedAt = at,
+                containers = listOf(bare),
+            )
+
+        // The container's own answer, not the sandbox's louder one.
+        // The container's own answer where it has one. Not the pin: under a merge
+        // this is `false` too, because the container carries the key.
+        observation.labels[Labels.WORLD_DATA] shouldBe "false"
+        // **The pin, both lines.** Present on the sandbox, absent on the container,
+        // so a merge answers them from the sandbox and only these can see it.
+        // Absent here means "this workload does not say", which every consumer
+        // answers on its own safe side.
+        observation.labels[Labels.SAVE_CONFIRMABLE] shouldBe null
+        Labels.volumeValue(observation.labels) shouldBe null
+        // …and the deliberate per-key fallback still works, which is what stops
+        // this being read as "sandbox labels are never useful".
+        observation.specHash shouldBe "abc"
+    }
+
     @Test
     fun `an empty container list is SANDBOX_ONLY, which is why the caller must ask an authoritative source`() {
         val observation = observe(emptyList())
