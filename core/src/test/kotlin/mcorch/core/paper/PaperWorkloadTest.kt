@@ -55,12 +55,35 @@ internal class PaperWorkloadTest {
      *
      * This is the claim the decision to record a fact as a *label* rests on:
      * labels are outside the fingerprint, so adding one recreates no container and
-     * drains no fleet. It could not be asserted at all until [canonicalSpec] was
-     * extracted — `specHash` returned only a digest, and there is no definition
-     * edit that adds a label without also changing a hashed field, so no
-     * comparison of two hashes can show an input to be *absent*. The property was
-     * true by reading the function and by nothing else; folding `spec.labels` in
-     * would have been caught by no test in this repository.
+     * drains no fleet.
+     *
+     * ## Read this before extending it, because the obvious instrument cannot work
+     *
+     * **Do not reach for "hash two things and compare".** Every other assertion in
+     * the sibling test does exactly that, and it is the wrong tool here for a
+     * structural reason: what is being asserted is an **absence**, and a digest
+     * comparison can only demonstrate that two inputs *differ*. To show that
+     * labels are not an input you would need a definition edit that adds a label
+     * and changes nothing else hashed — and there is none, because the label
+     * values are themselves derived from fields the hash already reads. So the
+     * input *list* has to be exposed and read. That is the whole reason
+     * [canonicalSpec] exists separately from `specHash`, and until it did, this
+     * property was true by reading the function and by nothing else: folding
+     * `spec.labels` in would have been caught by no test in this repository.
+     *
+     * The same shape shows up whenever a decision rests on something *not* being
+     * consulted. Ask what would have to be exposed before the absence is
+     * assertable at all, rather than assuming the existing instrument reaches it.
+     *
+     * ## Why keys and not values
+     *
+     * The scan is over label **keys**, and that is not a shortcut. One label value
+     * is deliberately in the hash — [Labels.VOLUME] carries the volume name and
+     * `storage.volume` is a hashed field — so a scan over values would be
+     * asserting something false. It is also the reason that label is safe to read
+     * back as an *observation* rather than as a snapshot that goes stale: renaming
+     * a volume already recreates the container, so the label and the container it
+     * sits on cannot come to disagree.
      *
      * The positive assertions are not decoration. Without them this is a scan over
      * a string that a typo in [canonicalSpec]'s name would satisfy by returning

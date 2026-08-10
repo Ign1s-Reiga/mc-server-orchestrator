@@ -328,6 +328,43 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 RESULTS="$REPO_ROOT/core/build/test-results/test"
+
+# Two runs against the same tree are not merely slow, they are **wrong, silently
+# and in the green direction**. Both back the sources up at start, both mutate the
+# same files, and each one's `restore` puts back what the *other* was measuring —
+# so a verdict is scored against source neither run wrote, and the board prints
+# "all N mutations caught" having proved nothing. Every instrument in this file
+# exists to stop exactly that class of result, and the harness itself was open to
+# it; a coordinator hit it with two concurrent runs in one tree.
+#
+# Keyed on [REPO_ROOT], not global: separate worktrees have their own sources and
+# their own `build/`, so they may run at once — that is the normal case for
+# parallel agents and blocking it would be a real cost. Two runs in *one* tree
+# never may.
+#
+# `flock` rather than a lock directory, because this harness is killed: the
+# forty-sixth round's run was cut down mid-mutation under memory pressure. A
+# kernel-held lock is released when the process dies however it dies, while a
+# `mkdir` lock left behind by a `SIGKILL` blocks every later run until somebody
+# removes it by hand — trading a silent-green for a mysterious refusal.
+#
+# Missing `flock` is a hard failure rather than a warning-and-continue. "Run
+# unlocked because the tool is absent" reintroduces the whole defect at exactly
+# the moment nobody is reading the preamble.
+LOCK_FILE="${TMPDIR:-/tmp}/mcorch-drain-wiring-$(printf '%s' "$REPO_ROOT" | cksum | cut -d' ' -f1).lock"
+if ! command -v flock >/dev/null 2>&1; then
+    echo "flock is not installed, and this harness will not run unlocked: two runs against one tree" >&2
+    echo "restore each other's mutations and the board reads green having measured nothing." >&2
+    exit 1
+fi
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo "another run of this harness already holds $LOCK_FILE for $REPO_ROOT." >&2
+    echo "Wait for it to finish: concurrent runs restore each other's mutations, so both verdicts" >&2
+    echo "would be measured against source neither run wrote." >&2
+    exit 1
+fi
+
 BACKUP_DIR="$(mktemp -d -t drain-wiring-XXXXXX)"
 
 CONTROLLER=core/src/main/kotlin/mcorch/core/DrainController.kt
