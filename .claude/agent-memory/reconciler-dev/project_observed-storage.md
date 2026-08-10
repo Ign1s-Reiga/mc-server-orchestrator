@@ -63,6 +63,39 @@ about what it was built with), which is what the `SANDBOX_ONLY` arm has to argue
 to satisfy `DrainWiringTest`'s classification scan — see
 [[classification-scan-scope]].
 
+## The label decision, and the hash question that gates every one like it
+
+`volumeName` got a producer: `Labels.VOLUME`, written by `PaperWorkloadPlanner`
+and read back the same way `persistent` reads `WORLD_DATA`. **Before doing it,
+answer "will adding a label restart the fleet"** — and answer it in two halves,
+because the first alone is not enough:
+
+1. Labels are not an input to either planner's `specHash`; both digest an
+   explicit hand-written list of *definition* fields, and `LocalNode` only ever
+   appends `SPEC_HASH` **into** the label map.
+2. **Nothing compares label maps wholesale.** Every read is a single-key lookup,
+   and replacement is decided by comparing one hash string at two sites. This is
+   the half that makes "no fleet-wide drain" a fact rather than a reading of one
+   function, and it is what the human said made the answer convincing.
+
+That answer now lives at `PaperWorkloadPlanner.plan`'s label construction rather
+than only here, because somebody will ask it again.
+
+**`canonicalSpec` had to be extracted for the claim to be assertable at all.**
+`specHash` returned only a digest, and *no definition edit adds a label without
+also changing a hashed field* — so no comparison of two hashes can show an input
+to be **absent**. The proxy planner had the split already; Paper did not. General
+rule: **a property of the form "X is not an input" needs the input list exposed,
+not the output compared.**
+
+**Absent, not empty.** The label is omitted when there is no volume, so absence
+means "the previous record stands" — which has to cover both "mounts nothing" and
+"predates the label". `WORLD_DATA` writes `false`; this one must not, or a
+workload that stopped mounting a volume erases the only record of where that
+world still lives. And the field converges **as the fleet turns over**, not at
+upgrade: labels being outside the hash is exactly why nothing is recreated to
+gain one.
+
 ## What I escalated: `volumeName` is emptied, not frozen
 
 The scope split deferred `volumeName` to the mounts plumbing and said to carry it
@@ -99,4 +132,46 @@ predicted: six, one and one. Full board 90/90.
 
 Drain-audit item 149 — a create-side guard against an ephemeral edit landing with
 no container — is still open, and is now buildable: the record it would consult is
-a memory of an observation.
+a memory of an observation. **It has to run before `ensureWorkload`, on the same
+pass.** The memory closes at `CREATED`, not at the create: once the ephemeral
+replacement exists, `labelsDescribeItsContainer(CREATED)` is true and the new
+container's `world-data=false` *correctly* replaces the carried `true`, so a guard
+one pass late reads the edit's own answer back through the container the edit
+built — item 149 closed on paper and open in fact.
+
+## Round 46: making a field observed falsifies the arguments that called it useless
+
+The audit found no criticals and three warnings, and the first is the shape to
+carry:
+
+**A justification can be falsified by a change in another module, and it fails
+open.** `PaperServerAgent`'s `holdsWorldData = worldData ?: true` — invariant 2's
+safe side — was defended partly on *"observed storage is computed from the
+definition every pass"*. Making it observed turned that into an **invitation**: a
+reader now sees a plausible second source and wires the fallback to
+`previous.storage.persistent`, which is null on rows that never said and
+correctly `false` about a *different container* one pass after a replacement. The
+default now stands on its own and names both reasons it must not be replaced.
+
+I had updated the sibling comment in `PaperWorkloadTest` and missed this one.
+**The sweep follows the claim, not the file** — same rule as
+[[prove-the-test-can-fail]]'s retired premise with no identifier to grep.
+
+**A safety property that holds by coincidence is worth replacing with one that
+holds by construction.** `WorkloadView` merged `sandboxLabels + mine.labels`,
+which reads as "the container wins" and is half that: a key the container *lacks*
+fell through to the sandbox's value, inside the state `labelsDescribeItsContainer`
+declares to be the container's own word. It was harmless only because both maps
+come from one `WorkloadSpec`, adoption is spec-hash gated, and every build wrote
+the label on the container — three unasserted facts. Now `mine?.labels ?:
+sandboxLabels`, with `SPEC_HASH`'s deliberate fall-through kept as its own
+expression one line above.
+
+**The audit leaned to pinning rather than dropping, on the risk of unchased
+consumers. Chasing them is what made the drop available**: five reads, all
+single-key, all wanting the container's answer. When an auditor hedges on a fact
+you can establish, establish it.
+
+**Two keys, not one, in the fixture.** With a merge the absent key is filled
+whichever key it is, so a one-key test cannot tell *"the container's map is used"*
+from *"this key happens to be present"*.

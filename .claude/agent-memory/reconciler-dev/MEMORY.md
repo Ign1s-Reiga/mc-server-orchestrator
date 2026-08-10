@@ -28,4 +28,4 @@
 - [Producer scan scope](project_producer-scan-scope.md) — a rule in another module keyed on a state this one produces; discovery by asking the rule, the obligation moved to the producer, the guard that fires on store-dev.
 - [Cross-module constant relation](project_cross-module-constant-relation.md) — four constants at equality decide a loop's termination; why a test, not the `require`, and which mutation is informative.
 - [Flapping escalation](project_flapping-escalation.md) — closed by a ledger plus an age gate; a count is not a duration, a codec is a second producer of an invariant, the neutral-pass traps.
-- [Observed storage](project_observed-storage.md) — a mixed type is fixed per field, not renamed; the alphabet that must disagree with its sibling; the sandbox that launders an edit; volumeName emptied, not frozen.
+- [Observed storage](project_observed-storage.md) — a mixed type is fixed per field, not renamed; the two-half hash answer that gates adding a label; making a field observed falsifies the arguments that called it useless.
