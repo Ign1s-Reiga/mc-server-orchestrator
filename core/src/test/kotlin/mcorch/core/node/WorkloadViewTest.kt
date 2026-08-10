@@ -80,15 +80,25 @@ internal class WorkloadViewTest {
      * that decides whether a world needs flushing would have read a fact about the
      * wrong object.
      *
-     * `SAVE_CONFIRMABLE` is here as the second half of the same claim rather than
-     * as decoration: with a merge, the absent key is filled from the sandbox
-     * whichever key it is, so a fixture testing one key alone cannot tell "the
-     * container's map is used" from "this particular key happens to be present".
+     * ## Which assertion is the pin, because it is not the obvious one
      *
-     * The one key that *does* fall through is [Labels.SPEC_HASH], and it does so
-     * through its own expression rather than through a map merge — which is the
-     * shape a per-key decision has to have, because it is the only one somebody
-     * can disagree with in review.
+     * **The `SAVE_CONFIRMABLE` and `volumeValue` nulls are load-bearing. Do not
+     * trim them.** The discriminating property is *a key present on the sandbox
+     * and absent on the container*, and only those two lines have it — the fixture
+     * carries two so that either alone would redden, rather than because the claim
+     * needs both.
+     *
+     * The `WORLD_DATA` assertion **cannot** detect the merge and is not the pin:
+     * the container carries `false` there, and `sandboxLabels + mine.labels` yields
+     * `false` too, so it is green either way. It earns its place as the other half
+     * of the claim — *the container wins where it has an opinion* — which a test
+     * built only from absent keys would leave unasserted.
+     *
+     * The `specHash` line guards against over-reading all of this as "sandbox
+     * labels are never useful". [Labels.SPEC_HASH] is the one key that *does* fall
+     * through, through its own expression rather than through a map merge — the
+     * shape a per-key decision has to have, because it is the only one somebody can
+     * disagree with in review.
      */
     @Test
     fun `a key the container does not carry is not answered by the sandbox`() {
@@ -115,9 +125,13 @@ internal class WorkloadViewTest {
             )
 
         // The container's own answer, not the sandbox's louder one.
+        // The container's own answer where it has one. Not the pin: under a merge
+        // this is `false` too, because the container carries the key.
         observation.labels[Labels.WORLD_DATA] shouldBe "false"
-        // Absent on the container, so absent here — "this workload does not say",
-        // which every consumer answers on its own safe side.
+        // **The pin, both lines.** Present on the sandbox, absent on the container,
+        // so a merge answers them from the sandbox and only these can see it.
+        // Absent here means "this workload does not say", which every consumer
+        // answers on its own safe side.
         observation.labels[Labels.SAVE_CONFIRMABLE] shouldBe null
         Labels.volumeValue(observation.labels) shouldBe null
         // …and the deliberate per-key fallback still works, which is what stops

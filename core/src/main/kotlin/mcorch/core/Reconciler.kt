@@ -3310,10 +3310,19 @@ private fun StoredServer.permanentFailureStopsPasses(): Boolean = !definition.te
  * Whether [WorkloadObservation.Present.labels] describes the **container** rather
  * than the sandbox around it.
  *
- * `WorkloadView.observe` lays a container's own labels over the sandbox's whenever
- * a container exists, and reports the sandbox's alone when one does not. That is
- * the whole of this predicate, and it is a question about *whose* facts are in
- * hand rather than about what they say.
+ * `WorkloadView.observe` reports the container's own labels when a container
+ * exists, and the sandbox's alone when one does not — **never the two merged**.
+ * That is the whole of this predicate, and it is a question about *whose* facts
+ * are in hand rather than about what they say. `Labels.SPEC_HASH` is the one
+ * deliberate per-key exception, and it falls through in its own expression rather
+ * than through the map, so it is not reachable from here at all.
+ *
+ * The distinction is load-bearing and this sentence used to get it wrong: it said
+ * the container's labels were laid *over* the sandbox's, which is a merge, and
+ * under a merge a key the container lacks is answered by the sandbox while this
+ * predicate still says `true`. Anyone asking "can a key I read here have come from
+ * the sandbox?" reads this KDoc to find out, so the answer has to be the one the
+ * code gives.
  *
  * Asked by [Reconciler.Pass.storageStatus], which records what a workload was
  * built with. It deliberately answers `CREATED` differently from

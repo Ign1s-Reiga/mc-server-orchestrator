@@ -115,6 +115,22 @@ internal object WorkloadView {
         // of the three and the sandbox starts answering for the container. A safety
         // property that holds by coincidence of three unrelated facts is worth
         // replacing with one that holds by construction.
+        //
+        // ## What this costs, and the wrong way to pay it
+        //
+        // **A label written only on the sandbox is now invisible here**, in exactly
+        // the states consumers trust most, and it goes missing silently — no
+        // compile error, no failing test, just a key that reads absent. Nothing
+        // today is written that way; the day something is, this is where it
+        // disappears.
+        //
+        // The correct response is **a per-key expression beside [specHash]'s**,
+        // spelling out for that one key where it may be read from and why. The
+        // response that will suggest itself first is restoring the merge, and it is
+        // the wrong one: it fixes one key by making *every* key fall through again,
+        // including the ones that decide whether a world needs flushing, and it
+        // restores the defect above in the course of fixing something unrelated to
+        // it. One key needing a fallback is not evidence that all of them do.
         val labels = mine?.labels ?: sandboxLabels
         if (mine == null) {
             return WorkloadObservation.Present(
