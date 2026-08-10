@@ -2185,3 +2185,145 @@ Related: [[standalone-paper-drain-shape]]
      understates the flag by orders of magnitude. Direction is quiet, so it is a
      doc finding — but it is the sentence an operator reads to decide whether
      silence means health.
+
+## Round 44: the verdict written on one path and read on all of them
+
+182. **A per-pass observation drafted from a fresh record erases the last pass's
+     verdict on every path that does not re-establish it.** `readControl` builds a
+     brand-new `ControlEndpointStatus` each pass, so `credential` starts `UNTESTED`
+     and only `assertBackends` refines it. Two proxy paths draft a status without
+     ever reaching `assertBackends` — `awaitProxyReady`'s non-joinable branch
+     (drafts the raw handshake record) and `drainProxy` (carries `previous.control`
+     forward untouched, while `ProxySelfLink` makes the authenticated calls that
+     would prove the verdict). The first *resets* a `REJECTED` to `UNTESTED` and
+     flips the derived `usable` green; the second freezes an `ACCEPTED` beside a
+     drain parked on the 401 that record is about. Both are exactly the "two
+     surfaces disagree about one endpoint" the field was added to end, reproduced
+     on the paths where the drain lives. Whenever a field is introduced as "the
+     verdict of this pass's calls", enumerate the passes that make no such call and
+     ask whether they *carry*, *reset*, or *freeze* it — three different answers,
+     and only carry-with-a-freshness-test is right.
+183. **A three-valued observation whose third value is the safe default is only
+     safe while nothing branches on the derived flag.** `usable =
+     reachable && compatible && credential != REJECTED` makes `UNTESTED` count as
+     not-refused. Correct for this field *because* its only consumers are
+     `deriveConditions`' `CONTROL_ENDPOINT_READY` and `:api`'s badge — the drain
+     re-establishes the credential per call through `ControlChannel` and classifies
+     a 401 as a retryable seal failure that parks, so no stop is ever authorised by
+     the flag. The KDoc headline ("whether the drain protocol can be conducted
+     through this endpoint") is a standing invitation to the first control-flow
+     consumer, and that consumer would be proceeding on an unobserved assumption.
+     Rule: a default-to-optimistic derived flag must be typed or documented as a
+     *presentation* predicate; any gate must require the positive verdict
+     (`ACCEPTED`), never `!= REJECTED`.
+184. **The remedy a message names has to work for both ways the fault is reached.**
+     A rotated control token is repairable by putting the old value back — but an
+     operator who rotated *deliberately* (leak response) must recreate the proxy
+     container, and the only orchestrator-driven recreate is a spec-hash change,
+     which starts a proxy replacement drain whose step 2 seal goes through the very
+     channel that is 401ing. So the documented remedy covers the accidental case
+     and the obvious alternative is a drain that cannot complete. Safe direction
+     (players keep playing, nothing stops, the edit is revertible) but it is the
+     shape that ends with somebody reaching for `crictl` on the front door. For
+     every operator-facing remedy, ask which *cause* of the fault it assumes.
+185. **The proxy status write-skip does not exist, and never did.**
+     `writeProxyStatus` compares `status.copy(observedAt = previous.observedAt) ==
+     previous`, while a running proxy's draft carries `control.lastContactAt`,
+     `backends.observedAt` and `players.observedAt` all set to `pass.now`. Every
+     pass writes. Do not accept "an unchanged pass does not rewrite the status" as
+     an argument for a proxy-side field's cost or safety — check the three moving
+     timestamps first. (`credential` itself is properly in `equals` and `usable`
+     properly out of it, being a body `val`.)
+186. **Still open, confirmed round 44:** `readControl`'s `ControlOutcome.Unavailable`
+     branch flattens *never attempted*, *no answer* and *answered unreadably* into
+     `reachable = false, compatible = false`. The malformed-body case is the wrong
+     one — `ControlChannel` builds `Unavailable(retryable = false)` for a body this
+     build cannot parse, i.e. an endpoint that demonstrably answered — and the
+     condition's `!reachable` arm outranks the `!compatible` arm, so the message
+     says "did not answer" and suppresses the only remedy that applies (upgrade the
+     image). `ControlCredential` does not touch this: all three cases stop the pass
+     before any authenticated call, so all three are honestly `UNTESTED`. What it
+     needs is a reason enum on the non-contact, not a credential verdict. Do not
+     mark it closed by the credential change.
+
+## Round 45: where the "same container?" question is answerable
+
+187. **A carry-forward guarded on container identity is dead code anywhere except
+     the pass that creates the container.** The create pass writes the new
+     container id into `runtime`, so every later pass compares the new id against
+     itself and the guard never fires. Round 44 prescribed the gate inside
+     `readControl`; it would have been inert there, and a mutation forcing it off
+     stayed green. The only sites where `previous.runtime.containerId` still names
+     the *old* container are the two `node.ensureWorkload` call sites in
+     `convergeProxy` (`Absent` and `SANDBOX_ONLY`). When asking "is this record
+     about the container in front of me", first ask which pass still holds the
+     predecessor's id.
+188. **The proxy replacement path never reaches its own teardown's clear.**
+     `teardownProxy`'s `control = null` / `runtime = null` block is only reached
+     with the workload observed `Absent` *and* a drain cause still standing —
+     which for a `REPLACEMENT` never happens, because after the removal the next
+     pass sees `Absent`, `outstandingStopCause` answers null (it needs a `Present`
+     observation) and `convergeProxy` builds the successor immediately. So every
+     per-container record must be cleared at the *create*, not at the teardown.
+     The same is true of the drain record, which is why `clearedDrainRecord` sits
+     at both create sites.
+189. **`recorded == null` is not the same silence as `observed == null`.**
+     `teardownProxy`'s partial-removal branch deliberately writes
+     `runtime.containerId = null` to record *"this loop removed the container, the
+     sandbox survived"*. A create-time guard of the shape `if (observed != null &&
+     recorded != null && observed != recorded) clear()` therefore **keeps** the
+     dead container's record on exactly that path — the sandbox survives, the
+     `SANDBOX_ONLY` create runs, and the successor inherits its predecessor's
+     record. `identity()` never nulls the id by accident (it falls back to the
+     previous one), so a null `recorded` is always a positive statement that no
+     container is known. Clear on it.
+190. **Scans that key on a receiver spelling.** `\bchannel\.[A-Za-z]+\(` catches
+     `channel.state()` and misses `pass.channel(node, h).state()` or any renamed
+     local. And a funnel scan scoped to one function does not cover the *other*
+     funnel: `ProxySelfLink.note` is a second, unscanned collection point, so a
+     second control call added to the proxy's own drain link drops its verdict
+     silently. When a rule has two enforcement points, the scan has to name both.
+191. **A reader-list scan that collects file *names* over a subset of modules.**
+     `usable`'s consumer list is pinned to `ServerJson.kt` + `StatusDrafting.kt`
+     by walking `:core` and `:api` only and comparing `File.name`. A gate in
+     `:store`, `:app` or `:schema`, or a second file with either name, passes. The
+     vacuity controls (file counts, positive and negative matcher probes,
+     `require(root.isDirectory)`) are genuine — the gap is scope, not vacuity.
+192. **Round 44's own W5 was wrong and the code is right: an empty proxy with a
+     refused credential *is* replaceable.** `sealIsPrecondition(router, reading)`
+     = `router != null || reading !is Empty`, `ProxyDrainSubject.router` is a
+     `get() = null`, and a proxy has no transfer and no deregister step, so on a
+     fresh zero-player reading the seal is waived and the replacement runs to the
+     stop. The park-for-ever framing holds only with players connected. Do not
+     repeat "a proxy that cannot seal can never be replaced" without checking the
+     player reading.
+193. **The justification comment whose *premise* a change falsifies while its
+     *conclusion* stays true.** `PaperServerAgent.contractOf` defends
+     `holdsWorldData = worldData ?: true` with "the last observed storage status
+     is *computed from* the definition every pass, so it agrees with the edit" —
+     a reason that stops being true the moment `StorageStatus` becomes observed.
+     The safe default is still right, but the stated reason now reads as an
+     invitation: the next reader sees a newly trustworthy second source and wires
+     the drain's fallback to `previous.storage.persistent`, moving invariant 2's
+     safe side off a literal `true` and onto a nullable runtime record. When a
+     change makes a field observed, grep every comment that argued *against*
+     consulting it — the argument, not the field, is what has to be re-derived.
+194. **A safe default protected by unasserted conjunctions.**
+     `WorkloadView.observe` merges `sandboxLabels + containerLabels`, so a key the
+     container lacks silently falls through to the sandbox's value.
+     `labelsDescribeItsContainer` discriminates by *state*, not by which map a key
+     came from, so at `CREATED`/`RUNNING`/`EXITED` that fall-through is inside the
+     trusted branch. It is harmless today only because three separate facts hold:
+     both maps are written from one `WorkloadSpec` in one `ensureWorkload` call,
+     sandbox adoption is gated on the spec hash so a persistent sandbox never
+     receives an ephemeral container, and every build has always written
+     `WORLD_DATA` on the container. None of the three is asserted anywhere. Ask
+     for the fall-through direction whenever a label gate is scoped by state.
+195. **A carried observation whose window closes at `CREATED`, not at the create.**
+     A record carried across a teardown/create gap survives only until the
+     replacement container reaches `CREATED` — at which point its own label is a
+     legitimate observation and overwrites the memory. So "there is a record to
+     ask" is true for a guard placed strictly before `node.ensureWorkload` and
+     false for one placed anywhere later, including one pass later. When a design
+     defers a guard on the strength of a record existing, pin *where in the pass*
+     that record still exists.

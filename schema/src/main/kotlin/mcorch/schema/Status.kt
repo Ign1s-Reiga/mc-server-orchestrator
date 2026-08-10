@@ -974,21 +974,122 @@ public data class BackendRoutingStatus(
 }
 
 /**
- * Whether `:core` can reach the shipped Velocity plugin, and whether they speak
- * the same protocol.
+ * What an authenticated control call to the proxy plugin did, on the pass that
+ * wrote this status.
+ *
+ * Three values and not a `Boolean`, because "we did not ask" is a real state and
+ * neither boolean answer describes it. A `Boolean` defaulting to `true` would
+ * claim a credential was accepted on every status written before the field
+ * existed, and on every pass that never made an authenticated call — a green
+ * light nobody lit. Defaulting to `false` would report a credential problem on
+ * the same rows, which is the "answering but not to us" alarm firing where
+ * nothing was observed at all. [UNTESTED] is the honest default and it is what a
+ * consumer must treat as *no evidence*, never as either verdict.
+ */
+public enum class ControlCredential {
+    /**
+     * No authenticated call was made, or none came back with a verdict.
+     *
+     * The ordinary reasons are: the handshake did not answer or reported an
+     * incompatible protocol, so the pass stopped before authenticating; the
+     * proxy is still starting; the row was written by a build that had no such
+     * field. Claims nothing either way.
+     */
+    UNTESTED,
+
+    /** An authenticated call was accepted. Establishes only that the credential is the right one. */
+    ACCEPTED,
+
+    /**
+     * The endpoint answered and refused this orchestrator's credential.
+     *
+     * The state that made this field necessary: the control token's *coordinates*
+     * are in the proxy's spec hash and its value is not, deliberately — so
+     * rotating the secret behind the reference does not recreate the container.
+     * The container keeps the token it was created with, `:core` starts sending
+     * the new one, and the unauthenticated handshake keeps reporting
+     * [ControlEndpointStatus.reachable] and [ControlEndpointStatus.compatible]
+     * while every seal, transfer and deregistration in the fleet is refused. The
+     * remedy is re-aligning the token, and it needs no definition edit.
+     */
+    REJECTED,
+    ;
+
+    /**
+     * This verdict updated by a later one taken in the same pass.
+     *
+     * The whole rule is that [UNTESTED] is *no evidence* and therefore never
+     * overwrites evidence: a call that established nothing — an endpoint that
+     * stopped answering, a refusal carrying some other code — leaves what the
+     * pass already learned alone, and anything else replaces it. Last verdict
+     * wins among the calls that had one.
+     *
+     * It lives here rather than at either caller because a pass refines this in
+     * two modules' worth of places — the routing sweep's authenticated calls and
+     * the proxy drain's own admission assertions — and two copies of a merge rule
+     * drift at whichever branch is added last. One rule, one home, one test.
+     */
+    public fun refinedBy(later: ControlCredential): ControlCredential = if (later == UNTESTED) this else later
+}
+
+/**
+ * Whether `:core` can reach the shipped Velocity plugin, whether they speak the
+ * same protocol, and whether the plugin accepts this orchestrator's credential.
  *
  * [pluginApiVersion] is what the endpoint reported, not what anybody declared —
  * [ControlEndpointSpec] explains why the spec does not pin it. [compatible] is
  * this build's verdict on that report, kept as its own field so a dashboard can
  * tell "did not answer" from "answered, wrong version": the remedies are
  * different and only one of them is "upgrade the proxy image".
+ *
+ * [credential] is the third such split, for the same reason. Answering is not
+ * answering *to us*: the handshake route needs no token by design — that is what
+ * lets a wrong credential be told from a wrong port — so [reachable] and
+ * [compatible] can both be true on a proxy that refuses every call the drain
+ * protocol is made of. Its remedy is neither "the proxy is down" nor "upgrade
+ * the image", so it is neither of those two fields.
+ *
+ * All three are observations. Nothing here is copied from a definition.
  */
 public data class ControlEndpointStatus(
     val reachable: Boolean,
     val pluginApiVersion: String? = null,
     val compatible: Boolean = false,
     val lastContactAt: Instant? = null,
-)
+    val credential: ControlCredential = ControlCredential.UNTESTED,
+) {
+    /**
+     * **A presentation predicate. Never a gate.**
+     *
+     * What it answers is "should a reader be told something is wrong with this
+     * endpoint", and its only permitted consumers are the
+     * `CONTROL_ENDPOINT_READY` condition and `:api`'s renderers. A structural
+     * test pins that list, because the sentence this KDoc used to lead with —
+     * *"whether the drain protocol can be conducted through this endpoint"* — is
+     * a standing invitation to write `if (control.usable)` before starting a
+     * drain or choosing a destination, and under **that** caller the rule below
+     * becomes "proceed on a fact nobody established".
+     *
+     * [ControlCredential.UNTESTED] counts as *not refused* rather than as *not
+     * accepted*. That asymmetry is right for a badge — requiring
+     * [ControlCredential.ACCEPTED] would light a red lamp on every starting proxy
+     * and every pass that had no reason to authenticate, and a flag that is false
+     * while nothing is wrong is the one that stops being read — and it is wrong
+     * for a gate, which must require [ControlCredential.ACCEPTED] and read the
+     * enum itself. The alarm-fatigue argument does not license the leniency; the
+     * *narrowness of the consumer list* does, which is why the list is enforced
+     * rather than described.
+     *
+     * The one derivation of the three fields, so the condition and the rendering
+     * cannot drift apart by asking slightly different questions. Derived rather
+     * than stored, so it cannot disagree with the fields it is computed from, and
+     * so it stays out of `equals` — the loop's write-skip compares statuses
+     * structurally and a derived property must not be able to make two equal
+     * records unequal.
+     */
+    public val usable: Boolean
+        get() = reachable && compatible && credential != ControlCredential.REJECTED
+}
 
 /**
  * Observed state of a [VelocityProxyDefinition].

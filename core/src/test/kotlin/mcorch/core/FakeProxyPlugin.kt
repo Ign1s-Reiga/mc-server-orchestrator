@@ -82,6 +82,18 @@ internal class FakeProxyPlugin(
     var rejectsCredential: Boolean = false
 
     /**
+     * The rotation lands *between* the pass's first authenticated call and the
+     * rest: `GET /v1/self` is accepted and every later route is 401.
+     *
+     * A window rather than a curiosity. `:core` learns the credential verdict from
+     * the first authenticated call it makes, and that call happening to be first
+     * is an ordering rather than a guarantee — the token can be re-read from the
+     * secret store between two calls of one pass. Modelled by path so the fake
+     * holds no per-pass state of its own.
+     */
+    var rejectsCredentialExceptState: Boolean = false
+
+    /**
      * The proxy accepts `PUT /v1/proxy` and goes on refusing logins whatever it was
      * asked for.
      *
@@ -161,7 +173,7 @@ internal class FakeProxyPlugin(
         // order the real transport does it: `ControlEndpoint.serve` exempts
         // `/v1/version` by path and authorises everything else before `ControlService`
         // sees the request at all.
-        if (rejectsCredential) {
+        if (rejectsCredential || (rejectsCredentialExceptState && request.path != ControlProtocol.PATH_STATE)) {
             return error(ControlErrorCode.UNAUTHENTICATED, "the bearer token is not the control token")
         }
         if (!ready) return error(ControlErrorCode.NOT_READY, "the proxy has not finished starting")

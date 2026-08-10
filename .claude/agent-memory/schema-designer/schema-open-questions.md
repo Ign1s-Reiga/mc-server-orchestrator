@@ -1,6 +1,6 @@
 ---
 name: schema-open-questions
-description: Deliberately contentious schema calls awaiting a human ruling, and what was left out of PaperServer v1alpha1 on purpose
+description: Deliberately contentious schema calls awaiting a human ruling — including the live one, StorageStatus being documented as observed while derived from desired — and what was left out of PaperServer v1alpha1 on purpose
 metadata:
   type: project
 ---
@@ -43,6 +43,28 @@ contentious, flagged for overrule:
   that at parse time. A fallback that is not a backend parses and then never routes.
 - **The proxy-side timings are on the proxy, not on the backend.** One slow backend cannot have a
   longer seal timeout than the rest of the fleet.
+
+Raised 2026-08-08 and **awaiting a ruling** — the one live question, so check the code before
+repeating it:
+
+- **`StorageStatus` is documented as observed and is derived from the desired definition.**
+  `Reconciler.Pass.storageStatus` fills `persistent` and `volumeName` from `definition.spec.storage`
+  on every pass (converge and drain both), so a volume that does not exist, or exists under another
+  name, reports exactly what was asked for. `bound` and `lastSaveConfirmedAt` on the same type *are*
+  observed, which is why the type must not be renamed wholesale. Consequence on record as
+  drain-audit item 149: a `persistent → ephemeral` edit landing in a window with no container
+  (`Absent`, `SANDBOX_ONLY`, `CREATED`) is applied with no refusal, because the loop's only memory of
+  "this server had a volume" is a field it rewrites from the edited definition. My recommendation is
+  **make it observed** — `persistent` from the running container's `Labels.WORLD_DATA` (already in
+  `WorkloadObservation.Present.labels`, no extra RPC), `volumeName` from the container's mounts
+  (`ContainerStatus.mounts`, already fetched on containerd 2.3.3 but only when the sandbox overlay
+  left `startedAt` null), the record carried forward rather than re-derived when nothing was
+  observed, and no elvis back to the definition. Non-breaking if the producer simply stops writing
+  what it did not see: `storage == null` already means "nothing observed". The rejected alternative —
+  renaming the two derived fields — costs a wire break plus a store migration and closes nothing.
+  Whoever takes this: it is a `:core` producer change plus a `:cri`→`Node` plumb, so it goes to
+  `reconciler-dev` + `cri-integration-dev` as one unit and through `drain-auditor`, because the
+  field it fixes sits next to the world-data decision.
 
 Deliberately left out of v1alpha1 (do not assume these exist):
 

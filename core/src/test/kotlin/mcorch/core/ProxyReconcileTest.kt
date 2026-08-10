@@ -9,6 +9,7 @@ import io.kotest.matchers.collections.shouldNotBeEmpty
 import io.kotest.matchers.nulls.shouldBeNull
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.types.shouldBeInstanceOf
 import mcorch.core.paper.PaperImageContract
@@ -16,6 +17,7 @@ import mcorch.core.proxy.VelocityWorkloadPlanner
 import mcorch.schema.BackendRegistration
 import mcorch.schema.ConditionStatus
 import mcorch.schema.ConditionType
+import mcorch.schema.ControlCredential
 import mcorch.schema.FailureClass
 import mcorch.schema.FailureReason
 import mcorch.schema.SecretRef
@@ -429,6 +431,15 @@ internal class ProxyReconcileTest {
      * failure on a proxy freezes its passes and with them the routing sweep, which
      * is the one thing that restores joins to a backend whose drain has parked.
      *
+     * **And on `control` itself.** It used to reach only `failure`, and this test
+     * used to assert that `reachable` and `compatible` were both true with a
+     * remark that a reader of `control` alone learns nothing is wrong. That was
+     * the defect stated as a property: a dashboard drawing a control badge from
+     * those two fields renders green on a proxy behind which nothing can be
+     * sealed, transferred or deregistered. `credential` is the third observation
+     * and it is what the badge has to read — through `usable`, which is the one
+     * derivation of the three.
+     *
      * The proxy is not stopped and not recreated: it is serving players perfectly
      * well, and this build cannot know whether the operator would rather fix the
      * secret than restart their front door.
@@ -439,11 +450,15 @@ internal class ProxyReconcileTest {
             val backend = backendDefinition("survival-01")
             val harness = ProxyHarness(backends = listOf(backend))
             harness.bringUp()
-            harness
-                .proxyStatus()
-                .shouldNotBeNull()
-                .failure
-                .shouldBeNull()
+            val healthy = harness.proxyStatus().shouldNotBeNull()
+            healthy.failure.shouldBeNull()
+
+            // The control of the control: a working proxy records the accepted
+            // verdict, so `REJECTED` below is a change this pass produced rather
+            // than the value the field always holds.
+            val before = healthy.control.shouldNotBeNull()
+            before.credential shouldBe ControlCredential.ACCEPTED
+            before.usable.shouldBeTrue()
 
             // The secret behind the reference is rotated. Nothing in the definition
             // changed, so nothing recreates the container, and the token it holds is
@@ -458,14 +473,448 @@ internal class ProxyReconcileTest {
             failure.message shouldContain "rejecting this orchestrator's credential"
 
             // The handshake still says the endpoint is there and speaks our
-            // protocol, and both are true. That is precisely why the failure above
-            // has to exist: a reader of `control` alone learns nothing is wrong.
+            // protocol, and both are still true — the version route needs no token.
+            // What has changed is the fact those two cannot express.
             val control = status.control.shouldNotBeNull()
             control.reachable.shouldBeTrue()
             control.compatible.shouldBeTrue()
+            control.credential shouldBe ControlCredential.REJECTED
+            control.usable.shouldBeFalse()
+
+            // And the condition an alerting channel quotes moves with it, naming
+            // the remedy rather than the version or the network.
+            val condition = status.conditions.single { it.type == ConditionType.CONTROL_ENDPOINT_READY }
+            condition.status shouldBe ConditionStatus.FALSE
+            condition.message shouldContain "refused this orchestrator's credential"
 
             harness.proxyNode.stops.shouldBeEmpty()
             harness.proxyNode.removals.shouldBeEmpty()
+        }
+
+    /**
+     * The same verdict arriving by the other door.
+     *
+     * `:core` learns whether the plugin accepts its credential from the pass's
+     * *first* authenticated call, `GET /v1/self`, and that call being first is an
+     * ordering rather than a guarantee: the token is re-read per call, so a
+     * rotation can land between it and the backend assertions that follow. A
+     * verdict only one call site can write is one that goes missing the day the
+     * order changes — and what goes missing here is a control endpoint reading
+     * `usable` while every registration it is being sent is refused.
+     */
+    @Test
+    fun `a credential refused after the first call still lands on the control record`() =
+        coreTest {
+            val harness = ProxyHarness(backends = listOf(backendDefinition("survival-01")))
+            harness.bringUp()
+
+            harness.plugin.rejectsCredentialExceptState = true
+            harness.sweep()
+
+            val status = harness.proxyStatus().shouldNotBeNull()
+            val control = status.control.shouldNotBeNull()
+            // The handshake answered and so did `/v1/self`, so nothing before the
+            // backend assertions saw anything wrong.
+            control.reachable.shouldBeTrue()
+            control.compatible.shouldBeTrue()
+            control.credential shouldBe ControlCredential.REJECTED
+            control.usable.shouldBeFalse()
+            status.failure.shouldNotBeNull().reason shouldBe FailureReason.PROXY_CONTROL_UNREACHABLE
+        }
+
+    /**
+     * A pass that authenticates nothing may not erase what a pass that did
+     * established.
+     *
+     * The handshake needs no token, so `readControl` cannot establish a verdict —
+     * and it builds the record. Built from scratch, `credential` re-enters
+     * `UNTESTED` every pass and only the routing sweep refines it, so any pass
+     * that does not reach the sweep **deletes** the verdict. The reachable one is
+     * this: the proxy's player port stops answering, `awaitProxyReady` returns at
+     * the not-joinable branch, and a proxy recorded `REJECTED` comes back with
+     * `usable` true and `CONTROL_ENDPOINT_READY` TRUE — the badge going green
+     * because a *second*, unrelated thing broke.
+     *
+     * The record is therefore seeded from the previous one, exactly as
+     * `lastContactAt` already is.
+     */
+    @Test
+    fun `a pass that makes no authenticated call keeps the verdict rather than erasing it`() =
+        coreTest {
+            val harness = ProxyHarness(backends = listOf(backendDefinition("survival-01")))
+            harness.bringUp()
+
+            harness.plugin.rejectsCredential = true
+            harness.sweep()
+            harness
+                .proxyStatus()
+                .shouldNotBeNull()
+                .control
+                .shouldNotBeNull()
+                .credential shouldBe
+                ControlCredential.REJECTED
+
+            // The player port stops answering. This pass returns before
+            // `assertBackends` and makes no authenticated call at all — the
+            // handshake is the only thing it asks, and that route needs no token.
+            harness.proxyNode.joinable = false
+            harness.sweep()
+
+            val status = harness.proxyStatus().shouldNotBeNull()
+            val control = status.control.shouldNotBeNull()
+            control.reachable.shouldBeTrue()
+            control.credential shouldBe ControlCredential.REJECTED
+            control.usable.shouldBeFalse()
+            // And the surface an alerting channel reads does not flip to green
+            // because a second thing broke.
+            status.conditions.single { it.type == ConditionType.CONTROL_ENDPOINT_READY }.status shouldBe
+                ConditionStatus.FALSE
+        }
+
+    /**
+     * The seed is a verdict about a *container*, so a replacement does not inherit
+     * one.
+     *
+     * The token lives in the container's environment, put there at create time. A
+     * refusal earned by the container that is being replaced says nothing about
+     * its successor, which was created from whatever the secret store holds now —
+     * and carrying it across would report a credential fault on a proxy that has
+     * never been asked, with no pass able to clear it until an authenticated call
+     * lands.
+     */
+    @Test
+    fun `a replaced proxy container does not inherit its predecessor's refusal`() =
+        coreTest {
+            val harness = ProxyHarness()
+            val name = harness.proxyDefinition.metadata.name
+            harness.bringUp()
+            harness.plugin.rejectsCredential = true
+            harness.sweep()
+            harness
+                .proxyStatus()
+                .shouldNotBeNull()
+                .control
+                .shouldNotBeNull()
+                .credential shouldBe
+                ControlCredential.REJECTED
+            val replaced =
+                harness
+                    .proxyStatus()
+                    .shouldNotBeNull()
+                    .runtime
+                    .shouldNotBeNull()
+                    .containerId
+
+            // **The endpoint goes dark before the replacement**, and that is what
+            // makes this test able to see the gate at all. Left answering, the
+            // sweep on the new container authenticates and writes `ACCEPTED` — so
+            // the assertion would hold whether the old verdict was carried across
+            // or not, and would be measuring the refinement rather than the seed.
+            // With no authenticated call possible, the only thing that can decide
+            // the field is what the seed did with it.
+            //
+            // Zero players, so the replacement drain's seal is waived and the
+            // container is genuinely replaced despite the dead endpoint.
+            harness.plugin.unreachable = true
+            harness.declare(proxyDefinition(maxPlayers = 300))
+            repeat(12) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+
+            val status = harness.proxyStatus().shouldNotBeNull()
+            status.runtime.shouldNotBeNull().containerId shouldNotBe replaced
+            val control = status.control.shouldNotBeNull()
+            control.reachable.shouldBeFalse()
+            // `UNTESTED`, not the predecessor's `REJECTED`: this container has
+            // never been asked. A seed with no identity gate reports a credential
+            // fault here — on a proxy that may hold a perfectly good token — and
+            // nothing can clear it while the endpoint stays down.
+            control.credential shouldBe ControlCredential.UNTESTED
+        }
+
+    /**
+     * The state that defeated the first version of this guard: a **partial
+     * removal**.
+     *
+     * `teardownProxy` nulls `runtime.containerId` deliberately when the container
+     * went and the sandbox did not — that field is how the loop records *this
+     * removal happened*. The guard was written as "clear when both ids are known
+     * and differ", so on the pass that finally creates the replacement the
+     * recorded id was null, the condition was false, and the new container
+     * inherited the removed one's `reachable`, `compatible`, `pluginApiVersion`
+     * and credential. Two different nulls had been lumped together: an
+     * under-reporting runtime, and the loop's own statement that it took the
+     * container away.
+     *
+     * Driven through `WorkloadRemoval(containerRemoved = true, sandboxRemoved =
+     * false)` rather than by assigning the node's workload, which is the reason
+     * the sibling test below did not catch it: mutating the observation leaves the
+     * *status* carrying the old id, so the case never arises.
+     */
+    @Test
+    fun `a replacement after a partial removal does not inherit the removed container's record`() =
+        coreTest {
+            val harness = ProxyHarness()
+            val name = harness.proxyDefinition.metadata.name
+            harness.bringUp()
+            harness.plugin.rejectsCredential = true
+            harness.sweep()
+            val refused = harness.proxyStatus().shouldNotBeNull()
+            refused.control.shouldNotBeNull().credential shouldBe ControlCredential.REJECTED
+            val replaced =
+                refused.runtime
+                    .shouldNotBeNull()
+                    .containerId
+                    .shouldNotBeNull()
+
+            // The endpoint goes dark, so nothing can re-establish a verdict and the
+            // assertion is about what the create did with the old record.
+            harness.plugin.unreachable = true
+            // The container goes; the sandbox teardown fails. This is the shape
+            // that writes `runtime.containerId = null` into the status.
+            harness.proxyNode.sandboxRemovalFails = true
+            harness.declare(proxyDefinition(maxPlayers = 300))
+
+            var partialRemovalRecorded = false
+            repeat(20) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+                val status = harness.proxyStatus()
+                if (!partialRemovalRecorded && status?.runtime != null && status.runtime?.containerId == null) {
+                    partialRemovalRecorded = true
+                    // …and the retry gets the sandbox, so the replacement is built.
+                    harness.proxyNode.sandboxRemovalFails = false
+                }
+            }
+
+            // The scenario really happened: without this the assertions below hold
+            // for a run that never partially removed anything.
+            partialRemovalRecorded.shouldBeTrue()
+            harness.proxyNode.containerRemovals.shouldNotBeEmpty()
+
+            val status = harness.proxyStatus().shouldNotBeNull()
+            status.runtime.shouldNotBeNull().containerId shouldNotBe replaced
+            status.control?.credential shouldNotBe ControlCredential.REJECTED
+        }
+
+    /**
+     * The other create, and the same rule — reached the way it happens in
+     * practice: the container is gone and its sandbox is not.
+     *
+     * `convergeProxy` builds a container into the surviving sandbox, so this is a
+     * second site where the record of the *previous* process must not be handed
+     * to the new one. It exists because a mutation proved it uncovered: the
+     * replacement test above goes through the `Absent` branch, and a clear
+     * deleted from this branch alone changed nothing that any test could see.
+     * Both creates now have one.
+     */
+    @Test
+    fun `a container rebuilt into a surviving sandbox starts with no control record`() =
+        coreTest {
+            val harness = ProxyHarness()
+            val name = harness.proxyDefinition.metadata.name
+            harness.bringUp()
+            harness.plugin.rejectsCredential = true
+            harness.sweep()
+            harness
+                .proxyStatus()
+                .shouldNotBeNull()
+                .control
+                .shouldNotBeNull()
+                .credential shouldBe
+                ControlCredential.REJECTED
+
+            // The container disappears from under the loop; the sandbox stays.
+            val present = harness.proxyNode.workload.shouldBeInstanceOf<WorkloadObservation.Present>()
+            harness.proxyNode.workload =
+                present.copy(
+                    handle = present.handle.copy(containerId = null),
+                    state = WorkloadState.SANDBOX_ONLY,
+                )
+            // …and the endpoint is down, so nothing can re-establish a verdict and
+            // the assertion below is about the create rather than about the sweep.
+            harness.plugin.unreachable = true
+
+            repeat(4) {
+                harness.pass(name)
+                harness.clock.advance(2.seconds)
+            }
+
+            val status = harness.proxyStatus().shouldNotBeNull()
+            status.runtime.shouldNotBeNull().containerId shouldNotBe present.handle.containerId
+            // Either cleared outright or re-observed as untested — never the
+            // predecessor's refusal, which is what this container would be
+            // reported with on a record inherited across the create.
+            status.control?.credential shouldNotBe ControlCredential.REJECTED
+        }
+
+    /**
+     * A drain pass that cannot reach the endpoint keeps the verdict rather than
+     * dropping it.
+     *
+     * The same rule as the converging path, applied where the drain writes the
+     * record: `refinedBy` treats a call that established nothing as no evidence,
+     * so an endpoint that refused the credential and then went down stays
+     * `REJECTED`. Dropping it here is worse than on a converge, because a drain
+     * that parks on a refused seal would then park with a record saying nothing is
+     * wrong with the endpoint it could not use.
+     *
+     * This is the behavioural half of the merge rule — `ControlCredentialTest`
+     * asserts the rule on the type, and this is a consumer that can see it break.
+     */
+    @Test
+    fun `a drain pass that cannot reach the endpoint keeps the refusal it recorded`() =
+        coreTest {
+            val harness = ProxyHarness()
+            val name = harness.proxyDefinition.metadata.name
+            harness.bringUp()
+            harness.proxyNode.online = 2
+            harness.plugin.rejectsCredential = true
+            harness.sweep()
+            val refused =
+                harness
+                    .proxyStatus()
+                    .shouldNotBeNull()
+                    .control
+                    .shouldNotBeNull()
+            refused.credential shouldBe ControlCredential.REJECTED
+            val contactedAt = refused.lastContactAt
+
+            // The endpoint stops answering entirely, and a hash-bearing edit puts
+            // the proxy on the drain path — where every seal call is now
+            // unanswerable and establishes nothing.
+            harness.plugin.unreachable = true
+            harness.declare(proxyDefinition(maxPlayers = 300))
+            harness.pass(name)
+            harness.clock.advance(2.seconds)
+            harness.pass(name)
+
+            val status = harness.proxyStatus().shouldNotBeNull()
+            status.drain.shouldNotBeNull()
+            val control = status.control.shouldNotBeNull()
+            control.credential shouldBe ControlCredential.REJECTED
+            control.usable.shouldBeFalse()
+            // And nothing claimed contact that did not happen: an unanswered call
+            // leaves the stamp where it was, or the freshness it reports is this
+            // loop's liveness rather than the proxy's.
+            control.lastContactAt shouldBe contactedAt
+        }
+
+    /**
+     * The drain path writes the proxy's status and never reaches the routing
+     * sweep, and it is the path whose authenticated calls matter most.
+     *
+     * A replacement drain seals the fleet's front door through the same control
+     * endpoint. When that endpoint refuses the credential, step 2 cannot be
+     * asserted and the drain parks — with a `status.failure` saying exactly that.
+     * The control record used to be untouched on this path (`drainProxy` drafts
+     * without a `control` argument, so it defaults to the previous record, and
+     * `readControl` is never called), so the same status carried
+     * `credential = ACCEPTED, usable = true` **beside** that failure: two surfaces
+     * disagreeing about one endpoint, on the one path where a stop is pending.
+     *
+     * Players are online deliberately. On an empty proxy the seal is *waived* —
+     * `sealIsPrecondition` is false for a subject with no router and a fresh
+     * zero-player reading — and the drain would carry on to the stop; the
+     * disagreement this pins is the parked one.
+     */
+    @Test
+    fun `a proxy drain that cannot seal records the refusal on the control record`() =
+        coreTest {
+            val harness = ProxyHarness()
+            val name = harness.proxyDefinition.metadata.name
+            harness.bringUp()
+            harness.proxyNode.online = 3
+            harness.plugin.rejectsCredential = true
+
+            // A hash-bearing edit, so these passes drain rather than converge.
+            // Two, which is what the parked-replacement case takes: the first
+            // observes the hash it no longer matches, the second runs step 2 and
+            // meets the refusal.
+            harness.declare(proxyDefinition(maxPlayers = 300))
+            harness.pass(name)
+            harness.clock.advance(2.seconds)
+            harness.pass(name)
+
+            val status = harness.proxyStatus().shouldNotBeNull()
+            // On the drain path: the record exists and the seal is what failed.
+            status.drain.shouldNotBeNull()
+            status.failure.shouldNotBeNull().message shouldContain "refused"
+            val control = status.control.shouldNotBeNull()
+            control.credential shouldBe ControlCredential.REJECTED
+            control.usable.shouldBeFalse()
+            // The proxy is still up. A refused seal parks the drain; it does not
+            // take the front door away.
+            harness.proxyNode.stops.shouldBeEmpty()
+        }
+
+    /**
+     * The other direction of the same field, and the reason it is three-valued.
+     *
+     * A proxy whose control endpoint has never answered has established *nothing*
+     * about the credential — no authenticated call was ever made, because every
+     * pass stops at the handshake. Recording `REJECTED` there would put a
+     * credential alarm on every network blip, and recording `ACCEPTED` would be a
+     * green light nobody lit; `UNTESTED` is what was observed. `usable` is false
+     * all the same, off `reachable` — an untested credential is *not refused*, and
+     * the flag still reports the endpoint unusable because a different field says
+     * so.
+     *
+     * **This test previously asserted the opposite of its second half** — that an
+     * endpoint going unreachable *reset* an established verdict to `UNTESTED` —
+     * and that assertion was the round-44 defect written down: a pass that
+     * authenticates nothing was erasing what a pass that did had learned, so a
+     * `REJECTED` proxy went green the moment a second thing broke. Rewritten
+     * rather than deleted, because the distinction it was reaching for is real and
+     * is now stated where it holds: `UNTESTED` is for having *no* evidence, not
+     * for losing it.
+     */
+    @Test
+    fun `a credential never established reads untested, and one already established survives`() =
+        coreTest {
+            // No prior observation at all: the endpoint is dead before the proxy
+            // ever comes up, so nothing was ever seeded in.
+            val harness = ProxyHarness(backends = listOf(backendDefinition("survival-01")))
+            harness.plugin.unreachable = true
+            harness.bringUp()
+
+            val fresh =
+                harness
+                    .proxyStatus()
+                    .shouldNotBeNull()
+                    .control
+                    .shouldNotBeNull()
+            fresh.reachable.shouldBeFalse()
+            fresh.credential shouldBe ControlCredential.UNTESTED
+            fresh.usable.shouldBeFalse()
+
+            // The endpoint comes back and a sweep authenticates against it.
+            harness.plugin.unreachable = false
+            harness.sweep()
+            harness
+                .proxyStatus()
+                .shouldNotBeNull()
+                .control
+                .shouldNotBeNull()
+                .credential shouldBe
+                ControlCredential.ACCEPTED
+
+            // …and goes away again. The pass learns nothing about the credential,
+            // so it says nothing about it: the verdict stands, and `usable` is
+            // false because `reachable` is.
+            harness.plugin.unreachable = true
+            harness.sweep()
+
+            val lost =
+                harness
+                    .proxyStatus()
+                    .shouldNotBeNull()
+                    .control
+                    .shouldNotBeNull()
+            lost.reachable.shouldBeFalse()
+            lost.credential shouldBe ControlCredential.ACCEPTED
+            lost.usable.shouldBeFalse()
         }
 
     /**

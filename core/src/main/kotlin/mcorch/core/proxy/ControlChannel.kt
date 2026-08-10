@@ -261,10 +261,25 @@ internal class ControlChannel(
      * is what a `PROXY_CONTROL_UNREACHABLE` on a *backend* then carries. The
      * **proxy's own** status is a residual: `Reconciler.readControl` discards this
      * detail and reports `reachable = false`, so a fleet with no backend draining
-     * sees "the control endpoint did not answer" and not the field. Closing that
-     * needs a place on `ControlEndpointStatus` for "answering is not the problem",
-     * which is the same field the `UNAUTHENTICATED` branch in `assertBackends` is
-     * waiting for.
+     * sees "the control endpoint did not answer" and not the field.
+     *
+     * **This is not the credential field, and `ControlEndpointStatus.credential`
+     * does not close it.** That note used to say the two wanted the same field;
+     * they do not, and sending the next reader to `credential` wastes a round.
+     * `credential` is the verdict of an authenticated call that was *made*. Every
+     * case that lands here made none: the request was never built (this
+     * function), the endpoint did not answer, or it answered a body this build
+     * cannot parse. `UNTESTED` is honest for all three and says nothing about any
+     * of them.
+     *
+     * What closing it needs is a **reason for the non-contact** — an enum on the
+     * status distinguishing "never attempted" from "no answer" from "answered
+     * unreadably", the last of which is an endpoint that demonstrably answered
+     * while the record claims `reachable = false`. Note the sharper half: the
+     * `CONTROL_ENDPOINT_READY` message tests `!reachable` *before* `!compatible`,
+     * so an unreadable answer is reported as "did not answer" and the one remedy
+     * that applies — upgrade the image — is suppressed. That, and not the
+     * discarded string, is the cost of the flattening.
      */
     private fun <T> unbuildable(
         verb: HttpVerb,

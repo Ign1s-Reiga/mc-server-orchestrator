@@ -10,9 +10,11 @@ import mcorch.core.proxy.ControlOutcome
 import mcorch.core.proxy.ProxySelfLink
 import mcorch.core.proxy.VelocityProxyAgent
 import mcorch.core.proxy.VelocityWorkloadPlanner
+import mcorch.core.proxy.credentialVerdict
 import mcorch.schema.BackendRegistration
 import mcorch.schema.BackendRoutingStatus
 import mcorch.schema.BackendStatus
+import mcorch.schema.ControlCredential
 import mcorch.schema.ControlEndpointStatus
 import mcorch.schema.DrainState
 import mcorch.schema.FailureClass
@@ -608,6 +610,12 @@ public class Reconciler(
                         // that no longer existed. It dies where the replacement is
                         // built — see [clearedDrainRecord].
                         drain = clearedDrainRecord(pass.previous?.drain, observation, pass.hadContainer),
+                        // And the same rule for the control record, which is *also*
+                        // about the container rather than about the definition:
+                        // whether the endpoint answered, which protocol it spoke and
+                        // whether it accepted this build's token are three facts
+                        // about the process that was running. See [controlOfCreated].
+                        control = controlOfCreated(pass, created),
                     ),
                 ) {
                     ReconcileOutcome.Progressed("proxy workload created")
@@ -632,8 +640,9 @@ public class Reconciler(
                                 ServerPhase.CREATING,
                                 image = image,
                                 runtime = pass.identity(created),
-                                // The other create, and the same rule.
+                                // The other create, and the same two rules.
                                 drain = clearedDrainRecord(pass.previous?.drain, observation, pass.hadContainer),
+                                control = controlOfCreated(pass, created),
                                 failure = blocker,
                             ),
                         ) { ReconcileOutcome.Progressed("proxy container created in the existing sandbox") }
@@ -832,7 +841,12 @@ public class Reconciler(
                 endpoint = endpoint,
                 players = players,
                 backends = routing.status,
-                control = control,
+                // `routing.control`, never the `control` handed to it: the
+                // handshake cannot see whether the plugin accepts this
+                // orchestrator's credential, and drafting the unrefined record
+                // here is exactly the "reachable and compatible beside a failure
+                // saying nothing can be sealed" that the field exists to end.
+                control = routing.control,
                 // A drain that had aborted and then became unnecessary leaves a
                 // stale record behind, and a joinable proxy means it is over —
                 // unless this proxy has a stop of its own outstanding, which is a
@@ -854,12 +868,52 @@ public class Reconciler(
         }
     }
 
-    /** The handshake, turned into the observation a dashboard reads. */
+    /**
+     * The handshake, turned into the observation a dashboard reads.
+     *
+     * ## The credential is carried in, not started fresh
+     *
+     * This asks `GET /v1/version`, which needs no token, so **no branch here can
+     * establish a credential verdict** — and a record built from scratch every
+     * pass would therefore erase one. That is not hypothetical: the branch above
+     * that handles a proxy whose player port stops answering never reaches
+     * `assertBackends`, so a proxy recorded `REJECTED` would come back `UNTESTED`
+     * on the first unanswered ping, flipping `usable` false→true and
+     * `CONTROL_ENDPOINT_READY` FALSE→TRUE on exactly the surface the field was
+     * added to stop lighting. The pass learned nothing about the credential, so
+     * it says nothing about it: the previous verdict is seeded in and only a
+     * later authenticated call replaces it, by the same rule `lastContactAt`
+     * already follows.
+     *
+     * ## Where "is this the same container" is answered, and why not here
+     *
+     * A verdict is about the token inside a particular container, so a
+     * replacement must not inherit the refusal its predecessor earned — and this
+     * is **the wrong place to ask**, which was found by mutation rather than by
+     * reading. A gate here comparing the observed container id against
+     * `previous.runtime.containerId` is dead code: the create pass writes the new
+     * id into `runtime` two passes before anything calls this, so by the time the
+     * comparison runs the two always agree. The question is answered at
+     * [controlOfCreated], on the pass that builds the container, where the
+     * recorded id is still the old one.
+     *
+     * ## A new field on [ControlEndpointStatus] inherits the erasing default
+     *
+     * Every branch below **constructs** the record rather than copying the
+     * previous one, so a field added to the type and not named here is reset on
+     * every pass — which is the defect the seed above exists to fix, waiting for
+     * the next field, and nothing scans for it. Whoever adds one decides
+     * explicitly whether the *handshake* establishes it: if it does not, seed it
+     * from `previous` the way [ControlEndpointStatus.credential] and
+     * `lastContactAt` are.
+     */
     private suspend fun readControl(
         pass: ProxyPass,
         channel: ControlChannel,
-    ): ControlEndpointStatus =
-        when (val outcome = channel.version()) {
+    ): ControlEndpointStatus {
+        val previous = pass.previous?.control
+        val credential = previous?.credential ?: ControlCredential.UNTESTED
+        return when (val outcome = channel.version()) {
             is ControlOutcome.Answered -> {
                 ControlEndpointStatus(
                     reachable = true,
@@ -869,21 +923,29 @@ public class Reconciler(
                     // arrow is that this build cannot hold a stale copy.
                     compatible = outcome.value.compatible,
                     lastContactAt = pass.now,
+                    credential = credential,
                 )
             }
 
             is ControlOutcome.Refused -> {
-                ControlEndpointStatus(reachable = true, compatible = false, lastContactAt = pass.now)
+                ControlEndpointStatus(
+                    reachable = true,
+                    compatible = false,
+                    lastContactAt = pass.now,
+                    credential = credential,
+                )
             }
 
             is ControlOutcome.Unavailable -> {
                 ControlEndpointStatus(
                     reachable = false,
                     compatible = false,
-                    lastContactAt = pass.previous?.control?.lastContactAt,
+                    lastContactAt = previous?.lastContactAt,
+                    credential = credential,
                 )
             }
         }
+    }
 
     /**
      * Asserts the routing table, every pass, from the fleet.
@@ -929,6 +991,13 @@ public class Reconciler(
                         "build does not. No backend behind it can complete a drain"
                 }
             return ProxyRouting(
+                // Carried forward, not refined: this pass stopped before
+                // authenticating, so it says nothing about the credential. **Not
+                // `UNTESTED`** — that is the erasure `readControl` was fixed to
+                // stop ten lines above, and writing it here would restore it on
+                // this path. `control` already holds whatever the last pass that
+                // did authenticate established.
+                control = control,
                 status = pass.previous?.backends,
                 failure =
                     recordFailure(
@@ -959,8 +1028,24 @@ public class Reconciler(
         // would turn that absence into an outbound `DELETE` against a live backend.
         val listing = store.listAll()
         val matched = pass.backends(listing)
+        // What this pass's authenticated calls established, seeded with what the
+        // handshake carried in. **Every** `ControlOutcome` below goes through
+        // `noting`, rather than a test per site: the justification for reading the
+        // verdict off the backend `PUT` as well as off `state()` — a verdict only
+        // one call site can write is one that goes missing the day the order
+        // changes — applies verbatim to the deregistration sweep and to the
+        // proxy's own admission assertion, and writing it three times is how the
+        // fourth site gets forgotten. `ControlCredential.refinedBy` is the rule:
+        // an outcome that establishes nothing leaves the verdict alone.
+        var credential = control.credential
+
+        fun <T> noting(outcome: ControlOutcome<T>): ControlOutcome<T> {
+            credential = credential.refinedBy(outcome.credentialVerdict())
+            return outcome
+        }
+
         val registered =
-            when (val state = channel.state()) {
+            when (val state = noting(channel.state())) {
                 is ControlOutcome.Answered -> {
                     state.value
                 }
@@ -983,13 +1068,14 @@ public class Reconciler(
                 // is wrong once, in the operator's terms, and skips assertions that
                 // could not have landed.
                 //
-                // It reaches `failure` and not `control`: `ControlEndpointStatus`
-                // has no field for "answering, but not to us", so a dashboard shows
+                // It reaches `control` as well as `failure`. The status field is
+                // `ControlEndpointStatus.credential`, and this branch is what fills
+                // it with `REJECTED`: without it a dashboard reads
                 // `reachable = true, compatible = true` beside a failure saying
-                // nothing can be sealed. **When that field lands, fill it from this
-                // branch.** The temptation is a second, authenticated probe inside
-                // `readControl`, which would be one more round trip per pass to
-                // learn what this `when` already knows.
+                // nothing can be sealed, and the two surfaces disagree about the
+                // same endpoint. The temptation is a second, authenticated probe
+                // inside `readControl`, which would be one more round trip per pass
+                // to learn what this `when` already knows.
                 is ControlOutcome.Refused if state.code == ControlErrorCode.UNAUTHENTICATED -> {
                     val message =
                         "the proxy's control endpoint is answering but rejecting this orchestrator's " +
@@ -999,6 +1085,11 @@ public class Reconciler(
                             "until the token they share is the same one again"
                     LOG.error("proxy={} is refusing this orchestrator's control token: {}", pass.name, message)
                     return ProxyRouting(
+                        // `credential`, which the funnel has already set to
+                        // `REJECTED` from this very outcome. Naming the value here
+                        // again would be a second derivation of the verdict, one
+                        // `when` arm away from the one that decides it.
+                        control = control.copy(credential = credential),
                         status = pass.previous?.backends,
                         failure =
                             recordFailure(
@@ -1044,7 +1135,7 @@ public class Reconciler(
             // has parked out of routing for ever — the running, invisible,
             // unreachable server this level trigger exists to repair.
             val admits = !backend.sealed
-            when (val outcome = channel.assertBackend(backend.server, address, admits)) {
+            when (val outcome = noting(channel.assertBackend(backend.server, address, admits))) {
                 is ControlOutcome.Answered -> {
                     statuses +=
                         BackendStatus(
@@ -1114,7 +1205,7 @@ public class Reconciler(
                 listing.unreadable.mapNotNull { it.name?.lowercase() }.toSet()
         registered?.backends?.filter { it.name.lowercase() !in wanted }?.forEach { stale ->
             ResourceName.of(stale.name).getOrNull()?.let { name ->
-                when (val outcome = channel.deregister(name)) {
+                when (val outcome = noting(channel.deregister(name))) {
                     is ControlOutcome.Answered -> {
                         LOG.info(
                             "deregistered `{}` from proxy={}: no definition matches its backend selector any more",
@@ -1150,10 +1241,17 @@ public class Reconciler(
                 ?.state
                 ?.sealsBackend() == true
         val anyAdmitting = matched.any { !it.sealed }
-        channel.assertProxyAdmission(admits = !proxyDraining && anyAdmitting)
+        // Through the funnel like every other call. Its outcome was discarded
+        // outright, which was survivable while nothing read it — and became
+        // load-bearing the moment a credential verdict existed, because this is
+        // the proxy's **own login seal** and a 401 here is the fleet's front door
+        // refusing the orchestrator in silence. The result is still not branched
+        // on: what the sweep does about a refused proxy admission is unchanged.
+        noting(channel.assertProxyAdmission(admits = !proxyDraining && anyAdmitting))
 
         val routing = BackendRoutingStatus(observedAt = pass.now, backends = statuses)
         return ProxyRouting(
+            control = control.copy(credential = credential),
             status = routing,
             failure =
                 problem?.let {
@@ -1171,6 +1269,16 @@ public class Reconciler(
     private class ProxyRouting(
         val status: BackendRoutingStatus?,
         val failure: FailureStatus?,
+        /**
+         * The control record the handshake produced, refined by whatever the
+         * pass's *authenticated* calls then learned.
+         *
+         * It is returned rather than drafted at the call site because the verdict
+         * only exists here: `readControl` runs before this and asks the one route
+         * that needs no token, so it cannot answer "does the plugin accept us".
+         * The caller drafts this record, never the one it passed in.
+         */
+        val control: ControlEndpointStatus,
     )
 
     /**
@@ -1227,6 +1335,12 @@ public class Reconciler(
                         ?.let { pass.identity(it) }
                         ?: pass.previous?.runtime,
                 players = progress.occupancy ?: pass.previous?.players,
+                // What the seal's own authenticated calls just learned. This path
+                // never reaches `assertBackends`, so without this the record would
+                // freeze at whatever the last converging pass wrote — and a proxy
+                // whose replacement drain parks on a 401 seal would render a usable
+                // control endpoint beside a failure saying the seal was refused.
+                control = drainedControl(pass, seal),
                 drain = progress.drain,
                 // A copy, and it must stay one — see the note on `Reconciler.drain`.
                 failure = progress.drain.failure,
@@ -1235,6 +1349,96 @@ public class Reconciler(
             return write(pass, status, mustRecord = progress.sideEffectIssued) { progress.outcome }
         }
         return teardownProxy(pass, node, observation, status, cause)
+    }
+
+    /**
+     * The control record a newly built workload starts with: **none of the
+     * previous one's, when the container is not the previous one.**
+     *
+     * Every field of [ControlEndpointStatus] is a fact about a process: whether
+     * it answered, which protocol it spoke, when it last did, and whether it
+     * accepted this build's token. A replacement inherits none of them. The
+     * credential is the sharpest — a refusal earned by the container being
+     * replaced would be reported against its successor, which was created from
+     * whatever the secret store holds now — but `reachable = true` beside a
+     * container nothing has ever contacted is the same lie in a quieter field.
+     *
+     * This is the site because it is the last one where `previous.runtime` still
+     * names the **old** container: the draft here writes the new id, so every
+     * later pass compares the new id against itself. The replacement path never
+     * passes through the teardown's `control = null` — converge builds the
+     * successor on the pass that first observes the workload absent — so without
+     * this the stale record survives the whole replacement.
+     *
+     * Adoption keeps its record: an `ensureWorkload` that found the container
+     * already there returns the same id, so the guard does not fire and a pass
+     * that created nothing throws nothing away.
+     *
+     * ## Kept on *confirmed* identity, never on an absence
+     *
+     * The rule is positive — keep only when both ids are known and equal — and
+     * that is the round-45 correction. It was written as its negation ("clear
+     * when both are known and differ") on the reasoning that an unreported id is
+     * not a new container, which is sound for [readControl]'s seed and does not
+     * transfer here, because the two nulls are not the same null:
+     *
+     * - `observed == null` is the runtime under-reporting, and a create that
+     *   cannot say which container it built is not evidence that the record
+     *   describes it.
+     * - `recorded == null` is **not silence at all**. The one thing that nulls
+     *   `runtime.containerId` is [teardownProxy], deliberately, to record *this
+     *   loop removed the container and the sandbox survived*. So the state the
+     *   negative form failed on is the state that says loudest that the old
+     *   container is gone — a partial removal, after which the successor
+     *   inherited a dead process's `reachable`, `compatible`, `pluginApiVersion`
+     *   and credential.
+     *
+     * What the positive form costs is a record dropped when a create cannot name
+     * its container: the next converging pass re-establishes it from the
+     * handshake and an authenticated call, and until then the status says
+     * nothing rather than something wrong. That is the right way round at a site
+     * whose whole subject is a container that has just come into existence.
+     */
+    private fun controlOfCreated(
+        pass: ProxyPass,
+        created: WorkloadObservation.Present,
+    ): ControlEndpointStatus? {
+        val previous = pass.previous ?: return null
+        val recorded = previous.runtime?.containerId
+        val observed = created.handle.containerId
+        return previous.control.takeIf { observed != null && observed == recorded }
+    }
+
+    /**
+     * The control record a drain pass writes, refreshed from the calls the seal
+     * made on this pass.
+     *
+     * Only ever a refinement of the record already held: a seal call proves the
+     * endpoint answered and, on a 401, that it refuses this build — but it asks
+     * `PUT /v1/proxy` and never the handshake, so it establishes nothing about
+     * the *protocol version* and must not be allowed to invent a record where
+     * there is none. A proxy with no control observation yet keeps having none;
+     * `compatible` would otherwise default to `false` and claim an incompatible
+     * plugin this pass never spoke to.
+     *
+     * [ControlCredential.refinedBy] is the same merge rule the routing sweep
+     * uses, so a drain and a converge cannot disagree about what a verdict-less
+     * call means.
+     */
+    private fun drainedControl(
+        pass: ProxyPass,
+        seal: ProxySelfLink?,
+    ): ControlEndpointStatus? {
+        val previous = pass.previous?.control ?: return null
+        if (seal == null) return previous
+        return previous.copy(
+            // Contact, in the same sense `readControl` records it: an answer,
+            // refusal included. An unreachable endpoint leaves the stamp alone
+            // rather than moving it, or the freshness it reports is this loop's
+            // liveness rather than the proxy's.
+            lastContactAt = if (seal.answered) pass.now else previous.lastContactAt,
+            credential = previous.credential.refinedBy(seal.observed),
+        )
     }
 
     private suspend fun teardownProxy(
@@ -1398,6 +1602,22 @@ public class Reconciler(
         }
     }
 
+    /**
+     * The proxy's status write, with the same unchanged-status skip a server's
+     * has — and **the skip does not fire on a running proxy.**
+     *
+     * Recorded because it is the sort of thing an argument gets built on. The
+     * comparison below is sound, but a converging proxy's draft stamps
+     * `control.lastContactAt`, `backends.observedAt` and `players.observedAt` all
+     * to this pass's `now`, so the drafted status differs from the previous one on
+     * every pass whatever the fleet is doing: a running proxy rewrites its row
+     * each time, and did before the credential field existed. Invariant 5 holds —
+     * idempotence is about side effects, and nothing game-side repeats — but
+     * *"an unchanged pass does not rewrite"* is **not available as an argument on
+     * the proxy path**, for status churn, for store load, or for anything that
+     * infers quiescence from a resourceVersion that stopped moving. Anything
+     * resting on it needs a different support.
+     */
     private suspend fun writeProxyStatus(
         pass: ProxyPass,
         status: VelocityProxyStatus,
