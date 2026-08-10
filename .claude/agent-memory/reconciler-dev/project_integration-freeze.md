@@ -1,6 +1,6 @@
 ---
 name: integration-freeze
-description: The "integration stall" was never a stall — runBlocking parented the reconcile loop, so a passing test could never return. Resolved, with the two things that identified it
+description: The "integration stall" was never a stall — runBlocking parented the reconcile loop, so a passing test could never return. Resolved, with the two things that identified it, plus why two concurrent integration runs on the shared dev containerd report a permanent create failure that is not yours
 metadata:
   type: project
 ---
@@ -56,6 +56,31 @@ quiet, establish *first* whether the loop is stalled or merely unable to return
 component broke. And when two symptoms appear together in a system this
 asynchronous, check whether they are actually one thing before assuming they
 are.
+
+## The dev containerd is one shared instance, and two runs collide
+
+Observed 2026-08-06. `:app:integrationTest` cannot run concurrently with another
+agent's copy of it: the sandbox *name* is derived from the fixture, so the second
+run gets `failed to reserve sandbox name "mcorch-it-bringup_…" is reserved for
+<sandbox id>` and the orchestrator reports it as
+`CONTAINER_CREATE_FAILED/PERMANENT` with the "something on this node holds the
+name without carrying this orchestrator's labels" message. **That reads exactly
+like a real regression against your own change**, and it is not — it is the
+neighbouring run's live sandbox.
+
+- Check `pgrep -f integrationTest` **before** starting one, and expect it while
+  `cri-integration-dev` or `integration-tester` is working. Only one of the
+  processes there is yours.
+- Do not clean up sandboxes to unblock yourself: on a shared instance the orphan
+  may be somebody's running fixture. Report the sandbox id and hand it over.
+- A killed run leaves no JUnit XML at all, and no XML is an *unknown*, never a
+  pass — the same rule the mutation harnesses apply. Two of my runs were killed
+  mid-flight (one by a Gradle daemon stop) and neither said anything about the
+  code.
+
+The same contention also produced an `HttpTimeoutException` in an unrelated
+`:api` test while the integration suite was loading the machine. A single
+timeout-shaped failure under load is worth re-running before diagnosing.
 
 See [[localnode-test-gap]] for why so little of this is reachable from unit
 tests at all.
