@@ -88,6 +88,7 @@ internal class ControlCredentialWiringTest {
     @Test
     fun `the funnel scan sees an unfunnelled call whatever the receiver is called`() {
         val alphabet = channelCalls()
+
         fun calls(line: String): Boolean = alphabet.any { codeOf(line).contains("$it(") }
 
         calls("            when (val outcome = channel.deregister(name)) {") shouldBe true
@@ -190,15 +191,6 @@ internal class ControlCredentialWiringTest {
     }
 
     /**
-     * Every `.kt` main source in every module, as paths relative to this one.
-     *
-     * All of them, not `:core` and `:api`: a gate on the flag is no less a gate
-     * for being written in `:app` or `:store`, and the scan's claim is about the
-     * repository rather than about the two modules that happen to read it today.
-     * `:schema`'s own declaration file is the single exclusion, named by path,
-     * because the property is declared and documented there.
-     */
-    /**
      * Whether these lines *read* the derived flag.
      *
      * Two conditions, and the second is what lets the first be wide. The token is
@@ -219,6 +211,15 @@ internal class ControlCredentialWiringTest {
         return knowsTheRecord && code.any { USABLE.containsMatchIn(it) }
     }
 
+    /**
+     * Every `.kt` main source in every module, as paths relative to this one.
+     *
+     * All of them, not `:core` and `:api`: a gate on the flag is no less a gate
+     * for being written in `:app` or `:store`, and the scan's claim is about the
+     * repository rather than about the two modules that happen to read it today.
+     * `:schema`'s own declaration file is the single exclusion, named by path,
+     * because the property is declared and documented there.
+     */
     private fun everyModuleSource(): List<File> =
         MODULES.flatMap { module ->
             val root = File("../$module/src/main/kotlin")
