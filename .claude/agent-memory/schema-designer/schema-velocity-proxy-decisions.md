@@ -80,6 +80,14 @@ implements the proxy side of the drain protocol, and most of them are arguments 
   was written, was dead, and only a mutation found it — the test covering it was measuring the sweep
   that re-establishes the verdict. Whenever a status field is *about the process rather than the
   definition*, ask both questions separately and write the answers at the two sites.
+- **The retirement rule must be a *positive* identity test, because "no recorded container id" is not
+  silence** (round 45). Written as "clear when both ids are known and differ", it walked past a
+  partial removal: `teardownProxy` nulls `runtime.containerId` deliberately, to record that the loop
+  took the container away and the sandbox survived — so the state that says loudest *the old
+  container is gone* was the one state the guard treated as "no evidence of a new container". Keep on
+  confirmed identity (`observed != null && observed == recorded`) and neither absence can be read as
+  evidence. Generally: before writing `x == null` into a guard, find every writer of `x` and ask
+  whether any of them nulls it as a *statement* rather than for want of an answer.
 - **Deliberately left out of the proxy:** any Velocity/Minecraft version field (the image is already
   pinned and a proxy speaks all protocols — unlike Paper, whose launcher image downloads a build per
   version), forced hosts, motd, compression, a plugin list (the reconciler mounts the shipped plugin),

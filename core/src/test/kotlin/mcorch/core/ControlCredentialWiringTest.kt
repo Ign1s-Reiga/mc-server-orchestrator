@@ -22,6 +22,17 @@ import java.io.File
  * presentation predicate, and its leniency — an untested credential counts as not
  * refused — is only sound while nothing gates on it. Its KDoc says so; this is
  * what makes the sentence enforcement rather than decoration.
+ *
+ * ## Red-proofing this file needs `--rerun-tasks --no-build-cache`
+ *
+ * These scans read **other modules'** sources, which are not inputs to
+ * `:core:test`. So a sabotage planted in `:app` — a gate on the flag, exactly the
+ * thing the scan exists to catch — leaves this task up to date, and `cleanTest`
+ * does not help: the outputs come back out of the build cache and the tests never
+ * execute. The run exits 0 and reads as a *surviving mutation* when in truth
+ * nothing was measured. Verified: the same mutation reads GREEN under
+ * `:core:cleanTest :core:test` and RED under
+ * `:core:test --rerun-tasks --no-build-cache`.
  */
 internal class ControlCredentialWiringTest {
     /**

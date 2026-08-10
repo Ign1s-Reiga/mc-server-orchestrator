@@ -7,3 +7,4 @@
 - [What a violation may repeat back](schema-violation-message-rules.md) — the no-echo rule on secret paths, why `describe()` names shapes, the accepted residuals.
 - [Queued findings need their own fact](feedback_queued-findings-need-their-own-fact.md) — check each parked finding against the field you actually added; two "same field" findings were not.
 - [Proxy status write cadence](project_proxy-status-write-cadence.md) — the unchanged-status skip cannot fire on a running proxy; do not rest an argument on it.
+- [Red-proofing a cross-module scan](feedback_cross-module-scan-red-proof.md) — a mutation outside the module under test reads GREEN from the build cache; force the re-run.
