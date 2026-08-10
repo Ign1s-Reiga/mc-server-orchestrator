@@ -2297,3 +2297,33 @@ Related: [[standalone-paper-drain-shape]]
      stop. The park-for-ever framing holds only with players connected. Do not
      repeat "a proxy that cannot seal can never be replaced" without checking the
      player reading.
+193. **The justification comment whose *premise* a change falsifies while its
+     *conclusion* stays true.** `PaperServerAgent.contractOf` defends
+     `holdsWorldData = worldData ?: true` with "the last observed storage status
+     is *computed from* the definition every pass, so it agrees with the edit" —
+     a reason that stops being true the moment `StorageStatus` becomes observed.
+     The safe default is still right, but the stated reason now reads as an
+     invitation: the next reader sees a newly trustworthy second source and wires
+     the drain's fallback to `previous.storage.persistent`, moving invariant 2's
+     safe side off a literal `true` and onto a nullable runtime record. When a
+     change makes a field observed, grep every comment that argued *against*
+     consulting it — the argument, not the field, is what has to be re-derived.
+194. **A safe default protected by unasserted conjunctions.**
+     `WorkloadView.observe` merges `sandboxLabels + containerLabels`, so a key the
+     container lacks silently falls through to the sandbox's value.
+     `labelsDescribeItsContainer` discriminates by *state*, not by which map a key
+     came from, so at `CREATED`/`RUNNING`/`EXITED` that fall-through is inside the
+     trusted branch. It is harmless today only because three separate facts hold:
+     both maps are written from one `WorkloadSpec` in one `ensureWorkload` call,
+     sandbox adoption is gated on the spec hash so a persistent sandbox never
+     receives an ephemeral container, and every build has always written
+     `WORLD_DATA` on the container. None of the three is asserted anywhere. Ask
+     for the fall-through direction whenever a label gate is scoped by state.
+195. **A carried observation whose window closes at `CREATED`, not at the create.**
+     A record carried across a teardown/create gap survives only until the
+     replacement container reaches `CREATED` — at which point its own label is a
+     legitimate observation and overwrites the memory. So "there is a record to
+     ask" is true for a guard placed strictly before `node.ensureWorkload` and
+     false for one placed anywhere later, including one pass later. When a design
+     defers a guard on the strength of a record existing, pin *where in the pass*
+     that record still exists.
