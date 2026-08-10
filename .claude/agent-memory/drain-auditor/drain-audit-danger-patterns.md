@@ -2308,17 +2308,21 @@ Related: [[standalone-paper-drain-shape]]
      safe side off a literal `true` and onto a nullable runtime record. When a
      change makes a field observed, grep every comment that argued *against*
      consulting it — the argument, not the field, is what has to be re-derived.
-194. **A safe default protected by unasserted conjunctions.**
-     `WorkloadView.observe` merges `sandboxLabels + containerLabels`, so a key the
-     container lacks silently falls through to the sandbox's value.
-     `labelsDescribeItsContainer` discriminates by *state*, not by which map a key
-     came from, so at `CREATED`/`RUNNING`/`EXITED` that fall-through is inside the
-     trusted branch. It is harmless today only because three separate facts hold:
-     both maps are written from one `WorkloadSpec` in one `ensureWorkload` call,
-     sandbox adoption is gated on the spec hash so a persistent sandbox never
-     receives an ephemeral container, and every build has always written
-     `WORLD_DATA` on the container. None of the three is asserted anywhere. Ask
-     for the fall-through direction whenever a label gate is scoped by state.
+194. **A safe default protected by unasserted conjunctions.** *(Closed round 47
+     — `observe` now answers `mine?.labels ?: sandboxLabels`. Kept because the
+     shape recurs.)* `WorkloadView.observe` merged `sandboxLabels +
+     containerLabels`, so a key the container lacked silently fell through to the
+     sandbox's value. `labelsDescribeItsContainer` discriminates by *state*, not
+     by which map a key came from, so at `CREATED`/`RUNNING`/`EXITED` that
+     fall-through sat inside the trusted branch. It was harmless only because
+     three separate facts held: both maps are written from one `WorkloadSpec` in
+     one `ensureWorkload` call, sandbox adoption is gated on the spec hash so a
+     persistent sandbox never receives an ephemeral container, and every build has
+     always written `WORLD_DATA` on the container. None of the three was asserted
+     anywhere. Ask for the fall-through direction whenever a label gate is scoped
+     by state. `Labels.SPEC_HASH` still falls through and should: it does so in
+     its own one-key expression, which is the shape a per-key safety decision has
+     to have.
 195. **A carried observation whose window closes at `CREATED`, not at the create.**
      A record carried across a teardown/create gap survives only until the
      replacement container reaches `CREATED` — at which point its own label is a
@@ -2327,3 +2331,37 @@ Related: [[standalone-paper-drain-shape]]
      false for one placed anywhere later, including one pass later. When a design
      defers a guard on the strength of a record existing, pin *where in the pass*
      that record still exists.
+
+196. **Auditing the *removal* of a fallback is a different job from auditing the
+     fallback.** The question is not "was the old value ever wrong" but "for every
+     consumer, what does the new `null` mean, and does it land on the safe side".
+     Round 47's `sandboxLabels + mine.labels` → `mine?.labels ?: sandboxLabels`
+     moved three keys from possibly-answered-by-the-sandbox to absent, and the
+     three consumer families answer absence in opposite directions:
+     *safe-defaulting readers* (`holdsWorldData = worldData ?: true`,
+     `saveConfirmable ?: declaresSaveChannel`, `storageStatus`'s carry-forward)
+     get **stricter** — a stop now demands a confirmed save where it might not
+     have; a *positive-label guard* (`Reconciler.forbiddenTransition`, which
+     refuses a persistent→ephemeral edit only on `WORLD_DATA == true`) **loses
+     coverage**, because absence is its pass-through. One edit therefore moves
+     safety in both directions at once, and only the second direction needs
+     arguing. Here it was acceptable — the un-refused edit still drains under
+     `holdsWorldData = true`, and nothing in this repo ever deletes a volume — but
+     the asymmetry is the thing to look for: enumerate readers by *how they treat
+     absence*, not by which key they read.
+197. **A predicate's KDoc that describes the producer it gates.** Round 47 left
+     `Reconciler.labelsDescribeItsContainer` saying "`WorkloadView.observe` lays a
+     container's own labels **over** the sandbox's" one commit after `observe`
+     stopped doing that. The predicate stayed correct; the sentence a future
+     reader consults to answer "can a key here be the sandbox's?" now answers yes
+     when the code answers no — which is an invitation to restore the merge or to
+     lean on a sandbox backstop that is gone. When a producer's shape changes,
+     grep for the *consumers' notes that describe the producer*, not only the
+     producer's own.
+198. **A new label written on the sandbox only is now invisible.** Since
+     `Present.labels` is the container's map alone whenever a container exists,
+     any future sandbox-scoped label (a network or port fact, say) reads as absent
+     in exactly the state a consumer trusts most. The fix is not to restore the
+     merge: it is a per-key expression next to `SPEC_HASH`'s. Check any new
+     `Labels.*` constant for which object it is written on and how `observe`
+     surfaces it.
