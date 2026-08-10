@@ -2582,13 +2582,24 @@ public class Reconciler(
                 // teardown and the next create is refused by nothing, and converges
                 // onto an empty world beside an orphaned volume. It still cannot be
                 // closed from here, and the reason has changed: [Pass.storageStatus]
-                // no longer overwrites the record from the desired definition, so a
-                // pass later there *is* a record to ask — the last container's own
+                // no longer overwrites the record from the desired definition, so
+                // there *is* a record to ask — the last container's own
                 // `WORLD_DATA`, carried across the window where nothing can be
-                // observed. Closing the gap means a guard in front of the create
-                // that consults it, which is a different call site and its own
-                // change. Widening this arm instead would freeze every replacement
-                // of an always-ephemeral lobby on advice that does not apply to it.
+                // observed.
+                //
+                // **A guard that consults it has to run before `ensureWorkload`,
+                // on the same pass**, and that is a correctness constraint rather
+                // than a preference about where to put it. The memory closes at
+                // `CREATED`, not at the create: once the ephemeral replacement
+                // exists, [labelsDescribeItsContainer] is true of `CREATED`, and
+                // the new container's own `world-data=false` correctly replaces the
+                // carried `true`. A guard placed one pass later therefore reads the
+                // edit's own answer back, laundered through the container the edit
+                // built, and closes item 149 on paper while leaving it open in
+                // fact.
+                //
+                // Widening this arm instead would freeze every replacement of an
+                // always-ephemeral lobby on advice that does not apply to it.
                 WorkloadState.CREATED, WorkloadState.SANDBOX_ONLY -> false
             }
         if (!couldBeTheContainerTheEditIsAbout) return null

@@ -88,11 +88,34 @@ internal object WorkloadView {
                 .filter { it.labels[Labels.SERVER] == server.value }
                 .maxByOrNull { it.createdAt ?: Instant.EPOCH }
         val handle = WorkloadHandle(node = node, sandboxId = sandboxId, containerId = mine?.id)
+        // The one key that falls through from the container to the sandbox, and it
+        // does so *explicitly*, one key at a time. That is the shape a per-key
+        // decision has to have — see below for what happens when it is a map merge
+        // instead.
         val specHash = mine?.labels?.get(Labels.SPEC_HASH) ?: sandboxLabels[Labels.SPEC_HASH]
-        // The container's labels over the sandbox's. They are what a drain reads
-        // to find out what this workload was built with, so they are reported as
-        // the runtime holds them and nothing here interprets them.
-        val labels = if (mine != null) sandboxLabels + mine.labels else sandboxLabels
+        // The container's labels when there is a container, the sandbox's only when
+        // there is not, and **never the two merged**. They are what a drain reads to
+        // find out what this workload was built with, so they are reported as the
+        // runtime holds them and nothing here interprets them.
+        //
+        // This was `sandboxLabels + mine.labels`, which looks like "the container's
+        // labels win" and is not: a key the *container* lacks falls through to the
+        // *sandbox's* value, inside the branch every consumer treats as the
+        // container's own word. `Reconciler.labelsDescribeItsContainer` gates on the
+        // workload state, which cannot see which map a key came from, so a container
+        // that carries no `WORLD_DATA` would be answered by the sandbox standing
+        // beside it — a fact about the wrong object, handed to the rule that decides
+        // whether a world needs flushing.
+        //
+        // Nothing was broken by it, but only through a conjunction that nothing
+        // asserted: both maps are built from one `WorkloadSpec` inside one
+        // `ensureWorkload`, adoption is gated on the spec hash so a persistent
+        // sandbox never receives an ephemeral container, and every build so far has
+        // written every label on the container as well as the sandbox. Break any one
+        // of the three and the sandbox starts answering for the container. A safety
+        // property that holds by coincidence of three unrelated facts is worth
+        // replacing with one that holds by construction.
+        val labels = mine?.labels ?: sandboxLabels
         if (mine == null) {
             return WorkloadObservation.Present(
                 handle = handle,

@@ -73,23 +73,45 @@ internal class PaperServerAgent(
      *   confirm a save through a listener the running container never started.
      *
      * Both are recreate-level changes, so the drain that applies them runs
-     * against the *old* container. The facts come off the workload's own labels;
-     * a workload created before those labels existed reports none, and the
-     * definition is the only thing left to go on.
+     * against the *old* container. The facts come off the workload's own labels,
+     * and a workload created before those labels existed reports none. What
+     * happens then differs per fact and is argued at each field below — one takes
+     * a fixed safe answer and the other falls back to the definition. Neither
+     * consults observed status, and the note on [WorkloadContract.holdsWorldData]
+     * says why that is not an oversight to correct.
      */
     fun contractOf(observation: WorkloadObservation.Present): WorkloadContract {
         val worldData = Labels.booleanValue(observation.labels, Labels.WORLD_DATA)
         val saveChannel = Labels.booleanValue(observation.labels, Labels.SAVE_CONFIRMABLE)
         return WorkloadContract(
             // An absent label means "this workload does not say", which is not
-            // the same as "no" — and there is no second source worth asking.
-            // The definition is the thing being edited; the last observed
-            // storage status is *computed from* the definition every pass, so
-            // it agrees with the edit within one pass of it landing. Both would
-            // answer "ephemeral" for a container holding a world, the drain
-            // would find nothing to flush, and the container would stop with
-            // the world in it. So this is the safe side and nothing else:
-            // CLAUDE.md invariant 2 says default to persistent.
+            // the same as "no". The literal `true` is CLAUDE.md invariant 2's
+            // safe side and is **not a guess waiting to be improved on**: a
+            // container that might hold a world is drained as though it does, so
+            // the worst case is a flush nobody needed rather than a world nobody
+            // saved.
+            //
+            // **Do not wire this to observed status.** That is now the tempting
+            // edit and it is the dangerous one. `StorageStatus.persistent` used
+            // to be computed from the definition every pass, which made it
+            // obviously worthless here; it is read off *this same label* now,
+            // which makes it look like a second opinion. It is not one, for two
+            // independent reasons, and each is enough on its own:
+            //
+            // - it is **absent** on every row that has never recorded a storage
+            //   block, so the fallback would be null exactly on the population
+            //   with the least other evidence — the same shape as the elvis that
+            //   drain-audit item 148 caught; and
+            // - it legitimately describes a **different container**. One pass
+            //   after an ephemeral replacement reaches `CREATED` it reads `false`
+            //   correctly, about the new container, while this question is being
+            //   asked about the old one.
+            //
+            // Either reading moves the safe side off a literal onto a nullable
+            // record, and the failure is a drain finding nothing to flush on a
+            // container holding a world. The definition is no better and for the
+            // older reason: it is the thing being edited, and the edit is why
+            // this question is being asked at all.
             holdsWorldData = worldData ?: true,
             // The save channel has no safe side in the same way: assuming one
             // exists costs a retryable failure, assuming it does not costs a

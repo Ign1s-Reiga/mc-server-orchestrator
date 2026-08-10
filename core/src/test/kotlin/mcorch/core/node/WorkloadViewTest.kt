@@ -67,6 +67,64 @@ internal class WorkloadViewTest {
         observation.labels[Labels.WORLD_DATA] shouldBe "true"
     }
 
+    /**
+     * A key the container does not carry is **not** answered by the sandbox.
+     *
+     * `Present.labels` used to be `sandboxLabels + mine.labels`, which reads like
+     * "the container wins" and is only half that: the container wins for keys it
+     * *has*, and for keys it lacks the sandbox's value survives — inside the state
+     * every consumer treats as the container's own word.
+     * `Reconciler.labelsDescribeItsContainer` gates on the workload state and
+     * cannot see which map a key came from, so a container carrying no
+     * `WORLD_DATA` would have been answered by the sandbox beside it, and the rule
+     * that decides whether a world needs flushing would have read a fact about the
+     * wrong object.
+     *
+     * `SAVE_CONFIRMABLE` is here as the second half of the same claim rather than
+     * as decoration: with a merge, the absent key is filled from the sandbox
+     * whichever key it is, so a fixture testing one key alone cannot tell "the
+     * container's map is used" from "this particular key happens to be present".
+     *
+     * The one key that *does* fall through is [Labels.SPEC_HASH], and it does so
+     * through its own expression rather than through a map merge — which is the
+     * shape a per-key decision has to have, because it is the only one somebody
+     * can disagree with in review.
+     */
+    @Test
+    fun `a key the container does not carry is not answered by the sandbox`() {
+        val bare =
+            container("mine").copy(
+                labels = mapOf(Labels.SERVER to server.value, Labels.WORLD_DATA to "false"),
+            )
+
+        val observation =
+            WorkloadView.observe(
+                node = node,
+                server = server,
+                sandboxId = "sandbox-1",
+                sandboxLabels =
+                    mapOf(
+                        Labels.SERVER to server.value,
+                        Labels.SPEC_HASH to "abc",
+                        Labels.WORLD_DATA to "true",
+                        Labels.SAVE_CONFIRMABLE to "true",
+                        Labels.VOLUME to "sandbox-world",
+                    ),
+                sandboxCreatedAt = at,
+                containers = listOf(bare),
+            )
+
+        // The container's own answer, not the sandbox's louder one.
+        observation.labels[Labels.WORLD_DATA] shouldBe "false"
+        // Absent on the container, so absent here — "this workload does not say",
+        // which every consumer answers on its own safe side.
+        observation.labels[Labels.SAVE_CONFIRMABLE] shouldBe null
+        Labels.volumeValue(observation.labels) shouldBe null
+        // …and the deliberate per-key fallback still works, which is what stops
+        // this being read as "sandbox labels are never useful".
+        observation.specHash shouldBe "abc"
+    }
+
     @Test
     fun `an empty container list is SANDBOX_ONLY, which is why the caller must ask an authoritative source`() {
         val observation = observe(emptyList())

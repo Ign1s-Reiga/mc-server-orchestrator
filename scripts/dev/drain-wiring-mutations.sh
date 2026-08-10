@@ -213,6 +213,13 @@
 #            be swept rather than renamed, so these two are re-anchored one level in,
 #            on the producer and on its absence branch, and the class that judges them
 #            is the one that holds a status field's provenance.
+#   D79      the map all of those reads come from. `WorkloadView` merged the
+#            sandbox's labels under the container's, so a key the *container* lacked
+#            fell through to the sandbox's value inside the state every consumer
+#            treats as the container's own word — and the gate that decides "these
+#            labels describe the container" is scoped by workload state, which
+#            cannot see which map a key came from. It was harmless only by a
+#            conjunction of three unasserted facts; the mutation restores the merge.
 #   D76..D78 the same field at its other two ends. D76 writes the volume label for a
 #            workload that mounts nothing, which is the sentinel spelling the
 #            omission exists to avoid. D77 folds a label into the hash input — the
@@ -343,6 +350,9 @@ PAPER_WORKLOAD=core/src/main/kotlin/mcorch/core/paper/PaperWorkload.kt
 # Where a label is *read* off a workload, including the lenient parse that keeps an
 # unreadable one from failing a pass.
 LABELS=core/src/main/kotlin/mcorch/core/Labels.kt
+# Where a sandbox and the container inside it are turned into one observation, and
+# where a label stops being the sandbox's and starts being the container's.
+VIEW=core/src/main/kotlin/mcorch/core/node/WorkloadView.kt
 PROXY_AGENT=core/src/main/kotlin/mcorch/core/proxy/VelocityProxyAgent.kt
 FLEET=core/src/main/kotlin/mcorch/core/ProxyFleet.kt
 
@@ -358,6 +368,7 @@ STOP_GRACE=mcorch.core.node.StopGraceGuardTest
 UNBUILDABLE=mcorch.core.UnbuildableRequestTest
 STORAGE=mcorch.core.StorageObservationTest
 PAPER_PLAN=mcorch.core.paper.PaperWorkloadTest
+WORKLOAD_VIEW=mcorch.core.node.WorkloadViewTest
 
 # The test cases, by name. A mutation names the ones it must redden and no others.
 EXIT='nothing leaves advance that has not been through the record-level rule'
@@ -472,6 +483,7 @@ OBSERVED_VOLUME='a settled server records the volume its container mounts'
 LABEL_OMITTED='a persistent workload names its volume and an ephemeral one carries no such label'
 HASH_TAKES_NO_LABEL='the spec hash lists definition fields, and no label the planner writes is one of them'
 UNREADABLE_LABEL='an unreadable volume label says nothing rather than failing a pass'
+CONTAINERS_OWN_MAP='a key the container does not carry is not answered by the sandbox'
 VOLUME_FOLLOWS_CONTAINER='a volume rename does not move the record until the container it names is replaced'
 VOLUME_SURVIVES_EPHEMERAL='a workload that stops mounting a volume keeps the name of the one that holds the world'
 VOLUME_PREDATING_CONTAINER='a container that predates the volume label does not clear the recorded name'
@@ -925,6 +937,12 @@ HASH_TAKES_A_LABEL='            add("maxPlayers=${spec.maxPlayers}")
 # converging for a reason that has nothing to do with it.
 VOLUME_PARSE_LENIENT='        labels[VOLUME]?.let { ResourceName.of(it).getOrNull() }'
 VOLUME_PARSE_STRICT='        labels[VOLUME]?.let { ResourceName.of(it).getOrThrow() }'
+# The sandbox answering for the container. `sandboxLabels + mine.labels` reads as
+# "the container wins" and is only half that: a key the container *lacks* falls
+# through to the sandbox`'"'"'s value, inside the state every consumer treats as the
+# container`'"'"'s own word. The forty-sixth audit`'"'"'s third warning.
+CONTAINER_LABELS_ALONE='        val labels = mine?.labels ?: sandboxLabels'
+CONTAINER_LABELS_MERGED='        val labels = if (mine != null) sandboxLabels + mine.labels else sandboxLabels'
 # The same erasure through a fallback, which is the shape a fix for the above keeps
 # growing back: "stop deriving X from the wrong source" followed by "and when there
 # is nothing to carry forward, derive X from the wrong source". It reaches only the
@@ -1478,6 +1496,10 @@ MUTATIONS=(
     # And the read, which is the one place a value written by something that is not
     # this build reaches the loop.
     "D78@@$LABELS@@$PAPER_PLAN@@$UNREADABLE_LABEL@@$VOLUME_PARSE_LENIENT@@$VOLUME_PARSE_STRICT"
+    # …and the map those reads come from. The merge is the shape that makes the
+    # state-scoped gate a half-truth: it decides *which container* the labels are
+    # about and cannot see that one key came from the sandbox instead.
+    "D79@@$VIEW@@$WORKLOAD_VIEW@@$CONTAINERS_OWN_MAP@@$CONTAINER_LABELS_ALONE@@$CONTAINER_LABELS_MERGED"
     # The round's instrument, proved on the shape it exists for: a classification of a
     # workload state that decides `SANDBOX_ONLY` with neither the fact nor a word about
     # doing without it. D62A is the same arm with a comment that explains the branch
@@ -1553,6 +1575,7 @@ restore() {
             PaperServerAgent.kt) cp -- "$backup" "$REPO_ROOT/$PAPER_AGENT" ;;
             PaperWorkload.kt) cp -- "$backup" "$REPO_ROOT/$PAPER_WORKLOAD" ;;
             Labels.kt) cp -- "$backup" "$REPO_ROOT/$LABELS" ;;
+            WorkloadView.kt) cp -- "$backup" "$REPO_ROOT/$VIEW" ;;
             VelocityProxyAgent.kt) cp -- "$backup" "$REPO_ROOT/$PROXY_AGENT" ;;
             ProxyFleet.kt) cp -- "$backup" "$REPO_ROOT/$FLEET" ;;
         esac
@@ -1597,6 +1620,7 @@ cp -- "$REPO_ROOT/$CHANNEL" "$BACKUP_DIR/ControlChannel.kt"
 cp -- "$REPO_ROOT/$PAPER_AGENT" "$BACKUP_DIR/PaperServerAgent.kt"
 cp -- "$REPO_ROOT/$PAPER_WORKLOAD" "$BACKUP_DIR/PaperWorkload.kt"
 cp -- "$REPO_ROOT/$LABELS" "$BACKUP_DIR/Labels.kt"
+cp -- "$REPO_ROOT/$VIEW" "$BACKUP_DIR/WorkloadView.kt"
 cp -- "$REPO_ROOT/$PROXY_AGENT" "$BACKUP_DIR/VelocityProxyAgent.kt"
 cp -- "$REPO_ROOT/$FLEET" "$BACKUP_DIR/ProxyFleet.kt"
 
