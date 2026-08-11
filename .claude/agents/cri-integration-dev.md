@@ -3,6 +3,7 @@ name: cri-integration-dev
 description: Owns the CRI client in :cri — generating gRPC stubs from the CRI .proto with the Gradle protobuf plugin and grpc-kotlin, and wrapping them in an idiomatic Kotlin client. Use proactively for anything touching containerd: sandbox and container lifecycle, image pulls, the proto build setup, or CRI call failures. Follow the generate-cri-stubs skill for the proto pipeline.
 tools: Read, Grep, Glob, Edit, Write, Bash, WebFetch
 model: inherit
+effort: high
 permissionMode: acceptEdits
 isolation: worktree
 memory: project

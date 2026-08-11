@@ -3,6 +3,7 @@ name: api-dev
 description: Implements the API server in :api — the dashboard backend. Use proactively for endpoints that list/create/update/delete server definitions, stream logs and status, trigger drains, and authenticate operators. The SPA lives in a separate repo and is out of scope; this is the backend it talks to.
 tools: Read, Grep, Glob, Edit, Write, Bash, WebFetch
 model: inherit
+effort: medium
 permissionMode: acceptEdits
 isolation: worktree
 memory: project

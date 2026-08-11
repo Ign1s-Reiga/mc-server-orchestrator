@@ -2365,3 +2365,42 @@ Related: [[standalone-paper-drain-shape]]
      merge: it is a per-key expression next to `SPEC_HASH`'s. Check any new
      `Labels.*` constant for which object it is written on and how `observe`
      surfaces it.
+199. **A gate that starts making node calls becomes clearable by node failures.**
+     Round 48's exemption let a gated `reconcilePaper` pass reach `place` and
+     `node.observe`. Those throw `NodeException` on any containerd hiccup, the
+     catch runs `nodeFailure`, and `recordFailure` *replaces* the top-level
+     failure class — which is the one input `isBlockedByPermanentFailure` reads —
+     with `RETRYABLE`, while `Pass.draft` keeps the `DRAIN_FAILED` record beside
+     it. So the next pass is ungated and resumes the drain on a live, populated
+     server. Nothing stops (the protocol still demands a confirmed save), but
+     "permanent means stop trying" now expires at the next node restart. **Rule:
+     whenever a change lets a gated pass touch the node, check every catch on the
+     way out for one that writes the field the gate reads.** The safe shape is to
+     re-assert the gate's own outcome when the pass's own observation failed.
+200. **"Not `RUNNING`" is not "not serving".** Of the five `WorkloadState`s only
+     `Absent`, `EXITED` and `CREATED` are provably empty. `UNKNOWN` is "the
+     runtime reported something this build does not recognise" and `SANDBOX_ONLY`
+     with `hadContainer` is "the runtime is failing to enumerate a container that
+     may still have players" — the exact state `containerIsDown` and
+     `stopIsInFlight` each split on `hadContainer`, and the one `WorkloadView`
+     warns kills live servers. A predicate written `state == RUNNING` therefore
+     lifts a guard over the two ambiguous states as well, and it will read as
+     correct because the enumeration in its own KDoc quietly omits `UNKNOWN`.
+     Today such a lift is inert only because both downstream arms (`advanceOnce`'s
+     UNKNOWN early return, `converge`'s UNKNOWN arm) happen to do nothing — safety
+     resting on two unrelated coincidences rather than on the cut. Write these
+     cuts as "provably not serving" (allow-list `Absent`/`EXITED`/`CREATED`),
+     never as "not running".
+201. **A policy predicate one branch now contradicts, held harmless only by
+     wiring.** `permanentFailureStopsPasses()` still answers *"no pass will look
+     at this server again"* after round 48 made that false for a Paper server
+     whose container is not running. It is harmless because its single
+     behavioural consumer — `abort`'s `releaseSeal` — returns false the moment
+     `subject.router != null`, and `Reconciler.drain` builds a Paper subject with
+     `seal = link, router = link` from one value. **Tripwire: the day a Paper
+     subject can carry a seal without a router (a standalone server that seals
+     itself), the answer becomes a live lie on the kind that holds worlds — the
+     twenty-seventh audit's critical, moved.** When a gate gains an exemption on
+     one branch, grep every predicate that *reports* that gate's answer to
+     another component, and re-derive the exemption there or record why the
+     consumer cannot see it.
