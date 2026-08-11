@@ -164,6 +164,12 @@ cannot be confirmed, so `DELETE` never completes. That behaviour is correct and
 is explained in [operating.md](operating.md) note 1 — but the time to notice it
 is while you are writing the definition.
 
+That is meant literally: **later is too late.** Enabling RCON changes the shape of
+the container, so it applies to the *next* one, and the running one cannot be
+replaced without a drain — which is the thing that needs the save channel. A
+persistent server created without RCON keeps running and cannot be given it. Turn
+it on at creation or accept that the server can only ever be retired by hand.
+
 ### Ephemeral storage is opt-in and means what it says
 
 `storage.mode: ephemeral` gives the container no volume that outlives it. Use it
