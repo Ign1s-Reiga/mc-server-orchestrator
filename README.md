@@ -192,6 +192,11 @@ to catch it does. A rule that nothing can break is not a rule.
   secret-reference contract, and what gets clamped rather than rejected.
 - **[docs/operating.md](docs/operating.md)** — behaviours that are deliberate, correct and
   surprising, and what to do when a drain will not finish.
+- **[docs/server-lifecycle.md](docs/server-lifecycle.md)** — the status model a client
+  renders: which phases and conditions follow which, what a drain reports at each step,
+  and the distinctions that must not be collapsed into one badge.
+- **[docs/troubleshooting.md](docs/troubleshooting.md)** — a symptom index, from "the
+  client cannot connect" to "the edit was accepted and nothing happened".
 - **[CLAUDE.md](CLAUDE.md)** — architecture rules and the invariants that must hold.
 - **[api/API.md](api/API.md)** — the HTTP API.
 
