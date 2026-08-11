@@ -3239,6 +3239,50 @@ internal class DrainTest {
         }
 
     /**
+     * The gate expires on an operator action, never on a containerd restart.
+     *
+     * The exemption above is the first thing that makes a gated pass touch the
+     * node, and a node that cannot answer has said nothing about whether the
+     * operator stopped anything. Recording that failure would *replace* the
+     * permanent one the gate reads, so a transient `RUNTIME_UNREACHABLE` would
+     * open the gate on the next pass and resume a drain against a server that is
+     * still running and may still have players on it. The drain-auditor's finding
+     * on the first draft of this change.
+     */
+    @Test
+    fun `a node that cannot answer a gated pass does not reopen the gate`() =
+        coreTest {
+            val harness = Harness()
+            val name = paperDefinition().metadata.name
+            harness.declare(paperDefinition(rcon = RconSpec.Disabled))
+            harness.settle(name)
+            harness.declare(paperDefinition(rcon = RconSpec.Enabled(passwordSecret = secretRef())))
+            repeat(6) { harness.pass(name) }
+
+            val stalled = harness.status(name).shouldNotBeNull()
+            stalled.drain
+                .shouldNotBeNull()
+                .failure
+                .shouldNotBeNull()
+                .failureClass shouldBe FailureClass.PERMANENT
+
+            // The node cannot answer the one question a gated pass asks.
+            harness.node.failAlways(NodeOperation.OBSERVE, harness.node.unreachable(NodeOperation.OBSERVE))
+            repeat(3) { harness.pass(name).shouldBeInstanceOf<ReconcileOutcome.Failed>() }
+
+            // Still shut: the permanent record stands rather than being overwritten
+            // by a retryable one, and nothing was re-issued at a running server.
+            val after = harness.status(name).shouldNotBeNull()
+            after.drain
+                .shouldNotBeNull()
+                .failure
+                .shouldNotBeNull()
+                .failureClass shouldBe FailureClass.PERMANENT
+            after.failure.shouldNotBeNull().failureClass shouldBe FailureClass.PERMANENT
+            harness.node.stops.shouldBeEmpty()
+        }
+
+    /**
      * The neighbouring case, which must **not** move: a permanent failure with no
      * drain at all.
      *
