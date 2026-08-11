@@ -408,7 +408,12 @@ public class ReconcileLoop(
             // Deliberately not requeued for another attempt. The next pass
             // happens at the resync, or when the definition changes and the
             // change feed wakes it — and a pass that finds the same permanent
-            // failure at the same generation does nothing at all.
+            // failure at the same generation does nothing at all, with one
+            // exception: a Paper server whose drain is parked permanently asks
+            // the node once whether the operator has stopped the container it
+            // was told to stop. That costs one observation per resync and, while
+            // the answer is anything but "not serving anybody", ends in this same
+            // branch. See `Reconciler.provablyNotServing`.
             is ReconcileOutcome.Failed -> {
                 queue.succeeded(name)
                 LOG.warn("server={} needs attention: {}", name, outcome.detail)

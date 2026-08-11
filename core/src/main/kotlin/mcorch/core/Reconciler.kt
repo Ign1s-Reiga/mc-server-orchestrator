@@ -182,20 +182,37 @@ public class Reconciler(
         // keep trying more slowly. The gate lifts when the operator changes the
         // definition (the generation moves) or asks for a delete that has not
         // been started yet.
-        if (pass.isBlockedByPermanentFailure()) {
-            return ReconcileOutcome.Failed(
-                pass.previous?.failure?.message ?: "a permanent failure is recorded on observed status",
-            )
-        }
+        val gated = pass.isBlockedByPermanentFailure()
+        // A plain value rather than a local function: `DrainWiringTest` resolves
+        // each line to its enclosing `fun`, and a helper declared here would take
+        // the drain-cause lines below out of `reconcilePaper` and into itself.
+        val gateMessage = pass.previous?.failure?.message ?: "a permanent failure is recorded on observed status"
+        // ...and it lifts for one more reason, which is the whole of this branch:
+        // a drain parked in `DRAIN_FAILED` tells the operator, in the message on
+        // its own status, to save and stop the container by hand and promises the
+        // teardown finishes once a stopped container is *observed*. Returning here
+        // is what made that a lie on a definition that is not terminating — no
+        // pass observed anything, so the stop nobody was watching for never
+        // arrived. The gate is asked again below, against what the node actually
+        // reports.
+        if (gated && !pass.gateCouldBeClearedByHand) return ReconcileOutcome.Failed(gateMessage)
 
         return try {
             when (val placement = place(pass)) {
                 is Placement.Refused -> {
+                    if (gated) return ReconcileOutcome.Failed(gateMessage)
                     refusePlacement(pass, placement)
                 }
 
                 is Placement.On -> {
                     val observation = placement.node.observe(pass.name)
+                    // The gate keeps its full force unless the runtime positively
+                    // says this workload is not serving anybody — the event the
+                    // operator was told to produce. Anything else, including a
+                    // state this build cannot read, leaves it exactly as it was
+                    // before the exemption existed, so nothing here can let the
+                    // loop act on a server that may still be populated.
+                    if (gated && !observation.provablyNotServing()) return ReconcileOutcome.Failed(gateMessage)
                     val cause =
                         placement.cause
                             ?: drainCause(pass, observation)
@@ -216,6 +233,17 @@ public class Reconciler(
                 }
             }
         } catch (failure: NodeException) {
+            // A gated pass touches the node only to answer one question — has the
+            // operator stopped this container — and a node that could not answer
+            // has said nothing about it. Recording this failure would *replace*
+            // the permanent one the gate reads (`recordFailure` overwrites the
+            // class), so a transient `RUNTIME_UNREACHABLE` would open the gate on
+            // the next pass and resume a drain against a server that is still
+            // running and may be populated. Before the exemption existed no gated
+            // pass reached the node at all, so this could not happen; it is this
+            // change's own regression and this is the guard for it. The gate must
+            // expire on an operator action, never on a containerd restart.
+            if (gated) return ReconcileOutcome.Failed(gateMessage)
             nodeFailure(pass, failure)
         } catch (failure: StoreException) {
             storeOutcome(pass.name, failure)
@@ -305,6 +333,23 @@ public class Reconciler(
                 return rejectProxyDefinition(stored, now, rejected)
             }
 
+        // The same gate as the Paper branch, and **deliberately without that
+        // branch's exemption.**
+        //
+        // The exemption rests on a promise a Paper server's status makes and this
+        // kind's does not: save the world and stop the container yourself, and the
+        // teardown finishes once a stopped container is observed. A proxy holds no
+        // world, so nothing here asks an operator to stop anything by hand, and
+        // there is no manual event for a later pass to notice.
+        //
+        // What lifting it would cost is concrete rather than theoretical.
+        // `DrainController.abort` releases a self-sealed login path only when this
+        // gate really does stop the passes — the sentence is *"no pass will look at
+        // this server again"* — and a release taken while passes carry on reopens a
+        // fleet's login path that the gated resume can never shut again. That is
+        // the twenty-seventh audit's critical, and `ProxyDrainTest`'s two
+        // seal-release tests are what hold it shut. An exemption here has to answer
+        // them first.
         if (pass.isBlockedByPermanentFailure()) {
             return ReconcileOutcome.Failed(
                 pass.previous?.failure?.message ?: "a permanent failure is recorded on observed status",
@@ -3120,6 +3165,25 @@ public class Reconciler(
          */
         val hadContainer: Boolean get() = previous?.runtime?.containerId != null
 
+        /**
+         * Whether a human stopping the container by hand is a thing this pass
+         * could still notice — which is to say, whether the gate this server sits
+         * behind is the one whose own message asks them to.
+         *
+         * A drain parked in `DRAIN_FAILED` is that case and the **only** one. A
+         * permanent failure with no drain at all — a container that exited on its
+         * own, a pin at a node that does not exist, a refused edit — is
+         * [DrainStatus]-less, and [parkedOnTheFailure] answers true for it by way
+         * of its `this == null` arm. Those must keep the gate exactly as it was:
+         * a container that exited on its own is deliberately not restarted, and
+         * lifting the gate on an absent workload would recreate it. So this asks
+         * for a drain record and a state, not for the absence of one.
+         */
+        val gateCouldBeClearedByHand: Boolean
+            get() =
+                previous?.drain?.state == DrainState.DRAIN_FAILED &&
+                    previous?.drain?.failure?.failureClass == FailureClass.PERMANENT
+
         fun isBlockedByPermanentFailure(): Boolean {
             val failed =
                 previous != null &&
@@ -3305,6 +3369,66 @@ public class Reconciler(
  * once.
  */
 private fun StoredServer.permanentFailureStopsPasses(): Boolean = !definition.terminating
+
+/*
+ * Tripwire on the predicate above, because its sentence is no longer exactly true
+ * and the one component that acts on it cannot tell.
+ *
+ * `reconcilePaper` now takes one more exemption than this answers: a drain parked
+ * permanently keeps being observed so the loop can notice an operator stopping the
+ * container by hand. So for that case this says "no pass will look at this server
+ * again" while passes do look. `DrainController.abort` is the only behavioural
+ * reader, and it uses the answer for one thing — releasing a login path the
+ * subject sealed *itself*, which no Paper subject has, because `Reconciler.drain`
+ * builds a Paper subject's seal and router from one value and a standalone Paper
+ * server has neither. So the lie is inert.
+ *
+ * It is inert by wiring rather than by construction. The day a Paper subject can
+ * carry a seal without a router, this predicate hands `abort` a reason to reopen a
+ * login path on a server whose passes are still running — which is the
+ * twenty-seventh audit's critical, on the kind that holds worlds. Anyone giving a
+ * Paper subject its own seal has to split this predicate first.
+ */
+
+/**
+ * Whether an observation is one of the states the runtime can only be reporting
+ * for a workload that is **provably not serving anybody** — the second half of
+ * the exemption on the Paper branch, which is the only branch that takes it.
+ * `reconcileProxy` says why it does not.
+ *
+ * An allow-list, and that shape is the safety argument rather than a style
+ * choice. Written as `!= RUNNING` it also lifted the gate for
+ * [WorkloadState.UNKNOWN] and [WorkloadState.SANDBOX_ONLY], and neither is a
+ * statement that nobody is connected:
+ *
+ * - `UNKNOWN` is the runtime saying something this build does not recognise, and
+ *   every other rule here reads it as possibly-running-with-players.
+ * - `SANDBOX_ONLY` is how a sandbox holding a *running* Paper server reads when
+ *   the container enumeration under-reports — which is exactly why
+ *   `containerIsDown` demands `!hadContainer` before believing it, and a gated
+ *   server always had a container. Lifting there could reach `ensureWorkload`
+ *   against a sandbox hiding a live server on the same volume: two Paper
+ *   processes, one world.
+ *
+ * Both were inert by coincidence rather than by this predicate — the arms they
+ * reached happened to do nothing — and a coincidence is not what a gate over a
+ * populated server should rest on. So the three states below are named, and
+ * anything else keeps the gate shut.
+ *
+ * Note what this does **not** do on its own: it is asked only after
+ * `gateCouldBeClearedByHand`, so a workload that exited under a permanent failure
+ * with no drain never reaches it. Reaching it would restart a container that
+ * exited on its own, which `FailureClassificationTest` pins shut.
+ */
+private fun WorkloadObservation.provablyNotServing(): Boolean =
+    when (this) {
+        // The node looked and there is nothing of this server's on it.
+        is WorkloadObservation.Absent -> true
+
+        // `EXITED`: the process has exited and been reaped, so there is provably
+        // nobody connected. `CREATED`: it was never started, so there never was.
+        is WorkloadObservation.Present -> state == WorkloadState.EXITED || state == WorkloadState.CREATED
+    }
 
 /**
  * Whether [WorkloadObservation.Present.labels] describes the **container** rather
