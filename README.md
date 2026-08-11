@@ -197,6 +197,14 @@ to catch it does. A rule that nothing can break is not a rule.
   and the distinctions that must not be collapsed into one badge.
 - **[docs/troubleshooting.md](docs/troubleshooting.md)** — a symptom index, from "the
   client cannot connect" to "the edit was accepted and nothing happened".
+- **[docs/deployment.md](docs/deployment.md)** — every environment variable with its
+  default, what happens when one is missing, and a first run that works.
+- **[docs/reconcile.md](docs/reconcile.md)** — the loop's contract: how it finds work,
+  the rules a pass obeys, and where it deliberately stops.
+- **[docs/store.md](docs/store.md)** — desired and observed state, the on-disk migrations,
+  and the secret-store contract.
+- **[docs/velocity-plugin.md](docs/velocity-plugin.md)** — the control channel mounted into
+  the proxy: what to stage where, its three variables, and the protocol handshake.
 - **[CLAUDE.md](CLAUDE.md)** — architecture rules and the invariants that must hold.
 - **[api/API.md](api/API.md)** — the HTTP API.
 
