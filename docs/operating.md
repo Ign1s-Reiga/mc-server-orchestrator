@@ -30,8 +30,35 @@ The status says so — look for `NEEDS_ATTENTION` and a message ending:
 > completes on its own once a stopped container is observed. To keep it, revert
 > `spec.network.rcon` and the server returns to running.
 
-Both exits work. Re-enabling RCON is the one that keeps the orchestrator in
-charge of the save.
+Both exits work **on a delete**, which is the case this note is about: a
+terminating definition keeps reconciling, so the loop is still watching and
+notices the moment you stop the container yourself.
+
+### The same stall reached by an edit does not clear itself
+
+An edit that changes the container's shape — enabling `spec.network.rcon` is the
+usual one — reaches the identical stall on a server that has no save channel, and
+prints the identical advice. **On that path the advice is currently wrong.** The
+definition is not terminating, so passes stop
+(`Reconciler.kt:3307`, `permanentFailureStopsPasses`), nothing observes the
+container you stopped, and the teardown never runs. The status goes on reporting
+`CONTAINER_RUNNING` and `DRAIN_STALLED` over a container that exited cleanly.
+
+Tracked as [issue #1](https://github.com/Ign1s-Reiga/mc-server-orchestrator/issues/1).
+
+Until it is fixed, either exit still works, but you have to take it deliberately:
+
+- **`DELETE` the server.** A terminating definition lifts the gate, the stopped
+  container is observed on the next pass, teardown finishes and the name is freed.
+- **Make a further spec change.** The gate also requires the observed generation
+  to equal the definition's, so any edit that actually alters the spec resumes
+  passes. Re-sending an identical definition does not — the generation only moves
+  when the spec differs.
+
+Note the ordering this implies for RCON: it has to be enabled **when the server is
+created**. Adding it to a persistent server that is already running cannot take
+effect, because the setting applies to the next container and the current one
+cannot be drained without it.
 
 ## 2. Reverting an edit stops working once the stop has been dispatched
 

@@ -283,6 +283,89 @@ Violations attach to fields, which is what a form needs:
 never a class or property name. `location` may be `null` for a problem with no
 single position; `source` is always `"request-body"`.
 
+### Which edits replace the container
+
+Some fields describe the container, and changing one cannot be applied to a
+container that already exists — the loop drains the server and builds a new one.
+Others are read while the loop works and take effect on the next pass. A client
+that offers an edit form should say which kind it is about to perform, because
+the first kind stops the server for minutes and moves players off it.
+
+The decision is a hash comparison, not a generation check
+(`core/src/main/kotlin/mcorch/core/Reconciler.kt:560`): the observed container
+carries the hash it was built from, and any difference from the desired hash is
+`DrainCause.REPLACEMENT`. The inputs are exactly these.
+
+**`PaperServer`** — from `core/src/main/kotlin/mcorch/core/paper/PaperWorkload.kt`:
+
+| Reshapes the container |
+|---|
+| `spec.image` |
+| `spec.paper.minecraftVersion`, `spec.paper.build` |
+| `spec.resources.memory`, `spec.resources.cpu` |
+| `spec.resources.heap.max`, `spec.resources.heap.min` |
+| `spec.storage.mode`, `spec.storage.mountPath`, `spec.storage.volume.name` |
+| `spec.network.port`, `spec.network.hostPort` |
+| `spec.network.rcon` — enabled/disabled, and its port and secret coordinates |
+| `spec.maxPlayers` |
+| *whether a proxy claims this server* — see below |
+
+**`VelocityProxy`** — from
+`core/src/main/kotlin/mcorch/core/proxy/VelocityWorkloadPlanner.kt`:
+
+| Reshapes the container |
+|---|
+| `spec.image`, and the pinned Velocity build |
+| `spec.resources.memory`, `spec.resources.cpu` |
+| `spec.resources.heap.max`, `spec.resources.heap.min` |
+| `spec.network.port`, `spec.network.hostPort` |
+| `spec.control.port`, `spec.control.hostPort`, `spec.control.tokenSecret` |
+| `spec.forwarding.mode`, `spec.forwarding.secret` |
+| `spec.maxPlayers` |
+| the control-plugin protocol version — orchestrator-side, not yours to set |
+
+Everything else is absent from the hash and applies without a replacement. The
+useful ones are the timings: `spec.lifecycle.drain.*`,
+`spec.lifecycle.stopGracePeriod`, `spec.lifecycle.startupTimeout`, and on a proxy
+`spec.backends.selector`, `spec.backends.fallback` and `spec.backends.drain.*`.
+Those are read when the loop needs them rather than baked into a container, so an
+operator can retune a drain on a running fleet.
+
+**A label can reshape a container it is not on.** `metadata.labels` is not a hash
+input, but a `PaperServer`'s hash carries `forwarding.secret` *only while a proxy
+claims it* — that is deliberate, so that declaring the first proxy does not
+recreate every unrelated server. The consequence is that adding a label which
+crosses a `VelocityProxy`'s `spec.backends.selector`, or editing the selector
+itself, changes the **backend's** hash and drains it. Two documents are involved
+and only one of them was edited, so a client that reasons "labels are metadata,
+this is safe" will be wrong exactly when a server joins or leaves a fleet.
+
+### Choices that are hard to reverse after creation
+
+Two of the fields above are effectively creation-time on a server that holds a
+world, and a create form is the last cheap moment to get them right.
+
+**`spec.network.rcon` on persistent storage.** Enabling RCON reshapes the
+container, and reshaping requires a drain, and a drain on persistent storage
+cannot finish without RCON to confirm the world reached disk. So a persistent
+server created without RCON cannot later be given it — the edit is accepted, the
+replacement drain starts, and it stalls permanently with the original container
+still running and still joinable. The status says so in as many words:
+
+> the running container was created with RCON disabled, so enabling
+> `spec.network.rcon` has not reached it — that setting applies to the next
+> container, and this one cannot be replaced until it has been drained
+
+The way out is not another edit. See `docs/operating.md` note 1. **A client
+creating a `PaperServer` with `spec.storage.mode: "persistent"` and no
+`spec.network.rcon` should say what that forecloses, while the choice is still
+free.**
+
+**`metadata.labels` on a server meant for a fleet.** A label added at creation
+costs nothing; the same label added later drains the server, for the reason in
+the previous section. Offering fleet membership on the create form is worth more
+than offering it on the edit form.
+
 ---
 
 ## 6. Servers
@@ -538,8 +621,14 @@ Replace. Body: a definition. `If-Match` required (§4).
 - `428` — no `If-Match`.
 
 **A spec change is a recreate.** If the running workload no longer matches, the
-loop drains the server before replacing it. Metadata-only changes (labels) do not
-move `generation` and cause no drain.
+loop drains the server before replacing it. Which fields do that, and which apply
+in place, is listed in §5 — worth showing the operator before the `PUT`, since a
+recreate moves players off a running server.
+
+A metadata-only change does not move `generation`, but **that is not the same as
+causing no drain**: the recreate decision compares the container's spec hash, not
+its generation, and a `metadata.labels` edit that crosses a `VelocityProxy`'s
+`spec.backends.selector` changes the *backend's* hash. See §5.
 
 ### `DELETE /api/v1/servers/{name}`
 
