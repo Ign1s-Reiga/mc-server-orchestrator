@@ -205,6 +205,8 @@ to catch it does. A rule that nothing can break is not a rule.
   and the secret-store contract.
 - **[docs/velocity-plugin.md](docs/velocity-plugin.md)** — the control channel mounted into
   the proxy: what to stage where, its three variables, and the protocol handshake.
+- **[docs/cri.md](docs/cri.md)** — the only place this project talks to a runtime: the
+  deadline budgets, the classified failure hierarchy, and why some error text is withheld.
 - **[CLAUDE.md](CLAUDE.md)** — architecture rules and the invariants that must hold.
 - **[api/API.md](api/API.md)** — the HTTP API.
 
