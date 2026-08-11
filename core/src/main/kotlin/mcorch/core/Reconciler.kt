@@ -182,20 +182,37 @@ public class Reconciler(
         // keep trying more slowly. The gate lifts when the operator changes the
         // definition (the generation moves) or asks for a delete that has not
         // been started yet.
-        if (pass.isBlockedByPermanentFailure()) {
-            return ReconcileOutcome.Failed(
-                pass.previous?.failure?.message ?: "a permanent failure is recorded on observed status",
-            )
-        }
+        val gated = pass.isBlockedByPermanentFailure()
+        // A plain value rather than a local function: `DrainWiringTest` resolves
+        // each line to its enclosing `fun`, and a helper declared here would take
+        // the drain-cause lines below out of `reconcilePaper` and into itself.
+        val gateMessage = pass.previous?.failure?.message ?: "a permanent failure is recorded on observed status"
+        // ...and it lifts for one more reason, which is the whole of this branch:
+        // a drain parked in `DRAIN_FAILED` tells the operator, in the message on
+        // its own status, to save and stop the container by hand and promises the
+        // teardown finishes once a stopped container is *observed*. Returning here
+        // is what made that a lie on a definition that is not terminating — no
+        // pass observed anything, so the stop nobody was watching for never
+        // arrived. The gate is asked again below, against what the node actually
+        // reports.
+        if (gated && !pass.gateCouldBeClearedByHand) return ReconcileOutcome.Failed(gateMessage)
 
         return try {
             when (val placement = place(pass)) {
                 is Placement.Refused -> {
+                    if (gated) return ReconcileOutcome.Failed(gateMessage)
                     refusePlacement(pass, placement)
                 }
 
                 is Placement.On -> {
                     val observation = placement.node.observe(pass.name)
+                    // The gate keeps its full force over a container that is still
+                    // running: that is where players are, and nothing about this
+                    // change may let the loop act on a populated server it had
+                    // stopped acting on. It lifts only once the runtime says the
+                    // workload is gone or no longer serving, which is precisely the
+                    // event the operator was told to produce.
+                    if (gated && observation.stillServing()) return ReconcileOutcome.Failed(gateMessage)
                     val cause =
                         placement.cause
                             ?: drainCause(pass, observation)
@@ -305,6 +322,23 @@ public class Reconciler(
                 return rejectProxyDefinition(stored, now, rejected)
             }
 
+        // The same gate as the Paper branch, and **deliberately without that
+        // branch's exemption.**
+        //
+        // The exemption rests on a promise a Paper server's status makes and this
+        // kind's does not: save the world and stop the container yourself, and the
+        // teardown finishes once a stopped container is observed. A proxy holds no
+        // world, so nothing here asks an operator to stop anything by hand, and
+        // there is no manual event for a later pass to notice.
+        //
+        // What lifting it would cost is concrete rather than theoretical.
+        // `DrainController.abort` releases a self-sealed login path only when this
+        // gate really does stop the passes — the sentence is *"no pass will look at
+        // this server again"* — and a release taken while passes carry on reopens a
+        // fleet's login path that the gated resume can never shut again. That is
+        // the twenty-seventh audit's critical, and `ProxyDrainTest`'s two
+        // seal-release tests are what hold it shut. An exemption here has to answer
+        // them first.
         if (pass.isBlockedByPermanentFailure()) {
             return ReconcileOutcome.Failed(
                 pass.previous?.failure?.message ?: "a permanent failure is recorded on observed status",
@@ -3120,6 +3154,25 @@ public class Reconciler(
          */
         val hadContainer: Boolean get() = previous?.runtime?.containerId != null
 
+        /**
+         * Whether a human stopping the container by hand is a thing this pass
+         * could still notice — which is to say, whether the gate this server sits
+         * behind is the one whose own message asks them to.
+         *
+         * A drain parked in `DRAIN_FAILED` is that case and the **only** one. A
+         * permanent failure with no drain at all — a container that exited on its
+         * own, a pin at a node that does not exist, a refused edit — is
+         * [DrainStatus]-less, and [parkedOnTheFailure] answers true for it by way
+         * of its `this == null` arm. Those must keep the gate exactly as it was:
+         * a container that exited on its own is deliberately not restarted, and
+         * lifting the gate on an absent workload would recreate it. So this asks
+         * for a drain record and a state, not for the absence of one.
+         */
+        val gateCouldBeClearedByHand: Boolean
+            get() =
+                previous?.drain?.state == DrainState.DRAIN_FAILED &&
+                    previous?.drain?.failure?.failureClass == FailureClass.PERMANENT
+
         fun isBlockedByPermanentFailure(): Boolean {
             val failed =
                 previous != null &&
@@ -3305,6 +3358,27 @@ public class Reconciler(
  * once.
  */
 private fun StoredServer.permanentFailureStopsPasses(): Boolean = !definition.terminating
+
+/**
+ * Whether an observation still has something for a permanent-failure gate to
+ * gate — the second half of the exemption on the Paper branch, which is the only
+ * branch that takes it. `reconcileProxy` says why it does not.
+ *
+ * `RUNNING` and nothing else. That is deliberately the narrowest reading, and the
+ * narrowness is the safety argument: wherever a container is running the gate
+ * behaves exactly as it did before this existed, so no change here can let the
+ * loop act on a populated server it had stopped acting on. It lifts over
+ * `EXITED` — *"the process has exited and been reaped, there is provably nobody
+ * connected"* — and over `Absent`, `CREATED` and `SANDBOX_ONLY`, none of which
+ * can be serving a player.
+ *
+ * Note what this does **not** do on its own: it is asked only after
+ * `gateCouldBeClearedByHand`, so a workload that exited under a permanent failure
+ * with no drain never reaches it. Reaching it would restart a container that
+ * exited on its own, which `FailureClassificationTest` pins shut.
+ */
+private fun WorkloadObservation.stillServing(): Boolean =
+    this is WorkloadObservation.Present && state == WorkloadState.RUNNING
 
 /**
  * Whether [WorkloadObservation.Present.labels] describes the **container** rather

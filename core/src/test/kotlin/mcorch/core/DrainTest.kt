@@ -3186,6 +3186,91 @@ internal class DrainTest {
             harness.store.getServer(name).shouldNotBeNull()
         }
 
+    /**
+     * The exemption that lets an operator finish a drain the loop cannot.
+     *
+     * A drain parked in `DRAIN_FAILED` carries a message telling the operator to
+     * save and stop the container themselves, and promising the teardown finishes
+     * once a stopped container is observed. On a **terminating** definition that
+     * was true, because a delete keeps the passes running. On this one — an
+     * ordinary edit — the gate returned before the pass observed anything, so the
+     * stop the message asked for was one nothing was left to notice, and the
+     * server sat over a container that had already exited. Issue #1.
+     *
+     * The setup is the one that produces it in practice: a persistent server
+     * created with RCON disabled, then edited to enable it. The edit reshapes the
+     * container, the replacement drain needs a confirmed save, and the container
+     * that is *running* has no channel to confirm one — so the drain aborts with
+     * the server still up and still joinable.
+     */
+    @Test
+    fun `a stalled drain finishes its teardown once the operator stops the container`() =
+        coreTest {
+            val harness = Harness()
+            val name = paperDefinition().metadata.name
+            harness.declare(paperDefinition(rcon = RconSpec.Disabled))
+            harness.settle(name)
+            harness.node.creates shouldHaveSize 1
+
+            // The edit that cannot reach the running container.
+            harness.declare(paperDefinition(rcon = RconSpec.Enabled(passwordSecret = secretRef())))
+            repeat(6) { harness.pass(name) }
+
+            val stalled =
+                harness
+                    .status(name)
+                    .shouldNotBeNull()
+                    .drain
+                    .shouldNotBeNull()
+            stalled.state shouldBe DrainState.DRAIN_FAILED
+            // The whole point of the state: nothing was stopped, and the loop said so.
+            harness.node.stops.shouldBeEmpty()
+            harness.node.removals.shouldBeEmpty()
+
+            // The operator does what the message asks and stops it by hand.
+            val present = harness.node.workload.shouldBeInstanceOf<WorkloadObservation.Present>()
+            harness.node.workload = present.copy(state = WorkloadState.EXITED, exitCode = 0)
+
+            repeat(4) { harness.pass(name) }
+
+            // ...and the loop notices, which is the sentence the status had been
+            // making all along.
+            harness.node.removals.shouldNotBeEmpty()
+        }
+
+    /**
+     * The neighbouring case, which must **not** move: a permanent failure with no
+     * drain at all.
+     *
+     * `parkedOnTheFailure` answers true for a null drain, so an exemption keyed on
+     * it alone would lift here too — and lifting here recreates a container that
+     * exited on its own, which the loop deliberately does not do. The exemption
+     * asks for a drain record and a state precisely so that this stays shut.
+     */
+    @Test
+    fun `a container that exited under a permanent failure with no drain is still not recreated`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            val present = harness.node.workload.shouldBeInstanceOf<WorkloadObservation.Present>()
+            harness.node.workload = present.copy(state = WorkloadState.EXITED, exitCode = 137, reason = "OOMKilled")
+
+            harness.pass(name)
+            harness
+                .status(name)
+                .shouldNotBeNull()
+                .drain
+                .shouldBeNull()
+            repeat(4) { harness.pass(name) }
+
+            harness.node.creates shouldHaveSize 1
+            harness.node.starts shouldHaveSize 1
+            harness.node.removals.shouldBeEmpty()
+        }
+
     private companion object {
         /**
          * `ReconcilerConfig.drainAttentionLedger`'s shipped value, restated rather
