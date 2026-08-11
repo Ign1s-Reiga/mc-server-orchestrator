@@ -203,4 +203,4 @@ kotest for tests.
 
 ## License
 
-Not yet chosen. Until one is added, no permissions are granted beyond viewing.
+[MIT](LICENSE).
