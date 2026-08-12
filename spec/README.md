@@ -39,6 +39,7 @@ from the dashboard, through RCON.
 | Dashboard hosting | Same origin — `:api` serves the bundle from `MCORCH_API_STATIC_ROOT` | Already what the CORS table calls "the normal deployment"; avoids `SameSite=None`, which would force TLS. Not a second container: a different port is a different origin |
 | Command transport | In the request body, never the path or query | The request carries the player name that the response never does; a query string is logged by every proxy |
 | Client identification | The credential type, not a header | A header is forgeable with one `curl -H` flag. `X-Mcorch-Client` exists for contract-version negotiation and audit context only, is optional everywhere, and is never authorised on |
+| Audit detail | Per server, via `spec.console.auditCommandText` | An argument can be a player name and the audit is a durable sink. Defaults to verb-plus-argument-count, which agrees with the logging rule; keeping full text is an operator overriding that for one server, written down in the manifest |
 
 The output decision has three consequences worth carrying forward: the `admin`
 tier is a general console bounded only by Gate 1, both the request and the
@@ -84,7 +85,10 @@ Neither blocks drafting or implementation.
 - [ ] **Tier allow-lists and the audit sink** ([04-output.md](04-output.md)).
       Gated by multi-identity auth. No parsers: `admin` is unrestricted below
       Gate 1, and the two lower tiers carry explicit sets.
-- [ ] **`spec.console` ceiling** — `:schema` plus consumers, in one change.
+- [ ] **`spec.console`** — `maxTier` and `auditCommandText`, `:schema` plus
+      consumers in one change, per the `add-server-kind` procedure. Lands *with*
+      the audit sink and the tier gate, never before them: a field the loop does
+      not honour is the first failure that procedure names.
 - [ ] **The contract into `api/API.md`**, and its §11 amended — roles and an
       audit log stop being absent. **§13 stands unchanged**, which is what the
       output decision bought.

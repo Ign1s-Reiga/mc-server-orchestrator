@@ -103,12 +103,13 @@ whoever grants it.
 
 ## 4. Per-server ceiling, declared in YAML
 
-A `PaperServerDefinition` declares the highest tier it will accept:
+A `PaperServerDefinition` declares what console it will accept:
 
 ```yaml
 spec:
   console:
-    maxTier: operator      # this server refuses admin-tier console entirely
+    maxTier: operator          # refuses admin-tier console on this server entirely
+    auditCommandText: false    # what the audit record keeps — see below
 ```
 
 So a production survival server can refuse `admin` console outright while a test
@@ -117,6 +118,47 @@ logs in, in the same place every other decision about a server is written — an
 it is where the op-level concept genuinely earns its place.
 
 The effective tier for a request is `min(identity tier, server ceiling)`.
+
+### 4.1 `auditCommandText`
+
+Whether the audit record keeps the command **as dispatched**, or only its verb
+and argument count.
+
+| | Recorded |
+|---|---|
+| `false` *(default)* | `kick`, 1 argument |
+| `true` | `kick Alice` |
+
+An argument can be a player name, and the audit log is the one sink guaranteed to
+be written to disk and read later. `false` is therefore the default: it is the
+setting that agrees with CLAUDE.md's standing rule — *never log player names,
+UUIDs, or IP addresses* — and turning it on is an operator deliberately
+overriding that convention for one server, which is a decision they should have
+to write down.
+
+It changes **only** what the audit keeps. It does not affect what the console
+returns, which is raw either way ([04-output.md](04-output.md)), and it never
+affects whether a command runs.
+
+### 4.2 What building this requires
+
+Per the `add-server-kind` procedure, in one change:
+
+- `ConsoleSpec` in `:schema`, optional with defaults, so definitions already on
+  disk keep parsing;
+- parse-time validation with field-level errors — `maxTier` against the known
+  tiers, and the pair rule that `console` on a `VelocityProxy` is an
+  unknown-field error, since a proxy has no RCON;
+- the field honoured where the audit record is written, not read later and
+  applied by the reader;
+- `docs/schema.md`, which is the only operator-facing description of the spec
+  fields, and `api/API.md` §6's spec-field list;
+- schema tests for both defaults and each rejection, and a test that the audit
+  record differs between the two settings.
+
+**Neither field is read by anything until the audit sink and the tier gate
+exist.** Landing the schema first would produce a field the loop does not honour,
+which the procedure names as the first way this kind of change goes wrong.
 
 This is a `:schema` change and goes to one agent together with its consumers, per
 the repository's rule about changes spanning `:schema`. It needs:
