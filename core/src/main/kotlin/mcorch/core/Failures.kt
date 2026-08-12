@@ -118,6 +118,20 @@ internal fun NodeException.asFailureReason(): FailureReason =
         // its own edge, exactly as the `Node` boundary requires of everything else.
         NodeOperation.ENDPOINT -> FailureReason.RUNTIME_UNREACHABLE
 
+        // Present to keep this total, and **not** expected to be reached. A console
+        // command is an operator's ad-hoc action, not a reconcile step: it arrives
+        // through the API and its failure goes back to that caller as an HTTP
+        // error. Nothing in the loop issues one, so nothing in the loop records
+        // one here.
+        //
+        // The distinction is worth the comment because getting it wrong is
+        // expensive in one direction: an operator's typo, or a server that refuses
+        // a command while running perfectly, must never land on observed status.
+        // That would make a report into a reason to act on a container — the thing
+        // `AttentionTest` exists to prevent — and would mark a healthy server
+        // failed for the duration of a mistyped word.
+        NodeOperation.CONSOLE -> FailureReason.RUNTIME_UNREACHABLE
+
         NodeOperation.STOP -> FailureReason.DRAIN_STALLED
 
         NodeOperation.REMOVE -> FailureReason.RUNTIME_UNREACHABLE

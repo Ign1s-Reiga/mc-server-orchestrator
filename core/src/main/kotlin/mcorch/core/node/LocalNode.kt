@@ -2,6 +2,7 @@ package mcorch.core.node
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import mcorch.core.ConsoleRequest
 import mcorch.core.EndpointRequest
 import mcorch.core.EndpointResponse
 import mcorch.core.ExecOutcome
@@ -22,6 +23,8 @@ import mcorch.core.WorkloadObservation
 import mcorch.core.WorkloadRemoval
 import mcorch.core.WorkloadSpec
 import mcorch.core.WorkloadState
+import mcorch.core.console.rcon.RconConnection
+import mcorch.core.console.rcon.RconException
 import mcorch.cri.ContainerFilter
 import mcorch.cri.ContainerId
 import mcorch.cri.ContainerSpec
@@ -61,6 +64,7 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.Path
 import kotlin.coroutines.cancellation.CancellationException
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.seconds
 import kotlin.time.toJavaDuration
 
 /**
@@ -550,6 +554,146 @@ public class LocalNode internal constructor(
             send(address, request, token)
         }
     }
+
+    /**
+     * Runs one console command over RCON.
+     *
+     * Shaped after [callEndpoint] because it solves the same problem: the address
+     * is read fresh on every call rather than cached, since a recreated sandbox
+     * gets a new one and a command aimed at the previous occupant of an address
+     * runs on somebody else's server.
+     *
+     * The connection is opened and closed per call. Holding authenticated
+     * sessions is the optimisation `spec/02-relay.md` describes and this
+     * interface admits without changing — but a cache would have to be keyed by
+     * sandbox id and dropped when that changes, or it reintroduces exactly the
+     * stale-address bug the paragraph above avoids.
+     */
+    override suspend fun console(
+        handle: WorkloadHandle,
+        request: ConsoleRequest,
+    ): String {
+        val sandboxId = SandboxId(handle.sandboxId)
+        return translating(NodeOperation.CONSOLE) {
+            val status = client.sandboxStatus(sandboxId)
+            val address =
+                status.ips.firstOrNull()
+                    ?: throw NodeException.Busy(
+                        name,
+                        NodeOperation.CONSOLE,
+                        "the runtime reports no address for sandbox ${handle.sandboxId} yet, so the console " +
+                            "port ${request.port} cannot be reached. A sandbox gets one when its network is " +
+                            "attached, so this is a wait rather than a misconfiguration",
+                        dispatch = NodeDispatch.NOTHING_SENT,
+                    )
+            runConsole(address, request)
+        }
+    }
+
+    private suspend fun runConsole(
+        address: String,
+        request: ConsoleRequest,
+    ): String {
+        // Coordinates in, material out, and the material never leaves this call:
+        // RCON authenticates once per connection, so the password is needed only
+        // here and the session that outlives it holds no credential.
+        val password = resolveConsolePassword(request.passwordSecret)
+        val connection =
+            try {
+                RconConnection.connect(
+                    address,
+                    request.port,
+                    CONNECT_TIMEOUT_SECONDS.seconds,
+                    request.timeout.period,
+                )
+            } catch (failure: RconException) {
+                throw consoleFailure(failure, request.port, NodeDispatch.NOTHING_SENT)
+            }
+        return connection.use { session ->
+            try {
+                session.authenticate(password)
+            } catch (failure: RconException) {
+                // Authentication carries no command, so nothing the caller asked
+                // for reached the server.
+                throw consoleFailure(failure, request.port, NodeDispatch.NOTHING_SENT)
+            }
+            try {
+                session.execute(request.command)
+            } catch (failure: RconException) {
+                // The command may have been dispatched and be running still. A
+                // timeout here is the case `07-api.md` tells clients not to retry.
+                throw consoleFailure(failure, request.port, NodeDispatch.UNKNOWN)
+            }
+        }
+    }
+
+    private suspend fun resolveConsolePassword(ref: SecretRef): String {
+        val secret =
+            secrets.resolve(ref) ?: throw NodeException.Rejected(
+                name,
+                NodeOperation.CONSOLE,
+                "the RCON password `${ref.name}/${ref.key}` is not in the secret store",
+                dispatch = NodeDispatch.NOTHING_SENT,
+            )
+        return try {
+            secret.use { material -> String(material) }
+        } finally {
+            secret.destroy()
+        }
+    }
+
+    /**
+     * Maps an RCON failure onto the node boundary.
+     *
+     * Never carries the address, the password or the command — the port is
+     * declared configuration and is all a message needs.
+     */
+    private fun consoleFailure(
+        failure: RconException,
+        port: Int,
+        dispatch: NodeDispatch,
+    ): NodeException =
+        when (failure) {
+            is RconException.AuthFailed -> {
+                NodeException.Rejected(
+                    name,
+                    NodeOperation.CONSOLE,
+                    "the server on port $port rejected the RCON password",
+                    dispatch = NodeDispatch.NOTHING_SENT,
+                )
+            }
+
+            is RconException.Timeout -> {
+                NodeException.Timeout(
+                    name,
+                    NodeOperation.CONSOLE,
+                    "the server on port $port did not answer the console command in time",
+                    failure,
+                    // A command the caller asked the node to run, not the call
+                    // itself: the main thread may simply be busy.
+                    commandTimeout = true,
+                )
+            }
+
+            is RconException.Protocol -> {
+                NodeException.Rejected(
+                    name,
+                    NodeOperation.CONSOLE,
+                    "port $port is not speaking RCON in a way this can follow: ${failure.message}",
+                    dispatch = dispatch,
+                )
+            }
+
+            is RconException.Transport -> {
+                NodeException.Unreachable(
+                    name,
+                    NodeOperation.CONSOLE,
+                    "port $port refused or dropped the console connection",
+                    failure,
+                    dispatch,
+                )
+            }
+        }
 
     private suspend fun resolveToken(ref: SecretRef): String {
         val secret =

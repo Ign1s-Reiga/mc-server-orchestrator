@@ -214,6 +214,50 @@ public interface Node {
     ): EndpointResponse
 
     /**
+     * Runs one console command against the workload's RCON port and returns the
+     * server's reply **verbatim**.
+     *
+     * The operator console of `spec/`. An interface method for the same reason
+     * [callEndpoint] is one: a remote node forwards this to its own agent, while
+     * on this host the sandbox has a CNI address the orchestrator can open a
+     * socket to. A caller that resolved an address itself would have hard-coded
+     * the single-host deployment (CLAUDE.md invariant 7).
+     *
+     * ## Not the drain's channel, on purpose
+     *
+     * The drain keeps its own [exec] path — `rcon-cli` through `ExecSync` — and
+     * does not come through here. That redundancy is deliberate: this channel is
+     * the one that can be wedged, misconfigured or refused, and a console outage
+     * must never become a drain outage. Nothing in the drain protocol may be
+     * routed onto this method.
+     *
+     * ## What it does not decide
+     *
+     * Whether the command *should* run. `ConsoleInvariants` refuses the commands
+     * no tier may run, and the tier gate refuses the rest; both sit above this.
+     * This method will faithfully run `stop` if something asks it to, which is
+     * exactly why nothing may call it without screening first.
+     *
+     * The reply is returned uninterpreted, exactly like [exec] and
+     * [callEndpoint]: what a server's text means is a property of the server, and
+     * the caller is the only thing that knows it.
+     *
+     * @throws NodeException.Busy when the sandbox has no address yet — a wait,
+     *   not a misconfiguration.
+     * @throws NodeException.Rejected when the password is missing from the store
+     *   or the server refuses it. Permanent; retrying cannot help.
+     * @throws NodeException.Timeout when the server did not answer in time. The
+     *   main thread may simply be busy, so this says nothing about whether the
+     *   command ran.
+     * @throws NodeException.Unreachable when the port refused or dropped the
+     *   connection.
+     */
+    public suspend fun console(
+        handle: WorkloadHandle,
+        request: ConsoleRequest,
+    ): String
+
+    /**
      * Stops the workload's container, killing it after [gracePeriod].
      *
      * **Never call this on a server with players online, and never before a
@@ -1155,6 +1199,45 @@ public enum class HttpVerb {
     PUT,
     POST,
     DELETE,
+}
+
+/**
+ * One console command to run against a workload's RCON port.
+ *
+ * [timeout] is an [ExecTimeout] rather than a type of its own: it bounds a
+ * command running on the game server, which is the quantity [ExecTimeout] already
+ * names, and it is capped by the same `PaperServerDefaults.MAX_TIMEOUT`.
+ * [EndpointTimeout] is separate from [ExecTimeout] because their ceilings differ;
+ * this one's does not.
+ */
+public data class ConsoleRequest(
+    val port: Int,
+    /**
+     * Coordinates of the RCON password. **Never material** — the node resolves it
+     * at the moment it authenticates and does not keep it, the same rule
+     * [EndpointRequest.bearerToken] and [WorkloadSpec.secretEnv] follow.
+     */
+    val passwordSecret: SecretRef,
+    /**
+     * The command line, without a leading slash.
+     *
+     * Uninterpreted here. It has already been screened by `ConsoleInvariants` and
+     * the tier gate, or it should not have reached this type.
+     */
+    val command: String,
+    val timeout: ExecTimeout,
+) {
+    init {
+        require(port in 1..65535) { "port must be in 1..65535, got: $port" }
+        require(command.isNotBlank()) { "console command must not be blank" }
+        // A newline may carry a second command, and nothing downstream can tell
+        // which one a refusal or an audit record refers to.
+        require(command.none { it == '\n' || it == '\r' }) { "console command must be a single line" }
+        require(timeout.period.isPositive()) { "console timeout must be positive, found ${timeout.period}" }
+    }
+
+    /** Redacted: a command argument can be a player name. */
+    override fun toString(): String = "ConsoleRequest(port=$port, command=<${command.length} chars redacted>)"
 }
 
 /**

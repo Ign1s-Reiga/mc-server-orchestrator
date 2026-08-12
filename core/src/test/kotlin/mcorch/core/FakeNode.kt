@@ -295,6 +295,26 @@ internal class FakeNode(
         return onExec(request.command)
     }
 
+    /** Replies a console command gets, by command. Absent means the port is unreachable. */
+    val consoleReplies: MutableMap<String, String> = mutableMapOf()
+
+    /** Every console request this node was asked to run, in order. */
+    val consoleCalls: MutableList<ConsoleRequest> = mutableListOf()
+
+    override suspend fun console(
+        handle: WorkloadHandle,
+        request: ConsoleRequest,
+    ): String {
+        check(NodeOperation.CONSOLE)
+        consoleCalls += request
+        return consoleReplies[request.command]
+            ?: throw NodeException.Unreachable(
+                name,
+                NodeOperation.CONSOLE,
+                "nothing is listening on port ${request.port}",
+            )
+    }
+
     /**
      * The in-sandbox HTTP channel, answered by whatever is listening on that port.
      *

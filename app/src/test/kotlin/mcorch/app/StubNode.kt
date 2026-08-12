@@ -1,5 +1,6 @@
 package mcorch.app
 
+import mcorch.core.ConsoleRequest
 import mcorch.core.EndpointRequest
 import mcorch.core.EndpointResponse
 import mcorch.core.ExecOutcome
@@ -197,6 +198,16 @@ internal class StubNode(
      * should reach for one — and a stub that answered would let a drain take the
      * proxied path in a file whose assertions are all about the standalone one.
      */
+    override suspend fun console(
+        handle: WorkloadHandle,
+        request: ConsoleRequest,
+    ): String =
+        throw NodeException.Unreachable(
+            name,
+            NodeOperation.CONSOLE,
+            "nothing is listening on port ${request.port}",
+        )
+
     override suspend fun callEndpoint(
         handle: WorkloadHandle,
         request: EndpointRequest,
