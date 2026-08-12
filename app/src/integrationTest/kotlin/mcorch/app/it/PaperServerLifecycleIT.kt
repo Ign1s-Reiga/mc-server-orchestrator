@@ -209,51 +209,28 @@ internal class PaperServerLifecycleIT {
             world.exists().shouldBeTrue()
         }
 
-    @Test
-    fun `a server whose save cannot be confirmed keeps running`() =
-        integrationTest {
-            // Persistent world data whose save cannot be confirmed, so this
-            // server cannot be drained — and the one thing that must not happen
-            // is it being stopped anyway.
-            //
-            // RCON is standard now, so "no save channel" can no longer be
-            // declared. The faithful equivalent against a real server is a
-            // password it will refuse: the container comes up, `rcon-cli` reaches
-            // the port, and authentication fails. `DrainTest` records that as
-            // permanent in practice and indistinguishable from a rotated secret,
-            // and it is the state an operator actually reaches.
-            val definition =
-                paperServer(
-                    name = "it-nosave",
-                    hostPort = 30415,
-                )
-            val name = definition.metadata.name
-            // Seeded so the container can be created, and wrong so the save can
-            // never be confirmed. The server generates its own password from the
-            // env this does not match.
-            harness.putSecret(rconSecret("it-nosave"), "not-the-password-the-server-has")
-            harness.declare(definition)
-            harness.start(this)
-            harness.await("the server to answer a Server List Ping") { harness.status(name)?.ready == true }
-
-            harness.store.deleteDefinition(name).getOrThrow()
-            harness.await("the drain to record why it cannot finish", timeout = ContainerdHarness.DRAIN_TIMEOUT) {
-                harness.status(name)?.drain?.failure != null
-            }
-            // Give it several more passes to do the wrong thing, if it is going
-            // to.
-            delay(20.seconds)
-
-            val status = harness.status(name).shouldNotBeNull()
-            val drain = status.drain.shouldNotBeNull()
-            drain.worldSaved.shouldBeFalse()
-            drain.failure.shouldNotBeNull().failureClass shouldBe mcorch.schema.FailureClass.PERMANENT
-            // The container is still running and the definition is still there.
-            harness.observe(name).shouldBeInstanceOf<WorkloadObservation.Present>().state shouldBe
-                WorkloadState.RUNNING
-            harness.store.getServer(name).shouldNotBeNull()
-            worldDirectory("it-nosave").exists().shouldBeTrue()
-        }
+    // `a server whose save cannot be confirmed keeps running` was here, and is
+    // gone because the state it constructed can no longer be constructed.
+    //
+    // It declared a `PaperServer` with RCON disabled. RCON is standard now, so the
+    // rewrite tried the next-closest thing — a password the server would refuse —
+    // and that does not work either: `RCON_PASSWORD` is one container environment
+    // variable, the image configures the server from it, and `rcon-cli` inside the
+    // same container reads the same one. They cannot disagree. The test ran, the
+    // drain confirmed its save, the server was deleted, and the assertion was left
+    // waiting on a store with nothing in it.
+    //
+    // A test that cannot fail is worse than no test, so it is not left in place
+    // asserting nothing. What it protected is still covered where the condition is
+    // reachable: `DrainTest` constructs the container that reports no save channel
+    // and pins the refusal against it, which is the layer the guard actually lives
+    // at — `PaperServerAgent.contractOf` reads the label off the running workload,
+    // not off the definition.
+    //
+    // Reaching this state against a real server now needs a genuine runtime
+    // failure — a wedged main thread, or a long world-generation pass — which is
+    // `docs/failure-modes.md`'s territory and is not something a definition can ask
+    // for.
 
     @Test
     fun `an explicitly ephemeral server is stopped without a save and leaves no volume`() =
@@ -264,6 +241,7 @@ internal class PaperServerLifecycleIT {
                     hostPort = 30416,
                     storage = StorageSpec.Ephemeral(),
                 )
+            harness.putSecret(rconSecret("it-lobby"), "integration-rcon-password")
             val name = definition.metadata.name
             harness.declare(definition)
             harness.start(this)
