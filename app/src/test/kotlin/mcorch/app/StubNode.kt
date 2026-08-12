@@ -155,7 +155,7 @@ internal class StubNode(
                 // Carried the way a real runtime carries them, because a drain
                 // reads what the container was built with rather than what the
                 // definition says now.
-                labels = spec.labels + ("mcorch.dev/spec-hash" to spec.specHash),
+                labels = applyLabelOverrides(spec.labels + ("mcorch.dev/spec-hash" to spec.specHash)),
                 createdAt = clock.instant(),
             )
         workload = created
@@ -244,12 +244,30 @@ internal class StubNode(
 internal fun resourceName(raw: String): ResourceName = ResourceName.of(raw).getOrThrow()
 
 /**
+ * Labels forced onto a created workload; a `null` value removes one.
+ *
+ * `Labels.SAVE_CONFIRMABLE` is why this exists. RCON is standard, so a
+ * `PaperServer` without a save channel can no longer be *declared* — but the
+ * drain reads that label off the running container, where absence means "this
+ * workload does not say". Constructing that container is the only way to reach
+ * the permanently-failed drain this suite asserts a display for.
+ */
+internal val stubLabelOverrides: MutableMap<String, String?> = mutableMapOf()
+
+private fun applyLabelOverrides(labels: Map<String, String>): Map<String, String> {
+    if (stubLabelOverrides.isEmpty()) return labels
+    val result = labels.toMutableMap()
+    stubLabelOverrides.forEach { (key, value) -> if (value == null) result.remove(key) else result[key] = value }
+    return result
+}
+
+/**
  * A definition that is boring on purpose. No forwarding secret, no player name,
  * no address — a fixture is where such a value gets committed by accident.
  */
 internal fun paperServer(
     name: String,
-    rcon: RconSpec = RconSpec.Enabled(passwordSecret = SecretRef.of("$name-rcon", "password").getOrThrow()),
+    rcon: RconSpec = RconSpec(passwordSecret = SecretRef.of("$name-rcon", "password").getOrThrow()),
     storage: StorageSpec = StorageSpec.Persistent(VolumeSpec(resourceName("$name-world"))),
     saveTimeout: Duration = 60.seconds,
 ): PaperServerDefinition =

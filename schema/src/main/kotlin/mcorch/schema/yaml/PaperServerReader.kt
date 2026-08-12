@@ -67,7 +67,9 @@ internal class PaperServerReader(
                 min = 1,
                 max = PaperServerDefaults.MAX_PLAYERS_LIMIT,
             )
-        val network = spec.mapping("network")?.let(::readNetwork) ?: NetworkSpec()
+        // Required, because `network.rcon.passwordSecret` is: RCON is standard and
+        // its secret cannot be defaulted.
+        val network = spec.mapping("network", required = true)?.let(::readNetwork)
         val resources = spec.mapping("resources", required = true)?.let(::readResources)
         val storage = readStorage(spec.mapping("storage"), metadata.name)
         val lifecycle = spec.mapping("lifecycle")?.let(::readLifecycle) ?: LifecycleSpec()
@@ -86,7 +88,7 @@ internal class PaperServerReader(
                     storage = storage,
                     eulaAccepted = eulaAccepted ?: return null,
                     maxPlayers = maxPlayers ?: PaperServerDefaults.MAX_PLAYERS,
-                    network = network,
+                    network = network ?: return null,
                     lifecycle = lifecycle,
                     placement = placement,
                 ),
@@ -100,40 +102,47 @@ internal class PaperServerReader(
         return PaperVersionSpec(version ?: return null, build)
     }
 
-    private fun readNetwork(reader: MappingReader): NetworkSpec {
+    private fun readNetwork(reader: MappingReader): NetworkSpec? {
         val port = reader.port("port", default = PaperServerDefaults.GAME_PORT) ?: PaperServerDefaults.GAME_PORT
         val hostPort = reader.port("hostPort")
-        val rcon = reader.mapping("rcon")?.let { readRcon(it, port) } ?: RconSpec.Disabled
+        val rcon = reader.mapping("rcon", required = true)?.let { readRcon(it, port) }
         reader.done()
-        return NetworkSpec(port = port, hostPort = hostPort, rcon = rcon)
+        return NetworkSpec(port = port, hostPort = hostPort, rcon = rcon ?: return null)
     }
 
+    /**
+     * `enabled` is deliberately not read.
+     *
+     * It leaves the key unconsumed, so [MappingReader.done] reports it as an
+     * unknown field with a suggestion — which is the right outcome. A definition
+     * still carrying `enabled: false` was written by somebody who believed RCON
+     * was off; accepting it and turning RCON on would be the orchestrator doing
+     * the opposite of what the document says.
+     */
     private fun readRcon(
         reader: MappingReader,
         gamePort: Int,
-    ): RconSpec {
-        val enabled = reader.boolean("enabled", default = false) ?: false
+    ): RconSpec? {
         val port = reader.port("port", default = PaperServerDefaults.RCON_PORT) ?: PaperServerDefaults.RCON_PORT
         val secretDeclared = reader.isPresent("passwordSecret")
         val secret = reader.secretRef("passwordSecret")
         reader.done()
 
-        if (!enabled) return RconSpec.Disabled
         if (port == gamePort) {
             reader.violation("port", "must differ from spec.network.port, both are $gamePort")
-            return RconSpec.Disabled
+            return null
         }
         if (secret == null) {
             if (!secretDeclared) {
                 reader.violation(
                     "passwordSecret",
-                    "is required when rcon is enabled: the password is named in the secret store, " +
-                        "it is never written in a definition",
+                    "is required: RCON is how a world save is confirmed, so every server has it. " +
+                        "The password is named in the secret store, never written in a definition",
                 )
             }
-            return RconSpec.Disabled
+            return null
         }
-        return RconSpec.Enabled(port = port, passwordSecret = secret)
+        return RconSpec(port = port, passwordSecret = secret)
     }
 
     private fun readResources(reader: MappingReader): ResourceSpec? {

@@ -100,9 +100,9 @@ within it — but the HTTP API takes **one document per request**.
 | `spec.resources.heap.min` | same as `heap.max` | ≥ 256Mi, ≤ `heap.max` |
 | `spec.network.port` | `25565` | 1 … 65535 |
 | `spec.network.hostPort` | unpublished | 1 … 65535 |
-| `spec.network.rcon.enabled` | `false` | |
+| `spec.network` | — | **required**, because `rcon.passwordSecret` is |
 | `spec.network.rcon.port` | `25575` | must differ from `network.port` |
-| `spec.network.rcon.passwordSecret` | — | **required** when `rcon.enabled: true` |
+| `spec.network.rcon.passwordSecret` | — | **required**. There is no `enabled` field |
 | `spec.storage.mode` | `persistent` | `persistent` or `ephemeral` |
 | `spec.storage.mountPath` | `/data` | absolute, not a system path |
 | `spec.storage.volume.name` | `metadata.name` | persistent only |
@@ -152,23 +152,32 @@ clamping can never *invert* the pair — that is enforced where the constants ar
 declared, not by the two moving together. See [operating.md](operating.md)
 note 3.
 
-### RCON does nothing until you enable it
+### RCON is standard, and its secret is required
 
-`spec.network.rcon.port` and `passwordSecret` are read and shape-checked even
-when `enabled` is absent or `false`, and then discarded. There is no warning. If
-RCON is not working, check `enabled: true` first.
+There is no `enabled` field. `spec.network.rcon` says *how* RCON is configured,
+never *whether* it is on, and a definition still carrying `enabled` is rejected
+as an unknown field rather than ignored — a document that says RCON is off means
+its author believed it was, and quietly enabling it would be the orchestrator
+doing the opposite of what the document says.
 
-Enabling it is not optional if you care about deleting the server later. **A
-persistent server with RCON disabled cannot be drained**, because the world save
-cannot be confirmed, so `DELETE` never completes. That behaviour is correct and
-is explained in [operating.md](operating.md) note 1 — but the time to notice it
-is while you are writing the definition.
+`passwordSecret` is required and cannot be defaulted, so `spec.network` is
+required too. `port` defaults to 25575 and must differ from `network.port`.
 
-That is meant literally: **later is too late.** Enabling RCON changes the shape of
-the container, so it applies to the *next* one, and the running one cannot be
-replaced without a drain — which is the thing that needs the save channel. A
-persistent server created without RCON keeps running and cannot be given it. Turn
-it on at creation or accept that the server can only ever be retired by hand.
+**Why there is no way to turn it off.** Stopping a server that holds a world
+requires evidence the world reached disk; evidence means the server saying so;
+RCON is the only channel that can say it. A persistent server without it could
+never be drained, so `DELETE` never completed — and the mistake was
+unrecoverable, because enabling RCON reshapes the container, the reshape needs a
+recreate, and the recreate needs the drain that needs the channel. A field whose
+wrong value is unrecoverable and whose right value is what everyone wants anyway
+is a field that should not exist.
+
+**What it still does not promise.** That anything answers. RCON dispatches onto
+the game's main thread, so a wedged server, a world-generation pass or a rotated
+password all leave a fully configured server unable to confirm a save.
+*Configured* and *responsive* are different properties —
+[failure-modes.md](failure-modes.md) is where the consequences live, and
+[operating.md](operating.md) note 1 is what an operator meets.
 
 ### Ephemeral storage is opt-in and means what it says
 

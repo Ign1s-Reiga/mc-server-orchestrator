@@ -101,9 +101,14 @@ definition, so a backend with no labels joins no fleet.
 
 ## RCON is configured but not working
 
-Check `enabled` first. `spec.network.rcon.port` and `passwordSecret` are read and
-shape-checked even when `enabled` is absent or `false`, **and then discarded, with
-no warning**. A block that looks complete does nothing without `enabled: true`.
+There is no `enabled` field to check — RCON is standard, and a definition
+carrying `enabled` is rejected as an unknown field.
+
+So the causes are the ones configuration cannot fix. RCON dispatches onto the
+game's main thread, which means a server busy generating world, or wedged, will
+not answer however correct the block is. The other common cause is a password the
+server does not have: rotating the secret does not reach a running container,
+because the value is handed to it at creation.
 
 The password lives in the secret store and is referenced by coordinates:
 
@@ -126,10 +131,10 @@ has stopped taking passes on it and your edit is sitting in desired state
 unapplied. This is the stalled-drain state; see `docs/operating.md` note 1,
 which also lists the two ways out.
 
-The most common route in is enabling `spec.network.rcon` on a persistent server
-that was created without it. That edit cannot take effect — RCON applies to the
-next container, and the current one cannot be replaced without a drain, which is
-what needs RCON. **Enable it at creation.**
+The most common route in is an edit to `spec.network.rcon` on a persistent server
+whose running container has stopped answering. That edit cannot take effect —
+`rcon` applies to the next container, and the current one cannot be replaced
+without a drain, which is what needs the channel that is not answering.
 
 ---
 

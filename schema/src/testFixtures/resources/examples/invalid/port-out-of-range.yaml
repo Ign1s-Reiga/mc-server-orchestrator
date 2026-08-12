@@ -12,3 +12,7 @@ spec:
     memory: 4Gi
   network:
     port: 70000
+    rcon:
+      passwordSecret:
+        name: survival-01-rcon
+        key: password

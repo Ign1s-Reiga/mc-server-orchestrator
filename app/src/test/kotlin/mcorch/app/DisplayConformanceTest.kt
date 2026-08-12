@@ -182,11 +182,12 @@ class DisplayConformanceTest {
             val registry = StaticNodeRegistry(listOf(node))
             val reconciler = Reconciler(embedded.state, registry, SingleNodeScheduler(registry))
 
-            // Persistent world data and no RCON: nothing can ever report that a
-            // save completed, so this drain aborts permanently and the container
-            // is deliberately left running. It is the state whose whole remedy is
-            // "a human resolves this".
-            val definition = paperServer(name = "stuck-01", rcon = RconSpec.Disabled)
+            // Persistent world data and a container that cannot confirm a save,
+            // so this drain aborts permanently and the container is deliberately
+            // left running. It is the state whose whole remedy is "a human
+            // resolves this".
+            stubLabelOverrides["mcorch.dev/save-confirmable"] = "false"
+            val definition = paperServer(name = "stuck-01")
             val name = definition.metadata.name
             runBlocking {
                 embedded.state.putDefinition(definition).getOrThrow()

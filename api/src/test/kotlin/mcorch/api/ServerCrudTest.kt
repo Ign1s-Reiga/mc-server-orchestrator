@@ -76,7 +76,8 @@ class ServerCrudTest {
             {"apiVersion":"mcorch.dev/v1alpha1","kind":"PaperServer",
              "metadata":{"name":"survival-json"},
              "spec":{"eulaAccepted":true,"image":"docker.io/itzg/minecraft-server:2026.6.1",
-                     "paper":{"minecraftVersion":"1.21.8"},"resources":{"memory":"4Gi"}}}
+                     "paper":{"minecraftVersion":"1.21.8"},"resources":{"memory":"4Gi"},
+                     "network":{"rcon":{"passwordSecret":{"name":"json-01-rcon","key":"password"}}}}}
             """.trimIndent()
         api.call("POST", "/api/v1/servers", json, contentType = "application/json").status shouldBe 201
 
@@ -88,7 +89,8 @@ class ServerCrudTest {
                 {"apiVersion":"mcorch.dev/v1alpha1","kind":"PaperServer",
                 "metadata":{"name":"bad-json"},
                 "spec":{"eulaAccepted":true,"image":"docker.io/itzg/minecraft-server:latest",
-                        "paper":{"minecraftVersion":"1.21.8"},"resources":{"memory":"4Gi"}}}
+                        "paper":{"minecraftVersion":"1.21.8"},"resources":{"memory":"4Gi"},
+                        "network":{"rcon":{"passwordSecret":{"name":"bad-json-rcon","key":"password"}}}}}
                 """.trimIndent(),
                 contentType = "application/json",
             )
@@ -102,7 +104,7 @@ class ServerCrudTest {
     }
 
     @Test
-    fun `the documented input type is the real one - seven fields validate, and each is required`() {
+    fun `the documented input type is the real one - eight fields validate, and each is required`() {
         // API.md's DefinitionInput claims nearly everything is optional on the way
         // in. The claim is only worth anything if the required set is exactly this,
         // so the test drops each field in turn and expects it to be named.
@@ -118,6 +120,11 @@ class ServerCrudTest {
                 "spec.eulaAccepted" to "\"eulaAccepted\":true,",
                 "spec.image" to "\"image\":\"docker.io/itzg/minecraft-server:2026.6.1\",",
                 "spec.paper.minecraftVersion" to "\"paper\":{\"minecraftVersion\":\"1.21.8\"},",
+                // Required since RCON became standard: the block carries a
+                // passwordSecret that cannot be defaulted, so neither can it.
+                "spec.network" to
+                    "\"network\":{\"rcon\":{\"passwordSecret\":" +
+                    "{\"name\":\"survival-min-rcon\",\"key\":\"password\"}}},",
                 "spec.resources.memory" to "\"resources\":{\"memory\":\"4Gi\"}",
             )
 

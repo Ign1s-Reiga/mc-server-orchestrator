@@ -346,9 +346,10 @@ internal class AttentionTest {
     fun `an aborted drain is worded as the drain's own failure, not as a failed pass`() =
         coreTest {
             val harness = Harness()
-            // No RCON: nothing can ever report that a save completed, so the drain
-            // aborts permanently and deliberately leaves the container running.
-            val definition = paperDefinition(rcon = RconSpec.Disabled)
+            // A container that cannot confirm a save, so the drain aborts
+            // permanently and deliberately leaves it running.
+            harness.node.labelOverrides[Labels.SAVE_CONFIRMABLE] = "false"
+            val definition = paperDefinition()
             val name = definition.metadata.name
             harness.declare(definition)
             harness.settle(name)

@@ -13,7 +13,6 @@ spec:
   network:
     port: 25565
     rcon:
-      enabled: true
       port: 25565
       passwordSecret:
         name: survival-01-rcon

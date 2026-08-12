@@ -251,10 +251,10 @@ internal class AdoptAfterCollisionTest {
     }
 
     private fun spec(): WorkloadSpec =
-        // RCON off, so the create resolves no secrets and [UnusedSecrets] can stay
-        // a fixture that refuses everything. What is under test is the collision,
-        // not the environment.
-        PaperWorkloadPlanner.plan(paperDefinition(rcon = RconSpec.Disabled))
+        // Every Paper workload now carries the RCON password reference, so a
+        // create resolves one secret. [UnusedSecrets] answers that one and nothing
+        // else — what is under test is the collision, not the environment.
+        PaperWorkloadPlanner.plan(paperDefinition())
 
     private fun node(
         client: CriClient,
@@ -502,13 +502,20 @@ private class RacingCriClient(
         error("the collision fixture reached $operation; a create asks for none of it")
 }
 
+/**
+ * Answers the one secret a Paper create needs, and refuses everything else.
+ *
+ * Every Paper workload carries an RCON password reference now that RCON is
+ * standard, so a store that refused outright would fail these tests on the
+ * environment rather than on the collision they are about.
+ */
 private object UnusedSecrets : SecretStore {
     override suspend fun put(
         ref: SecretRef,
         value: SecretValue,
     ): Unit = error("this create resolves no secrets")
 
-    override suspend fun resolve(ref: SecretRef): SecretValue? = error("this create resolves no secrets")
+    override suspend fun resolve(ref: SecretRef): SecretValue? = SecretValue.of("rcon-password".toCharArray())
 
     override suspend fun contains(ref: SecretRef): Boolean = error("this create resolves no secrets")
 

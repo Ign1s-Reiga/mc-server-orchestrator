@@ -9,6 +9,13 @@ import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 
 /**
+ * RCON is standard, so every `PaperServerSpec` needs a network block. Nothing in
+ * this file is about its contents.
+ */
+private fun rconNetwork(): NetworkSpec =
+    NetworkSpec(rcon = RconSpec(passwordSecret = SecretRef.of("survival-01-rcon", "password").getOrThrow()))
+
+/**
  * The two rules that cost world data are enforced by the constructors as well
  * as by the parser, so no module can build a spec that breaks them — not even
  * in a test fixture.
@@ -66,6 +73,7 @@ class SpecInvariantsTest {
                 resources = ResourceSpec(memory = memory("4Gi"), heap = HeapSpec(max = memory("2Gi"))),
                 storage = StorageSpec.Persistent(VolumeSpec(ResourceName.of("survival-01").getOrThrow())),
                 eulaAccepted = false,
+                network = rconNetwork(),
             )
         }
     }
@@ -325,6 +333,7 @@ class VelocityProxyTypesTest {
                 resources = ResourceSpec(memory = memory("4Gi"), heap = HeapSpec(max = memory("2Gi"))),
                 storage = storage,
                 eulaAccepted = true,
+                network = rconNetwork(),
             )
         }
 

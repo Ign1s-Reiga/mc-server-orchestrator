@@ -18,7 +18,6 @@ import mcorch.schema.PaperServerDefinition
 import mcorch.schema.PaperServerSpec
 import mcorch.schema.PaperServerStatus
 import mcorch.schema.PlayerOccupancy
-import mcorch.schema.RconSpec
 import mcorch.schema.RuntimeIdentity
 import mcorch.schema.SecretRef
 import mcorch.schema.ServerDefinition
@@ -57,9 +56,12 @@ import mcorch.store.UnreadableServer
  * the definition is.
  *
  * The fields this affects are exactly the optional ones: `paper.build`,
- * `network.hostPort`, `network.rcon`, `resources.cpu`, `storage.volume.size`,
- * `placement.node`, and `metadata.labels` when empty. Read them as
- * `spec.network.rcon ?? { enabled: false }`.
+ * `network.hostPort`, `resources.cpu`, `storage.volume.size`, `placement.node`,
+ * and `metadata.labels` when empty.
+ *
+ * `network.rcon` is **not** among them. RCON is standard, so the block is always
+ * present and always carries a `passwordSecret`; there is no `enabled` key to
+ * read and a definition carrying one is rejected.
  *
  * ## What is not here
  *
@@ -125,23 +127,15 @@ internal object ServerJson {
                 jsonObject {
                     put("port", spec.network.port)
                     spec.network.hostPort?.let { put("hostPort", it) }
-                    when (val rcon = spec.network.rcon) {
-                        // Omitted rather than rendered as `enabled: false`: absent is
-                        // how the schema spells "off", and this document has to parse.
-                        RconSpec.Disabled -> {
-                        }
-
-                        is RconSpec.Enabled -> {
-                            put(
-                                "rcon",
-                                jsonObject {
-                                    put("enabled", true)
-                                    put("port", rcon.port)
-                                    put("passwordSecret", secretRef(rcon.passwordSecret))
-                                },
-                            )
-                        }
-                    }
+                    // No `enabled`: the schema has no such field, and this document
+                    // has to parse back through the same reader that rejects it.
+                    put(
+                        "rcon",
+                        jsonObject {
+                            put("port", spec.network.rcon.port)
+                            put("passwordSecret", secretRef(spec.network.rcon.passwordSecret))
+                        },
+                    )
                 },
             )
             put(

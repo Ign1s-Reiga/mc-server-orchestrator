@@ -124,24 +124,41 @@ public value class MinecraftVersion private constructor(
 public data class NetworkSpec(
     val port: Int = PaperServerDefaults.GAME_PORT,
     val hostPort: Int? = null,
-    val rcon: RconSpec = RconSpec.Disabled,
+    val rcon: RconSpec,
 )
 
 /**
- * RCON, off unless asked for.
+ * RCON. Standard on every Paper server, so this says *how*, never *whether*.
  *
- * Sealed rather than a flag plus nullable fields: "enabled but no password
- * reference" is not a state anything in this system can hold. There is no
- * inline password field and there will not be one.
+ * ## Why there is no `enabled`
+ *
+ * There used to be, and the disabled case was the source of the first surprise
+ * in `docs/operating.md`: a persistent server that could never be deleted,
+ * because a world save cannot be confirmed without a channel that replies, and
+ * the drain will not stop a server on an unconfirmed save. Worse, the mistake
+ * was unrecoverable — enabling RCON reshapes the container, the reshape needs a
+ * recreate, and the recreate needs the drain that needs the channel.
+ *
+ * A field whose wrong value is unrecoverable, and whose right value is what
+ * every deployment wants anyway, is a field that should not exist.
+ *
+ * ## What it still does not guarantee
+ *
+ * That anything answers. A wedged main thread, a world-generation pass, or a
+ * rotated password all leave a fully configured server unable to confirm a save
+ * — RCON dispatches onto the game's main thread, so *configured* and
+ * *responsive* are different properties. `docs/failure-modes.md` is where the
+ * consequences live.
+ *
+ * ## Still a reference, never material
+ *
+ * [passwordSecret] names the password in the secret store. There is no inline
+ * password field and there will not be one.
  */
-public sealed interface RconSpec {
-    public data object Disabled : RconSpec
-
-    public data class Enabled(
-        val port: Int = PaperServerDefaults.RCON_PORT,
-        val passwordSecret: SecretRef,
-    ) : RconSpec
-}
+public data class RconSpec(
+    val port: Int = PaperServerDefaults.RCON_PORT,
+    val passwordSecret: SecretRef,
+)
 
 /** The container's memory/CPU limits and the JVM heap that has to fit inside them. */
 public data class ResourceSpec(
@@ -283,7 +300,8 @@ public data class PaperServerSpec(
     val storage: StorageSpec,
     val eulaAccepted: Boolean,
     val maxPlayers: Int = PaperServerDefaults.MAX_PLAYERS,
-    val network: NetworkSpec = NetworkSpec(),
+    /** No default: [RconSpec.passwordSecret] is required and cannot be invented. */
+    val network: NetworkSpec,
     val lifecycle: LifecycleSpec = LifecycleSpec(),
     val placement: PlacementSpec = PlacementSpec(),
 ) : ServerSpec {

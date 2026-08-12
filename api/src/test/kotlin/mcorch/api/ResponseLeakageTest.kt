@@ -104,7 +104,7 @@ class ResponseLeakageTest {
                 .parse(ExampleDefinitions.valid("full.yaml"), "test")
                 .getOrThrow()
                 .paper()
-                .spec.network.rcon as RconSpec.Enabled
+                .spec.network.rcon
         ).passwordSecret.name
 
     @Test
@@ -114,7 +114,7 @@ class ResponseLeakageTest {
             (
                 definition
                     .paper()
-                    .spec.network.rcon as RconSpec.Enabled
+                    .spec.network.rcon
             ).passwordSecret
         val value = SecretValue.random(48)
         val material = reveal(value)

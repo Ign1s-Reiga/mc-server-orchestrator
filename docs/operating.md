@@ -13,22 +13,32 @@ one that loses a world.
 
 ---
 
-## 1. A persistent server with RCON disabled cannot be deleted
+## 1. A persistent server whose save cannot be confirmed cannot be deleted
 
-If a `PaperServer` has persistent storage and `spec.network.rcon` is disabled,
-its drain cannot finish, so `DELETE` never completes and the container keeps
-running.
+If a `PaperServer` has persistent storage and its world save cannot be
+confirmed, its drain cannot finish, so `DELETE` never completes and the
+container keeps running.
 
 This is not a bug. Stopping a server that holds a world requires evidence the
 world reached disk, evidence means the server saying so, and RCON is the only
-channel that can say it. Without RCON the orchestrator has a choice between
-stopping on no evidence and not stopping. It does not stop.
+channel that can say it. Without that evidence the orchestrator has a choice
+between stopping on no evidence and not stopping. It does not stop.
+
+**RCON is standard, so this is no longer something you can declare your way
+into** — but configuring RCON is not the same as RCON answering. It dispatches
+onto the game's main thread, so the ways to arrive here are a wedged server, a
+long world-generation pass, or a password the server refuses. All three leave a
+fully configured server unable to say the save finished.
 
 The status says so — look for `NEEDS_ATTENTION` and a message ending:
 
 > To retire it, save the world and stop the container yourself; the teardown
 > completes on its own once a stopped container is observed. To keep it, revert
 > `spec.network.rcon` and the server returns to running.
+
+The second exit applies when an edit to `spec.network.rcon` is what asked for the
+recreate. When the cause is a server that has stopped answering, the way out is
+the first one.
 
 Both exits work **on a delete**, which is the case this note is about: a
 terminating definition keeps reconciling, so the loop is still watching and
@@ -55,10 +65,10 @@ Until it is fixed, either exit still works, but you have to take it deliberately
   passes. Re-sending an identical definition does not — the generation only moves
   when the spec differs.
 
-Note the ordering this implies for RCON: it has to be enabled **when the server is
-created**. Adding it to a persistent server that is already running cannot take
-effect, because the setting applies to the next container and the current one
-cannot be drained without it.
+Note the ordering this implies for RCON: its settings apply **when the server is
+created**. Changing them on a persistent server whose container has stopped
+answering cannot take effect, because the change applies to the next container
+and the current one cannot be drained without the channel that is not answering.
 
 ## 2. Reverting an edit stops working once the stop has been dispatched
 
