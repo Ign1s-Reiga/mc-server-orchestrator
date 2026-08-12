@@ -93,12 +93,20 @@ So the audit record keeps its shape:
 about auditing requires keeping it: the question an audit log answers is who did
 what and when.
 
-`command` now records what was dispatched rather than a matched allow-list entry,
+`command` records what was dispatched rather than a matched allow-list entry,
 because under a general console there is no entry to match for the top tier. An
-argument may therefore carry a player name — `kick Alice`. If that is judged too
-much for a durable sink, the mitigation is to record the verb and the argument
-count rather than the arguments, and that choice belongs with whoever owns log
-retention.
+argument may therefore carry a player name — `kick Alice`.
+
+**How much of it is kept is declared per server**, by
+`spec.console.auditCommandText` — see [03-command-policy.md](03-command-policy.md)
+§4.1. It defaults to recording the verb and an argument count, which is the
+setting that agrees with the logging rule above; `true` keeps the command
+verbatim. The choice sits in the manifest rather than in global configuration
+because the servers where full command text is worth its retention cost are not
+usually the whole fleet.
+
+The setting governs the audit sink alone. The console returns raw output either
+way, and nothing about it decides whether a command runs.
 
 **Gate 1 is untouched.** `stop` and `save-off` are refused for every identity and
 every tier, general console or not. See
