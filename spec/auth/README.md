@@ -34,21 +34,17 @@ the document that matters most here.
 
 ## Open decisions
 
-1. **What a force `DELETE` may skip** — [03-authorization.md](03-authorization.md)
-   §3.5. Its *tier* is settled (`Superuser`); its *semantics* are not. Skipping
-   the drain's patience is specifiable; skipping the confirmed world save
-   contradicts CLAUDE.md invariants 1 and 3, `api/API.md` §1, the current `DELETE`
-   contract and `RouteTableTest`. **Blocking**, and the one item here that should
-   go through the drain audit CLAUDE.md requires before it is settled.
-2. **Whether `Member` may read secret *coordinates*.** A server definition carries
+1. **Whether `Member` may read secret *coordinates*.** A server definition carries
    `{name, key}` references. They are not material, but they are a map of where
    material lives. §3.
-3. **Whether a `Superuser` may create another `Superuser`.** Necessarily yes for
+2. **Whether a `Superuser` may create another `Superuser`.** Necessarily yes for
    bootstrap, but it means one compromised Superuser credential is unbounded. The
    alternative is that only the operator token may mint Superusers.
 
 **Settled since the first draft:** the tier assignment for every existing route
-([03-authorization.md](03-authorization.md) §2), and the three tier names.
+([03-authorization.md](03-authorization.md) §2), the three tier names, and the
+forced-`DELETE` semantics — now specified in
+[`../termination/`](../termination/README.md).
 
 ## Sequencing
 

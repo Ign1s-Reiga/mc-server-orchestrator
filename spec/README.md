@@ -23,6 +23,13 @@ from the dashboard, through RCON.
 | [07-api.md](07-api.md) | The HTTP contract the dashboard is written against |
 | [08-origin-and-client.md](08-origin-and-client.md) | Same-origin hosting, why the request side is the exposure, and what the API can and cannot know about its caller |
 
+Two related specifications live alongside this one:
+
+| | |
+|---|---|
+| [auth/](auth/README.md) | Multi-identity authentication. The console's tier gate depends on it |
+| [termination/](termination/README.md) | RCON becoming standard, and the forced-stop path. **Makes RCON universal, which is what makes the console universal** |
+
 ## Settled decisions
 
 | Decision | Ruling | Why |

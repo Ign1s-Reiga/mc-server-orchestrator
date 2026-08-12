@@ -76,53 +76,25 @@ is `{online, max, observedAt}` — no identities, by construction. That is fine 
 expose at `Member`; it is noted here so that nobody later "improves" it into
 something that names players and quietly widens what the lowest tier can see.
 
-## 3.5 `DELETE` semantics are **not** settled by its tier
+## 3.5 `DELETE` semantics — settled, and specified elsewhere
 
-The tier is settled: `Superuser`. What that `Superuser` may *do* is not, and the
-two questions are independent.
+The tier is `Superuser`. What that `Superuser` may *do* is a separate question,
+and it is now answered in [`../termination/`](../termination/README.md): a forced
+path exists, as `DELETE ?force=true`, restricted to this tier.
 
-A force-delete that **terminates the process and removes the container regardless
-of drain readiness** has been proposed. It is recorded here as open rather than
-specified, because it contradicts things this repository states rather than
-implies:
+It is specified there rather than here because it is a drain change and a schema
+change, not an authorization one — and because it can lose world data, which
+deserves a document that says so at the top rather than a subsection of a
+permissions table.
 
-- **CLAUDE.md invariant 1** — *"Never stop or remove a container that has players
-  online without draining it first… Do not put an unconditional container stop in
-  any code path."*
-- **`api/API.md` §1** — *"There is no stop, kill, force or restart endpoint, and
-  there will not be one."*
-- **The current `DELETE` contract** — *"**No force flag.** There is no way to make
-  this stop a server faster."*
-- **`RouteTableTest`** asserts no route pattern contains `stop`, `kill`, `force`
-  or `purge`, with the reason inline.
-- **The drain-protocol skill** — *"A kill mid-save can corrupt region files."* The
-  loss is not only the unsaved minutes; it can be the region file itself.
+Two things from it that belong in this table's reading:
 
-**The need behind it is real.** `status.drain.state: "DRAIN_FAILED"` today means
-the drain aborted and the server is still running, and `api/API.md` says
-outright: *"There is no edge from there to a stop. It needs an operator."* The
-persistent server with RCON disabled — `docs/operating.md`'s first documented
-surprise — cannot be deleted at all. An operator with a genuinely stuck server
-currently has `crictl` and nothing else, which the drain audits treat as the
-symptom of a design failure.
-
-### What can be built without breaking the invariant
-
-Force should skip the **patience**, never the **save**:
-
-| Skipped | Safe? |
-|---|---|
-| Waiting for players to drain, when zero players is confirmed | Yes — there is nobody to transfer |
-| Retrying a drain that has already reported `DRAIN_FAILED` | Yes — it is not going to succeed |
-| Waiting out the full save timeout after a save is confirmed | Yes — the evidence already exists |
-| **Confirming the world save at all** | **No.** This is invariant 3, and it is where the data goes |
-
-That covers the stuck-server case that motivates the request. What it does not
-cover is a server that can never confirm a save because it has no RCON — and for
-that one, the honest options are *accept documented data loss behind an explicit
-second flag* or *leave it as it is*. That is a decision about the invariant
-itself, not about a route, and it is the one thing here that should not be
-settled without the drain audit CLAUDE.md requires for drain-related changes.
+- **The forced form requires `Superuser`**, and `RouteTableTest` gains an
+  assertion of that tier rather than keeping its current blanket claim that no
+  route can stop a container. That claim stops being true, and a test left green
+  while the capability arrives is a test that no longer checks what it says.
+- **It skips the drain's patience, never its save.** The distinction is the whole
+  design and the reason the tier alone was never sufficient to settle this.
 
 ## 4. The default for a route that has not been decided
 
