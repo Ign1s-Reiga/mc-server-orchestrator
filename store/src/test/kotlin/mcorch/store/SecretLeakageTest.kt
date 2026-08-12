@@ -110,7 +110,7 @@ class SecretLeakageTest {
             val material = reveal(value)
             val definition = Fixtures.definition("full.yaml")
             val reference =
-                (definition.spec.network.rcon as RconSpec.Enabled).passwordSecret
+                definition.spec.network.rcon.passwordSecret
 
             EmbeddedStore.open(EmbeddedStoreConfig(directory = directory, clock = clock)).use { store ->
                 store.secrets.put(reference, value)
@@ -194,7 +194,7 @@ class SecretLeakageTest {
             val value = SecretValue.random(48)
             val material = reveal(value)
             val definition = Fixtures.definition("full.yaml")
-            val reference = (definition.spec.network.rcon as RconSpec.Enabled).passwordSecret
+            val reference = definition.spec.network.rcon.passwordSecret
 
             EmbeddedStore.open(EmbeddedStoreConfig(directory = directory, clock = clock)).use { store ->
                 store.secrets.put(reference, value)
@@ -219,7 +219,7 @@ class SecretLeakageTest {
             val value = SecretValue.random(48)
             val material = reveal(value)
             val definition = Fixtures.definition("full.yaml")
-            val reference = (definition.spec.network.rcon as RconSpec.Enabled).passwordSecret
+            val reference = definition.spec.network.rcon.passwordSecret
 
             EmbeddedStore.open(EmbeddedStoreConfig(directory = directory, clock = clock)).use { store ->
                 store.secrets.put(reference, value)

@@ -51,7 +51,15 @@ class PaperServerValidationTest {
         val fields = violationsOf("missing-required.yaml").map { it.field }
 
         fields shouldContainExactlyInAnyOrder
-            listOf("spec.image", "spec.paper", "spec.eulaAccepted", "spec.resources")
+            listOf(
+                "spec.image",
+                "spec.paper",
+                "spec.eulaAccepted",
+                "spec.resources",
+                // Required since RCON became standard: the block carries a
+                // passwordSecret that cannot be defaulted, so neither can it.
+                "spec.network",
+            )
     }
 
     @Test
@@ -100,10 +108,12 @@ class PaperServerValidationTest {
                     "spec.network.rcon.password",
                     "inline secrets are not supported",
                 ),
+                // No longer "when rcon is enabled": there is no enabling. RCON is
+                // standard, so the secret is required outright.
                 ValidationCase(
                     "rcon-without-secret.yaml",
                     "spec.network.rcon.passwordSecret",
-                    "is required when rcon is enabled",
+                    "is required",
                 ),
                 ValidationCase("heap-exceeds-memory.yaml", "spec.resources.heap.max", "must leave headroom"),
                 ValidationCase(

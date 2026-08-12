@@ -82,12 +82,14 @@ class PaperServerParseTest {
     }
 
     @Test
-    fun `omitted network settings default to the vanilla port with rcon off`() {
+    fun `omitted network settings default to the vanilla ports`() {
         val network = parse("valid/minimal.yaml").spec.network
 
         network.port shouldBe PaperServerDefaults.GAME_PORT
         network.hostPort.shouldBeNull()
-        network.rcon shouldBe RconSpec.Disabled
+        // The block itself is required — the secret cannot be defaulted — but the
+        // port inside it can be, and is.
+        network.rcon.port shouldBe PaperServerDefaults.RCON_PORT
         parse("valid/minimal.yaml").spec.maxPlayers shouldBe 20
         parse("valid/minimal.yaml")
             .spec.placement.node
@@ -122,13 +124,12 @@ class PaperServerParseTest {
     fun `rcon is a reference to the secret store, never a password`() {
         val rcon = parse("valid/full.yaml").spec.network.rcon
 
-        val enabled = rcon.shouldBeInstanceOf<RconSpec.Enabled>()
-        enabled.port shouldBe 25575
-        enabled.passwordSecret.name shouldBe ResourceName.of("survival-02-rcon").getOrThrow()
-        enabled.passwordSecret.key shouldBe "password"
+        rcon.port shouldBe 25575
+        rcon.passwordSecret.name shouldBe ResourceName.of("survival-02-rcon").getOrThrow()
+        rcon.passwordSecret.key shouldBe "password"
         // Nothing that could hold secret material exists on the type, so no
         // rendering of it can leak one.
-        enabled.toString().contains("hunter") shouldBe false
+        rcon.toString().contains("hunter") shouldBe false
     }
 
     @Test

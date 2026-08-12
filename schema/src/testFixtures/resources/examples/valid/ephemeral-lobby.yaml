@@ -7,6 +7,11 @@ metadata:
   labels:
     role: lobby
 spec:
+  network:
+    rcon:
+      passwordSecret:
+        name: lobby-01-rcon
+        key: password
   eulaAccepted: true
   image: docker.io/itzg/minecraft-server:2026.6.1
   paper:

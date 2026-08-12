@@ -18,6 +18,7 @@ import mcorch.core.memory
 import mcorch.core.nodeName
 import mcorch.core.paperDefinition
 import mcorch.core.resourceName
+import mcorch.core.secretRef
 import mcorch.schema.MemoryQuantity
 import mcorch.schema.RconSpec
 import mcorch.schema.StorageSpec
@@ -39,7 +40,11 @@ internal class PaperWorkloadTest {
             base
         PaperWorkloadPlanner.specHash(paperDefinition(memoryBytes = 8L * MemoryQuantity.GIB)) shouldNotBe base
         PaperWorkloadPlanner.specHash(paperDefinition(storage = StorageSpec.Ephemeral())) shouldNotBe base
-        PaperWorkloadPlanner.specHash(paperDefinition(rcon = RconSpec.Disabled)) shouldNotBe base
+        // RCON cannot be turned off any more, but its port still reshapes the
+        // container, so moving it must still provoke a recreate.
+        PaperWorkloadPlanner.specHash(
+            paperDefinition(rcon = RconSpec(port = 25599, passwordSecret = secretRef())),
+        ) shouldNotBe base
         PaperWorkloadPlanner.specHash(paperDefinition(maxPlayers = 40)) shouldNotBe base
         PaperWorkloadPlanner.specHash(paperDefinition(hostPort = 30099)) shouldNotBe base
 
@@ -145,14 +150,18 @@ internal class PaperWorkloadTest {
 
     @Test
     fun `RCON is published inside the sandbox only, and only when it is enabled`() {
-        val enabled = PaperWorkloadPlanner.plan(paperDefinition())
-        val rcon = enabled.ports.single { it.name == PaperWorkloadPlanner.RCON_PORT_NAME }
+        val planned = PaperWorkloadPlanner.plan(paperDefinition())
+        val rcon = planned.ports.single { it.name == PaperWorkloadPlanner.RCON_PORT_NAME }
         rcon.containerPort shouldBe 25575
+
+        // Never published on the host. RCON is a remote console with full server
+        // authority, and the only things that need it are inside the sandbox or
+        // dialling the sandbox address.
         rcon.hostPort shouldBe null
 
-        val disabled = PaperWorkloadPlanner.plan(paperDefinition(rcon = RconSpec.Disabled))
-        disabled.ports.none { it.name == PaperWorkloadPlanner.RCON_PORT_NAME }.shouldBeTrue()
-        disabled.env[PaperImageContract.ENABLE_RCON] shouldBe "false"
+        // Standard now, so there is no plan that turns it off.
+        planned.env[PaperImageContract.ENABLE_RCON] shouldBe "true"
+        planned.secretEnv.containsKey(PaperImageContract.RCON_PASSWORD) shouldBe true
     }
 
     @Test
@@ -161,12 +170,14 @@ internal class PaperWorkloadTest {
         persistent.labels[Labels.WORLD_DATA] shouldBe "true"
         persistent.labels[Labels.SAVE_CONFIRMABLE] shouldBe "true"
 
-        val disposable =
-            PaperWorkloadPlanner.plan(
-                paperDefinition(storage = StorageSpec.Ephemeral(), rcon = RconSpec.Disabled),
-            )
+        // The two labels are independent, and this is the pair that proves it:
+        // an ephemeral server has no world to flush, and still has the channel
+        // that could confirm one. SAVE_CONFIRMABLE is constant for a PaperServer
+        // now that RCON is standard — it earns its place by telling a Paper
+        // server apart from a VelocityProxy, which has neither.
+        val disposable = PaperWorkloadPlanner.plan(paperDefinition(storage = StorageSpec.Ephemeral()))
         disposable.labels[Labels.WORLD_DATA] shouldBe "false"
-        disposable.labels[Labels.SAVE_CONFIRMABLE] shouldBe "false"
+        disposable.labels[Labels.SAVE_CONFIRMABLE] shouldBe "true"
     }
 
     /**

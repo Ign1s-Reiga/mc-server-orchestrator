@@ -267,11 +267,35 @@ internal class FakeNode(
                 // real runtime does. This is what makes a later drain able to
                 // read what the *container* was built with rather than what the
                 // definition says after an edit.
-                labels = spec.labels + (Labels.SPEC_HASH to spec.specHash),
+                labels = applyLabelOverrides(spec.labels + (Labels.SPEC_HASH to spec.specHash)),
                 createdAt = clock.instant(),
             )
         workload = created
         return created
+    }
+
+    /**
+     * Labels forced onto a created workload. A `null` value **removes** the
+     * label.
+     *
+     * The container is not the definition, and some of what a drain reads is
+     * only knowable from the container. `Labels.SAVE_CONFIRMABLE` is the case
+     * that matters: the schema no longer lets a `PaperServer` be declared
+     * without RCON, but `PaperServerAgent.contractOf` still reads that label off
+     * the running workload, and absence there means *"this workload does not
+     * say"* rather than *"yes"*. A container adopted from elsewhere, or one whose
+     * labels a runtime did not report, lands in exactly that state.
+     *
+     * So this exists to construct that container, and the drain's refusal to stop
+     * a world it cannot confirm a save for stays under test.
+     */
+    val labelOverrides: MutableMap<String, String?> = mutableMapOf()
+
+    private fun applyLabelOverrides(labels: Map<String, String>): Map<String, String> {
+        if (labelOverrides.isEmpty()) return labels
+        val result = labels.toMutableMap()
+        labelOverrides.forEach { (key, value) -> if (value == null) result.remove(key) else result[key] = value }
+        return result
     }
 
     override suspend fun startWorkload(handle: WorkloadHandle) {

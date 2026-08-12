@@ -212,17 +212,26 @@ internal class PaperServerLifecycleIT {
     @Test
     fun `a server whose save cannot be confirmed keeps running`() =
         integrationTest {
-            // Persistent world data and no RCON: there is no channel through
-            // which a completed save could be confirmed, so this server cannot
-            // be drained — and the one thing that must not happen is it being
-            // stopped anyway.
+            // Persistent world data whose save cannot be confirmed, so this
+            // server cannot be drained — and the one thing that must not happen
+            // is it being stopped anyway.
+            //
+            // RCON is standard now, so "no save channel" can no longer be
+            // declared. The faithful equivalent against a real server is a
+            // password it will refuse: the container comes up, `rcon-cli` reaches
+            // the port, and authentication fails. `DrainTest` records that as
+            // permanent in practice and indistinguishable from a rotated secret,
+            // and it is the state an operator actually reaches.
             val definition =
                 paperServer(
                     name = "it-nosave",
                     hostPort = 30415,
-                    rcon = mcorch.schema.RconSpec.Disabled,
                 )
             val name = definition.metadata.name
+            // Seeded so the container can be created, and wrong so the save can
+            // never be confirmed. The server generates its own password from the
+            // env this does not match.
+            harness.putSecret(rconSecret("it-nosave"), "not-the-password-the-server-has")
             harness.declare(definition)
             harness.start(this)
             harness.await("the server to answer a Server List Ping") { harness.status(name)?.ready == true }
@@ -254,7 +263,6 @@ internal class PaperServerLifecycleIT {
                     name = "it-lobby",
                     hostPort = 30416,
                     storage = StorageSpec.Ephemeral(),
-                    rcon = mcorch.schema.RconSpec.Disabled,
                 )
             val name = definition.metadata.name
             harness.declare(definition)

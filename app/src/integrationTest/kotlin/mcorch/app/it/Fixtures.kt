@@ -159,7 +159,7 @@ internal fun paperServer(
     image: String = PAPER_IMAGE,
     hostPort: Int,
     storage: StorageSpec = StorageSpec.Persistent(VolumeSpec(resourceName("$name-world"))),
-    rcon: RconSpec = RconSpec.Enabled(passwordSecret = rconSecret(name)),
+    rcon: RconSpec = RconSpec(passwordSecret = rconSecret(name)),
     maxPlayers: Int = 20,
     saveTimeout: Duration = 60.seconds,
     startupTimeout: Duration = 5.minutes,

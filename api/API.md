@@ -306,7 +306,7 @@ carries the hash it was built from, and any difference from the desired hash is
 | `spec.resources.heap.max`, `spec.resources.heap.min` |
 | `spec.storage.mode`, `spec.storage.mountPath`, `spec.storage.volume.name` |
 | `spec.network.port`, `spec.network.hostPort` |
-| `spec.network.rcon` — enabled/disabled, and its port and secret coordinates |
+| `spec.network.rcon` — its port and secret coordinates. Always present |
 | `spec.maxPlayers` |
 | *whether a proxy claims this server* — see below |
 
@@ -345,21 +345,17 @@ this is safe" will be wrong exactly when a server joins or leaves a fleet.
 Two of the fields above are effectively creation-time on a server that holds a
 world, and a create form is the last cheap moment to get them right.
 
-**`spec.network.rcon` on persistent storage.** Enabling RCON reshapes the
+**`spec.network.rcon` on persistent storage.** Changing it reshapes the
 container, and reshaping requires a drain, and a drain on persistent storage
-cannot finish without RCON to confirm the world reached disk. So a persistent
-server created without RCON cannot later be given it — the edit is accepted, the
-replacement drain starts, and it stalls permanently with the original container
-still running and still joinable. The status says so in as many words:
+cannot finish without RCON to confirm the world reached disk. So if the running
+container has stopped answering, an edit to `rcon` cannot rescue it — the edit is
+accepted, the replacement drain starts, and it stalls permanently with the
+original container still running and still joinable.
 
-> the running container was created with RCON disabled, so enabling
-> `spec.network.rcon` has not reached it — that setting applies to the next
-> container, and this one cannot be replaced until it has been drained
-
-The way out is not another edit. See `docs/operating.md` note 1. **A client
-creating a `PaperServer` with `spec.storage.mode: "persistent"` and no
-`spec.network.rcon` should say what that forecloses, while the choice is still
-free.**
+RCON is standard, so this can no longer be reached by *declaring* a server
+without it. It is still reachable whenever the running container stops answering:
+a wedged main thread, a long world-generation pass, or a password it does not
+have. The way out is not another edit — see `docs/operating.md` note 1.
 
 **`metadata.labels` on a server meant for a fleet.** A label added at creation
 costs nothing; the same label added later drains the server, for the reason in
@@ -473,9 +469,11 @@ first time a dashboard round-tripped it. Nothing else in a response is ever sent
 back, so nothing else pays that price, and a fixed key set is worth more to a
 TypeScript client than symmetry is.
 
-Affected: `paper.build`, `network.hostPort`, `network.rcon`, `resources.cpu`,
-`storage.volume.size`, `placement.node`, and `metadata.labels` when empty. Read
-them as `spec.network.rcon ?? { enabled: false }`.
+Affected: `paper.build`, `network.hostPort`, `resources.cpu`,
+`storage.volume.size`, `placement.node`, and `metadata.labels` when empty.
+
+`network.rcon` is **not** affected. RCON is standard, so the block is always
+present and always carries a `passwordSecret`.
 
 This is what makes `Definition` assignable to `DefinitionInput` in §14 —
 `const draft: DefinitionInput = server.definition` compiles. What comes *out* is
@@ -1447,8 +1445,8 @@ export interface PaperServerSpecInput {
   network?: {
     port?: number;                      // default 25565
     hostPort?: number;
-    /** Omit for no RCON. `passwordSecret` is required once `enabled` is true. */
-    rcon?: { enabled?: boolean; port?: number; passwordSecret?: SecretRef };
+    /** Required. RCON is standard; `port` defaults to 25575. */
+    rcon: { port?: number; passwordSecret: SecretRef };
   };
   /** Defaults to persistent, on a volume named after the server. */
   storage?:
@@ -1521,7 +1519,7 @@ export interface PaperServerSpec {
   network: {
     port: number;
     hostPort?: number;
-    rcon?: { enabled: true; port: number; passwordSecret: SecretRef };
+    rcon: { port: number; passwordSecret: SecretRef };
   };
   resources: { memory: string; cpu?: string; heap: { max: string; min: string } };
   storage:

@@ -18,7 +18,6 @@ spec:
     port: 25565
     hostPort: 30002
     rcon:
-      enabled: true
       port: 25575
       # There is no inline password field. The value lives in the secret store.
       passwordSecret:

@@ -5,6 +5,11 @@ kind: PaperServer
 metadata:
   name: Survival_01
 spec:
+  network:
+    rcon:
+      passwordSecret:
+        name: Survival_01-rcon
+        key: password
   eulaAccepted: true
   image: docker.io/itzg/minecraft-server:2026.6.1
   paper:

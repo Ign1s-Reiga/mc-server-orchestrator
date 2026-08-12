@@ -129,7 +129,7 @@ internal fun paperDefinition(
     labels: Map<String, String> = emptyMap(),
     image: String = DEFAULT_SERVER_IMAGE,
     storage: StorageSpec = StorageSpec.Persistent(VolumeSpec(resourceName("$name-world"))),
-    rcon: RconSpec = RconSpec.Enabled(passwordSecret = secretRef()),
+    rcon: RconSpec = RconSpec(passwordSecret = secretRef()),
     maxPlayers: Int = 20,
     hostPort: Int? = 30001,
     placement: PlacementSpec = PlacementSpec(),

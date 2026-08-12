@@ -666,9 +666,11 @@ internal class DrainTest {
     fun `a server with world data and no RCON cannot be drained and is not stopped`() =
         coreTest {
             val harness = Harness()
-            // Persistent storage, no RCON: there is no channel through which a
-            // completed save could be confirmed.
-            val definition = paperDefinition(rcon = RconSpec.Disabled)
+            // Persistent storage, and a container that cannot confirm a save.
+            // See the note in `a deleted server whose container has no save
+            // channel...` for why this is set on the workload rather than declared.
+            harness.node.labelOverrides[Labels.SAVE_CONFIRMABLE] = "false"
+            val definition = paperDefinition()
             val name = definition.metadata.name
             harness.declare(definition)
             harness.settle(name)
@@ -695,7 +697,7 @@ internal class DrainTest {
     fun `an ephemeral server has no world to save and stops without one`() =
         coreTest {
             val harness = Harness()
-            val definition = paperDefinition(storage = StorageSpec.Ephemeral(), rcon = RconSpec.Disabled)
+            val definition = paperDefinition(storage = StorageSpec.Ephemeral())
             val name = definition.metadata.name
             harness.declare(definition)
             harness.settle(name)
@@ -1700,23 +1702,24 @@ internal class DrainTest {
         }
 
     @Test
-    fun `enabling RCON on a container that has none does not wedge the server`() =
+    fun `an rcon edit against a container that cannot confirm a save does not wedge it`() =
         coreTest {
             val harness = Harness()
-            val definition = paperDefinition(rcon = RconSpec.Disabled)
+            harness.node.labelOverrides[Labels.SAVE_CONFIRMABLE] = "false"
+            val definition = paperDefinition()
             val name = definition.metadata.name
             harness.declare(definition)
             harness.settle(name)
 
-            // The operator follows the advice on the stalled drain and enables
-            // RCON. It is in the spec hash, so it asks for a recreate — and the
-            // recreate has to drain the container that is running, which was
-            // created with RCON disabled and has nothing listening. The loop
-            // must not believe the new definition, must not send a save into
-            // that socket, and above all must not record a request it never
-            // delivered: that record is what used to make the state permanent
-            // and unrecoverable.
-            harness.store.putDefinition(paperDefinition(rcon = RconSpec.Enabled(passwordSecret = secretRef())))
+            // The operator moves the RCON port. It is in the spec hash, so it asks
+            // for a recreate — and the recreate has to drain the container that is
+            // running, which reports no save channel. The loop must not believe
+            // the new definition, must not send a save into that socket, and above
+            // all must not record a request it never delivered: that record is
+            // what used to make the state permanent and unrecoverable.
+            harness.store.putDefinition(
+                paperDefinition(rcon = RconSpec(port = 25599, passwordSecret = secretRef())),
+            )
             repeat(8) { harness.pass(name) }
 
             val stalled =
@@ -1754,10 +1757,20 @@ internal class DrainTest {
         }
 
     @Test
-    fun `a deleted server whose container has no RCON is finished off by hand and then torn down`() =
+    fun `a deleted server whose container has no save channel is finished off by hand and then torn down`() =
         coreTest {
             val harness = Harness()
-            val definition = paperDefinition(rcon = RconSpec.Disabled)
+            // A container that reports no save channel. RCON is standard, so this
+            // can no longer be *declared* — but the drain is conducted against the
+            // container, and `contractOf` reads the label off the running workload
+            // rather than off the definition. With `declaresSaveChannel` now
+            // constant, that label is the only thing left that can say "no", which
+            // makes it the whole of the guard rather than a second opinion on it.
+            //
+            // What this pins is the refusal: a container that says it cannot
+            // confirm a save is not stopped, whatever the definition claims.
+            harness.node.labelOverrides[Labels.SAVE_CONFIRMABLE] = "false"
+            val definition = paperDefinition()
             val name = definition.metadata.name
             harness.declare(definition)
             harness.settle(name)
@@ -2051,7 +2064,8 @@ internal class DrainTest {
     fun `a drain that failed permanently needs a human straight away`() =
         coreTest {
             val harness = Harness(config = ReconcilerConfig(drainAttentionAfter = 10.minutes))
-            val definition = paperDefinition(rcon = RconSpec.Disabled)
+            harness.node.labelOverrides[Labels.SAVE_CONFIRMABLE] = "false"
+            val definition = paperDefinition()
             val name = definition.metadata.name
             harness.declare(definition)
             harness.settle(name)
@@ -3208,12 +3222,14 @@ internal class DrainTest {
         coreTest {
             val harness = Harness()
             val name = paperDefinition().metadata.name
-            harness.declare(paperDefinition(rcon = RconSpec.Disabled))
+            harness.node.labelOverrides[Labels.SAVE_CONFIRMABLE] = "false"
+            harness.declare(paperDefinition())
             harness.settle(name)
             harness.node.creates shouldHaveSize 1
 
-            // The edit that cannot reach the running container.
-            harness.declare(paperDefinition(rcon = RconSpec.Enabled(passwordSecret = secretRef())))
+            // An edit that reshapes the container, so it asks for a recreate the
+            // running container cannot be drained for.
+            harness.declare(paperDefinition(image = REPLACEMENT_SERVER_IMAGE))
             repeat(6) { harness.pass(name) }
 
             val stalled =
@@ -3254,9 +3270,10 @@ internal class DrainTest {
         coreTest {
             val harness = Harness()
             val name = paperDefinition().metadata.name
-            harness.declare(paperDefinition(rcon = RconSpec.Disabled))
+            harness.node.labelOverrides[Labels.SAVE_CONFIRMABLE] = "false"
+            harness.declare(paperDefinition())
             harness.settle(name)
-            harness.declare(paperDefinition(rcon = RconSpec.Enabled(passwordSecret = secretRef())))
+            harness.declare(paperDefinition(image = REPLACEMENT_SERVER_IMAGE))
             repeat(6) { harness.pass(name) }
 
             val stalled = harness.status(name).shouldNotBeNull()

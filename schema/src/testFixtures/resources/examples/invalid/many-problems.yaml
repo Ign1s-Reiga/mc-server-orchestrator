@@ -17,6 +17,10 @@ spec:
     minecraftVersion: "snapshot-24w14a"
   maxPlayers: 0
   network:
+    rcon:
+      passwordSecret:
+        name: survival-01-rcon
+        key: password
     port: 0
   resources:
     memory: 128Mi

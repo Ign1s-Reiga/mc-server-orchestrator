@@ -9,7 +9,6 @@ import mcorch.core.NodeException
 import mcorch.core.WorkloadHandle
 import mcorch.core.WorkloadObservation
 import mcorch.schema.PaperServerDefinition
-import mcorch.schema.RconSpec
 import mcorch.schema.StorageSpec
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
@@ -53,13 +52,19 @@ internal class PaperServerAgent(
      * Whether the *declared* server has any channel through which a save can be
      * *confirmed*.
      *
-     * Confirmation needs a reply, and the only thing that replies is RCON.
-     * Without it the loop can push a save request into the console and learn
-     * nothing about whether it finished — which is precisely the conflation the
-     * drain protocol forbids. A server with world data and no RCON therefore
-     * cannot be drained, and the loop says so rather than stopping it anyway.
+     * Constant now that RCON is standard on every `PaperServer`, and kept rather
+     * than inlined for two reasons. It is still read against the **container**
+     * through [contractOf], where it is not constant — a container created by an
+     * older build has whatever it was created with, and the drain is conducted
+     * against the container, never against the definition as it reads today. And
+     * it names the property the drain actually depends on, which a bare `true`
+     * at the call site would not.
+     *
+     * Declaring the channel is not having a working one: RCON dispatches onto
+     * the game's main thread, so a wedged server answers nothing. That is
+     * `docs/failure-modes.md`'s territory, not this property's.
      */
-    val declaresSaveChannel: Boolean get() = spec.network.rcon is RconSpec.Enabled
+    val declaresSaveChannel: Boolean get() = true
 
     /**
      * What the container that is actually running was built with.

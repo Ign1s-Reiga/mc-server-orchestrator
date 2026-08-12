@@ -7,7 +7,6 @@ import mcorch.core.StorageRequest
 import mcorch.core.WorkloadSpec
 import mcorch.schema.MemoryQuantity
 import mcorch.schema.PaperServerDefinition
-import mcorch.schema.RconSpec
 import mcorch.schema.SecretRef
 import mcorch.schema.StorageSpec
 import java.security.MessageDigest
@@ -48,13 +47,11 @@ internal object PaperWorkloadPlanner {
                         hostPort = spec.network.hostPort,
                     ),
                 )
-                val rcon = spec.network.rcon
-                if (rcon is RconSpec.Enabled) {
-                    // Deliberately not published on the host: RCON is a remote
-                    // console with full server authority, and the only thing
-                    // that needs it is an exec from inside the sandbox.
-                    add(PortRequest(name = RCON_PORT_NAME, containerPort = rcon.port))
-                }
+                // Deliberately not published on the host: RCON is a remote
+                // console with full server authority, and the only thing that
+                // needs it is an exec from inside the sandbox or the console
+                // channel dialling the sandbox address.
+                add(PortRequest(name = RCON_PORT_NAME, containerPort = spec.network.rcon.port))
             }
 
         val storage =
@@ -84,10 +81,7 @@ internal object PaperWorkloadPlanner {
         val environment = PaperImageContract.environment(definition)
         val secretEnvironment =
             buildMap {
-                when (val rcon = spec.network.rcon) {
-                    is RconSpec.Enabled -> put(PaperImageContract.RCON_PASSWORD, rcon.passwordSecret)
-                    RconSpec.Disabled -> Unit
-                }
+                put(PaperImageContract.RCON_PASSWORD, spec.network.rcon.passwordSecret)
                 forwardingSecret?.let { put(PaperImageContract.FORWARDING_SECRET, it) }
             }
 
@@ -128,7 +122,10 @@ internal object PaperWorkloadPlanner {
                         // recorded on the container itself. A definition that
                         // changes underneath it does not change these.
                         put(Labels.WORLD_DATA, Labels.booleanLabel(storage is StorageRequest.Persistent))
-                        put(Labels.SAVE_CONFIRMABLE, Labels.booleanLabel(spec.network.rcon is RconSpec.Enabled))
+                        // Constant for a PaperServer now that RCON is standard, and
+                        // kept anyway: it is what tells a Paper server apart from a
+                        // VelocityProxy, which has no RCON and never will.
+                        put(Labels.SAVE_CONFIRMABLE, Labels.booleanLabel(true))
                         // Absent rather than empty when there is no volume, and
                         // [Labels.VOLUME] says why at length: absence has to read
                         // as "the previous record stands", because an ephemeral
@@ -212,16 +209,8 @@ internal object PaperWorkloadPlanner {
             )
             add("network.port=${spec.network.port}")
             add("network.hostPort=${spec.network.hostPort ?: "none"}")
-            when (rcon) {
-                is RconSpec.Enabled -> {
-                    add("rcon.port=${rcon.port}")
-                    add("rcon.secret=${rcon.passwordSecret.name}/${rcon.passwordSecret.key}")
-                }
-
-                RconSpec.Disabled -> {
-                    add("rcon=disabled")
-                }
-            }
+            add("rcon.port=${rcon.port}")
+            add("rcon.secret=${rcon.passwordSecret.name}/${rcon.passwordSecret.key}")
             add("maxPlayers=${spec.maxPlayers}")
             // Absent rather than "none" when nothing claims this server, so a
             // fleet with no proxy in it hashes exactly as it did before this
@@ -303,19 +292,15 @@ internal object PaperImageContract {
             put(MAX_PLAYERS, spec.maxPlayers.toString())
             put(SERVER_PORT, spec.network.port.toString())
 
-            when (val rcon = spec.network.rcon) {
-                is RconSpec.Enabled -> {
-                    put(ENABLE_RCON, "true")
-                    put(RCON_PORT, rcon.port.toString())
-                    // RCON_PASSWORD is deliberately absent: it is carried as a
-                    // secret reference and resolved by the node at the moment
-                    // it is handed to the runtime.
-                }
-
-                RconSpec.Disabled -> {
-                    put(ENABLE_RCON, "false")
-                }
-            }
+            put(ENABLE_RCON, "true")
+            put(
+                RCON_PORT,
+                spec.network.rcon.port
+                    .toString(),
+            )
+            // RCON_PASSWORD is deliberately absent: it is carried as a secret
+            // reference and resolved by the node at the moment it is handed to
+            // the runtime.
         }
     }
 

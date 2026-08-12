@@ -1,5 +1,8 @@
 # Expected, all in one parse: spec.image, spec.paper, spec.resources,
-# spec.eulaAccepted — is required
+# spec.eulaAccepted, spec.network — is required.
+#
+# spec.network joined the list when RCON became standard: the block carries a
+# passwordSecret that cannot be defaulted, so the block itself cannot be either.
 apiVersion: mcorch.dev/v1alpha1
 kind: PaperServer
 metadata:

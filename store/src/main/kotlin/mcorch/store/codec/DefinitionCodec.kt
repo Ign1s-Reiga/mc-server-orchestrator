@@ -169,20 +169,12 @@ internal object DefinitionCodec {
         writer.scope("network") {
             put("port", spec.network.port)
             put("hostPort", spec.network.hostPort)
-            when (val rcon = spec.network.rcon) {
-                is RconSpec.Disabled -> {
-                    put("rcon.enabled", false)
-                }
-
-                is RconSpec.Enabled -> {
-                    scope("rcon") {
-                        put("enabled", true)
-                        put("port", rcon.port)
-                        // Coordinates only. There is no field here that could hold the password.
-                        put("passwordSecret.name", rcon.passwordSecret.name.value)
-                        put("passwordSecret.key", rcon.passwordSecret.key)
-                    }
-                }
+            scope("rcon") {
+                val rcon = spec.network.rcon
+                put("port", rcon.port)
+                // Coordinates only. There is no field here that could hold the password.
+                put("passwordSecret.name", rcon.passwordSecret.name.value)
+                put("passwordSecret.key", rcon.passwordSecret.key)
             }
         }
         writer.scope("storage") {
@@ -286,9 +278,15 @@ internal object DefinitionCodec {
         }
     }
 
-    private fun readRcon(reader: DocumentReader): RconSpec {
-        if (!reader.requireBoolean("network.rcon.enabled")) return RconSpec.Disabled
-        return RconSpec.Enabled(
+    /**
+     * No `enabled` key, in either direction.
+     *
+     * A row written by a build that had one will not decode, which surfaces as
+     * `SERVER_UNREADABLE` — the path that already exists for a stored form this
+     * build cannot read, and the right outcome rather than a silent default.
+     */
+    private fun readRcon(reader: DocumentReader): RconSpec =
+        RconSpec(
             port = reader.requireInt("network.rcon.port"),
             passwordSecret =
                 SecretRef(
@@ -296,7 +294,6 @@ internal object DefinitionCodec {
                     key = reader.requireString("network.rcon.passwordSecret.key"),
                 ),
         )
-    }
 
     // --------------------------------------------------------------- VelocityProxy
 
