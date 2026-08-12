@@ -1,11 +1,11 @@
 # 07 — The HTTP contract
 
-Responses carry typed, parsed results per [04-output.md](04-output.md). Raw RCON
-text never crosses this boundary.
+Responses carry **raw server output**, per [04-output.md](04-output.md).
 
-This section, once built, belongs in `api/API.md` — with its §11 amended to match
-(roles and an audit log stop being absent). **§13 needs no amendment**, which is
-the point of the output decision.
+This section, once built, belongs in `api/API.md` — with **§11** amended (roles
+and an audit log stop being absent) and **§13** amended to carve out this
+endpoint, since it is the one place the API returns player names, UUIDs and
+client addresses. `ResponseLeakageTest` gains a matching, explicit exemption.
 
 ---
 
@@ -79,38 +79,34 @@ command, so that an audit record and a refusal always refer to exactly one thing
 ```json
 { "server": "survival-01",
   "command": "list",
-  "tier": "viewer",
+  "tier": "admin",
   "executedAt": "2026-08-12T09:14:02Z",
-  "result": { "kind": "players", "online": 3, "max": 20 } }
+  "output": "There are 3 of a max of 20 players online: Alice, Bob, Carol" }
 ```
 
-`command` is the **matched allow-list entry**, not the raw input — the same value
-the audit sink records, and for the same reason (see
-[04-output.md](04-output.md)). `tier` is the effective tier the request ran at,
-after the per-server ceiling was applied.
+`command` is the command as dispatched. `tier` is the effective tier the request
+ran at, after the per-server ceiling was applied.
 
-`result` is a typed, parsed shape drawn from the parser set in
-[04-output.md](04-output.md) §3. It never carries a player name, UUID or client
-address, so `api/API.md` §13 continues to hold structurally and
-`ResponseLeakageTest` covers this endpoint with no carve-out.
+`output` is **whatever the server replied, verbatim**. It routinely carries player
+names, UUIDs and client addresses — that is the point of a general console, and
+it is why this endpoint is §13's one exception. A client must treat it as
+untrusted text: render it escaped, never as HTML.
 
-Note the asymmetry ([04-output.md](04-output.md) §2): a moderation command's
-**request** carries a player name as an argument, while no **response** ever
-does. A dashboard cannot list who is online, so it cannot offer a player to
-click — the operator supplies the name from elsewhere.
+Both halves are sensitive here. The command travels in the request body rather
+than the query so it stays out of access logs (§2), and same-origin removes the
+intermediaries that would otherwise hold copies of either half — see
+[08-origin-and-client.md](08-origin-and-client.md).
 
 ### Errors
 
 | code | status | carries | meaning |
 |---|---|---|---|
 | `CONSOLE_NOT_CONFIGURED` | 409 | | `spec.network.rcon` is `Disabled` — no channel exists to carry a command |
-| `CONSOLE_UNKNOWN_COMMAND` | 422 | | not in the allow-list at all |
-| `CONSOLE_FORBIDDEN` | 403 | `requiredTier` | in the allow-list, above the caller's effective tier |
+| `CONSOLE_FORBIDDEN` | 403 | `requiredTier` | not in this tier's set. `admin` never receives this — it is bounded only by Gate 1 |
 | `CONSOLE_COMMAND_REFUSED` | 409 | `useInstead` | Gate 1. Refused for every identity and tier |
 | `CONSOLE_BUSY` | 503 | `Retry-After` | a drain is in flight, or the per-server queue is full. **Retryable, and safe to retry** |
 | `CONSOLE_UNAVAILABLE` | 503 | `Retry-After` | the relay is unreachable, or the container is not running. **Retryable, and safe to retry** |
 | `CONSOLE_TIMEOUT` | 504 | | the command outran its deadline. **Not safe to retry** — see §5 |
-| `CONSOLE_OUTPUT_UNPARSED` | 502 | | The command **ran**; its output did not parse. **Not safe to retry** — see §5 |
 
 `CONSOLE_COMMAND_REFUSED` carries the declarative alternative:
 
@@ -129,8 +125,14 @@ than discovering its limits from `403`s.
 { "server": "survival-01",
   "available": true,
   "tier": "operator",
+  "unrestricted": false,
   "commands": ["list", "say", "tps", "whitelist", "kick"] }
 ```
+
+An `admin` caller gets `"unrestricted": true` and an empty `commands`, because
+that tier has no finite set — it may run anything Gate 1 permits. A dashboard
+reads `unrestricted` to decide between offering a command picker and offering a
+free-text prompt.
 
 When RCON is disabled the capability is reported absent rather than `404` — open
 decision 3 in [README.md](README.md):

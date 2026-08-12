@@ -69,12 +69,16 @@ proving the search could have failed.
 RCON returns free-form text. `/list` returns
 `There are 3 of a max of 20 players online: Alice, Bob, Carol`. A console that
 returns raw RCON output returns a string, and a string has no shape to guarantee.
-The guarantee would change from *structural* to *filtered* — from "there is
-nothing to leave out" to "we tried to take it out" — and that is a different and
-much weaker claim.
 
-[04-output.md](04-output.md) is where this gets decided. It is the central
-decision in this specification.
+**This one is broken deliberately.** [04-output.md](04-output.md) settles that raw
+output crosses the boundary, because a general console cannot be built any other
+way. §13 becomes true of every endpoint except the console, the exception is
+written into it as part of the same change, and `ResponseLeakageTest` gains an
+explicit carve-out rather than discovering the collision during implementation.
+
+The guarantee stops being *absolute* — which is most of what it was worth, since
+an absolute claim is checkable and a qualified one has to be remembered. That
+cost was weighed and accepted against a console that works on modded fleets.
 
 ---
 
@@ -112,3 +116,7 @@ Worth stating, because these are the guarantees the console must not erode:
 - **Secret material is still never returned.** `passwordSecret` remains
   `{name, key}` coordinates and no endpoint resolves it. The relay resolving it
   internally is a separate cost, recorded in [02-relay.md](02-relay.md) §5.
+- **The logging convention is untouched.** *Never log player names, UUIDs, or IP
+  addresses* governs what the orchestrator writes to disk. The output decision is
+  about a response body to an authenticated caller and does not reach it — the
+  audit sink stays redacted. See [04-output.md](04-output.md) §3.

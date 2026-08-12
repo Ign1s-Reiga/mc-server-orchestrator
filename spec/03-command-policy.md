@@ -66,27 +66,38 @@ Drafted with orchestrator-native names — see open decision 2 in
 
 | Tier | Holds |
 |---|---|
-| `viewer` | Commands returning no identifiers — `tps`, `mspt`, `seed`, version queries |
-| `operator` | Gameplay and moderation — `say`, `whitelist`, `kick`, `ban`, `gamemode`, `give` |
-| `admin` | Configuration, and everything else the allow-list permits |
+| `viewer` | An allow-listed set returning no identifiers — `tps`, `mspt`, `seed`, version queries |
+| `operator` | An allow-listed set covering gameplay and moderation — `say`, `whitelist`, `kick`, `ban`, `gamemode`, `give` |
+| `admin` | **Anything Gate 1 permits.** The general console |
 
-## 3. Allow-list, failing closed
+## 3. Two tiers allow-list; the top tier does not
 
-Each tier carries an explicit set of permitted commands. **An unrecognised
-command is refused, never passed through.**
+[04-output.md](04-output.md) settles that raw output crosses the boundary and the
+console is general-purpose. A general console cannot be allow-listed — an
+allow-list is exactly the thing that stops a Forge mod's custom command from
+working — so `admin` is bounded by Gate 1 and by nothing else.
 
-Three reasons this must be an allow-list rather than a deny-list:
+The lower two tiers keep explicit sets, and **an unrecognised command is refused
+there, never passed through**. Two reasons that survive the output decision:
 
-1. **Output handling requires it.** You cannot safely redact or parse output
-   whose shape you have never seen — see [04-output.md](04-output.md). Permitting
-   only commands with known output is the same constraint viewed from the other
-   side.
-2. **Mods and plugins register arbitrary commands.** On a modded fleet a
-   deny-list develops a silent hole the moment someone installs a mod. An
-   allow-list degrades gracefully instead: the new command is refused until
-   somebody adds it deliberately.
-3. **Failing closed is the only safe direction** for a facility with full server
-   authority.
+1. **Mods and plugins register arbitrary commands.** On a modded fleet a
+   deny-list develops a silent hole the moment somebody installs a mod. An
+   allow-list degrades gracefully: the new command is refused until somebody adds
+   it deliberately.
+2. **Failing closed is the right direction for a bounded tier.** `viewer` exists
+   to be safe to hand out; a `viewer` that inherits every mod command as it is
+   installed is not.
+
+> An earlier draft required an allow-list at every tier, on the grounds that
+> output whose shape you have never seen cannot be safely handled. That reason
+> died with the typed-parser design — under a general console, unknown output is
+> the normal case and is returned as-is. The two reasons above are what is left,
+> and they are about bounding a *tier*, not about handling output.
+
+**What the tiers now mean.** `viewer` and `operator` are capability sets; `admin`
+is unrestricted server authority minus the two commands that lose data. Granting
+`admin` is granting the server console, and should be described that way to
+whoever grants it.
 
 ---
 
