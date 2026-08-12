@@ -86,6 +86,7 @@ internal object Migrations {
             V4RejectUnnamedRows,
             V5BlockedDrainIsNotAFailure,
             V6DrainFaultLedger,
+            V7Identities,
         )
 
     val latest: Int = ALL.maxOf { it.version }
@@ -764,5 +765,39 @@ private object V6DrainFaultLedger : Migration {
         }
         writer.put(LEDGER, "0")
         return writer.render()
+    }
+}
+
+/**
+ * The identity table, empty.
+ *
+ * Reads no stored document, so the `doc_encoding` rule above does not apply: it
+ * adds a table and touches nothing that exists, which is what makes it the cheap
+ * half of `spec/auth/04-store.md`.
+ *
+ * The hard half is what an **empty** table means on the first run after this, and
+ * it has exactly one safe answer: *no identities exist yet*, and the bootstrap
+ * credential is the only way in until one is created.
+ *
+ * It must **not** create a default administrator with a generated credential. A
+ * credential minted by a migration is one printed into a log or lost, and a lost
+ * administrator credential is one nobody holds and nothing revokes.
+ */
+private object V7Identities : Migration {
+    override val version: Int = 7
+    override val description: String = "operator identities and their tiers"
+
+    override fun apply(connection: Connection) {
+        connection.execute(
+            """
+            CREATE TABLE identity (
+                name              TEXT PRIMARY KEY,
+                credential_digest TEXT NOT NULL,
+                tier              TEXT NOT NULL,
+                enabled           INTEGER NOT NULL,
+                created_at        TEXT NOT NULL
+            )
+            """.trimIndent(),
+        )
     }
 }
