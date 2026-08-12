@@ -57,21 +57,42 @@ This gives the architecture without a new artifact to deploy, supervise, version
 and secure. When nodes multiply it moves with `Node`, and every caller is already
 written against the handle.
 
-### 4.1 What `:cri` must surface
+### 4.1 The address path already exists
 
-`SandboxStatus` today carries id, labels and `createdAt`. It does **not** carry
-the sandbox IP. That must be plumbed through `:cri` and surfaced on the `Node`
-handle.
+An earlier draft of this document said the sandbox IP was not surfaced and would
+have to be plumbed through `:cri`. **That was wrong.** `SandboxStatus` already
+carries `ips: List<String>`, primary first, redacted from its own `toString`;
+and `Node.callEndpoint` already resolves that address and dials it, to reach the
+Velocity control plugin for drain steps 2, 4 and 6.
 
-Two constraints on doing so:
+So there is no `:cri` work here, and the relay is not inventing a pattern —
+`callEndpoint` **is** the pattern, and its KDoc states the reasoning the console
+channel should inherit verbatim:
 
-- **The relay receives a reachable address from the `Node` handle. It never
-  derives or guesses one.** An address the relay works out for itself is a "the
-  local one" assumption, and the seventh invariant exists to keep those out.
-- **The address is a routing detail, never a log field.** `SandboxSpec` already
-  redacts host IPs and nameserver addresses from `toString` on the grounds that
-  structured logging must not carry IP addresses. A sandbox IP on `Node` inherits
-  that discipline.
+> A remote node would forward this to its own agent and never expose an address
+> at all; on this host the sandbox has a CNI address and the orchestrator process
+> can open a socket to it directly. That difference is the whole reason
+> `Node.callEndpoint` exists as an interface method — a caller that resolved an
+> address itself would have hard-coded the single-host deployment.
+
+Three properties the console channel takes from it:
+
+- **It is an interface method on `Node`.** A caller that resolved an address
+  itself would hard-code single-host, which the seventh invariant exists to
+  prevent.
+- **The address is read fresh on every call, never cached on the handle.** A
+  recreated sandbox gets a new address, and a request aimed at the previous
+  occupant of one is a request sent to somebody else's server. `callEndpoint`
+  makes this point about sealing the wrong backend; a console command sent to the
+  wrong server is the same error with a worse blast radius.
+- **The address is never logged.** Not in a failure message, not at debug.
+  Failures name the port, which is declared configuration.
+
+A sandbox with no address yet is a **wait, not a misconfiguration** —
+`callEndpoint` raises a retryable `NodeException.Busy` carrying
+`NodeDispatch.NOTHING_SENT`. The console channel needs the same distinction, and
+[07-api.md](07-api.md) maps it to `CONSOLE_UNAVAILABLE`, which is retryable and
+safe to retry precisely because nothing was sent.
 
 ## 5. Why not a sidecar
 
@@ -91,14 +112,23 @@ permanent.
 
 ## 6. Costs accepted explicitly
 
-### 6.1 Secret concentration
+### 6.1 Authority concentration
 
-A per-node relay holds RCON passwords for every server on its node. Compromising
-it yields console authority over that whole node.
+A per-node relay can reach the console of every server on its node, so
+compromising it yields console authority over all of them.
 
-Mitigation bounds the window rather than removing it: resolve a server's password
-lazily on first use and drop it after idle, rather than loading the node's full
-set at startup.
+What it does **not** need to hold is the passwords. `LocalNode.resolveToken`
+already establishes the pattern for the Velocity control token — *"Coordinates
+in, material out, and the material never leaves this function"* — resolving the
+secret, using it, and destroying it in a `finally`.
+
+RCON authenticates once per connection, so a relay built on persistent
+connections needs the password only at connect time. Resolve it there, send the
+auth packet, destroy it. **The relay then holds N authenticated sockets, not N
+credentials**, and a memory disclosure yields sessions rather than secrets.
+
+This does not remove the authority concentration in the first paragraph, which is
+inherent to the shape. It removes the credential concentration, which is not.
 
 ### 6.2 A new failure domain
 
@@ -117,8 +147,14 @@ safety-critical one keeps the dumber, more robust path.
 `rcon-cli` reads it in-container. That is why `BringUpTest` can assert *the RCON
 password travels as a reference, never as a value*.
 
-A host-side relay resolves that material into its own memory, making the
-assertion false in a new place, permanently. The auth handshake also moves from
+A host-side relay resolves that material into the orchestrator's memory, which
+`rcon-cli` in-container never required. The auth handshake also moves from
 loopback onto the CNI bridge.
+
+Both are real. Both are narrower than an earlier draft of this document claimed:
+per §6.1 the material is held only for the length of a connect, and the CNI
+bridge is host-local rather than an external interface. The Velocity control
+token already crosses the same boundary on the same terms, so this is an existing
+trade being extended rather than a new one being made.
 
 Accepted in exchange for not draining the fleet (§5).

@@ -54,20 +54,26 @@ Neither blocks drafting or implementation.
 
 ## Sequencing
 
-1. **Multi-identity auth** — `:store` and `:api` ([06-auth.md](06-auth.md)).
-   Nothing in Gate 2 can be built before this, because every credential in the
-   system is currently the same token.
-2. **Gate 1, the invariant refusal set** ([03-command-policy.md](03-command-policy.md)).
-   Independent of everything else and useful on its own.
-3. **Sandbox IP through `:cri` → `Node`** ([02-relay.md](02-relay.md)).
-4. **The `:core` edge and the relay** ([01-impact.md](01-impact.md) §2, [02-relay.md](02-relay.md)).
-5. **Allow-list, parsers and the audit sink** ([04-output.md](04-output.md)).
-6. **`spec.console` ceiling** — `:schema` plus consumers, in one change.
-7. **The contract into `api/API.md`**, and its §11 amended — roles and an audit
-   log stop being absent. **§13 stands unchanged**, which is what the output
-   decision bought.
+- [x] **Gate 1, the invariant refusal set** ([03-command-policy.md](03-command-policy.md)).
+      `mcorch.core.console.ConsoleInvariants`. Independent of everything else and
+      useful on its own, so it went first.
+- [x] **~~Sandbox IP through `:cri` → `Node`~~** — **not needed.** Already
+      present: `SandboxStatus.ips` carries it and `Node.callEndpoint` already
+      dials it for the Velocity control channel. See
+      [02-relay.md](02-relay.md) §4.1.
+- [ ] **Multi-identity auth** — `:store` and `:api` ([06-auth.md](06-auth.md)).
+      Nothing in Gate 2 can be built before this, because every credential in the
+      system is currently the same token.
+- [ ] **The `:core` edge and the console channel on `Node`**
+      ([01-impact.md](01-impact.md) §2, [02-relay.md](02-relay.md)). Shaped after
+      `callEndpoint`, which solves the same problem.
+- [ ] **Allow-list, parsers and the audit sink** ([04-output.md](04-output.md)).
+      Gated by multi-identity auth for the tier half; the parsers are not.
+- [ ] **`spec.console` ceiling** — `:schema` plus consumers, in one change.
+- [ ] **The contract into `api/API.md`**, and its §11 amended — roles and an
+      audit log stop being absent. **§13 stands unchanged**, which is what the
+      output decision bought.
 
-Steps 2 and 3 are independent and can run concurrently. Step 1 gates step 5.
-
-**The permission model is the long pole, not the RCON plumbing.** Step 1 is a
-project in its own right; steps 3 and 4 are comparatively mechanical.
+**The permission model is the long pole, not the RCON plumbing.** Multi-identity
+auth is a project in its own right; the console channel is comparatively
+mechanical now that `callEndpoint` has established its shape.
