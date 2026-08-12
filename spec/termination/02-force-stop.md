@@ -80,6 +80,11 @@ for.
 
 ## 5. `RouteTableTest` has to change, deliberately
 
+> Authorised. The rewrite lands **in the change that adds the force parameter**,
+> not before — a test asserting a `Superuser` tier and a `force` parameter that do
+> not exist yet would not compile, and one reworded ahead of them would be a test
+> describing a system that is not there.
+
 It currently asserts that no route pattern contains `stop`, `kill`, `force` or
 `purge`, with the reason inline: *"one that could stop a container directly could
 stop one with players on it."*

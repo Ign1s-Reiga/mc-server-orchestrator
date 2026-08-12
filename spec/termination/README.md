@@ -26,17 +26,17 @@ that is not is the half the force button gets used for.**
 | Scenario | Closed by mandatory RCON? |
 |---|---|
 | A *new* persistent server declared without RCON, undeletable forever | **Yes.** It can no longer be declared |
-| An *existing* container created without RCON | **No.** `docs/schema.md`: *"a persistent server created without RCON keeps running and cannot be given it"* — the edit needs a recreate, the recreate needs a drain, the drain needs the channel that is not there. `DrainTest` has a test for exactly this deadlock |
+| An *existing* container created without RCON | **Moot.** Pre-release: nothing is running |
 | RCON configured, but the main thread is wedged | **No.** `docs/failure-modes.md`: *"SLP answers, RCON does not. Attempt the save and wait the full save timeout, then abort unconfirmed"* |
 | RCON configured, main thread busy during world generation | **No.** Same file: *"when RCON is up but the main thread is busy for a minute or more — becomes permanently undeletable"* |
 | The RCON password is wrong | **No.** Permanent in practice and indistinguishable from a rotated one |
 
 **RCON being *configured* is not RCON being *responsive*.** Three of the five
-rows survive the schema change untouched.
+rows survive the schema change untouched, and they are the live ones.
 
 So the thing that actually closes the gap is the **force path**, not the schema
-change. The schema change stops new instances of the easiest case; the force path
-is what makes the remaining four exitable.
+change. The schema change removes the declarable case; the force path is what
+makes the three unresponsive ones exitable.
 
 That matters for one reason, and it is the whole design constraint of
 [02-force-stop.md](02-force-stop.md):
@@ -53,10 +53,12 @@ dangerous. So the button is not an immediate kill.
 | Decision | Ruling |
 |---|---|
 | RCON in the manifest | Standard. `spec.network.rcon` declares port and secret, not `enabled` |
-| Old definitions carrying `enabled: false` | Rejected at parse with a field-level error, not silently migrated — [01-mandatory-rcon.md](01-mandatory-rcon.md) §3 |
+| Old definitions carrying `enabled: false` | Rejected at parse as an unknown field. No migration — pre-release, nothing to preserve — [01-mandatory-rcon.md](01-mandatory-rcon.md) §3 |
 | Force path | `DELETE /api/v1/servers/{name}?force=true`, `Superuser` only |
 | Force semantics | Attempt the save, wait the save timeout, **then** stop regardless of confirmation. Not an immediate kill |
 | True immediate kill | Stays out of band — `crictl stop --force`, which the orchestrator does not offer and cannot see |
+| Reporting an unresponsive RCON | From use and from the drain, never from a poller — [01-mandatory-rcon.md](01-mandatory-rcon.md) §4.1. A probe is tick budget spent on every server forever, to detect what a failed command already reports |
+| `RouteTableTest` | Rewritten, not deleted, in the change that adds the force path — [02-force-stop.md](02-force-stop.md) §5 |
 
 ## Before any of this is implemented
 
