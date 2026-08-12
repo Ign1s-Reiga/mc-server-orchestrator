@@ -33,7 +33,7 @@ from the dashboard, through RCON.
 | Relay packaging | A component behind `Node`, not a separate deployable | Distributes with `Node` later; nothing new to deploy or version now |
 | Sidecar alternative | Rejected | Adding a container changes the workload shape → spec hash → recreate → a drain for every existing persistent server |
 | Drain's channel | Unchanged — keeps its own `ExecSync` path | A relay outage must not become a data-safety outage |
-| Command policy | Allow-list, failing closed | You cannot safely handle output you cannot parse |
+| Command policy | Two gates: invariant refusals, then tiers. `Member` and `Operator` allow-list; `Superuser` does not | An allow-list at every tier is what would stop a Forge mod's command working, so the top tier is bounded by Gate 1 alone |
 | Concurrency | Parallel across servers, serial within one, subordinate to a drain | The bottleneck is the game's main thread, not relay capacity |
 | Command output | **Raw server output crosses the boundary unmodified** | A general console cannot be built any other way. `api/API.md` §13 gains its one exception, written deliberately, with a matching `ResponseLeakageTest` carve-out. The endpoint returns unredacted output to authorised operators — it does not mask anything, and must never be described as if it did |
 | Dashboard hosting | Same origin — `:api` serves the bundle from `MCORCH_API_STATIC_ROOT` | Already what the CORS table calls "the normal deployment"; avoids `SameSite=None`, which would force TLS. Not a second container: a different port is a different origin |
@@ -41,7 +41,7 @@ from the dashboard, through RCON.
 | Client identification | The credential type, not a header | A header is forgeable with one `curl -H` flag. `X-Mcorch-Client` exists for contract-version negotiation and audit context only, is optional everywhere, and is never authorised on |
 | Audit detail | Per server, via `spec.console.auditCommandText` | An argument can be a player name and the audit is a durable sink. Defaults to verb-plus-argument-count, which agrees with the logging rule; keeping full text is an operator overriding that for one server, written down in the manifest |
 
-The output decision has three consequences worth carrying forward: the `admin`
+The output decision has three consequences worth carrying forward: the `Superuser`
 tier is a general console bounded only by Gate 1, both the request and the
 response carry player identities so neither may reach a place that keeps them,
 and the audit sink stays redacted regardless — that is CLAUDE.md's logging rule,
@@ -50,15 +50,12 @@ See [04-output.md](04-output.md) §2–§3.
 
 ## Open decisions
 
-1. **Tier naming.** Orchestrator-native (`viewer`/`operator`/`admin`) as drafted
-   in [03-command-policy.md](03-command-policy.md), or op-level numbers kept as
-   familiar labels over the same sets.
-2. **Behaviour when `spec.network.rcon` is `Disabled`.** Report the console as an
+1. **Behaviour when `spec.network.rcon` is `Disabled`.** Report the console as an
    absent capability so the dashboard can grey it out, or `404` the route. The
    first matches how `display` already communicates state; the second is less to
    specify. [07-api.md](07-api.md) drafts the first.
 
-Neither blocks drafting or implementation.
+It does not block drafting or implementation.
 
 ## Sequencing
 
@@ -71,8 +68,9 @@ Neither blocks drafting or implementation.
       [02-relay.md](02-relay.md) §4.1.
 - [x] **The RCON wire codec** — `mcorch.core.console.rcon.RconCodec`. Frame only:
       no I/O, no connection state, so every bound is testable without a server.
-- [ ] **The RCON connection** — auth handshake, multi-packet reassembly, and the
-      per-server serialisation of [05-concurrency.md](05-concurrency.md).
+- [x] **The RCON connection** — `RconConnection`. Auth handshake, multi-packet
+      reassembly, and the per-server serialisation of
+      [05-concurrency.md](05-concurrency.md) made structural by a `Mutex`.
 - [ ] **Static serving in `:api`** ([08-origin-and-client.md](08-origin-and-client.md) §1.1).
       Independent of the console entirely, and the thing that makes same-origin
       real rather than assumed.
@@ -91,15 +89,16 @@ Neither blocks drafting or implementation.
       [auth/03-authorization.md](auth/03-authorization.md) §5 the console's tier
       gate ships after the API-wide tier assignment, not before.
 - [ ] **Tier allow-lists and the audit sink** ([04-output.md](04-output.md)).
-      Gated by multi-identity auth. No parsers: `admin` is unrestricted below
+      Gated by multi-identity auth. No parsers: `Superuser` is unrestricted below
       Gate 1, and the two lower tiers carry explicit sets.
 - [ ] **`spec.console`** — `maxTier` and `auditCommandText`, `:schema` plus
       consumers in one change, per the `add-server-kind` procedure. Lands *with*
       the audit sink and the tier gate, never before them: a field the loop does
       not honour is the first failure that procedure names.
-- [ ] **The contract into `api/API.md`**, and its §11 amended — roles and an
-      audit log stop being absent. **§13 stands unchanged**, which is what the
-      output decision bought.
+- [ ] **The contract into `api/API.md`** — §11 amended as roles and the audit log
+      arrive, and **§13 amended to carve out the console**, which is the one
+      endpoint that returns player names, UUIDs and client addresses.
+      `ResponseLeakageTest` gains a matching exemption.
 
 **The permission model is the long pole, not the RCON plumbing.** Multi-identity
 auth is a project in its own right; the console channel is comparatively

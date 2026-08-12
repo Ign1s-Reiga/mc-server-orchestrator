@@ -23,7 +23,7 @@ nothing for [the audit record's](04-output.md) `identity` field to name.
 
 **The console's tier gate ships after the API-wide tier assignment, not before.**
 A tier honoured by exactly one endpoint is worse than no tier: an operator who
-sees `viewer` refuse a console command reasonably concludes `viewer` is
+sees `Member` refuse a console command reasonably concludes `Member` is
 constrained, and that conclusion would be false everywhere else.
 
 See [`auth/03-authorization.md`](auth/03-authorization.md) §5.

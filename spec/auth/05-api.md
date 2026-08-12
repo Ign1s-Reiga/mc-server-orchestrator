@@ -23,7 +23,7 @@ A bearer caller gets `identity` and `tier` too; `csrfToken` and `expiresAt` stay
 
 ## 2. Identity management
 
-All `admin`. All audited.
+All `Superuser`. All audited.
 
 | | |
 |---|---|
@@ -70,23 +70,23 @@ New codes, in the shape `api/API.md` §3 already uses.
 | `FORBIDDEN` | 403 | `requiredTier` | Authenticated, insufficient tier. Distinct from `UNAUTHENTICATED`: the caller does not need to log in again, and a dashboard that retries the login on this loops |
 | `IDENTITY_EXISTS` | 409 | | `POST` never overwrites, matching how `POST /servers` behaves |
 | `IDENTITY_NOT_FOUND` | 404 | | |
-| `LAST_ADMIN` | 409 | | The change would leave no enabled `admin` — see §4 |
+| `LAST_SUPERUSER` | 409 | | The change would leave no enabled `Superuser` — see §4 |
 
-`FORBIDDEN` carries `requiredTier` so a dashboard can say *"this needs admin"*
+`FORBIDDEN` carries `requiredTier` so a dashboard can say *"this needs Superuser"*
 rather than *"forbidden"*. It does **not** carry the caller's own tier, which the
 caller already knows from `/auth/session`.
 
-## 4. The last admin
+## 4. The last Superuser
 
-Deleting, disabling or demoting the only enabled `admin` is refused with
-`LAST_ADMIN`.
+Deleting, disabling or demoting the only enabled `Superuser` is refused with
+`LAST_SUPERUSER`.
 
 Not because it is unrecoverable — the operator token gets you back in, which is
 half of why it exists ([06-bootstrap.md](06-bootstrap.md)) — but because the
 recovery requires reaching the host's environment, and an operator who does not
 realise that is one click from an orchestrator they can only fix by shell.
 
-The refusal names what to do first: create or enable another `admin`.
+The refusal names what to do first: create or enable another `Superuser`.
 
 > This check is racy in the honest sense — two concurrent demotions could each
 > see the other as the survivor. The store write is the serialisation point, so

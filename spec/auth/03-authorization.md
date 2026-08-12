@@ -24,27 +24,34 @@ and replace it**. `api/API.md` §5 has a whole section — *"Which edits replace
 container"* — on exactly this. A tier that may `PUT` may cause every player on a
 server to be transferred and the container recreated.
 
-Neither may be reachable below `admin` on the strength of "it is just a write".
+**`PUT` is assigned to `Operator` anyway, and that is a decision rather than an
+oversight.** An `Operator` who may create servers and edit manifests but may not
+edit a *running* one is an `Operator` who cannot do the job the tier exists for.
+The mitigation is that the replacement still goes through the drain — nobody is
+disconnected, the world is saved first — so the cost of a careless `PUT` is a
+restart, not lost data. That is a different class of mistake from `DELETE`, which
+is why they land on different tiers.
 
-## 2. Proposed assignment
+What this does mean: **an `Operator` can cause a fleet-wide restart** by editing
+several manifests, and nothing rate-limits that. Worth knowing before granting
+the tier.
 
-Open decision 1 in [README.md](README.md). Proposed, not settled — this table is
-what needs a review that is not the author's.
+## 2. The assignment
 
 | Route | Tier | Note |
 |---|---|---|
 | `GET /healthz` | none | Unauthenticated today and stays so |
-| `GET /api/v1/meta` | `viewer` | |
+| `GET /api/v1/meta` | `Member` | |
 | `POST /api/v1/auth/session` | none | Establishes a credential; checks the credential itself |
 | `GET` / `DELETE /api/v1/auth/session` | any | Your own session |
-| `GET /api/v1/servers`, `/{name}`, `/{name}/status` | `viewer` | See §3 — this is less obviously safe than it looks |
-| `GET /api/v1/stream` | `viewer` | Same content as the reads, incrementally |
-| `POST /api/v1/validate` | `viewer` | Parses a document, touches nothing |
-| `POST /api/v1/servers` | `operator` | Creates. Cannot stop anything that exists |
-| `PUT /api/v1/servers/{name}` | **`admin`** | An edit drains and replaces — §1 |
-| `DELETE /api/v1/servers/{name}` | **`admin`** | Ends a server — §1 |
-| `GET /api/v1/secrets` | `admin` | Coordinates only, never material — but see §3 |
-| `PUT` / `DELETE /api/v1/secrets/…` | **`admin`** | Writes the forwarding secret and the RCON password |
+| `GET /api/v1/servers`, `/{name}`, `/{name}/status` | `Member` | See §3 — this is less obviously safe than it looks |
+| `GET /api/v1/stream` | `Member` | Same content as the reads, incrementally |
+| `POST /api/v1/validate` | `Member` | Parses a document, touches nothing |
+| `POST /api/v1/servers` | `Operator` | Creates, and only creates. Never overwrites |
+| `PUT /api/v1/servers/{name}` | `Operator` | Updates the manifest. **Decided knowingly** — see §1 |
+| `DELETE /api/v1/servers/{name}` | **`Superuser`** | Ends a server — §1 |
+| `GET /api/v1/secrets` | `Superuser` | Coordinates only, never material — but see §3 |
+| `PUT` / `DELETE /api/v1/secrets/…` | **`Superuser`** | Writes the forwarding secret and the RCON password |
 | `POST /api/v1/servers/{name}/console` | per `spec.console` | The console's own gates, on top of this |
 
 `POST /servers` sitting below `PUT` and `DELETE` is deliberate and is the one
@@ -61,17 +68,65 @@ a second look.
 `spec.forwarding.secret` and `spec.control.tokenSecret` are `{name, key}` pairs.
 They are not material — `api/API.md` §13 is unambiguous that no endpoint resolves
 one — but they are a **map of where material lives**, which is the useful half of
-reconnaissance. Open decision 2 is whether `viewer` should see them, or whether
-definitions render with coordinates elided below `admin`.
+reconnaissance. Open decision 2 is whether `Member` should see them, or whether
+definitions render with coordinates elided below `Superuser`.
 
 **A proxy's status counts every player in the fleet.** `status.backends[].players`
 is `{online, max, observedAt}` — no identities, by construction. That is fine to
-expose at `viewer`; it is noted here so that nobody later "improves" it into
+expose at `Member`; it is noted here so that nobody later "improves" it into
 something that names players and quietly widens what the lowest tier can see.
+
+## 3.5 `DELETE` semantics are **not** settled by its tier
+
+The tier is settled: `Superuser`. What that `Superuser` may *do* is not, and the
+two questions are independent.
+
+A force-delete that **terminates the process and removes the container regardless
+of drain readiness** has been proposed. It is recorded here as open rather than
+specified, because it contradicts things this repository states rather than
+implies:
+
+- **CLAUDE.md invariant 1** — *"Never stop or remove a container that has players
+  online without draining it first… Do not put an unconditional container stop in
+  any code path."*
+- **`api/API.md` §1** — *"There is no stop, kill, force or restart endpoint, and
+  there will not be one."*
+- **The current `DELETE` contract** — *"**No force flag.** There is no way to make
+  this stop a server faster."*
+- **`RouteTableTest`** asserts no route pattern contains `stop`, `kill`, `force`
+  or `purge`, with the reason inline.
+- **The drain-protocol skill** — *"A kill mid-save can corrupt region files."* The
+  loss is not only the unsaved minutes; it can be the region file itself.
+
+**The need behind it is real.** `status.drain.state: "DRAIN_FAILED"` today means
+the drain aborted and the server is still running, and `api/API.md` says
+outright: *"There is no edge from there to a stop. It needs an operator."* The
+persistent server with RCON disabled — `docs/operating.md`'s first documented
+surprise — cannot be deleted at all. An operator with a genuinely stuck server
+currently has `crictl` and nothing else, which the drain audits treat as the
+symptom of a design failure.
+
+### What can be built without breaking the invariant
+
+Force should skip the **patience**, never the **save**:
+
+| Skipped | Safe? |
+|---|---|
+| Waiting for players to drain, when zero players is confirmed | Yes — there is nobody to transfer |
+| Retrying a drain that has already reported `DRAIN_FAILED` | Yes — it is not going to succeed |
+| Waiting out the full save timeout after a save is confirmed | Yes — the evidence already exists |
+| **Confirming the world save at all** | **No.** This is invariant 3, and it is where the data goes |
+
+That covers the stuck-server case that motivates the request. What it does not
+cover is a server that can never confirm a save because it has no RCON — and for
+that one, the honest options are *accept documented data loss behind an explicit
+second flag* or *leave it as it is*. That is a decision about the invariant
+itself, not about a route, and it is the one thing here that should not be
+settled without the drain audit CLAUDE.md requires for drain-related changes.
 
 ## 4. The default for a route that has not been decided
 
-**Refuse.** A route with no tier assigned is `admin`-only until somebody assigns
+**Refuse.** A route with no tier assigned is `Superuser`-only until somebody assigns
 one.
 
 The alternative — an unassigned route falls through to "any authenticated
@@ -86,8 +141,8 @@ properties of that table and is the natural place to assert this one.
 ## 5. What must not happen
 
 **Do not ship the console's tier gate before this.** A tier honoured by exactly
-one endpoint is worse than no tier at all: an operator who sees `viewer` refuse a
-console command reasonably concludes `viewer` is constrained, and that conclusion
+one endpoint is worse than no tier at all: an operator who sees `Member` refuse a
+console command reasonably concludes `Member` is constrained, and that conclusion
 would be false everywhere else in the API.
 
 The console is the reason this is being written. It is not the thing that

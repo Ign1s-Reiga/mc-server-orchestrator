@@ -31,7 +31,7 @@ body. **The guard has to move into the command policy**, or the console
 reintroduces precisely the thing the route table was written to prevent — just
 spelled differently and routed through an operator's keyboard.
 
-An `admin`-tier operator still must not be able to `stop` a server outside the
+An `Superuser`-tier operator still must not be able to `stop` a server outside the
 drain. That is not a question of trust; it is a property of the system.
 
 ### 1.2 Why op levels cannot express this
@@ -66,16 +66,16 @@ Drafted with orchestrator-native names — see open decision 2 in
 
 | Tier | Holds |
 |---|---|
-| `viewer` | An allow-listed set returning no identifiers — `tps`, `mspt`, `seed`, version queries |
-| `operator` | An allow-listed set covering gameplay and moderation — `say`, `whitelist`, `kick`, `ban`, `gamemode`, `give` |
-| `admin` | **Anything Gate 1 permits.** The general console |
+| `Member` | An allow-listed set returning no identifiers — `tps`, `mspt`, `seed`, version queries |
+| `Operator` | An allow-listed set covering gameplay and moderation — `say`, `whitelist`, `kick`, `ban`, `gamemode`, `give` |
+| `Superuser` | **Anything Gate 1 permits.** The general console |
 
 ## 3. Two tiers allow-list; the top tier does not
 
 [04-output.md](04-output.md) settles that raw output crosses the boundary and the
 console is general-purpose. A general console cannot be allow-listed — an
 allow-list is exactly the thing that stops a Forge mod's custom command from
-working — so `admin` is bounded by Gate 1 and by nothing else.
+working — so `Superuser` is bounded by Gate 1 and by nothing else.
 
 The lower two tiers keep explicit sets, and **an unrecognised command is refused
 there, never passed through**. Two reasons that survive the output decision:
@@ -84,8 +84,8 @@ there, never passed through**. Two reasons that survive the output decision:
    deny-list develops a silent hole the moment somebody installs a mod. An
    allow-list degrades gracefully: the new command is refused until somebody adds
    it deliberately.
-2. **Failing closed is the right direction for a bounded tier.** `viewer` exists
-   to be safe to hand out; a `viewer` that inherits every mod command as it is
+2. **Failing closed is the right direction for a bounded tier.** `Member` exists
+   to be safe to hand out; a `Member` that inherits every mod command as it is
    installed is not.
 
 > An earlier draft required an allow-list at every tier, on the grounds that
@@ -94,9 +94,9 @@ there, never passed through**. Two reasons that survive the output decision:
 > the normal case and is returned as-is. The two reasons above are what is left,
 > and they are about bounding a *tier*, not about handling output.
 
-**What the tiers now mean.** `viewer` and `operator` are capability sets; `admin`
+**What the tiers now mean.** `Member` and `Operator` are capability sets; `Superuser`
 is unrestricted server authority minus the two commands that lose data. Granting
-`admin` is granting the server console, and should be described that way to
+`Superuser` is granting the server console, and should be described that way to
 whoever grants it.
 
 ---
@@ -108,11 +108,11 @@ A `PaperServerDefinition` declares what console it will accept:
 ```yaml
 spec:
   console:
-    maxTier: operator          # refuses admin-tier console on this server entirely
+    maxTier: Operator          # refuses Superuser-tier console on this server entirely
     auditCommandText: false    # what the audit record keeps — see below
 ```
 
-So a production survival server can refuse `admin` console outright while a test
+So a production survival server can refuse `Superuser` console outright while a test
 server allows it. This is a bound the operator writes down, independent of who
 logs in, in the same place every other decision about a server is written — and
 it is where the op-level concept genuinely earns its place.

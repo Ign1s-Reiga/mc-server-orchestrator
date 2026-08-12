@@ -27,23 +27,28 @@ the document that matters most here.
 | Decision | Ruling | Why |
 |---|---|---|
 | Credential form | **Generated tokens, not chosen passwords** | Keeps the existing SHA-256-and-constant-time discipline, which is sound for ≥32 chars of entropy and is not sound for a password. Avoids the KDF question entirely |
-| `MCORCH_API_TOKEN` | Stays, as a root credential that is **always admin-equivalent** | Scripts and CI depend on it, something has to create the first identity, and something has to get back in when identities are lost. Tiers do not bound it — see [06-bootstrap.md](06-bootstrap.md) |
+| `MCORCH_API_TOKEN` | Stays, as a root credential that is **always Superuser-equivalent** | Scripts and CI depend on it, something has to create the first identity, and something has to get back in when identities are lost. Tiers do not bound it — see [06-bootstrap.md](06-bootstrap.md) |
 | Sessions | Bind to an identity; stay in memory | `SessionRegistry` already holds them in a `ConcurrentHashMap` and they die with the process. Identity binding is a field, not a migration |
 | Tenancy | **Still none.** Identities differ in tier, not in which servers they can see | Per-server visibility is a much larger feature and is not proposed here |
 | Disabling | Separate from deletion | An audit record that names an identity must keep resolving after that identity stops being used |
 
 ## Open decisions
 
-1. **The tier assignment for every existing route** — [03-authorization.md](03-authorization.md)
-   §2 proposes one. It is the decision this specification exists to force, and it
-   needs a review that is not mine, because getting `DELETE /servers/{name}` wrong
-   is a data-safety error rather than an access-control one.
-2. **Whether `viewer` may read secret *coordinates*.** A server definition carries
+1. **What a force `DELETE` may skip** — [03-authorization.md](03-authorization.md)
+   §3.5. Its *tier* is settled (`Superuser`); its *semantics* are not. Skipping
+   the drain's patience is specifiable; skipping the confirmed world save
+   contradicts CLAUDE.md invariants 1 and 3, `api/API.md` §1, the current `DELETE`
+   contract and `RouteTableTest`. **Blocking**, and the one item here that should
+   go through the drain audit CLAUDE.md requires before it is settled.
+2. **Whether `Member` may read secret *coordinates*.** A server definition carries
    `{name, key}` references. They are not material, but they are a map of where
    material lives. §3.
-3. **Whether an `admin` may create another `admin`.** Necessarily yes for
-   bootstrap, but it means one compromised admin credential is unbounded. The
-   alternative is that only the operator token may mint admins.
+3. **Whether a `Superuser` may create another `Superuser`.** Necessarily yes for
+   bootstrap, but it means one compromised Superuser credential is unbounded. The
+   alternative is that only the operator token may mint Superusers.
+
+**Settled since the first draft:** the tier assignment for every existing route
+([03-authorization.md](03-authorization.md) §2), and the three tier names.
 
 ## Sequencing
 
