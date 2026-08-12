@@ -20,18 +20,41 @@ This is the only endpoint in the API for which that is true, and a dashboard tha
 treats a console response the way it treats a `PUT` will be wrong about both. See
 [01-impact.md](01-impact.md) §1.
 
-## 2. Why the request body is not JSON
+## 2. Why the command travels in the body
 
-`api/build.gradle.kts` records that nothing in `:api` parses JSON — the two
-structured request bodies today are a server definition (parsed by `:schema`,
-YAML 1.2 being a strict superset of JSON) and secret material (read as raw bytes
-so it is never bound into an intermediate `String`).
+Two reasons, and the second is the one that must survive a refactor.
 
-A console request carries one string. It is sent as **`text/plain`**, read as
-bytes, and needs no parser. That keeps the module's position intact rather than
-importing a JSON parser for a single field.
+**No JSON parser exists here.** `api/build.gradle.kts` records that nothing in
+`:api` parses JSON — the two structured request bodies today are a server
+definition (parsed by `:schema`, YAML 1.2 being a strict superset of JSON) and
+secret material (read as raw bytes so it is never bound into an intermediate
+`String`). A console request carries one string, sent as **`text/plain`** and
+read as bytes, so it needs no parser.
+
+**A query string is logged by every proxy.** `api/API.md` already applies this to
+the operator token, and `ApiServer.kt:176` logs `requestURI.rawPath` — the path
+without the query — so the API's own lines cannot carry one either. It matters
+more here than it does for a credential: [04-output.md](04-output.md) §2
+guarantees no identity in a *response*, but `kick Alice` puts one in the
+**request**. The body is the only place it does not end up in an access log. See
+[08-origin-and-client.md](08-origin-and-client.md) §2.
+
+The server name stays in the path — a declared object's name, not an identity.
 
 Responses are JSON, written by the existing writer.
+
+## 2.1 `X-Mcorch-Client`
+
+Optional on every route, including this one. Carries a client name and the API
+contract version it was built against — `dashboard/1` — so the API can refuse a
+skewed client explicitly instead of failing in pieces.
+
+It is **not** evidence about the caller: one `curl -H` forges it. Nothing
+authorises on it, and it is recorded in the audit as *claimed*. When something
+genuinely needs to know whether the dashboard is calling, the credential type
+answers that and is already trusted. It cannot be made mandatory, because
+`EventSource` cannot set headers and `GET /api/v1/stream` depends on that. Full
+reasoning in [08-origin-and-client.md](08-origin-and-client.md) §3.
 
 ---
 
