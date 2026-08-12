@@ -48,9 +48,9 @@ run after upgrade, and it has exactly one safe answer: it means *no identities
 exist yet*, and the bootstrap credential is the only way in until one is created
 ([06-bootstrap.md](06-bootstrap.md)).
 
-It must **not** mean "create a default admin identity with a generated
+It must **not** mean "create a default Superuser identity with a generated
 credential", because a credential generated during a migration is a credential
-printed into a log or lost — and if it is lost, it is an admin credential nobody
+printed into a log or lost — and if it is lost, it is a Superuser credential nobody
 holds and nothing revokes.
 
 ## 4. What the migration test has to prove

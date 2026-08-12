@@ -1209,8 +1209,23 @@ with nothing describing it.
 **Stop / kill / force.** See §1. `RouteTableTest` asserts no route matching those
 words exists.
 
-**Metrics, audit log, per-user roles, pagination.** Not needed at this scale.
-`GET /api/v1/servers` returns everything; the change feed is the incremental path.
+**Metrics and pagination.** Not needed at this scale. `GET /api/v1/servers`
+returns everything; the change feed is the incremental path.
+
+**Per-user roles and an audit log.** Absent today — §2's threat model is accurate,
+and *any authenticated caller can still do anything this API offers*. But they are
+no longer absent *by decision*: both are specified in `spec/auth/` and are being
+built, because the premise that justified their absence has changed. A larger
+fleet has more than one operator, and the remote console (`spec/`) is a facility
+whose safe use depends on knowing who used it.
+
+Three tiers are specified — `Member` (read-only), `Operator` (non-destructive plus
+limited creation and editing) and `Superuser` (full access) — with a tier assigned
+per route, and Kubernetes' role model as the reference for anything richer later.
+
+**Nothing in this document describes them yet, on purpose.** This file is the
+contract a client is written against, so it says what the API *does*, not what it
+is going to do. When the tiers ship, this section shrinks and §2 grows.
 
 ---
 

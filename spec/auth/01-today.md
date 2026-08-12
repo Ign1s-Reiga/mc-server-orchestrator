@@ -52,11 +52,11 @@ With per-identity credentials that argument weakens — a lockout would take out
 one identity rather than all of them. But it does not invert:
 
 - An attacker who can reach the port can enumerate identity names cheaply, or
-  simply lock out every name they can guess, including `admin`.
+  simply lock out every name they can guess, including `Superuser`.
 - The failure delay already bounds guessing, and it costs an attacker the same
   whether credentials are shared or not.
 - A lockout adds a state machine — who unlocks, how, and what happens when the
-  only admin is locked out — whose failure mode is *no way in*, which is worse
+  only Superuser is locked out — whose failure mode is *no way in*, which is worse
   than the one it prevents.
 
 **Conclusion: still no lockout.** Same ruling, different reason, and the reason
@@ -68,12 +68,12 @@ longer exists.
 Today a hostile operator is explicitly out of scope, and correctly so: there is
 one credential and it does everything.
 
-With tiers, a hostile *`viewer`* is meaningfully constrained, and that is real
+With tiers, a hostile *`Member`* is meaningfully constrained, and that is real
 value. But:
 
-- A hostile `admin` is exactly as unconstrained as today. Tiers bound authority;
+- A hostile `Superuser` is exactly as unconstrained as today. Tiers bound authority;
   they do not bound someone granted all of it.
-- The operator token remains admin-equivalent by construction
+- The operator token remains Superuser-equivalent by construction
   ([06-bootstrap.md](06-bootstrap.md)), so anyone holding it is outside the tier
   system entirely.
 - Nothing here prevents a hostile operator from acting; the audit record makes it
@@ -82,4 +82,4 @@ value. But:
 
 The honest statement for the amended threat model: **tiers reduce blast radius
 and make actions attributable. They are not a defence against someone you gave
-`admin` to.**
+`Superuser` to.**

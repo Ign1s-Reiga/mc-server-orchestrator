@@ -6,7 +6,7 @@
 |---|---|
 | `name` | Operator-facing, unique, an RFC 1123 label like every other name in this system |
 | `credentialDigest` | SHA-256, compared in constant time — the discipline `OperatorAuth` already uses |
-| `tier` | `viewer` / `operator` / `admin` |
+| `tier` | `Member` / `Operator` / `Superuser` |
 | `enabled` | Disabling must not require deleting |
 | `createdAt` | |
 
@@ -81,22 +81,48 @@ next login", which is not what an operator revoking access believes they did.
 
 ## 5. Tiers
 
-`viewer` ⊂ `operator` ⊂ `admin`, and the ordering is total — which is what makes
+| Tier | Holds |
+|---|---|
+| `Member` | Non-destructive operations. Read-only |
+| `Operator` | Non-destructive operations, plus limited creation and editing |
+| `Superuser` | Full access |
+
+`Member` ⊂ `Operator` ⊂ `Superuser`, and the ordering is total — which is what makes
 `min(identity tier, server ceiling)` meaningful in
 [`spec.console`](../03-command-policy.md) §4.
 
+> `Superuser` is a placeholder name. It is used consistently throughout this
+> specification so that renaming it later is one mechanical change rather than a
+> hunt.
+
+### 5.1 Where this is heading
+
+Kubernetes' model is the reference for later work: roles as sets of verbs over
+resource types, and bindings that attach a role to a subject. Three flat tiers is
+deliberately *not* that — it is the smallest thing that answers the question the
+console asks.
+
+The migration path worth protecting is that a tier is expressible as a role: if
+`Operator` is ever redefined as a named set of verb-resource pairs, nothing above
+it should have to change. That argues for two things now, cheaply:
+
+- **Tiers are compared, not switched on.** A call site asking `tier >= Operator`
+  survives the change; one with a `when` over three names does not.
+- **The tier is decided at the route table**, not scattered through handlers, so
+  there is one place a role lookup would later replace.
+
 What they mean for the console is in that document. What they mean for every
 *other* endpoint is [03-authorization.md](03-authorization.md), and it is not
-derivable from the console's meaning — a `viewer` who may read a server's status
+derivable from the console's meaning — a `Member` who may read a server's status
 is not thereby someone who may read a secret's coordinates.
 
 ## 6. What this does not introduce
 
 - **No tenancy.** Identities differ in tier, not in which servers they see. Two
-  `operator`s see the same fleet.
+  `Operator`s see the same fleet.
 - **No groups, no inheritance, no per-resource grants.** A flat, totally ordered
   tier is the smallest thing that answers the question the console asks. Anything
   richer is a policy engine, and this project should not acquire one by accident.
-- **No password reset, no email, no self-service.** An `admin` creates a
+- **No password reset, no email, no self-service.** An `Superuser` creates a
   replacement credential; there is no channel through which the system could
   deliver one anyway.

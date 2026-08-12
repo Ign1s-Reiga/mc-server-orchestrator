@@ -79,7 +79,7 @@ command, so that an audit record and a refusal always refer to exactly one thing
 ```json
 { "server": "survival-01",
   "command": "list",
-  "tier": "admin",
+  "tier": "Superuser",
   "executedAt": "2026-08-12T09:14:02Z",
   "output": "There are 3 of a max of 20 players online: Alice, Bob, Carol" }
 ```
@@ -102,7 +102,7 @@ intermediaries that would otherwise hold copies of either half — see
 | code | status | carries | meaning |
 |---|---|---|---|
 | `CONSOLE_NOT_CONFIGURED` | 409 | | `spec.network.rcon` is `Disabled` — no channel exists to carry a command |
-| `CONSOLE_FORBIDDEN` | 403 | `requiredTier` | not in this tier's set. `admin` never receives this — it is bounded only by Gate 1 |
+| `CONSOLE_FORBIDDEN` | 403 | `requiredTier` | not in this tier's set. `Superuser` never receives this — it is bounded only by Gate 1 |
 | `CONSOLE_COMMAND_REFUSED` | 409 | `useInstead` | Gate 1. Refused for every identity and tier |
 | `CONSOLE_BUSY` | 503 | `Retry-After` | a drain is in flight, or the per-server queue is full. **Retryable, and safe to retry** |
 | `CONSOLE_UNAVAILABLE` | 503 | `Retry-After` | the relay is unreachable, or the container is not running. **Retryable, and safe to retry** |
@@ -129,7 +129,7 @@ than discovering its limits from `403`s.
   "commands": ["list", "say", "tps", "whitelist", "kick"] }
 ```
 
-An `admin` caller gets `"unrestricted": true` and an empty `commands`, because
+An `Superuser` caller gets `"unrestricted": true` and an empty `commands`, because
 that tier has no finite set — it may run anything Gate 1 permits. A dashboard
 reads `unrestricted` to decide between offering a command picker and offering a
 free-text prompt.
