@@ -13,6 +13,9 @@ public enum class NodeOperation {
 
     /** An HTTP call to a port inside a workload — the proxy control channel. */
     ENDPOINT,
+
+    /** An RCON command against a port inside a workload — the operator console. */
+    CONSOLE,
     STOP,
     REMOVE,
 }
