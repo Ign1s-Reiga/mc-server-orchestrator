@@ -35,14 +35,17 @@ from the dashboard, through RCON.
 | Drain's channel | Unchanged — keeps its own `ExecSync` path | A relay outage must not become a data-safety outage |
 | Command policy | Allow-list, failing closed | You cannot safely handle output you cannot parse |
 | Concurrency | Parallel across servers, serial within one, subordinate to a drain | The bottleneck is the game's main thread, not relay capacity |
-| Command output | Typed parsers; raw RCON text never crosses the boundary | Keeps `api/API.md` §13's no-PII guarantee structural and absolute, with no `ResponseLeakageTest` carve-out |
+| Command output | **Raw server output crosses the boundary unmodified** | A general console cannot be built any other way. `api/API.md` §13 gains its one exception, written deliberately, with a matching `ResponseLeakageTest` carve-out. The endpoint returns unredacted output to authorised operators — it does not mask anything, and must never be described as if it did |
 | Dashboard hosting | Same origin — `:api` serves the bundle from `MCORCH_API_STATIC_ROOT` | Already what the CORS table calls "the normal deployment"; avoids `SameSite=None`, which would force TLS. Not a second container: a different port is a different origin |
 | Command transport | In the request body, never the path or query | The request carries the player name that the response never does; a query string is logged by every proxy |
 | Client identification | The credential type, not a header | A header is forgeable with one `curl -H` flag. `X-Mcorch-Client` exists for contract-version negotiation and audit context only, is optional everywhere, and is never authorised on |
 
-The output decision has two consequences worth carrying forward: the console is a
-set of typed operations rather than a general console, and the allow-list is
-bounded by which parsers exist. See [04-output.md](04-output.md) §1–§2.
+The output decision has three consequences worth carrying forward: the `admin`
+tier is a general console bounded only by Gate 1, both the request and the
+response carry player identities so neither may reach a place that keeps them,
+and the audit sink stays redacted regardless — that is CLAUDE.md's logging rule,
+which governs what is written to disk rather than what is returned to a caller.
+See [04-output.md](04-output.md) §2–§3.
 
 ## Open decisions
 
@@ -78,8 +81,9 @@ Neither blocks drafting or implementation.
 - [ ] **The `:core` edge and the console channel on `Node`**
       ([01-impact.md](01-impact.md) §2, [02-relay.md](02-relay.md)). Shaped after
       `callEndpoint`, which solves the same problem.
-- [ ] **Allow-list, parsers and the audit sink** ([04-output.md](04-output.md)).
-      Gated by multi-identity auth for the tier half; the parsers are not.
+- [ ] **Tier allow-lists and the audit sink** ([04-output.md](04-output.md)).
+      Gated by multi-identity auth. No parsers: `admin` is unrestricted below
+      Gate 1, and the two lower tiers carry explicit sets.
 - [ ] **`spec.console` ceiling** — `:schema` plus consumers, in one change.
 - [ ] **The contract into `api/API.md`**, and its §11 amended — roles and an
       audit log stop being absent. **§13 stands unchanged**, which is what the

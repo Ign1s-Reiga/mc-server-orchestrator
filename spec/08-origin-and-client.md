@@ -52,12 +52,15 @@ TLS-terminating proxy in front reinstates every access log it was meant to avoid
 That belongs in `docs/deployment.md`, because it is a deployment choice that
 quietly undoes a property the design assumes.
 
-## 2. The request side is the console's exposure
+## 2. Both halves of a console exchange are sensitive
 
-[04-output.md](04-output.md) guarantees no player identity in a *response*. The
-**request** carries one — `kick Alice` — which is the asymmetry in its §2. So the
-request side is the whole exposure, and an intermediary's access log is where it
-would land.
+[04-output.md](04-output.md) settles that raw server output crosses the boundary,
+so a **response** carries player names, UUIDs and client addresses. The
+**request** carries them too — `kick Alice`. Neither half may reach a place that
+keeps a copy, and an intermediary's access log is the likeliest such place.
+
+This is what makes same-origin load-bearing rather than merely tidy: it is what
+removes the intermediaries.
 
 This repository already reasons exactly this way about credentials.
 `api/API.md`, on the operator token:
