@@ -99,10 +99,11 @@ code:
   that record is written under `NonCancellable`, which bounds a shutdown by one
   store write rather than by a container operation.
 
-The authoritative treatment of the state machine and its failure modes lives in
-`.claude/skills/drain-protocol/references/` (`state-machine.md`,
-`failure-modes.md`). Source comments across `:schema`, `:core` and
-`:velocity-plugin` cite `failure-modes.md` by item number.
+The authoritative treatment is in [`state-machine.md`](state-machine.md) — every
+state, what advances it and its timeout — and [`failure-modes.md`](failure-modes.md),
+whose numbered items source across `:schema`, `:core` and `:velocity-plugin` cites
+directly. Those numbers are load-bearing: renumbering an item silently rewrites
+what a comment in the reconciler claims.
 
 ---
 

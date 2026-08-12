@@ -207,6 +207,10 @@ to catch it does. A rule that nothing can break is not a rule.
   the proxy: what to stage where, its three variables, and the protocol handshake.
 - **[docs/cri.md](docs/cri.md)** — the only place this project talks to a runtime: the
   deadline budgets, the classified failure hierarchy, and why some error text is withheld.
+- **[docs/state-machine.md](docs/state-machine.md)** and
+  **[docs/failure-modes.md](docs/failure-modes.md)** — the drain, normatively: every state
+  with its timeout, and the implementations that look reasonable and lose player data.
+  Source cites the failure modes by item number.
 - **[CLAUDE.md](CLAUDE.md)** — architecture rules and the invariants that must hold.
 - **[api/API.md](api/API.md)** — the HTTP API.
 

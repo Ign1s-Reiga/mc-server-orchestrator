@@ -72,7 +72,12 @@ If any of steps 3–5 fails:
 
 ## Detailed references
 
-- State transitions and per-state timeouts: `references/state-machine.md`
-- Failure patterns, remedies, and forbidden implementations: `references/failure-modes.md`
+Both live in the repository's own documentation rather than under this skill,
+because source across `:schema`, `:core` and `:velocity-plugin` cites
+`failure-modes.md` by item number and a contributor reading those comments has to
+be able to find it.
+
+- State transitions and per-state timeouts: `docs/state-machine.md`
+- Failure patterns, remedies, and forbidden implementations: `docs/failure-modes.md`
 
 Read both before implementing. "Not enough notice" in particular is covered in failure-modes.

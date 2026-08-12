@@ -91,7 +91,7 @@ public object VelocityProxyDefaults {
 
     public const val MAX_PLAYERS: Int = 500
 
-    /** Proxy-side drain handshakes, from `drain-protocol/references/state-machine.md`. */
+    /** Proxy-side drain handshakes, from `docs/state-machine.md`. */
     public val SEAL_TIMEOUT: Duration = 10.seconds
     public val DESTINATION_TIMEOUT: Duration = 30.seconds
     public val DEREGISTER_TIMEOUT: Duration = 10.seconds

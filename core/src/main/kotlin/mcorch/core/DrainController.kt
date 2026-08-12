@@ -1774,7 +1774,7 @@ internal class DrainController(
      * The clock has neither problem. It measures the thing an operator would
      * measure — how long these players have been failing to move — it cannot be
      * outrun by the poll interval, and it is what
-     * `drain-protocol/references/state-machine.md` prescribes. The allowance is
+     * `docs/state-machine.md` prescribes. The allowance is
      * extended per player, because a fixed value always fails on a full server.
      *
      * [mcorch.schema.DrainStatus.transferAttempts] survives as a *report* — how many
@@ -3826,7 +3826,7 @@ internal class DrainController(
          * Added to `spec.lifecycle.drain.playerTransferTimeout` per player.
          *
          * A fixed transfer allowance always fails on a full server
-         * (`drain-protocol/references/state-machine.md`), so the declared timeout is
+         * (`docs/state-machine.md`), so the declared timeout is
          * the floor and this is the slope. Together they are the **only** bound on
          * step 4 — the retry limit the orchestrator was said to own is this, in the
          * unit an operator can reason about.
