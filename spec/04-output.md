@@ -145,6 +145,7 @@ live session; it never controls what is written down.
 | tier | the effective tier the request ran at |
 | at | timestamp |
 | outcome | executed, refused-by-gate-1, refused-by-tier, unavailable, timed out |
+| client | the `X-Mcorch-Client` value, **as claimed** — forgeable, never verified, never authorised on. Context for whoever reads the log, nothing more |
 
 **Not the output**, and **not the raw input.** The output is where identities
 appear in replies; the raw input is where they appear in requests (§2). Neither

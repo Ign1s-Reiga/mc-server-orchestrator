@@ -21,6 +21,7 @@ from the dashboard, through RCON.
 | [05-concurrency.md](05-concurrency.md) | Why the bottleneck is the Minecraft main thread, and the three rules that follow |
 | [06-auth.md](06-auth.md) | Multi-identity authentication — the prerequisite, and the long pole |
 | [07-api.md](07-api.md) | The HTTP contract the dashboard is written against |
+| [08-origin-and-client.md](08-origin-and-client.md) | Same-origin hosting, why the request side is the exposure, and what the API can and cannot know about its caller |
 
 ## Settled decisions
 
@@ -35,6 +36,9 @@ from the dashboard, through RCON.
 | Command policy | Allow-list, failing closed | You cannot safely handle output you cannot parse |
 | Concurrency | Parallel across servers, serial within one, subordinate to a drain | The bottleneck is the game's main thread, not relay capacity |
 | Command output | Typed parsers; raw RCON text never crosses the boundary | Keeps `api/API.md` §13's no-PII guarantee structural and absolute, with no `ResponseLeakageTest` carve-out |
+| Dashboard hosting | Same origin — `:api` serves the bundle from `MCORCH_API_STATIC_ROOT` | Already what the CORS table calls "the normal deployment"; avoids `SameSite=None`, which would force TLS. Not a second container: a different port is a different origin |
+| Command transport | In the request body, never the path or query | The request carries the player name that the response never does; a query string is logged by every proxy |
+| Client identification | The credential type, not a header | A header is forgeable with one `curl -H` flag. `X-Mcorch-Client` exists for contract-version negotiation and audit context only, is optional everywhere, and is never authorised on |
 
 The output decision has two consequences worth carrying forward: the console is a
 set of typed operations rather than a general console, and the allow-list is
@@ -61,6 +65,13 @@ Neither blocks drafting or implementation.
       present: `SandboxStatus.ips` carries it and `Node.callEndpoint` already
       dials it for the Velocity control channel. See
       [02-relay.md](02-relay.md) §4.1.
+- [x] **The RCON wire codec** — `mcorch.core.console.rcon.RconCodec`. Frame only:
+      no I/O, no connection state, so every bound is testable without a server.
+- [ ] **The RCON connection** — auth handshake, multi-packet reassembly, and the
+      per-server serialisation of [05-concurrency.md](05-concurrency.md).
+- [ ] **Static serving in `:api`** ([08-origin-and-client.md](08-origin-and-client.md) §1.1).
+      Independent of the console entirely, and the thing that makes same-origin
+      real rather than assumed.
 - [ ] **Multi-identity auth** — `:store` and `:api` ([06-auth.md](06-auth.md)).
       Nothing in Gate 2 can be built before this, because every credential in the
       system is currently the same token.
