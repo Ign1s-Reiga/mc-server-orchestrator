@@ -1,5 +1,13 @@
 # Drain state machine
 
+The states a drain moves through, what advances each, and the timeout each is
+given. `:core` implements this and `:schema` names the states a client sees — see
+[`server-lifecycle.md`](server-lifecycle.md) for the wire names and what a
+dashboard should render for each.
+
+The timeouts below are the prescribed defaults. Where the code deliberately
+allows something different it says so and cites this file.
+
 ## States
 
 | State | Meaning | Advances when | Suggested timeout |

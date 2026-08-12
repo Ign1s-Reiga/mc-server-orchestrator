@@ -1,5 +1,15 @@
 # Failure patterns and remedies
 
+The normative list of ways a stop loses player data. Source comments across
+`:schema`, `:core` and `:velocity-plugin` cite these **by item number** — "see
+`failure-modes.md` item 4" — so the numbering is part of the contract:
+renumbering an item silently rewrites what a comment elsewhere claims. Append
+rather than reorder.
+
+Read alongside [`state-machine.md`](state-machine.md), which gives the states and
+their timeouts, and [`reconcile.md`](reconcile.md) for where the loop enforces
+them.
+
 ## Forbidden implementations
 
 Each looks reasonable and loses player data. Flag any as critical in review.

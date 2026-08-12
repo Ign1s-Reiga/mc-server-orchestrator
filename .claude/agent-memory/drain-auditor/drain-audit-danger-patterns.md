@@ -6,7 +6,7 @@ metadata:
 ---
 
 Audit heuristics that go beyond the seven forbidden implementations in
-`.claude/skills/drain-protocol/references/failure-modes.md`. Each was found in a
+`docs/failure-modes.md`. Each was found in a
 real review of this codebase and each looks correct on first reading.
 
 **Why:** the drain skill's forbidden list catches the obvious shapes (force stop
