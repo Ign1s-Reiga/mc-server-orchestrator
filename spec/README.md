@@ -19,7 +19,7 @@ from the dashboard, through RCON.
 | [03-command-policy.md](03-command-policy.md) | Two gates — invariant refusals, then permission tiers. The per-server ceiling |
 | [04-output.md](04-output.md) | How command output crosses the API boundary. **Contains the decision everything else depends on** |
 | [05-concurrency.md](05-concurrency.md) | Why the bottleneck is the Minecraft main thread, and the three rules that follow |
-| [06-auth.md](06-auth.md) | Multi-identity authentication — the prerequisite, and the long pole |
+| [06-auth.md](06-auth.md) | What the console needs from multi-identity auth. The model itself is specified separately in [auth/](auth/README.md) |
 | [07-api.md](07-api.md) | The HTTP contract the dashboard is written against |
 | [08-origin-and-client.md](08-origin-and-client.md) | Same-origin hosting, why the request side is the exposure, and what the API can and cannot know about its caller |
 
@@ -76,12 +76,20 @@ Neither blocks drafting or implementation.
 - [ ] **Static serving in `:api`** ([08-origin-and-client.md](08-origin-and-client.md) §1.1).
       Independent of the console entirely, and the thing that makes same-origin
       real rather than assumed.
-- [ ] **Multi-identity auth** — `:store` and `:api` ([06-auth.md](06-auth.md)).
-      Nothing in Gate 2 can be built before this, because every credential in the
-      system is currently the same token.
-- [ ] **The `:core` edge and the console channel on `Node`**
-      ([01-impact.md](01-impact.md) §2, [02-relay.md](02-relay.md)). Shaped after
-      `callEndpoint`, which solves the same problem.
+- [x] **The console channel on `Node`** — `Node.console`, shaped after
+      `callEndpoint`. Connections are per call; session pooling is the
+      optimisation [02-relay.md](02-relay.md) §4 describes and the interface
+      admits unchanged.
+- [ ] **An integration test for `LocalNode.console`** against the `mcorch-dev`
+      containerd (`scripts/dev/containerd-up.sh`). It opens a socket, so it
+      cannot be covered by a unit test; the protocol beneath it already is.
+      **That instance is one shared daemon** — two concurrent runs collide and
+      report a permanent create failure that is not yours, so this test needs
+      run-unique server names.
+- [ ] **Multi-identity auth** — specified separately in [auth/](auth/README.md).
+      Nothing in Gate 2 can be built before it, and per
+      [auth/03-authorization.md](auth/03-authorization.md) §5 the console's tier
+      gate ships after the API-wide tier assignment, not before.
 - [ ] **Tier allow-lists and the audit sink** ([04-output.md](04-output.md)).
       Gated by multi-identity auth. No parsers: `admin` is unrestricted below
       Gate 1, and the two lower tiers carry explicit sets.
