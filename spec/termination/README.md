@@ -1,6 +1,11 @@
 # Forced termination — specification
 
-> **Status: proposed. Nothing here is implemented.**
+> **Status: the forced path is implemented; RCON-as-standard shipped separately.**
+>
+> It is **not** built the way §2 of this document described. The specification
+> called for three exemptions inside the drain; the code said no, and the
+> implementation note in `02-force-stop.md` §2 records why and what was built
+> instead.
 >
 > This specification describes a path that **can lose world data**. That is its
 > purpose, and every document here is written so that nobody can adopt it without

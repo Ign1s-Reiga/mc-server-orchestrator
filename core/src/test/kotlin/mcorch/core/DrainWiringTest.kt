@@ -389,7 +389,21 @@ internal class DrainWiringTest {
                     .map { source.path to source.enclosing(it).name }
             }
 
-        built shouldBe listOf(CONTROLLER_PATH to "stopGrace")
+        // Two sites now. The second is the forced stop, and it satisfies this
+        // test's own condition rather than being excused from it: it passes
+        // `spec.lifecycle.drain.saveTimeout` as the floor, off the same definition
+        // it read the grace period from, so the pair travels together exactly as
+        // the reconcile path's does.
+        //
+        // Forcing shortens the orchestrator's patience, never the server's. The
+        // grace period is the last protection still working when RCON is not, which
+        // is why the one path allowed to skip the evidence rule is not allowed to
+        // trim this.
+        built shouldBe
+            listOf(
+                CONTROLLER_PATH to "stopGrace",
+                FORCED_TERMINATION_PATH to "stop",
+            )
     }
 
     /**
@@ -598,7 +612,24 @@ internal class DrainWiringTest {
         naming("stopWorkload").size shouldBeGreaterThan decidingFiles("stopWorkload").size
         naming("removeWorkload").size shouldBeGreaterThan decidingFiles("removeWorkload").size
 
-        deciding("stopWorkload") shouldBe listOf(CONTROLLER_PATH to "stop", CONTROLLER_PATH to "awaitStopped")
+        // Three now, and the third is the one this list exists to make visible.
+        //
+        // `NodeForcedTermination.stop` ends a container **without** the drain's
+        // evidence rule — no `mayStop`, no zero-player gate, no retry. That is
+        // CLAUDE.md's first invariant being spent, deliberately and once, so that a
+        // server whose drain cannot finish can still be retired through the API
+        // instead of by hand with `crictl` (`spec/termination/`).
+        //
+        // It is on this list rather than exempted from it because that is the point:
+        // a fourth entry appearing here should be as hard to add as this one was,
+        // and an entry that disappeared would mean the path stopped going through
+        // the Node abstraction.
+        deciding("stopWorkload") shouldBe
+            listOf(
+                CONTROLLER_PATH to "stop",
+                CONTROLLER_PATH to "awaitStopped",
+                FORCED_TERMINATION_PATH to "stop",
+            )
         // Both teardowns, and nothing else. A removal decided anywhere else — a
         // rescheduling path, a node drain — is the case this test's own motivation
         // names, and `Reconciler.kt` is where that case is written, which is why the
@@ -2358,6 +2389,7 @@ internal class DrainWiringTest {
             )
 
         const val CONTROLLER_PATH: String = "src/main/kotlin/mcorch/core/DrainController.kt"
+        const val FORCED_TERMINATION_PATH: String = "src/main/kotlin/mcorch/core/termination/ForcedTermination.kt"
 
         const val RECONCILER_PATH: String = "src/main/kotlin/mcorch/core/Reconciler.kt"
 

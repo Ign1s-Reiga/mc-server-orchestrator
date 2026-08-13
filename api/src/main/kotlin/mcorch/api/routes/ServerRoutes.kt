@@ -11,6 +11,9 @@ import mcorch.api.http.Response
 import mcorch.api.http.Route
 import mcorch.api.json.jsonObject
 import mcorch.api.render.ServerJson
+import mcorch.core.termination.ForcedTermination
+import mcorch.core.termination.ForcedTerminationUnavailable
+import mcorch.schema.PaperServerDefinition
 import mcorch.schema.ResourceName
 import mcorch.schema.SchemaViolation
 import mcorch.schema.ServerDefinition
@@ -18,6 +21,7 @@ import mcorch.schema.Tier
 import mcorch.store.Precondition
 import mcorch.store.Store
 import mcorch.store.StoreException
+import mcorch.store.StoredDefinition
 import mcorch.store.StoredServer
 import mcorch.store.UnreadableServer
 import mcorch.store.WriteOutcome
@@ -45,6 +49,7 @@ import org.slf4j.LoggerFactory
  */
 internal class ServerRoutes(
     private val store: Store,
+    private val forced: ForcedTermination,
 ) {
     fun routes(): List<Route> =
         listOf(
@@ -228,19 +233,85 @@ internal class ServerRoutes(
     private suspend fun delete(request: Request): Response {
         val name = Requests.name(request)
         val ifMatch = Requests.precondition(request)
+        val forced = request.queryValue("force") == "true"
         val existing = mustFind(name)
-        if (ifMatch == Requests.IfMatch.Any && existing.definition.terminating) {
+        if (!forced && ifMatch == Requests.IfMatch.Any && existing.definition.terminating) {
             // Already tombstoned: nothing to do, and reporting it as a conflict
             // would make a retried delete look like a failure.
+            //
+            // Not taken when forcing, because forcing an already-terminating server
+            // is the whole point: the ordinary delete is what stalled.
             return accepted(existing)
         }
         val stored =
-            when (val outcome = store.deleteDefinition(name, ifMatch.toPrecondition())) {
-                is WriteOutcome.Applied -> outcome.value
-                is WriteOutcome.Conflict -> throw ApiException.conflict(outcome)
+            if (existing.definition.terminating) {
+                existing.definition
+            } else {
+                when (val outcome = store.deleteDefinition(name, ifMatch.toPrecondition())) {
+                    is WriteOutcome.Applied -> outcome.value
+                    is WriteOutcome.Conflict -> throw ApiException.conflict(outcome)
+                }
             }
+        if (forced) return force(request, stored, name)
         LOG.info("delete requested name={} generation={}", stored.name, stored.generation)
         return accepted(store.getServer(name) ?: StoredServer(stored))
+    }
+
+    /**
+     * Stops the container without waiting for the drain to be satisfied.
+     *
+     * Tombstoned first, above, and deliberately in that order: a terminating
+     * definition keeps reconciling, so the loop is already watching and finishes
+     * the teardown the moment it sees the container stopped. Stopping a server the
+     * loop still wants running would only have it started again.
+     *
+     * The response leads with what was lost rather than with success, because
+     * `saveConfirmed: false` is the only part of it an operator has to read.
+     */
+    private suspend fun force(
+        request: Request,
+        stored: StoredDefinition,
+        name: ResourceName,
+    ): Response {
+        val definition =
+            stored.definition as? PaperServerDefinition
+                ?: throw ApiException(
+                    ErrorCode.FORCE_NOT_APPLICABLE,
+                    "`${name.value}` is not a PaperServer. A VelocityProxy holds no world, so its drain cannot " +
+                        "stall on a save and there is nothing here to force",
+                )
+        val principal = request.principal()
+        val outcome =
+            try {
+                forced.stop(definition)
+            } catch (unavailable: ForcedTerminationUnavailable) {
+                throw ApiException(
+                    ErrorCode.FORCE_NOT_APPLICABLE,
+                    unavailable.message ?: "there is no running container to stop",
+                )
+            }
+        // Warn, not info. This is the most consequential thing this API can do, and
+        // `saveConfirmed` is the field an investigator reads first.
+        LOG.warn(
+            "forced stop identity={} server={} saveConfirmed={}",
+            principal.name,
+            name.value,
+            outcome.saveConfirmed,
+        )
+        return Response.json(
+            202,
+            jsonObject {
+                put("accepted", true)
+                put("forced", true)
+                put("saveConfirmed", outcome.saveConfirmed)
+                put("detail", outcome.detail)
+                put(
+                    "message",
+                    "the container was stopped. The reconcile loop completes the teardown and frees the name " +
+                        "once it observes the stopped container; poll this server until it reports 404",
+                )
+            },
+        )
     }
 
     private fun accepted(server: StoredServer): Response =

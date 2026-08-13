@@ -19,6 +19,23 @@ the name-freeing guard all working exactly as they do now.
 
 ## 2. Semantics: it skips the patience, not the save
 
+> **As built, this is not a change to the drain — and that is a correction to what
+> this section originally specified.**
+>
+> The exemptions below were written as behaviour inside `DrainController`. Two
+> things in that file refuse them. `DrainPass.cause` carries an explicit rule —
+> *"what a drain does is the same whatever asked for it, and a cause consulted at a
+> gate is how a delete comes to take a path a replacement was written for"* — and
+> force-as-exemptions is exactly a per-drain variation read at gates.
+> `DrainStatus.mayStop` is the single precondition for every stop in the file,
+> carrying a comment saying it exists to catch *"a future edit that routes into
+> the stop without a current save"*.
+>
+> So `NodeForcedTermination` does what `docs/operating.md` note 1 already tells an
+> operator to do by hand — save, stop, let the teardown observe it — and the drain
+> is untouched. The table below still describes the *effect*; it no longer
+> describes where the code lives.
+
 This is the whole design, and it follows from *when the button gets used*.
 
 An operator reaches for Force Stop when an ordinary delete did not finish — which

@@ -28,6 +28,7 @@ import mcorch.api.routes.ServerRoutes
 import mcorch.api.routes.StreamRoutes
 import mcorch.api.stream.StreamRegistry
 import mcorch.core.console.ServerConsole
+import mcorch.core.termination.ForcedTermination
 import mcorch.store.IdentityStore
 import mcorch.store.SecretStore
 import mcorch.store.Store
@@ -103,13 +104,14 @@ public class ApiServer private constructor(
             secrets: SecretStore,
             identities: IdentityStore,
             console: ServerConsole,
+            forced: ForcedTermination,
         ): ApiServer {
             val streams = StreamRegistry(config.maxStreams)
             val sessions = SessionRegistry(config.clock, config.sessionTtl)
             val auth = OperatorAuth(config.token.digest, sessions, config.authFailureDelay, identities)
             val dispatcher =
                 Dispatcher(
-                    Router(routeTable(config, store, secrets, identities, console, auth, sessions, streams)),
+                    Router(routeTable(config, store, secrets, identities, console, forced, auth, sessions, streams)),
                     auth,
                     Cors(config.allowedOrigins),
                     config,
@@ -156,13 +158,14 @@ public class ApiServer private constructor(
             secrets: SecretStore,
             identities: IdentityStore,
             console: ServerConsole,
+            forced: ForcedTermination,
             auth: OperatorAuth,
             sessions: SessionRegistry,
             streams: StreamRegistry,
         ): List<Route> =
             MetaRoutes(config).routes() +
                 AuthRoutes(auth, sessions, config).routes() +
-                ServerRoutes(store).routes() +
+                ServerRoutes(store, forced).routes() +
                 SecretRoutes(secrets).routes() +
                 IdentityRoutes(identities, sessions, config.clock).routes() +
                 ConsoleRoutes(store, console, ConsoleAudit(), config.clock).routes() +

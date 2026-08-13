@@ -13,6 +13,8 @@ import mcorch.core.console.NodeServerConsole
 import mcorch.core.console.ServerConsole
 import mcorch.core.node.LocalNode
 import mcorch.core.node.LocalNodeConfig
+import mcorch.core.termination.ForcedTermination
+import mcorch.core.termination.NodeForcedTermination
 import mcorch.store.IdentityStore
 import mcorch.store.SecretStore
 import mcorch.store.Store
@@ -49,6 +51,8 @@ public class Orchestrator private constructor(
     public val nodes: NodeRegistry,
     /** The one method `:api` reaches `:core` through, for the remote console. */
     public val console: ServerConsole,
+    /** The forced-stop path. Superuser-only at the API, and it can lose unsaved play. */
+    public val forcedTermination: ForcedTermination,
     public val reconciler: Reconciler,
     private val loop: ReconcileLoop,
 ) : AutoCloseable {
@@ -197,6 +201,7 @@ public class Orchestrator private constructor(
                     secrets = embedded.secrets,
                     identities = embedded.identities,
                     console = NodeServerConsole(registry, CONSOLE_TIMEOUT),
+                    forcedTermination = NodeForcedTermination(registry),
                     nodes = registry,
                     reconciler = reconciler,
                     loop = ReconcileLoop(embedded.state, reconciler, loopConfig),

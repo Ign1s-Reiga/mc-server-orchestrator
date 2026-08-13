@@ -704,7 +704,9 @@ its generation, and a `metadata.labels` edit that crosses a `VelocityProxy`'s
 
 - `202 Accepted` + `ETag`. Repeating it is a no-op that answers `202` again.
 - `404` if the name is unknown. `409` if `If-Match` was sent and does not match.
-- **No force flag.** There is no way to make this stop a server faster.
+- **`?force=true` stops it anyway.** `superuser` only, and it is not a way to make
+  an ordinary delete faster — it is the way out of a delete that **cannot
+  finish**. See below.
 
 What a client should do afterwards:
 
@@ -716,8 +718,37 @@ What a client should do afterwards:
    confirmed the containers are gone and freed the name — **the API cannot do it
    and does not expose a way to.**
 4. `status.drain.state: "DRAIN_FAILED"` means the drain aborted **and the server
-   is still running**. There is no edge from there to a stop. It needs an
-   operator.
+   is still running**. There is no edge from there to a stop within the drain —
+   `?force=true` is the edge, and it is an operator decision rather than something
+   the loop reaches on its own.
+
+#### `DELETE /api/v1/servers/{name}?force=true`
+
+**This can lose the last several minutes of play.** It exists because the
+alternative — a server that cannot be retired at all — is worse.
+
+`superuser` only. It is for the state note 1 of `docs/operating.md` describes: a
+persistent server whose world save cannot be confirmed, whose drain therefore
+aborts, and which otherwise has to be stopped by hand.
+
+What it does, in order: tombstone the definition, **request a world save and wait
+the declared save timeout**, then stop the container with its **full declared
+grace period** regardless of whether the save was confirmed. The reconcile loop
+then observes the stopped container and completes the teardown as it always does.
+
+What it does **not** do is skip the save or shorten the grace period. Skipping the
+save would buy tens of seconds in exchange for the data this system exists to
+protect; the grace period is the last protection still working when RCON is not.
+
+```json
+{ "accepted": true, "forced": true, "saveConfirmed": false,
+  "detail": "the container was stopped without a confirmed world save; unsaved play since the last successful save is lost" }
+```
+
+**Read `saveConfirmed` first.** It is the difference between retiring a stuck
+server and losing a world, and months later it is the only thing that can tell
+them apart. `409 FORCE_NOT_APPLICABLE` if the server is a `VelocityProxy`, which
+holds no world, or if there is no running container to stop.
 
 ### `POST /api/v1/validate`
 

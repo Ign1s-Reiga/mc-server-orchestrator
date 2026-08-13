@@ -13,6 +13,9 @@ import mcorch.core.SingleNodeScheduler
 import mcorch.core.StaticNodeRegistry
 import mcorch.core.console.ConsoleUnavailable
 import mcorch.core.console.ServerConsole
+import mcorch.core.termination.ForcedStopOutcome
+import mcorch.core.termination.ForcedTermination
+import mcorch.core.termination.ForcedTerminationUnavailable
 import mcorch.schema.DrainStatus
 import mcorch.schema.PaperServerDefinition
 import mcorch.schema.PaperServerStatus
@@ -563,6 +566,10 @@ class DisplayConformanceTest {
                         definition: PaperServerDefinition,
                         command: String,
                     ): String = throw ConsoleUnavailable("no workload in this test")
+                },
+                object : ForcedTermination {
+                    override suspend fun stop(definition: PaperServerDefinition): ForcedStopOutcome =
+                        throw ForcedTerminationUnavailable("no workload in this test")
                 },
             ).use { server ->
                 block(ApiClient("http://127.0.0.1:${server.port}", token))

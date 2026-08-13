@@ -48,6 +48,7 @@ class RouteTableTest {
             secrets = api.secrets,
             identities = api.identities,
             console = RefusingConsole,
+            forced = api.forced,
             auth = OperatorAuth(config.token.digest, sessions, Duration.ZERO, api.identities),
             sessions = sessions,
             streams = StreamRegistry(config.maxStreams),
@@ -113,7 +114,11 @@ class RouteTableTest {
             imports.filter { (_, imported) ->
                 imported.startsWith("mcorch.cri.") ||
                     imported.startsWith("io.grpc.") ||
-                    (imported.startsWith("mcorch.core.") && !imported.startsWith("mcorch.core.console."))
+                    (
+                        imported.startsWith("mcorch.core.") &&
+                            !imported.startsWith("mcorch.core.console.") &&
+                            !imported.startsWith("mcorch.core.termination.")
+                    )
             }
         forbidden shouldBe emptyList()
 
