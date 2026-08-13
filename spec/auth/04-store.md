@@ -16,7 +16,12 @@ So this is one new persisted concept, not two.
 
 ## 2. The interface
 
-Behind `Store`, with no storage-engine specifics leaking — the third of the
+**Correction to an earlier draft:** this said "behind `Store`". It is a sibling of
+`SecretStore` instead — `Store` holds what the operator declared and what the loop
+observed, and an identity is neither. `EmbeddedStore` exposes three narrow stores
+rather than one that answers unrelated questions.
+
+With no storage-engine specifics leaking — the third of the
 distribution seams CLAUDE.md names, and the rule that the interface must be
 satisfiable by a distributed backend later.
 

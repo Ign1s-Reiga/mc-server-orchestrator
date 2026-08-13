@@ -20,8 +20,8 @@ import kotlin.time.Duration
  *
  * ## Threat model
  *
- * This is a single-host operational tool with one class of user — the operator —
- * and no tenancy. What it is defending against, in the order it matters:
+ * This is a single-host operational tool with three tiers of user and no tenancy.
+ * What it is defending against, in the order it matters:
  *
  * 1. **Anything else that can reach the port.** The API can stop and replace
  *    Minecraft servers, so an unauthenticated request that reaches a mutating
@@ -39,25 +39,35 @@ import kotlin.time.Duration
  *    long-lived credential. The CSRF token *is* readable by script, on purpose:
  *    it is not a credential on its own, and script that can read it can already
  *    make requests.
- * 4. **Brute force of the operator token.** The token is required to be at least
- *    32 characters, is compared as a SHA-256 digest in constant time, and every
- *    failure costs a fixed delay. There is deliberately no lockout: a lockout on
- *    a shared credential is a denial-of-service anyone who can reach the port
- *    can trigger.
+ * 4. **Brute force of a credential.** Every credential is at least 32 characters,
+ *    is compared as a SHA-256 digest in constant time, and every failure costs a
+ *    fixed delay. There is deliberately **still** no lockout, and the reason has
+ *    changed shape without changing conclusion: it used to be that locking a
+ *    shared credential locks everyone. Now an attacker who can reach the port can
+ *    enumerate or guess identity names cheaply, so a lockout would hand them a
+ *    denial of service against every name they can think of — including the last
+ *    superuser. The delay bounds guessing at the same cost either way, and a
+ *    lockout adds a state machine whose failure mode is *no way in*.
+ * 5. **An operator exceeding their tier.** Every route declares what it requires
+ *    ([mcorch.api.http.Access]) and one registered without a tier does not
+ *    compile, so the enforcement cannot be forgotten for a route added later.
  *
  * What it is **not** defending against, and these are stated so nobody assumes
  * otherwise: an attacker with read access to the host's environment or process
- * table (the token is an env var), transport interception (run it behind TLS or
- * on loopback — this server speaks plain HTTP), or an operator who is themselves
- * hostile. There are no roles: any authenticated caller can do anything the API
- * offers.
+ * table (`MCORCH_API_TOKEN` is an env var), transport interception (run it behind
+ * TLS or on loopback — this server speaks plain HTTP), or a **superuser** who is
+ * themselves hostile.
+ *
+ * Tiers reduce blast radius and make actions attributable. They are not a defence
+ * against somebody granted `superuser`, and they do not bound the operator token
+ * at all — see [Credential.OperatorToken].
  *
  * ## Two credentials, one of which needs CSRF
  *
- * - `Authorization: Bearer <operator token>` — for scripts and for `curl`. No
- *   CSRF token is required with it, because a browser never attaches an
- *   `Authorization` header on its own; a cross-site request simply cannot carry
- *   one.
+ * - `Authorization: Bearer <credential>` — the operator token or any enabled
+ *   identity's, for scripts and for `curl`. No CSRF token is required with it,
+ *   because a browser never attaches an `Authorization` header on its own; a
+ *   cross-site request simply cannot carry one.
  * - `Cookie: mcorch_session=<id>` — for the SPA, and the only thing an
  *   `EventSource` can send, since that API cannot set headers. Mutating requests
  *   authenticated this way must also send `X-CSRF-Token`.
