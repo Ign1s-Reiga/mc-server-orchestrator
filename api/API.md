@@ -49,7 +49,7 @@ So:
 
 ### Threat model
 
-Single host, one class of user, no tenancy. In priority order this defends
+Single host, **three tiers of user**, no tenancy. In priority order this defends
 against:
 
 1. **Anything else that can reach the port.** Every route except `/healthz` and
@@ -60,21 +60,73 @@ against:
 3. **Script running in the dashboard's own page.** The session cookie is
    `HttpOnly`, so injected script cannot read or exfiltrate it. The CSRF token is
    readable on purpose — it is not a credential on its own.
-4. **Guessing the operator token.** Minimum 32 characters, compared as a SHA-256
-   digest in constant time, fixed delay on every failure. No lockout: a lockout on
-   a shared credential is a denial of service anyone who can reach the port can
-   trigger.
+4. **Guessing a credential.** Every credential is at least 32 characters,
+   compared as a SHA-256 digest in constant time, with a fixed delay on every
+   failure. **No lockout**, still: an attacker who can reach the port can
+   enumerate or guess identity names cheaply, so a lockout would hand them a
+   denial of service against every name they can think of — including the last
+   superuser. The delay bounds guessing at the same cost either way, and a lockout
+   adds a state machine whose failure mode is *no way in*.
+5. **An operator exceeding what they were granted.** Every route declares the
+   tier it requires, and a route registered without one does not compile. See
+   §2.1.
 
 Explicitly **not** defended against: an attacker who can read the host's
-environment or process table (the token is an env var), transport interception
-(this server speaks plain HTTP), and a hostile operator. **There are no roles** —
-any authenticated caller can do anything the API offers.
+environment or process table (`MCORCH_API_TOKEN` is an env var), transport
+interception (this server speaks plain HTTP), and **a hostile superuser**.
+
+Tiers reduce blast radius and make actions attributable. They are not a defence
+against somebody you granted `superuser` to, and they do not bound the operator
+token at all — see §2.2.
+
+### 2.1 Tiers
+
+| Tier | Holds |
+|---|---|
+| `member` | Non-destructive operations. Read-only |
+| `operator` | Reads, plus creating and editing servers |
+| `superuser` | Everything, including deleting a server, writing secrets, and managing identities |
+
+Totally ordered, so a tier holds everything the ones below it do. `GET
+/api/v1/auth/session` reports yours — **read it on page load and render only what
+it permits**, rather than discovering the limits from a scatter of `403`s.
+
+Two of the assignments are data-safety decisions rather than access-control ones,
+because every mutating endpoint can request a drain and a drain is how a Minecraft
+server stops:
+
+- **`DELETE /api/v1/servers/{name}` is `superuser`.** It is the endpoint that ends
+  a server.
+- **`PUT /api/v1/servers/{name}` is `operator`**, knowingly. An edit that changes
+  the spec drains the running server and replaces it — so an `operator` can cause
+  a fleet-wide restart by editing several manifests, and nothing rate-limits that.
+  It is not `superuser` because the replacement still drains: nobody is
+  disconnected, the world is saved first, and a careless `PUT` costs a restart
+  rather than data.
+
+A tier below what a route requires gets **`403 FORBIDDEN`** carrying
+`requiredTier`. That is deliberately not `401`: the credential is fine and there is
+nothing to log in again *as*, so a client that retries the login on it loops.
+
+### 2.2 The operator token is outside the tier system
+
+`MCORCH_API_TOKEN` is not an identity that happens to hold `superuser`. It exists
+before any identity does, it cannot be demoted, and it is how you get back in when
+every credential is lost. It reports itself as `<operator-token>`.
+
+Two consequences worth seeing coming:
+
+- **Demoting yourself changes nothing if you still hold it.**
+- **Host read access is superuser access.** Threat-model item 5 above already says
+  the token is an environment variable; with tiers, that sentence means reading
+  the host's environment does not get you *a* credential, it gets you the
+  *unbounded* one.
 
 ### Two credentials
 
 | | Header | CSRF needed | For |
 |---|---|---|---|
-| Operator token | `Authorization: Bearer <token>` | no | scripts, `curl`, CI |
+| Bearer credential | `Authorization: Bearer <token>` | no | scripts, `curl`, CI. The operator token or any enabled identity's |
 | Session cookie | `Cookie: mcorch_session=…` | yes, on mutations | the SPA |
 
 The bearer exemption is not a convenience: a browser never attaches an
@@ -88,15 +140,16 @@ whereas an operator token in `localStorage` is one it can post anywhere.
 
 ### `POST /api/v1/auth/session`
 
-Exchanges the operator token for a session. The only route where a credential is
-*established*, so it checks the token itself before doing anything.
+Exchanges a credential for a session. The only route where a credential is
+*established*, so it checks it directly before doing anything.
 
-- Request: `Authorization: Bearer <operator token>`. No body. The token is never
-  accepted in a body or query string — a query string is logged by every proxy
-  in the world.
+- Request: `Authorization: Bearer <credential>`. No body. Accepts the operator
+  token or any **enabled** identity's credential. It is never accepted in a body
+  or query string — a query string is logged by every proxy in the world.
 - `200`:
   ```json
   { "authenticated": true, "method": "session",
+    "identity": "rin", "tier": "operator",
     "csrfToken": "9Xk…", "expiresAt": "2026-07-28T22:15:30Z" }
   ```
   plus `Set-Cookie: mcorch_session=…; Path=/; Max-Age=43200; HttpOnly;
@@ -108,7 +161,9 @@ Exchanges the operator token for a session. The only route where a credential is
 Who am I, and which CSRF token should I be sending. Call this on page load.
 
 - `200` with the same shape. `method` is `"session"` or `"bearer"`; for a bearer
-  caller `csrfToken` and `expiresAt` are `null`.
+  caller `csrfToken` and `expiresAt` are `null`. `identity` and `tier` are always
+  present — **this is the call a dashboard reads on load to decide what to
+  render**.
 - `401` if the session is unknown or expired — the SPA's cue to show a login.
 
 ### `DELETE /api/v1/auth/session`
@@ -184,7 +239,11 @@ API by `PUT`ting a valid definition with `If-Match: *`.
 | `CSRF_REQUIRED` | 403 | | cookie-authenticated mutation with no `X-CSRF-Token` |
 | `CSRF_INVALID` | 403 | | the token does not match the session |
 | `ORIGIN_NOT_ALLOWED` | 403 | | cross-origin request from an unconfigured origin |
+| `FORBIDDEN` | 403 | `requiredTier` | authenticated, and below the tier the route needs. **Not** a reason to log in again |
 | `NOT_FOUND` | 404 | | no such server, secret or endpoint |
+| `IDENTITY_NOT_FOUND` | 404 | | no identity holds that name |
+| `IDENTITY_EXISTS` | 409 | | `POST /identities/{name}` never overwrites |
+| `LAST_SUPERUSER` | 409 | | the change would leave no enabled superuser |
 | `METHOD_NOT_ALLOWED` | 405 | `Allow` | |
 | `SECRET_NOT_READABLE` | 405 | `Allow` | reading secret material. Never possible. |
 | `CONFLICT` | 409 | `conflict`, `ETag` | a write lost a race or hit an integrity rule |
@@ -1115,6 +1174,58 @@ operation does not exist. There is no debug view, no export and no reveal flag.
 
 ---
 
+## 9.5 Identities
+
+Managing operators. **Every route here is `superuser`.**
+
+| | |
+|---|---|
+| `GET /api/v1/identities` | name, tier, enabled, `createdAt`. **Never a digest** |
+| `POST /api/v1/identities/{name}` | creates. Body is the tier |
+| `PUT /api/v1/identities/{name}` | sets the tier. Body is the tier |
+| `PUT /api/v1/identities/{name}/enabled` | body is `true` or `false` |
+| `POST /api/v1/identities/{name}/credential` | rotates. No body |
+| `DELETE /api/v1/identities/{name}` | removes |
+
+Bodies are `text/plain` and one word, for the reason §5 gives for definitions
+being YAML: nothing here parses JSON. It also keeps each endpoint doing one thing
+— setting a tier and disabling are different decisions with different blast
+radii.
+
+### The credential is shown exactly once
+
+`POST /identities/{name}` (`201`) and `POST /identities/{name}/credential` (`200`)
+return a generated credential:
+
+```json
+{ "name": "rin", "tier": "operator", "credential": "…",
+  "warning": "this credential is not stored in recoverable form and cannot be shown again. If it is lost, rotate it" }
+```
+
+**Store it at that moment.** It is kept only as a digest; there is no endpoint
+that returns it again, and the listing carries no digest either. A caller that
+loses one rotates.
+
+This is the one place this API returns secret material, and §13 records why it is
+not a contradiction.
+
+### Disabling and rotating end live sessions
+
+Both revoke every session belonging to that identity and report
+`sessionsRevoked`. Without that, disabling would mean *"cannot log in again"*
+while an existing session kept working — which is not what an operator revoking a
+leaked credential intends. Rotation is usually the response to a leak, so it
+matters most there.
+
+### The last superuser
+
+Demoting, disabling or removing the only enabled `superuser` is refused with
+`LAST_SUPERUSER`. Not because it cannot be undone — `MCORCH_API_TOKEN` is the way
+back — but because that recovery needs shell access to the host. Create or enable
+another first.
+
+---
+
 ## 10. Meta and health
 
 ### `GET /healthz` — unauthenticated
@@ -1210,20 +1321,10 @@ words exists.
 **Metrics and pagination.** Not needed at this scale. `GET /api/v1/servers`
 returns everything; the change feed is the incremental path.
 
-**Per-user roles and an audit log.** Absent today — §2's threat model is accurate,
-and *any authenticated caller can still do anything this API offers*. But they are
-no longer absent *by decision*: both are specified in `spec/auth/` and are being
-built, because the premise that justified their absence has changed. A larger
-fleet has more than one operator, and the remote console (`spec/`) is a facility
-whose safe use depends on knowing who used it.
+**An audit log.** Still absent. The console (`spec/`) is what will need one, and
+it lands with the console rather than ahead of it.
 
-Three tiers are specified — `Member` (read-only), `Operator` (non-destructive plus
-limited creation and editing) and `Superuser` (full access) — with a tier assigned
-per route, and Kubernetes' role model as the reference for anything richer later.
-
-**Nothing in this document describes them yet, on purpose.** This file is the
-contract a client is written against, so it says what the API *does*, not what it
-is going to do. When the tiers ship, this section shrinks and §2 grows.
+Per-user roles are no longer absent — see §2.1 and §9.
 
 ---
 
@@ -1255,7 +1356,7 @@ start looks exactly like a healthy one until somebody needs it.
   `{online, max, observedAt}` and the type has no field an identity could live in.
   `status.endpoint.address` is the *server's* address, never a client's.
   `status.drain.destination` is a server name.
-- **No secret material, ever.** `spec.network.rcon.passwordSecret`,
+- **No secret material the operator supplied, ever.** `spec.network.rcon.passwordSecret`,
   `spec.forwarding.secret` and `spec.control.tokenSecret` are all `{name, key}` —
   coordinates. There is no endpoint that resolves any of them. The second is the
   modern-forwarding secret, which the repository's fourth invariant says travels
@@ -1275,6 +1376,13 @@ start looks exactly like a healthy one until somebody needs it.
   the server and what about the stored form was rejected, and it carries no stack
   trace, no class name, no SQL and no file path — `:store` does not put them in
   the value, and nothing here reaches past it to the exception to add them.
+
+- **One exception, and it runs the other way.** `POST /api/v1/identities/{name}`
+  and `POST /api/v1/identities/{name}/credential` return a credential this API
+  *generated* — see §9.5. The rule above is about material an operator handed in,
+  which is never returned; a generated credential shown once is the only way it
+  can ever be used, since there is no other channel to deliver it. It is stored
+  as a digest and is not readable again.
 
 `ResponseLeakageTest` enforces all of this against every response body an
 operator can obtain, with control assertions proving the search could have

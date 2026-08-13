@@ -1,6 +1,7 @@
 # Multi-identity authentication — specification
 
-> **Status: proposed. Nothing here is implemented.**
+> **Status: implemented**, except the audit log, which belongs to the console.
+> Sequencing at the end records what landed.
 
 Today every credential in this system is the same credential. This specifies
 replacing that with identities that differ in authority.
@@ -48,18 +49,25 @@ forced-`DELETE` semantics — now specified in
 
 ## Sequencing
 
-1. **The tier assignment** (open decision 1). Nothing can be built against an
-   authorization model that has not been decided.
-2. **Identity storage** — `:store` interface plus a forward-only migration
-   ([04-store.md](04-store.md)).
-3. **`Credential` becomes identity-bearing**, `SessionRegistry` binds identity,
-   `GET /auth/session` reports it ([02-model.md](02-model.md), [05-api.md](05-api.md)).
-4. **Route-level enforcement** for every existing endpoint
-   ([03-authorization.md](03-authorization.md)).
-5. **Identity management endpoints** ([05-api.md](05-api.md)).
-6. **`api/API.md` §11 amended** — per-user roles and an audit log stop being
-   absent.
+- [x] **The tier assignment.** Settled with the three tier names and the `PUT` /
+      `DELETE` rulings.
+- [x] **Identity storage** — `IdentityStore`, `V7Identities`
+      ([04-store.md](04-store.md)).
+- [x] **`Credential` becomes identity-bearing**, sessions bind a `Principal`,
+      `GET /auth/session` reports identity and tier.
+- [x] **Route-level enforcement.** `Access` is sealed and required, so a route
+      cannot be registered without stating its tier
+      ([03-authorization.md](03-authorization.md)).
+- [x] **Identity management endpoints**, with the session sweeps disabling and
+      rotation need ([05-api.md](05-api.md)).
+- [x] **`api/API.md` amended** — §2 documents the tiers, §9.5 the identity
+      endpoints, §11 stops listing roles as absent, §13 records the
+      generated-credential exception.
 
-The console's tier gate and `spec.console` land after step 4, not before: a tier
-that only one endpoint honours is worse than no tier, because it reads as a
-system-wide guarantee.
+**This specification is implemented.** What remains is the audit log, which is the
+console's to build (`../04-output.md` §3) rather than this one's — it lands with
+the console because the console is what needs it.
+
+The console's tier gate and `spec.console` were gated on route-level enforcement,
+which is now done: a tier that only one endpoint honoured would have been worse
+than no tier, because it reads as a system-wide guarantee.
