@@ -1,17 +1,43 @@
 package mcorch.api.http
 
 import com.sun.net.httpserver.HttpExchange
+import mcorch.schema.Tier
 
-/** Whether a route may be reached without an operator credential. */
-internal enum class Access {
+/**
+ * What a route requires of its caller.
+ *
+ * Sealed, and a required constructor argument of [Route], so **a route cannot be
+ * registered without stating one**. `spec/auth/03-authorization.md` §4 asks for
+ * exactly that: the alternative — an unassigned route falling through to "any
+ * authenticated caller" — reproduces the old behaviour precisely, which means a
+ * route added later is wide open and nothing fails to warn anyone.
+ *
+ * Failing closed here makes the omission impossible rather than merely caught.
+ */
+internal sealed interface Access {
     /**
      * Reachable by anyone who can reach the port. Only two things are: the
      * liveness probe and the CORS preflight, and neither reads any state.
      */
-    PUBLIC,
+    data object Public : Access
 
-    /** Requires an operator credential. Everything else. */
-    OPERATOR,
+    /**
+     * Any authenticated caller, whatever their tier.
+     *
+     * A deliberate choice rather than an omission, and it has exactly one honest
+     * use: an endpoint that acts on *the caller's own session*. Reading who you
+     * are and logging yourself out cannot be tier-gated without locking the
+     * lowest tier out of its own login.
+     *
+     * It is **not** the place to put a route whose tier nobody has decided. That
+     * is what [AtLeast] is for, and deciding is the point.
+     */
+    data object AnyIdentity : Access
+
+    /** Requires [tier] or above. */
+    data class AtLeast(
+        val tier: Tier,
+    ) : Access
 }
 
 internal sealed interface Segment {

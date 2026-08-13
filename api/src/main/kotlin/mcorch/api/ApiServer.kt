@@ -138,7 +138,7 @@ public class ApiServer private constructor(
          * The whole route table, in one expression.
          *
          * Pulled out of [start] so a test can assert on it directly — in
-         * particular that no mutating route is declared [Access.PUBLIC]. That
+         * particular that no mutating route is declared [Access.Public]. That
          * check cannot be made by exercising endpoints, because it has to hold
          * for endpoints nobody has thought to exercise yet.
          */
@@ -275,8 +275,30 @@ internal class Dispatcher(
         // Authentication joins the handler's bridge rather than opening a second
         // one: resolving an identity reads the store, which suspends.
         return runBlocking {
-            if (found.route.access == Access.OPERATOR) {
-                auth.authenticate(request)
+            when (val access = found.route.access) {
+                Access.Public -> {
+                    Unit
+                }
+
+                Access.AnyIdentity -> {
+                    auth.authenticate(request)
+                }
+
+                is Access.AtLeast -> {
+                    val credential = auth.authenticate(request)
+                    val held = credential.principal.tier
+                    if (!held.atLeast(access.tier)) {
+                        // Distinct from UNAUTHENTICATED on purpose: the caller does
+                        // not need to log in again, and a dashboard that retries the
+                        // login on this loops. `requiredTier` lets it say "this needs
+                        // superuser" rather than "forbidden".
+                        throw ApiException(
+                            ErrorCode.FORBIDDEN,
+                            "this endpoint requires the ${access.tier.wireValue} tier",
+                            requiredTier = access.tier.wireValue,
+                        )
+                    }
+                }
             }
             when (val result = found.route.handler(request, exchange)) {
                 is HandlerResult.Send -> result.response

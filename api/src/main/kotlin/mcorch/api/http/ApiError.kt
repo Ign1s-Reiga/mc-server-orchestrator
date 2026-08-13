@@ -36,6 +36,16 @@ internal enum class ErrorCode(
     /** An `Origin` header naming an origin the server was not configured to accept. */
     ORIGIN_NOT_ALLOWED(403),
 
+    /**
+     * Authenticated, and not holding the tier the route requires.
+     *
+     * Distinct from [UNAUTHENTICATED] because the remedy is different and a client
+     * that confuses them loops: there is nothing to log in again *as*, and the
+     * credential is fine. Carries `requiredTier` so a dashboard can name what is
+     * missing.
+     */
+    FORBIDDEN(403),
+
     NOT_FOUND(404),
     METHOD_NOT_ALLOWED(405),
 
@@ -96,6 +106,8 @@ internal class ApiException(
      * with no name at all is one of the ways a row becomes unreadable.
      */
     val unreadable: Pair<String?, Unreadable>? = null,
+    /** Set on [ErrorCode.FORBIDDEN]: the tier the route needed. Never the caller's own. */
+    val requiredTier: String? = null,
     /** Response headers this failure needs — `Allow` on a 405, `ETag` on a conflict. */
     val headers: List<Pair<String, String>> = emptyList(),
     cause: Throwable? = null,
@@ -124,6 +136,7 @@ internal class ApiException(
                         put("currentResourceVersion", detail.currentResourceVersion?.token)
                         put("explanation", explain(detail.reason))
                     }
+                    put("requiredTier", requiredTier?.let(Json::Str) ?: Json.Null)
                     putObject("unreadable", unreadable) { (name, detail) ->
                         put("name", name)
                         put("part", detail.part)

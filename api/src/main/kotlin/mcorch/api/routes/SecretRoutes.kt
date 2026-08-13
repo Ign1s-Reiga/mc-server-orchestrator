@@ -11,6 +11,7 @@ import mcorch.api.http.Route
 import mcorch.api.json.Json
 import mcorch.api.json.jsonObject
 import mcorch.schema.ResourceName
+import mcorch.schema.Tier
 import mcorch.store.SecretStore
 import mcorch.store.SecretValue
 import org.slf4j.LoggerFactory
@@ -50,12 +51,20 @@ internal class SecretRoutes(
 ) {
     fun routes(): List<Route> =
         listOf(
-            Route("GET", SECRETS, Access.OPERATOR) { _, _ -> HandlerResult.Send(list()) },
-            Route("GET", SECRET, Access.OPERATOR) { request, _ -> HandlerResult.Send(keys(request)) },
-            Route("DELETE", SECRET, Access.OPERATOR) { request, _ -> HandlerResult.Send(removeSecret(request)) },
-            Route("PUT", SECRET_KEY, Access.OPERATOR) { request, _ -> HandlerResult.Send(put(request)) },
-            Route("DELETE", SECRET_KEY, Access.OPERATOR) { request, _ -> HandlerResult.Send(removeKey(request)) },
-            Route("GET", SECRET_KEY, Access.OPERATOR) { _, _ -> refuseRead() },
+            Route("GET", SECRETS, Access.AtLeast(Tier.SUPERUSER)) { _, _ -> HandlerResult.Send(list()) },
+            Route("GET", SECRET, Access.AtLeast(Tier.SUPERUSER)) { request, _ -> HandlerResult.Send(keys(request)) },
+            Route(
+                "DELETE",
+                SECRET,
+                Access.AtLeast(Tier.SUPERUSER),
+            ) { request, _ -> HandlerResult.Send(removeSecret(request)) },
+            Route("PUT", SECRET_KEY, Access.AtLeast(Tier.SUPERUSER)) { request, _ -> HandlerResult.Send(put(request)) },
+            Route(
+                "DELETE",
+                SECRET_KEY,
+                Access.AtLeast(Tier.SUPERUSER),
+            ) { request, _ -> HandlerResult.Send(removeKey(request)) },
+            Route("GET", SECRET_KEY, Access.AtLeast(Tier.SUPERUSER)) { _, _ -> refuseRead() },
         )
 
     private suspend fun list(): Response {
