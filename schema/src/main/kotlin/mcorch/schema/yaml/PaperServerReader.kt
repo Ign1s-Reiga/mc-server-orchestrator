@@ -304,17 +304,18 @@ internal class PaperServerReader(
      */
     private fun readConsole(reader: MappingReader): ConsoleSpec {
         val declared = reader.string("maxTier")
+        val auditCommandText = reader.boolean("auditCommandText", default = false) ?: false
         reader.done()
-        if (declared == null) return ConsoleSpec()
+        if (declared == null) return ConsoleSpec(auditCommandText = auditCommandText)
         val tier =
             Tier.parse(declared) ?: run {
                 reader.violation(
                     "maxTier",
                     "`$declared` is not a tier. Expected one of ${Tier.entries.joinToString(", ") { it.wireValue }}",
                 )
-                return ConsoleSpec()
+                return ConsoleSpec(auditCommandText = auditCommandText)
             }
-        return ConsoleSpec(maxTier = tier)
+        return ConsoleSpec(maxTier = tier, auditCommandText = auditCommandText)
     }
 
     private fun readPlacement(reader: MappingReader): PlacementSpec {

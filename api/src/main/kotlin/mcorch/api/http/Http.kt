@@ -1,6 +1,7 @@
 package mcorch.api.http
 
 import com.sun.net.httpserver.HttpExchange
+import mcorch.api.auth.Principal
 import mcorch.api.json.Json
 import java.io.IOException
 import java.net.URLDecoder
@@ -39,6 +40,30 @@ internal class Request(
     private val headers: Map<String, List<String>>,
     val body: ByteArray,
 ) {
+    /**
+     * Who authenticated, once the dispatcher has resolved it.
+     *
+     * Set after [Request.read] because the body is read before the credential is
+     * checked, and null on a `PUBLIC` route, which by definition has none.
+     *
+     * A handler that needs it should use [principal], which fails loudly rather
+     * than letting a missing one read as "no authority" — a null tier silently
+     * becoming the lowest one is how an authorisation check comes to pass by
+     * accident.
+     */
+    var authenticated: Principal? = null
+
+    /**
+     * The caller, or a failure.
+     *
+     * Only a route that declares a tier may ask, and every such route has been
+     * authenticated before its handler runs — so a null here is a wiring bug, not
+     * a request to interpret.
+     */
+    fun principal(): Principal =
+        authenticated
+            ?: error("no principal on $method $path; a handler that needs one must not be on a PUBLIC route")
+
     fun header(name: String): String? = headers[name.lowercase()]?.firstOrNull()
 
     fun headers(name: String): List<String> = headers[name.lowercase()].orEmpty()

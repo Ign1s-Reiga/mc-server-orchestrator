@@ -179,7 +179,10 @@ internal object DefinitionCodec {
                 put("passwordSecret.key", rcon.passwordSecret.key)
             }
         }
-        writer.scope("console") { put("maxTier", spec.console.maxTier.wireValue) }
+        writer.scope("console") {
+            put("maxTier", spec.console.maxTier.wireValue)
+            put("auditCommandText", spec.console.auditCommandText)
+        }
         writer.scope("storage") {
             put("mode", spec.storage.mode.wireValue)
             put("mountPath", spec.storage.mountPath)
@@ -273,11 +276,12 @@ internal object DefinitionCodec {
      * did not write.
      */
     private fun readConsole(reader: DocumentReader): ConsoleSpec {
-        val raw = reader.string("console.maxTier") ?: return ConsoleSpec()
+        val audit = reader.boolean("console.auditCommandText") ?: false
+        val raw = reader.string("console.maxTier") ?: return ConsoleSpec(auditCommandText = audit)
         val tier =
             Tier.parse(raw)
                 ?: throw StoreException.Corrupt("console.maxTier is `$raw`, which this build does not recognise")
-        return ConsoleSpec(maxTier = tier)
+        return ConsoleSpec(maxTier = tier, auditCommandText = audit)
     }
 
     private fun readStorage(reader: DocumentReader): StorageSpec {

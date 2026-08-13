@@ -1,6 +1,8 @@
 package mcorch.api
 
 import io.kotest.matchers.collections.shouldContainAll
+import io.kotest.matchers.collections.shouldNotBeEmpty
+import io.kotest.matchers.ints.shouldBeGreaterThan
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
 import mcorch.api.auth.OperatorAuth
@@ -12,6 +14,7 @@ import mcorch.schema.Tier
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import java.nio.file.Path
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.hours
 
@@ -44,6 +47,7 @@ class RouteTableTest {
             store = api.store,
             secrets = api.secrets,
             identities = api.identities,
+            console = RefusingConsole,
             auth = OperatorAuth(config.token.digest, sessions, Duration.ZERO, api.identities),
             sessions = sessions,
             streams = StreamRegistry(config.maxStreams),
@@ -72,30 +76,49 @@ class RouteTableTest {
     }
 
     @Test
-    fun `this module cannot reach a container runtime at all`() {
-        // The strongest form of "a mutating handler writes desired state and does
-        // not act": the types it would have to call are not on the classpath, so no
-        // handler can call one however it is written, and no future one can either
-        // without a visible change to api/build.gradle.kts.
+    fun `this module reaches core through one package and no further`() {
+        // This used to assert that `mcorch.core.Node` and `mcorch.cri.CriClient`
+        // were not on the classpath at all — the strongest form of "a handler
+        // cannot act on a container, however it is written".
         //
-        // A test rather than a build-file comment because the comment cannot fail.
-        val outOfReach =
-            listOf(
-                "mcorch.cri.CriClient",
-                "mcorch.cri.ContainerSpec",
-                "mcorch.cri.StopGracePeriod",
-                "mcorch.core.Node",
-                "mcorch.core.Reconciler",
-                "mcorch.core.DrainController",
-                "io.grpc.ManagedChannel",
-            )
-        outOfReach.filter { runCatching { Class.forName(it) }.isSuccess } shouldBe emptyList()
+        // The remote console ended that. A console command has to reach a running
+        // container, so `:api` now depends on `:core`, and those types are
+        // reachable whether or not anything uses them. api/API.md 11 called that
+        // edge "a real decision with a real justification, not something to slip
+        // in", and it was made deliberately.
+        //
+        // So the rule moves from the classpath to the source, where it can still
+        // fail: this module may name `mcorch.core.console` and nothing else under
+        // `mcorch.core`, and nothing under `mcorch.cri` at all. That is the
+        // property the old test was really protecting — a handler cannot stop a
+        // container — and it is now checked where a future handler would break it.
+        val imports =
+            Path
+                .of("src/main/kotlin")
+                .toFile()
+                .walkTopDown()
+                .filter { it.isFile && it.extension == "kt" }
+                .flatMap { file ->
+                    file.readLines().filter { it.startsWith("import ") }.map {
+                        file.name to
+                            it.removePrefix("import ").trim()
+                    }
+                }.toList()
 
-        // Control: the classpath is not simply empty, and the search does find the
-        // things this module *is* allowed to depend on.
-        listOf("mcorch.store.Store", "mcorch.schema.PaperServerDefinition")
-            .filter { runCatching { Class.forName(it) }.isSuccess }
-            .size shouldBe 2
+        // Control: the scan found something, so the assertions below are about
+        // absence rather than about an empty list.
+        imports.size shouldBeGreaterThan 50
+
+        val forbidden =
+            imports.filter { (_, imported) ->
+                imported.startsWith("mcorch.cri.") ||
+                    imported.startsWith("io.grpc.") ||
+                    (imported.startsWith("mcorch.core.") && !imported.startsWith("mcorch.core.console."))
+            }
+        forbidden shouldBe emptyList()
+
+        // And the doorway is genuinely used, so the rule above is not vacuous.
+        imports.map { it.second }.filter { it.startsWith("mcorch.core.console.") }.shouldNotBeEmpty()
     }
 
     @Test

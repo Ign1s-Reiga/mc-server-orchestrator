@@ -49,6 +49,19 @@ dependencies {
     api(project(":schema"))
 
     implementation(project(":store"))
+
+    // The :core edge, and it is one method wide.
+    //
+    // api/API.md 11 anticipated this pressure from the container-logs direction
+    // and ruled that adding it is "a real decision with a real justification, not
+    // something to slip in". The justification is the remote console: a console
+    // command reaches a running container, which needs Node, which lives there.
+    //
+    // What is imported is mcorch.core.console — ServerConsole, which runs one
+    // already-screened command, and ConsolePolicy, which decides whether it is
+    // screened. Nothing here touches the reconciler, the node registry or the
+    // drain, and nothing here can stop a container.
+    implementation(project(":core"))
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.slf4j.api)
 

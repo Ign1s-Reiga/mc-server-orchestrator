@@ -242,6 +242,10 @@ API by `PUT`ting a valid definition with `If-Match: *`.
 | `FORBIDDEN` | 403 | `requiredTier` | authenticated, and below the tier the route needs. **Not** a reason to log in again |
 | `NOT_FOUND` | 404 | | no such server, secret or endpoint |
 | `IDENTITY_NOT_FOUND` | 404 | | no identity holds that name |
+| `CONSOLE_COMMAND_REFUSED` | 409 | | a console command refused at every tier — see §9.6 |
+| `CONSOLE_NOT_APPLICABLE` | 409 | | the console was asked of a `VelocityProxy`, which has no RCON |
+| `CONSOLE_UNAVAILABLE` | 503 | `Retry-After` | the server cannot answer yet. **Retryable**, and nothing was sent |
+| `CONSOLE_TIMEOUT` | 504 | | the command **ran or may have run** and no reply arrived. **Do not retry** |
 | `IDENTITY_EXISTS` | 409 | | `POST /identities/{name}` never overwrites |
 | `LAST_SUPERUSER` | 409 | | the change would leave no enabled superuser |
 | `METHOD_NOT_ALLOWED` | 405 | `Allow` | |
@@ -1175,6 +1179,62 @@ operation does not exist. There is no debug view, no export and no reveal flag.
 
 ---
 
+## 9.4 The remote console
+
+```http
+POST /api/v1/servers/{name}/console
+Content-Type: text/plain
+
+list
+```
+
+**This is the one endpoint here that is not a write to desired state.** §1 tells
+you a 2xx means the request was recorded; on this route a `200` means the command
+**ran on the server**. There is no loop behind it and no status to watch after.
+
+```json
+{ "server": "survival-01", "command": "list", "tier": "operator",
+  "executedAt": "2026-08-13T09:14:02Z",
+  "output": "There are 3 of a max of 20 players online: Alice, Bob, Carol" }
+```
+
+`output` is whatever the server replied, **verbatim**. It routinely carries player
+names, UUIDs and client addresses — that is the point of a general console, and it
+is why §13 has an exception for this route. Treat it as untrusted text and render
+it escaped: it contains whatever a player typed.
+
+The body is `text/plain`, one command, no leading slash. A body with more than one
+line is a `400`, so a refusal and an audit record always refer to exactly one
+thing. It is a body rather than a query parameter because a command routinely
+names a player and a query string is logged by every proxy in the world.
+
+### Two gates, and the route tier is neither
+
+Reaching the handler needs `member`. What runs is decided after that:
+
+1. **Invariant refusals.** `stop`, `save-off` and anything that ends the process
+   are refused **at every tier, including `superuser`** — `CONSOLE_COMMAND_REFUSED`,
+   pointing at `DELETE /api/v1/servers/{name}`, which drains. Stopping a server is
+   not a permission this API grants to anybody.
+2. **The tier gate.** `superuser` may run anything the first gate permits;
+   `operator` and `member` have explicit sets. The effective tier is the lesser of
+   your own and the server's `spec.console.maxTier`, so a refusal can be the
+   *server's* doing — `FORBIDDEN` names both, so you can tell which.
+
+### `GET /api/v1/servers/{name}/console`
+
+What this caller may run here. `unrestricted: true` means the effective tier is
+bounded only by the invariant refusals and there is no finite list — render a
+free-text prompt. Otherwise `commands` is the set, and a picker is the honest UI.
+
+### There is no scrollback
+
+RCON is request/reply. It returns nothing between commands, so this shows the
+replies to commands you sent and nothing else — no join and leave messages, no
+server log. Live server output is container logs, which §11 still lists as absent.
+
+---
+
 ## 9.5 Identities
 
 Managing operators. **Every route here is `superuser`.**
@@ -1390,7 +1450,13 @@ start looks exactly like a healthy one until somebody needs it.
   trace, no class name, no SQL and no file path — `:store` does not put them in
   the value, and nothing here reaches past it to the exception to add them.
 
-- **One exception, and it runs the other way.** `POST /api/v1/identities/{name}`
+- **The console is the exception to all of the above.**
+  `POST /api/v1/servers/{name}/console` returns the server's reply verbatim, which
+  routinely contains player names, UUIDs and client addresses. It is the one route
+  where the guarantee does not hold, it is deliberate, and `ResponseLeakageTest`
+  exempts exactly it. A general console cannot be built otherwise: the alternative
+  needs a parser per command and cannot support a modded server's commands at all.
+- **One further exception, and it runs the other way.** `POST /api/v1/identities/{name}`
   and `POST /api/v1/identities/{name}/credential` return a credential this API
   *generated* — see §9.5. The rule above is about material an operator handed in,
   which is never returned; a generated credential shown once is the only way it

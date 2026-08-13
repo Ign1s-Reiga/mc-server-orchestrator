@@ -184,6 +184,24 @@ public data class RconSpec(
  */
 public data class ConsoleSpec(
     val maxTier: Tier = Tier.MEMBER,
+    /**
+     * Whether the audit record keeps the command as dispatched, or only its verb
+     * and how many arguments it had.
+     *
+     * `false` records `kick`, 1 argument. `true` records `kick Alice`.
+     *
+     * An argument can be a player name, and the audit log is the one sink
+     * guaranteed to be written to disk and read later — so `false` is the default,
+     * because it is the setting that agrees with the standing rule against logging
+     * player names, UUIDs and addresses. Turning it on is an operator deliberately
+     * overriding that convention for one server, which is a decision worth having
+     * to write down.
+     *
+     * It changes **only** what the audit keeps. It does not affect what the
+     * console returns, which is raw either way, and it never affects whether a
+     * command runs.
+     */
+    val auditCommandText: Boolean = false,
 )
 
 /** The container's memory/CPU limits and the JVM heap that has to fit inside them. */

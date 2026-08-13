@@ -19,12 +19,15 @@ import mcorch.api.http.RouteMatch
 import mcorch.api.http.Router
 import mcorch.api.http.StaticFiles
 import mcorch.api.routes.AuthRoutes
+import mcorch.api.routes.ConsoleAudit
+import mcorch.api.routes.ConsoleRoutes
 import mcorch.api.routes.IdentityRoutes
 import mcorch.api.routes.MetaRoutes
 import mcorch.api.routes.SecretRoutes
 import mcorch.api.routes.ServerRoutes
 import mcorch.api.routes.StreamRoutes
 import mcorch.api.stream.StreamRegistry
+import mcorch.core.console.ServerConsole
 import mcorch.store.IdentityStore
 import mcorch.store.SecretStore
 import mcorch.store.Store
@@ -99,13 +102,14 @@ public class ApiServer private constructor(
             store: Store,
             secrets: SecretStore,
             identities: IdentityStore,
+            console: ServerConsole,
         ): ApiServer {
             val streams = StreamRegistry(config.maxStreams)
             val sessions = SessionRegistry(config.clock, config.sessionTtl)
             val auth = OperatorAuth(config.token.digest, sessions, config.authFailureDelay, identities)
             val dispatcher =
                 Dispatcher(
-                    Router(routeTable(config, store, secrets, identities, auth, sessions, streams)),
+                    Router(routeTable(config, store, secrets, identities, console, auth, sessions, streams)),
                     auth,
                     Cors(config.allowedOrigins),
                     config,
@@ -151,6 +155,7 @@ public class ApiServer private constructor(
             store: Store,
             secrets: SecretStore,
             identities: IdentityStore,
+            console: ServerConsole,
             auth: OperatorAuth,
             sessions: SessionRegistry,
             streams: StreamRegistry,
@@ -160,6 +165,7 @@ public class ApiServer private constructor(
                 ServerRoutes(store).routes() +
                 SecretRoutes(secrets).routes() +
                 IdentityRoutes(identities, sessions, config.clock).routes() +
+                ConsoleRoutes(store, console, ConsoleAudit(), config.clock).routes() +
                 StreamRoutes(store, config, streams).routes()
     }
 }
@@ -304,6 +310,7 @@ internal class Dispatcher(
 
                 is Access.AtLeast -> {
                     val credential = auth.authenticate(request)
+                    request.authenticated = credential.principal
                     val held = credential.principal.tier
                     if (!held.atLeast(access.tier)) {
                         // Distinct from UNAUTHENTICATED on purpose: the caller does
