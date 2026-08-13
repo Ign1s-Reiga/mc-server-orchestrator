@@ -1,5 +1,6 @@
 package mcorch.schema.yaml
 
+import mcorch.schema.ConsoleSpec
 import mcorch.schema.CpuQuantity
 import mcorch.schema.DrainPolicy
 import mcorch.schema.DrainSpec
@@ -24,6 +25,7 @@ import mcorch.schema.SecretRef
 import mcorch.schema.SpecInvariants
 import mcorch.schema.StorageMode
 import mcorch.schema.StorageSpec
+import mcorch.schema.Tier
 import mcorch.schema.VolumeSpec
 import org.snakeyaml.engine.v2.nodes.Node
 import kotlin.time.Duration.Companion.seconds
@@ -74,6 +76,7 @@ internal class PaperServerReader(
         val storage = readStorage(spec.mapping("storage"), metadata.name)
         val lifecycle = spec.mapping("lifecycle")?.let(::readLifecycle) ?: LifecycleSpec()
         val placement = spec.mapping("placement")?.let(::readPlacement) ?: PlacementSpec()
+        val console = spec.mapping("console")?.let(::readConsole) ?: ConsoleSpec()
         spec.done()
 
         if (sink.size > before) return null
@@ -91,6 +94,7 @@ internal class PaperServerReader(
                     network = network ?: return null,
                     lifecycle = lifecycle,
                     placement = placement,
+                    console = console,
                 ),
         )
     }
@@ -288,6 +292,29 @@ internal class PaperServerReader(
             ) ?: PaperServerDefaults.SAVE_TIMEOUT
         reader.done()
         return DrainSpec(policy = policy, playerTransferTimeout = transfer, saveTimeout = save)
+    }
+
+    /**
+     * `console.maxTier`, defaulting to the most restrictive tier.
+     *
+     * An unrecognised tier is a violation rather than a fallback. Falling back
+     * would mean choosing a privilege level for a document whose author asked for
+     * a different one, and the safe-looking fallback is still a choice made on
+     * their behalf.
+     */
+    private fun readConsole(reader: MappingReader): ConsoleSpec {
+        val declared = reader.string("maxTier")
+        reader.done()
+        if (declared == null) return ConsoleSpec()
+        val tier =
+            Tier.parse(declared) ?: run {
+                reader.violation(
+                    "maxTier",
+                    "`$declared` is not a tier. Expected one of ${Tier.entries.joinToString(", ") { it.wireValue }}",
+                )
+                return ConsoleSpec()
+            }
+        return ConsoleSpec(maxTier = tier)
     }
 
     private fun readPlacement(reader: MappingReader): PlacementSpec {

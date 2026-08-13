@@ -4,6 +4,7 @@ import mcorch.schema.BackendDrainSpec
 import mcorch.schema.BackendSelector
 import mcorch.schema.BackendsSpec
 import mcorch.schema.BoundedDefinition
+import mcorch.schema.ConsoleSpec
 import mcorch.schema.ControlEndpointSpec
 import mcorch.schema.CpuQuantity
 import mcorch.schema.DrainPolicy
@@ -35,6 +36,7 @@ import mcorch.schema.ServerSpec
 import mcorch.schema.SpecBounds
 import mcorch.schema.StorageMode
 import mcorch.schema.StorageSpec
+import mcorch.schema.Tier
 import mcorch.schema.VelocityProxyDefinition
 import mcorch.schema.VelocityProxySpec
 import mcorch.schema.VolumeSpec
@@ -177,6 +179,7 @@ internal object DefinitionCodec {
                 put("passwordSecret.key", rcon.passwordSecret.key)
             }
         }
+        writer.scope("console") { put("maxTier", spec.console.maxTier.wireValue) }
         writer.scope("storage") {
             put("mode", spec.storage.mode.wireValue)
             put("mountPath", spec.storage.mountPath)
@@ -254,8 +257,28 @@ internal object DefinitionCodec {
                         startupTimeout = reader.requireDuration("lifecycle.startupTimeout"),
                     ),
                 placement = PlacementSpec(node = reader.value("placement.node", NodeName::of)),
+                console = readConsole(reader),
             )
         }
+
+    /**
+     * `console.maxTier`.
+     *
+     * Absent means a row written before the field existed, and it reads as the
+     * schema's own default — the most restrictive tier. A row that names a tier
+     * this build does not know is [StoreException.Corrupt] rather than that
+     * default, because the two cases are different: one is a field nobody set, the
+     * other is a field somebody set to something this build cannot honour, and
+     * quietly restricting the second would mean acting on a definition its author
+     * did not write.
+     */
+    private fun readConsole(reader: DocumentReader): ConsoleSpec {
+        val raw = reader.string("console.maxTier") ?: return ConsoleSpec()
+        val tier =
+            Tier.parse(raw)
+                ?: throw StoreException.Corrupt("console.maxTier is `$raw`, which this build does not recognise")
+        return ConsoleSpec(maxTier = tier)
+    }
 
     private fun readStorage(reader: DocumentReader): StorageSpec {
         val mode = readWire("storage.mode", reader, StorageMode::fromWire) { StorageMode.supported() }

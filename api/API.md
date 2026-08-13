@@ -366,6 +366,7 @@ carries the hash it was built from, and any difference from the desired hash is
 | `spec.storage.mode`, `spec.storage.mountPath`, `spec.storage.volume.name` |
 | `spec.network.port`, `spec.network.hostPort` |
 | `spec.network.rcon` — its port and secret coordinates. Always present |
+| `spec.console.maxTier` — the highest tier the console accepts here. Clamps; never grants |
 | `spec.maxPlayers` |
 | *whether a proxy claims this server* — see below |
 

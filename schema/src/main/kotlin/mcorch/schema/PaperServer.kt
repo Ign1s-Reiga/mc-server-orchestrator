@@ -160,6 +160,32 @@ public data class RconSpec(
     val passwordSecret: SecretRef,
 )
 
+/**
+ * What the remote console may do on this server.
+ *
+ * ## The ceiling, not the grant
+ *
+ * [maxTier] does not give anybody anything. It **clamps** what a caller who
+ * already holds a tier may do here, so the effective tier of a console request is
+ * `min(identity tier, this)`. A production survival server can refuse
+ * `superuser` console outright while a test server allows it, and that bound is
+ * written down beside the server rather than living in whoever holds a
+ * credential.
+ *
+ * ## Why the default is the most restrictive
+ *
+ * A definition that says nothing about the console gets [Tier.MEMBER] — read-only
+ * commands, nothing that changes the world. That is the same rule
+ * `holdsWorldData` and persistent storage follow: the default is the safe side,
+ * and a server whose author never considered the console is exactly the server
+ * where an unconsidered default should do the least.
+ *
+ * Opening it up is one line and an operator writing it has decided to.
+ */
+public data class ConsoleSpec(
+    val maxTier: Tier = Tier.MEMBER,
+)
+
 /** The container's memory/CPU limits and the JVM heap that has to fit inside them. */
 public data class ResourceSpec(
     val memory: MemoryQuantity,
@@ -304,6 +330,7 @@ public data class PaperServerSpec(
     val network: NetworkSpec,
     val lifecycle: LifecycleSpec = LifecycleSpec(),
     val placement: PlacementSpec = PlacementSpec(),
+    val console: ConsoleSpec = ConsoleSpec(),
 ) : ServerSpec {
     /**
      * Persistent storage is the whole question: an ephemeral lobby has nothing

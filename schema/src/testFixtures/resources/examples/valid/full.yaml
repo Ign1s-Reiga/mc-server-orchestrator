@@ -14,6 +14,9 @@ spec:
     minecraftVersion: "1.21.8"
     build: 42
   maxPlayers: 60
+  console:
+    # The highest tier the remote console accepts here. Defaults to `member`.
+    maxTier: operator
   network:
     port: 25565
     hostPort: 30002
