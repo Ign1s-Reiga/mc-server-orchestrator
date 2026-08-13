@@ -97,7 +97,7 @@ class StoreFailureTest {
             )
         val broken =
             healthy.sharing(
-                ApiServer.start(config, FailingStore(failure), healthy.secrets, healthy.identities),
+                ApiServer.start(config, FailingStore(failure), healthy.secrets, healthy.identities, RefusingConsole),
             )
         try {
             block(broken)
@@ -352,7 +352,10 @@ class StoreFailureTest {
                     statusPollInterval = kotlin.time.Duration.parse("100ms"),
                 )
             val store = PartlyUnreadableStore(stored.shouldNotBeNull())
-            val partial = healthy.sharing(ApiServer.start(config, store, healthy.secrets, healthy.identities))
+            val partial =
+                healthy.sharing(
+                    ApiServer.start(config, store, healthy.secrets, healthy.identities, RefusingConsole),
+                )
             try {
                 block(partial, store)
             } finally {

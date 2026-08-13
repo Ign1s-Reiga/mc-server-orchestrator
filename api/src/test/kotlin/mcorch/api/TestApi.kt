@@ -257,7 +257,14 @@ class TestApi private constructor(
                     ),
                 )
             return try {
-                val server = ApiServer.start(config, embedded.state, embedded.secrets, embedded.identities)
+                val server =
+                    ApiServer.start(
+                        config,
+                        embedded.state,
+                        embedded.secrets,
+                        embedded.identities,
+                        RefusingConsole,
+                    )
                 TestApi(
                     server = server,
                     store = embedded.state,

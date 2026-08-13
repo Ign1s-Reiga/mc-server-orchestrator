@@ -62,6 +62,29 @@ internal enum class ErrorCode(
 
     /** No identity holds that name. */
     IDENTITY_NOT_FOUND(404),
+
+    /** A console command refused for every caller, at every tier. Gate 1. */
+    CONSOLE_COMMAND_REFUSED(409),
+
+    /** The console was asked of something that has no RCON — a `VelocityProxy`. */
+    CONSOLE_NOT_APPLICABLE(409),
+
+    /**
+     * The command **ran or may have run** and no reply arrived in time.
+     *
+     * `retryable = false` on purpose. RCON offers no way to tell "never ran" from
+     * "still queued on the main thread" from "ran after the deadline", and there
+     * is no request id to reconcile against later — so an automatic retry may run
+     * a side-effecting command twice.
+     */
+    CONSOLE_TIMEOUT(504),
+
+    /**
+     * The server is not in a state that can answer, or could not be reached.
+     *
+     * Retryable, and nothing was dispatched — unlike [CONSOLE_TIMEOUT].
+     */
+    CONSOLE_UNAVAILABLE(503, retryable = true),
     METHOD_NOT_ALLOWED(405),
 
     /**

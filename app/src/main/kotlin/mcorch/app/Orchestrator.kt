@@ -9,6 +9,8 @@ import mcorch.core.Reconciler
 import mcorch.core.ReconcilerConfig
 import mcorch.core.SingleNodeScheduler
 import mcorch.core.StaticNodeRegistry
+import mcorch.core.console.NodeServerConsole
+import mcorch.core.console.ServerConsole
 import mcorch.core.node.LocalNode
 import mcorch.core.node.LocalNodeConfig
 import mcorch.store.IdentityStore
@@ -45,6 +47,8 @@ public class Orchestrator private constructor(
     /** Operators and their tiers. Empty until one is created. */
     public val identities: IdentityStore,
     public val nodes: NodeRegistry,
+    /** The one method `:api` reaches `:core` through, for the remote console. */
+    public val console: ServerConsole,
     public val reconciler: Reconciler,
     private val loop: ReconcileLoop,
 ) : AutoCloseable {
@@ -124,6 +128,16 @@ public class Orchestrator private constructor(
     public companion object {
         private val LOG = LoggerFactory.getLogger(Orchestrator::class.java)
 
+        /**
+         * How long a console command has to answer.
+         *
+         * RCON dispatches onto the game's main thread, so this is really "how long
+         * a busy server is given". Long enough that an ordinary command on a
+         * loaded server answers; short enough that an operator learns the server
+         * is wedged rather than watching a spinner.
+         */
+        private val CONSOLE_TIMEOUT: kotlin.time.Duration = kotlin.time.Duration.parse("30s")
+
         /** Opens the store and the node described by [config]. Does not connect eagerly. */
         public fun open(
             config: OrchestratorConfig,
@@ -182,6 +196,7 @@ public class Orchestrator private constructor(
                     store = embedded.state,
                     secrets = embedded.secrets,
                     identities = embedded.identities,
+                    console = NodeServerConsole(registry, CONSOLE_TIMEOUT),
                     nodes = registry,
                     reconciler = reconciler,
                     loop = ReconcileLoop(embedded.state, reconciler, loopConfig),

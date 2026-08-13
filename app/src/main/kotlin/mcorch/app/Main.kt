@@ -152,6 +152,7 @@ private fun serveApi(
                     orchestrator.store,
                     orchestrator.secrets,
                     orchestrator.identities,
+                    orchestrator.console,
                 )
             } catch (failure: IOException) {
                 LOG.error(

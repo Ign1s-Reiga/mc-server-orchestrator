@@ -11,7 +11,10 @@ import mcorch.api.OperatorToken
 import mcorch.core.Reconciler
 import mcorch.core.SingleNodeScheduler
 import mcorch.core.StaticNodeRegistry
+import mcorch.core.console.ConsoleUnavailable
+import mcorch.core.console.ServerConsole
 import mcorch.schema.DrainStatus
+import mcorch.schema.PaperServerDefinition
 import mcorch.schema.PaperServerStatus
 import mcorch.schema.RconSpec
 import mcorch.schema.ResourceName
@@ -548,9 +551,22 @@ class DisplayConformanceTest {
                 token = OperatorToken.of(token).getOrThrow(),
                 authFailureDelay = kotlin.time.Duration.ZERO,
             )
-        ApiServer.start(config, embedded.state, embedded.secrets, embedded.identities).use { server ->
-            block(ApiClient("http://127.0.0.1:${server.port}", token))
-        }
+        ApiServer
+            .start(
+                config,
+                embedded.state,
+                embedded.secrets,
+                embedded.identities,
+                // No containerd here; the display assertions do not touch the console.
+                object : ServerConsole {
+                    override suspend fun run(
+                        definition: PaperServerDefinition,
+                        command: String,
+                    ): String = throw ConsoleUnavailable("no workload in this test")
+                },
+            ).use { server ->
+                block(ApiClient("http://127.0.0.1:${server.port}", token))
+            }
     }
 
     private class ApiClient(

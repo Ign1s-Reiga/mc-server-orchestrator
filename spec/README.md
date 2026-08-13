@@ -97,13 +97,17 @@ It does not block drafting or implementation.
       gate ships after the API-wide tier assignment, not before.
 - [x] **Tier allow-lists** — `ConsolePolicy`. `Superuser` is unrestricted below
       Gate 1; the two lower tiers carry explicit sets.
-- [ ] **The audit sink** ([04-output.md](04-output.md) §3), which lands with
-      `spec.console.auditCommandText` — the field and its only consumer together.
+- [x] **The audit sink** — `ConsoleAudit`, landed with
+      `spec.console.auditCommandText`, its only consumer.
 - [x] **`spec.console.maxTier`** — landed with `ConsolePolicy`, which is what
       honours it. `auditCommandText` waits for the sink, for the same reason:
       a field nothing honours is the first failure `add-server-kind` names.
-- [ ] **The console endpoint** — `POST /api/v1/servers/{name}/console`
-      ([07-api.md](07-api.md)), which is what makes any of this reachable.
+- [x] **The console endpoint** — `POST`/`GET /api/v1/servers/{name}/console`, and
+      the `:api` → `:core` edge it required, one method wide.
+- [ ] **An integration test for the console end to end** against `mcorch-dev`.
+      The API suite covers the gates, the audit and the error mapping against a
+      seam with nothing behind it; nothing yet proves a command reaches a
+      Minecraft server.
 - [ ] **The contract into `api/API.md`** — §11 amended as roles and the audit log
       arrive, and **§13 amended to carve out the console**, which is the one
       endpoint that returns player names, UUIDs and client addresses.
