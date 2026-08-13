@@ -1,5 +1,6 @@
 package mcorch.api
 
+import mcorch.store.IdentityStore
 import mcorch.store.SecretStore
 import mcorch.store.Store
 import mcorch.store.sqlite.EmbeddedStore
@@ -33,6 +34,7 @@ class TestApi private constructor(
     val server: ApiServer,
     val store: Store,
     val secrets: SecretStore,
+    val identities: IdentityStore,
     val directory: Path,
     val token: String,
     private val onClose: () -> Unit,
@@ -176,7 +178,8 @@ class TestApi private constructor(
      * one, say — while still having somewhere real to keep secrets. Closing it
      * closes only [other]; this harness still owns the store and the directory.
      */
-    fun sharing(other: ApiServer): TestApi = TestApi(other, store, secrets, directory, token) { other.close() }
+    fun sharing(other: ApiServer): TestApi =
+        TestApi(other, store, secrets, identities, directory, token) { other.close() }
 
     override fun close(): Unit = onClose()
 
@@ -254,10 +257,11 @@ class TestApi private constructor(
                     ),
                 )
             return try {
-                val server = ApiServer.start(config, embedded.state, embedded.secrets)
+                val server = ApiServer.start(config, embedded.state, embedded.secrets, embedded.identities)
                 TestApi(
                     server = server,
                     store = embedded.state,
+                    identities = embedded.identities,
                     secrets = embedded.secrets,
                     directory = directory,
                     token = token,

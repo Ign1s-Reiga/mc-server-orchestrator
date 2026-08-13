@@ -4,6 +4,9 @@ import mcorch.api.http.ApiException
 import mcorch.api.http.ErrorCode
 import mcorch.api.http.HeaderNames
 import mcorch.api.http.Request
+import mcorch.schema.Tier
+import mcorch.store.Identity
+import mcorch.store.IdentityStore
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.time.Clock
@@ -64,6 +67,8 @@ internal class OperatorAuth(
     private val sessions: SessionRegistry,
     /** Fixed cost of a rejected credential. Blunts guessing without offering a lockout to trigger. */
     private val failureDelay: Duration,
+    /** Operators and their tiers. Empty until one is created — see `spec/auth/06-bootstrap.md`. */
+    private val identities: IdentityStore,
 ) {
     private val expected: ByteArray = tokenDigest.copyOf()
 
@@ -74,11 +79,12 @@ internal class OperatorAuth(
      * conditional on *how* the caller authenticated, and separating the two is
      * how a mechanism ends up protected in one place and not another.
      */
-    fun authenticate(request: Request): Credential {
+    suspend fun authenticate(request: Request): Credential {
         val bearer = bearerToken(request)
         if (bearer != null) {
-            if (!matchesOperatorToken(bearer)) reject("the bearer token is not the operator token")
-            return Credential.OperatorToken
+            if (matchesOperatorToken(bearer)) return Credential.OperatorToken
+            val identity = resolveIdentity(bearer) ?: reject("the bearer token is not a known credential")
+            return Credential.Bearer(Principal.of(identity))
         }
         val cookie = request.cookie(SESSION_COOKIE) ?: reject("no operator credential was supplied")
         val session = sessions.lookup(cookie) ?: reject("the session is unknown or has expired")
@@ -100,6 +106,29 @@ internal class OperatorAuth(
     /** Whether [candidate] is the configured operator token. Constant time in the digest. */
     fun matchesOperatorToken(candidate: String): Boolean = MessageDigest.isEqual(expected, digest(candidate))
 
+    /**
+     * The enabled identity whose credential is [candidate], or null.
+     *
+     * Linear in the number of identities, because the store is keyed by name and a
+     * credential does not carry one. That is affordable for the same reason
+     * `api/API.md` §11 declines pagination — there are tens of operators at most —
+     * and it is stated rather than hidden because it stops being affordable if that
+     * ever changes.
+     *
+     * **A disabled identity resolves to nothing.** Disabling has to bite here as
+     * well as at session creation, or it would mean "cannot log in again" while a
+     * bearer credential kept working indefinitely.
+     */
+    suspend fun resolveIdentity(candidate: String): Identity? {
+        val supplied = hex(digest(candidate))
+        return identities
+            .list()
+            .firstOrNull {
+                it.enabled &&
+                    MessageDigest.isEqual(supplied.toByteArray(), it.credentialDigest.toByteArray())
+            }
+    }
+
     fun bearerToken(request: Request): String? {
         val raw = request.header(HeaderNames.AUTHORIZATION)?.trim() ?: return null
         if (!raw.regionMatches(0, "Bearer ", 0, 7, ignoreCase = true)) return null
@@ -115,13 +144,39 @@ internal class OperatorAuth(
         throw ApiException(ErrorCode.UNAUTHENTICATED, problem)
     }
 
+    /**
+     * Who is calling, and with what authority.
+     *
+     * Every variant carries a [Principal], because the tier gate and the audit
+     * record both need one and neither can be added later without touching every
+     * call site again.
+     */
     internal sealed interface Credential {
-        /** Authenticated with the operator token itself. Not subject to CSRF. */
-        data object OperatorToken : Credential
+        val principal: Principal
+
+        /**
+         * Authenticated with `MCORCH_API_TOKEN` itself. Not subject to CSRF.
+         *
+         * Outside the tier system rather than an identity that happens to hold the
+         * top tier: it exists before identities do, it cannot be demoted, and it is
+         * how an operator gets back in when every credential is lost. See
+         * `spec/auth/06-bootstrap.md` §2 — the risk it carries is being
+         * misunderstood, which is why it is named rather than disguised.
+         */
+        data object OperatorToken : Credential {
+            override val principal: Principal get() = Principal.BOOTSTRAP
+        }
+
+        /** An identity presenting its credential directly. Not subject to CSRF. */
+        data class Bearer(
+            override val principal: Principal,
+        ) : Credential
 
         data class Session(
             val session: SessionRegistry.Session,
-        ) : Credential
+        ) : Credential {
+            override val principal: Principal get() = session.principal
+        }
     }
 
     companion object {
@@ -132,6 +187,8 @@ internal class OperatorAuth(
 
         fun digest(value: String): ByteArray =
             MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8))
+
+        fun hex(bytes: ByteArray): String = bytes.joinToString("") { "%02x".format(it) }
 
         fun constantTimeEquals(
             a: String,
@@ -169,10 +226,21 @@ internal class SessionRegistry(
         val csrfToken: String,
         val createdAt: Instant,
         val expiresAt: Instant,
+        /**
+         * Who this session belongs to, resolved once when it was issued.
+         *
+         * Resolved once rather than re-read per request, which is cheap and is also
+         * a hazard worth naming: **disabling or rotating an identity does not
+         * invalidate its live sessions.** `spec/auth/05-api.md` requires those
+         * operations to sweep this registry, or "disabled" would mean "disabled at
+         * next login" — not what an operator revoking a leaked credential believes
+         * they did.
+         */
+        val principal: Principal,
     )
 
     /** A new session. The returned id is the only time the raw value exists here. */
-    fun create(): Issued {
+    fun create(principal: Principal): Issued {
         prune()
         if (sessions.size >= maxSessions) {
             sessions.entries
@@ -184,17 +252,18 @@ internal class SessionRegistry(
         val now = clock.instant()
         val session =
             Session(
-                idDigest = hex(OperatorAuth.digest(id)),
+                idDigest = OperatorAuth.hex(OperatorAuth.digest(id)),
                 csrfToken = randomToken(),
                 createdAt = now,
                 expiresAt = now.plusMillis(ttl.inWholeMilliseconds),
+                principal = principal,
             )
         sessions[session.idDigest] = session
         return Issued(id, session)
     }
 
     fun lookup(id: String): Session? {
-        val key = hex(OperatorAuth.digest(id))
+        val key = OperatorAuth.hex(OperatorAuth.digest(id))
         val session = sessions[key] ?: return null
         if (!clock.instant().isBefore(session.expiresAt)) {
             sessions.remove(key)
@@ -203,7 +272,7 @@ internal class SessionRegistry(
         return session
     }
 
-    fun revoke(id: String): Boolean = sessions.remove(hex(OperatorAuth.digest(id))) != null
+    fun revoke(id: String): Boolean = sessions.remove(OperatorAuth.hex(OperatorAuth.digest(id))) != null
 
     fun size(): Int = sessions.size
 
@@ -227,7 +296,5 @@ internal class SessionRegistry(
     companion object {
         const val DEFAULT_MAX_SESSIONS: Int = 64
         private const val TOKEN_BYTES = 32
-
-        private fun hex(bytes: ByteArray): String = bytes.joinToString("") { "%02x".format(it) }
     }
 }

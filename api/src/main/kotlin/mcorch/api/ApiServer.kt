@@ -23,6 +23,7 @@ import mcorch.api.routes.SecretRoutes
 import mcorch.api.routes.ServerRoutes
 import mcorch.api.routes.StreamRoutes
 import mcorch.api.stream.StreamRegistry
+import mcorch.store.IdentityStore
 import mcorch.store.SecretStore
 import mcorch.store.Store
 import mcorch.store.StoreConflictException
@@ -94,10 +95,11 @@ public class ApiServer private constructor(
             config: ApiConfig,
             store: Store,
             secrets: SecretStore,
+            identities: IdentityStore,
         ): ApiServer {
             val streams = StreamRegistry(config.maxStreams)
             val sessions = SessionRegistry(config.clock, config.sessionTtl)
-            val auth = OperatorAuth(config.token.digest, sessions, config.authFailureDelay)
+            val auth = OperatorAuth(config.token.digest, sessions, config.authFailureDelay, identities)
             val dispatcher =
                 Dispatcher(
                     Router(routeTable(config, store, secrets, auth, sessions, streams)),
@@ -270,13 +272,16 @@ internal class Dispatcher(
                     "the request body is larger than ${config.maxBodyBytes} bytes",
                 )
 
-        if (found.route.access == Access.OPERATOR) {
-            auth.authenticate(request)
-        }
-
-        return when (val result = runBlocking { found.route.handler(request, exchange) }) {
-            is HandlerResult.Send -> result.response
-            HandlerResult.Handled -> null
+        // Authentication joins the handler's bridge rather than opening a second
+        // one: resolving an identity reads the store, which suspends.
+        return runBlocking {
+            if (found.route.access == Access.OPERATOR) {
+                auth.authenticate(request)
+            }
+            when (val result = found.route.handler(request, exchange)) {
+                is HandlerResult.Send -> result.response
+                HandlerResult.Handled -> null
+            }
         }
     }
 

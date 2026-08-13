@@ -95,7 +95,10 @@ class StoreFailureTest {
                 clock = TestApi.CLOCK,
                 authFailureDelay = kotlin.time.Duration.ZERO,
             )
-        val broken = healthy.sharing(ApiServer.start(config, FailingStore(failure), healthy.secrets))
+        val broken =
+            healthy.sharing(
+                ApiServer.start(config, FailingStore(failure), healthy.secrets, healthy.identities),
+            )
         try {
             block(broken)
         } finally {
@@ -349,7 +352,7 @@ class StoreFailureTest {
                     statusPollInterval = kotlin.time.Duration.parse("100ms"),
                 )
             val store = PartlyUnreadableStore(stored.shouldNotBeNull())
-            val partial = healthy.sharing(ApiServer.start(config, store, healthy.secrets))
+            val partial = healthy.sharing(ApiServer.start(config, store, healthy.secrets, healthy.identities))
             try {
                 block(partial, store)
             } finally {

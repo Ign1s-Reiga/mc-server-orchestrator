@@ -11,6 +11,7 @@ import mcorch.core.SingleNodeScheduler
 import mcorch.core.StaticNodeRegistry
 import mcorch.core.node.LocalNode
 import mcorch.core.node.LocalNodeConfig
+import mcorch.store.IdentityStore
 import mcorch.store.SecretStore
 import mcorch.store.Store
 import mcorch.store.sqlite.EmbeddedStore
@@ -41,6 +42,8 @@ public class Orchestrator private constructor(
     public val store: Store,
     /** Secret material. The RCON password lives here, never in a definition. */
     public val secrets: SecretStore,
+    /** Operators and their tiers. Empty until one is created. */
+    public val identities: IdentityStore,
     public val nodes: NodeRegistry,
     public val reconciler: Reconciler,
     private val loop: ReconcileLoop,
@@ -178,6 +181,7 @@ public class Orchestrator private constructor(
                     node = node,
                     store = embedded.state,
                     secrets = embedded.secrets,
+                    identities = embedded.identities,
                     nodes = registry,
                     reconciler = reconciler,
                     loop = ReconcileLoop(embedded.state, reconciler, loopConfig),

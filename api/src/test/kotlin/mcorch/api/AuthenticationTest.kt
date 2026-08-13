@@ -4,10 +4,16 @@ import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.string.shouldNotContain
+import kotlinx.coroutines.test.runTest
+import mcorch.api.auth.OperatorAuth
+import mcorch.schema.ResourceName
+import mcorch.schema.Tier
 import mcorch.schema.fixtures.ExampleDefinitions
+import mcorch.store.Identity
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import java.time.Instant
 
 /**
  * Nothing that changes anything is reachable without an operator credential.
@@ -237,5 +243,100 @@ class AuthenticationTest {
         } catch (failure: AssertionError) {
             throw AssertionError("$clue: ${failure.message}", failure)
         }
+    }
+
+    @Test
+    fun `the operator token reports itself as outside the tier system`() {
+        val described =
+            api.anonymous(
+                "GET",
+                "/api/v1/auth/session",
+                headers = listOf("Authorization" to "Bearer ${api.token}"),
+            )
+        described.status shouldBe 200
+        val body = described.json()
+
+        // Named rather than disguised as an identity that happens to hold the top
+        // tier. An audit line reading `<operator-token>` says at a glance that this
+        // was the environment credential, which no invented username would.
+        body["identity"] shouldBe "<operator-token>"
+        body["tier"] shouldBe "superuser"
+    }
+
+    @Test
+    fun `an identity's credential opens a session that reports its own tier`() =
+        runTest {
+            api.identities.put(
+                Identity(
+                    name = ResourceName.of("rin").getOrThrow(),
+                    credentialDigest = OperatorAuth.hex(OperatorAuth.digest(IDENTITY_CREDENTIAL)),
+                    tier = Tier.OPERATOR,
+                    enabled = true,
+                    createdAt = Instant.parse("2026-08-13T09:00:00Z"),
+                ),
+            )
+
+            val opened =
+                api.anonymous(
+                    "POST",
+                    "/api/v1/auth/session",
+                    headers = listOf("Authorization" to "Bearer $IDENTITY_CREDENTIAL"),
+                )
+            opened.status shouldBe 200
+            opened.json()["identity"] shouldBe "rin"
+            opened.json()["tier"] shouldBe "operator"
+
+            // And the session carries it, so a later request is attributable without
+            // re-reading the store.
+            val cookie = opened.header("Set-Cookie").shouldNotBeNull().substringBefore(';')
+            val described = api.anonymous("GET", "/api/v1/auth/session", headers = listOf("Cookie" to cookie))
+            described.json()["identity"] shouldBe "rin"
+            described.json()["tier"] shouldBe "operator"
+        }
+
+    @Test
+    fun `a disabled identity cannot authenticate`() =
+        runTest {
+            val identity =
+                Identity(
+                    name = ResourceName.of("rin").getOrThrow(),
+                    credentialDigest = OperatorAuth.hex(OperatorAuth.digest(IDENTITY_CREDENTIAL)),
+                    tier = Tier.OPERATOR,
+                    enabled = true,
+                    createdAt = Instant.parse("2026-08-13T09:00:00Z"),
+                )
+            api.identities.put(identity)
+
+            // Control: it works while enabled, so the refusal below is about the flag
+            // and not about the credential being wrong.
+            api
+                .anonymous(
+                    "POST",
+                    "/api/v1/auth/session",
+                    headers = listOf("Authorization" to "Bearer $IDENTITY_CREDENTIAL"),
+                ).status shouldBe 200
+
+            api.identities.put(identity.copy(enabled = false))
+
+            api
+                .anonymous(
+                    "POST",
+                    "/api/v1/auth/session",
+                    headers = listOf("Authorization" to "Bearer $IDENTITY_CREDENTIAL"),
+                ).status shouldBe 401
+
+            // Disabling has to bite on the bearer path too, or it would mean "cannot
+            // log in again" while a bearer credential kept working indefinitely.
+            api
+                .anonymous(
+                    "GET",
+                    "/api/v1/servers",
+                    headers = listOf("Authorization" to "Bearer $IDENTITY_CREDENTIAL"),
+                ).status shouldBe 401
+        }
+
+    private companion object {
+        /** Long enough to be a real credential; the value itself is not asserted on. */
+        const val IDENTITY_CREDENTIAL = "rin-credential-0123456789abcdef0123456789abcdef"
     }
 }
