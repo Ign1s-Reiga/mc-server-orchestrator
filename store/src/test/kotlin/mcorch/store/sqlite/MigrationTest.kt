@@ -1,6 +1,9 @@
 package mcorch.store.sqlite
 
+import io.kotest.assertions.throwables.shouldThrow
+import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.collections.shouldContainExactly
+import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.nulls.shouldBeNull
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
@@ -17,13 +20,16 @@ import mcorch.schema.FailureReason
 import mcorch.schema.PaperServerDefinition
 import mcorch.schema.PaperServerSpec
 import mcorch.schema.PaperServerStatus
+import mcorch.schema.ResourceName
 import mcorch.schema.SchemaVersion
 import mcorch.schema.ServerKind
 import mcorch.schema.ServerPhase
 import mcorch.schema.SpecBounds
+import mcorch.schema.Tier
 import mcorch.store.ChangeFeed
 import mcorch.store.ChangeKind
 import mcorch.store.Fixtures
+import mcorch.store.Identity
 import mcorch.store.StoreException
 import mcorch.store.codec.DefinitionCodec
 import mcorch.store.codec.PropertyDocument
@@ -82,7 +88,7 @@ class MigrationTest {
             appliedVersions(directory) shouldBe listOf(1)
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6, 7)
 
                 val servers = migrated.state.listServers().associateBy { it.name.value }
                 servers.keys shouldBe setOf("survival-a", "survival-b", "survival-c")
@@ -187,7 +193,7 @@ class MigrationTest {
             }
 
             stores.open(directory).use { second ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6, 7)
                 second.state.listServers().map { it.name.value } shouldBe listOf("survival-a")
             }
         }
@@ -232,7 +238,7 @@ class MigrationTest {
             appliedVersions(directory) shouldBe listOf(1)
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6, 7)
 
                 val spec =
                     migrated.state
@@ -311,7 +317,7 @@ class MigrationTest {
             statusDocument(directory, "survival-a") shouldNotContain "drain.stopDispatchedAt"
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6, 7)
 
                 val drain =
                     migrated.state
@@ -385,7 +391,7 @@ class MigrationTest {
             appliedVersions(directory) shouldBe listOf(1, 2, 3)
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6, 7)
 
                 // Nothing was dropped, renamed or cascaded away.
                 val server = migrated.state.getServer(definition.metadata.name).shouldNotBeNull()
@@ -458,7 +464,7 @@ class MigrationTest {
             }
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6, 7)
 
                 val listing = migrated.state.listAll()
                 listing.servers.map { it.name.value } shouldBe listOf("survival-a")
@@ -561,7 +567,7 @@ class MigrationTest {
             appliedVersions(directory) shouldBe listOf(1, 2)
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6, 7)
 
                 val confirmed = drainOf(migrated, "survival-a")
                 confirmed.worldSavedAt shouldBe confirmedAt
@@ -642,7 +648,7 @@ class MigrationTest {
             appliedVersions(directory) shouldBe listOf(1, 2)
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6, 7)
                 val drain = drainOf(migrated, "survival-a")
 
                 // Undated evidence is no evidence. Nothing may appear here.
@@ -798,7 +804,7 @@ class MigrationTest {
             appliedVersions(directory) shouldBe listOf(1, 2, 3, 4)
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6, 7)
 
                 for (name in listOf("survival-a", "survival-b")) {
                     val status =
@@ -891,7 +897,7 @@ class MigrationTest {
             }
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6, 7)
 
                 val status =
                     migrated.state
@@ -969,7 +975,7 @@ class MigrationTest {
             statusDocument(directory, "survival-a") shouldNotContain "drain.faultLedger"
 
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6, 7)
 
                 statusDocument(directory, "survival-a") shouldContain "drain.faultLedger=0"
                 statusDocument(directory, "survival-b") shouldNotContain "faultLedger"
@@ -1172,7 +1178,7 @@ class MigrationTest {
             val proxy = Fixtures.proxyDefinitionNamed("edge-01")
             val proxyStatus = Fixtures.fullProxyStatus("edge-01", drainState = DrainState.SEALED)
             stores.open(directory).use { migrated ->
-                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6)
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6, 7)
 
                 migrated.state.putDefinition(proxy).getOrThrow()
                 migrated.state.putStatus(proxyStatus).getOrThrow()
@@ -1576,6 +1582,33 @@ class MigrationTest {
             }
         }
 
+    /**
+     * Writes a tier straight into the column, bypassing [Tier] entirely.
+     *
+     * The refusal it sets up cannot be reached through the store's own API — a
+     * `Tier` is an enum, so there is no unrecognised value to put in. What this
+     * reproduces is a row written by a **different build** that had a tier this
+     * one does not, which is the only way the guard fires and therefore the only
+     * way it can be tested.
+     */
+    private fun writeRawTier(
+        directory: Path,
+        name: String,
+        tier: String,
+    ) {
+        rawConnection(directory).use { connection ->
+            // `rawConnection` turns autoCommit off, so an update outside a
+            // transaction is rolled back when the connection closes — which would
+            // leave the row untouched and the refusal below asserting nothing.
+            connection.transaction {
+                connection.update("UPDATE identity SET tier = ? WHERE name = ?") {
+                    setString(1, tier)
+                    setString(2, name)
+                } shouldBe 1
+            }
+        }
+    }
+
     /** The raw stored bytes, so "nothing was rewritten" is checked on disk rather than through a decode. */
     private fun statusDocument(
         directory: Path,
@@ -1613,4 +1646,86 @@ class MigrationTest {
          */
         const val UNREADABLE_ENCODING = 2
     }
+
+    /**
+     * Version 7 adds the identity table and nothing else.
+     *
+     * Two halves, and the second is the one that matters. The easy half is that a
+     * database written before it still opens with every definition and status
+     * intact — it adds a table and rewrites nothing.
+     *
+     * The hard half is what an **empty** identity table means, and this pins the
+     * answer: *nobody has been created yet*. A migration that minted a default
+     * administrator would produce a credential nobody asked for and nobody holds,
+     * and a lost administrator credential is one nothing can revoke.
+     */
+    @Test
+    fun `version 7 adds an empty identity table and leaves the data already stored alone`() =
+        runTest {
+            val directory = stores.directory()
+            val definition = Fixtures.definitionNamed("survival-a")
+            val status = Fixtures.fullStatus("survival-a", phase = ServerPhase.RUNNING)
+
+            writeVersion1Database(directory) { legacy ->
+                legacy.definition(definition, generation = 3L, revision = 1L)
+                legacy.status(status, revision = 2L)
+            }
+
+            stores.open(directory).use { store ->
+                appliedVersions(directory) shouldBe listOf(1, 2, 3, 4, 5, 6, 7)
+
+                // The data that was already there.
+                val stored = store.state.getServer(definition.metadata.name).shouldNotBeNull()
+                stored.definition.shouldNotBeNull().generation shouldBe 3L
+
+                // And nobody in it. Not "a default administrator with a generated
+                // credential" — see the note above.
+                store.identities.list().shouldBeEmpty()
+            }
+        }
+
+    @Test
+    fun `an identity survives a round trip, and an unknown tier is refused rather than guessed`() =
+        runTest {
+            val directory = stores.directory()
+            val created = Instant.parse("2026-08-13T09:00:00Z")
+
+            stores.open(directory).use { store ->
+                store.identities.put(
+                    Identity(
+                        name = ResourceName.of("rin").getOrThrow(),
+                        credentialDigest = "a".repeat(64),
+                        tier = Tier.OPERATOR,
+                        enabled = true,
+                        createdAt = created,
+                    ),
+                )
+            }
+
+            stores.open(directory).use { store ->
+                val read = store.identities.get(ResourceName.of("rin").getOrThrow()).shouldNotBeNull()
+                read.tier shouldBe Tier.OPERATOR
+                read.enabled shouldBe true
+                read.createdAt shouldBe created
+
+                // Disabling replaces the record rather than removing it, so an audit
+                // entry naming this identity keeps resolving.
+                store.identities.put(read.copy(enabled = false))
+                store.identities
+                    .get(read.name)
+                    .shouldNotBeNull()
+                    .enabled shouldBe false
+                store.identities.list() shouldHaveSize 1
+            }
+
+            // A tier this build does not recognise is a row to refuse. The
+            // safe-looking guess — the lowest tier — is still a guess about
+            // authority, made on somebody else's behalf.
+            writeRawTier(directory, "rin", "emperor")
+            stores.open(directory).use { store ->
+                shouldThrow<StoreException.Corrupt> {
+                    store.identities.get(ResourceName.of("rin").getOrThrow())
+                }
+            }
+        }
 }

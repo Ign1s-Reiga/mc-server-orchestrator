@@ -2,6 +2,7 @@ package mcorch.store.sqlite
 
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import mcorch.store.IdentityStore
 import mcorch.store.SecretStore
 import mcorch.store.Store
 import mcorch.store.StoreException
@@ -30,6 +31,8 @@ public class EmbeddedStore private constructor(
     public val state: Store,
     /** Secret material. A separate interface backed by a separate file — see [SecretStore]. */
     public val secrets: SecretStore,
+    /** Operators and their tiers. Empty on a fresh install — see `spec/auth/06-bootstrap.md`. */
+    public val identities: IdentityStore,
 ) : AutoCloseable {
     override fun close() {
         // Both are closed even if the first throws: leaking a file handle because the
@@ -90,6 +93,14 @@ public class EmbeddedStore private constructor(
                         SqliteSecretStore(
                             connection = secretsConnection,
                             clock = config.clock,
+                            dispatcher = config.dispatcher,
+                        ),
+                    // On the state connection: identities hold digests, not
+                    // material, and the state file is where the versioned
+                    // migration chain lives.
+                    identities =
+                        SqliteIdentityStore(
+                            connection = stateConnection,
                             dispatcher = config.dispatcher,
                         ),
                 )
