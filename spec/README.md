@@ -104,10 +104,11 @@ It does not block drafting or implementation.
       a field nothing honours is the first failure `add-server-kind` names.
 - [x] **The console endpoint** — `POST`/`GET /api/v1/servers/{name}/console`, and
       the `:api` → `:core` edge it required, one method wide.
-- [ ] **An integration test for the console end to end** against `mcorch-dev`.
-      The API suite covers the gates, the audit and the error mapping against a
-      seam with nothing behind it; nothing yet proves a command reaches a
-      Minecraft server.
+- [x] **An integration test for the console end to end** — `ConsoleIT` against
+      `mcorch-dev`. It is the only test of the RCON client that is not a test of
+      itself: the codec and connection suites drive buffers this repository wrote,
+      and agree with the implementation by construction. The auth handshake and
+      multi-packet reassembly are falsifiable here and nowhere else.
 - [ ] **The contract into `api/API.md`** — §11 amended as roles and the audit log
       arrive, and **§13 amended to carve out the console**, which is the one
       endpoint that returns player names, UUIDs and client addresses.

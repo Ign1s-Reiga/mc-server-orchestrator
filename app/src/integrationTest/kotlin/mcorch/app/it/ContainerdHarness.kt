@@ -15,6 +15,7 @@ import mcorch.core.StopGrace
 import mcorch.core.WorkloadAsset
 import mcorch.core.WorkloadObservation
 import mcorch.core.WorkloadState
+import mcorch.core.console.ServerConsole
 import mcorch.schema.NodeName
 import mcorch.schema.PaperServerStatus
 import mcorch.schema.ResourceName
@@ -97,6 +98,15 @@ internal class ContainerdHarness(
         )
 
     val store = orchestrator.store
+
+    /**
+     * The console seam, exactly as `main` wires it.
+     *
+     * Built by [Orchestrator] rather than by the test, so what is exercised is the
+     * wiring an operator gets — including the timeout and the node registry the
+     * real thing uses.
+     */
+    val console: ServerConsole = orchestrator.console
 
     private var loop: Job? = null
 
