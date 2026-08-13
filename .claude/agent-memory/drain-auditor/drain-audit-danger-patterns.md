@@ -2472,3 +2472,66 @@ Related: [[standalone-paper-drain-shape]]
      status code and never asserts the definition survived, which is the
      instrument-that-looks-like-a-result shape. For every error return in a
      mutating handler, ask what has already been written when it fires.
+
+## Round 50: the refusals that fix a stop by making it unreachable
+
+208. **A refusal added on a delete path inherits the tombstone that was already
+     written, and `putDefinition` refuses a terminating row.** `SqliteStore`
+     returns `ConflictReason.TERMINATING` for *any* write to a definition with
+     `deleted_at` set, and there is no un-tombstone anywhere — `purge` is the only
+     other operation and the loop reaches it only from an `Absent` observation. So
+     a refusal whose message says "correct that field and force again" is advice
+     the operator cannot follow the moment it fires below a `deleteDefinition`
+     call: the row is frozen, the drain still cannot stop the server, and the
+     escape hatch refuses on every retry. Erring safe **and** unrecoverable
+     without `crictl` is item 13's rule, and a validation moved *into* the stop
+     path is the newest way to reach it. Any refusal on a delete path must be
+     decided above the tombstone write, or must not be a refusal.
+209. **`StopGrace.of`'s second argument only ever raises a ceiling, so passing a
+     "floor" to it is inert.** `StopGraceCeiling.ceilingFor` returns
+     `maxOf(MAX = 2h, saveTimeout + 30s)` and `bound` only caps — it can never
+     raise a requested duration, and it can never cap below two hours, which
+     `SpecBounds` already caps `stopGracePeriod` at. So `StopGrace.of(declared, X)`
+     produces `declared` for every `X` any definition can carry. A change that
+     introduces a new floor "so `ceilingFor` cannot cap the window the world has
+     left" has written a comment describing a mechanism that does not exist; the
+     real protection is whatever separate `if` sits beside it. When a fix is
+     expressed as an argument to an existing bounding function, evaluate the
+     function at the reachable range before believing the argument does anything.
+210. **A zero-player observation means something only while a seal holds it.**
+     `requireEmpty`'s freshly-observed zero is durable because every state from
+     `SEALED` onward re-asserts `holdSeal`, and `saveEvidenceMaxGap` (30 s) voids
+     it when the chain breaks. A probe on an *unsealed* server decays the instant
+     it is taken. Any new path that substitutes "probe once, then act" for
+     `requireEmpty` has a window between the probe and the stop as wide as the save
+     timeout plus the grace period — up to an hour — during which players join a
+     server nothing is holding shut. The probe returning zero is then not a
+     licence; it is a measurement with no shelf life. Ask of every occupancy check
+     outside the drain: what keeps this true until the stop?
+211. **An acknowledgement flag that carries no value is a checkbox, and one that
+     the target population always trips is a constant.** A boolean
+     `acknowledgeOccupancy` says "proceed regardless", not "I acknowledge *n*",
+     so it cannot detect that the population changed between the operator's
+     decision and the request — the compare-and-swap shape (acknowledge the
+     count, refuse on mismatch) is the one that protects anybody. Worse, the
+     population this path exists for is wedged servers, whose probe never answers,
+     so the count is `null`, so the acknowledgement is *mandatory* on every real
+     use and becomes a fixed string in the runbook. A confirmation that fires on
+     every legitimate invocation has been designed into noise.
+212. **A guard reading stored observed status treats "cannot read" as "not
+     happening".** `guardAgainstDispatchedStop` is
+     `(existing.status?.status as? PaperServerStatus)?.drain ?: return` — an
+     unreadable status row (round 30 made those `status = null` rather than a
+     fleet-wide failure) and a stop dispatched since the last status write both
+     fall to the permissive side of a guard whose entire purpose is preventing a
+     second stop and a second `save-all flush`. Same family as item 200: absence
+     of evidence read as evidence of absence, on the one branch where the cost is
+     a flush into a container already shutting down.
+213. **Fixing a claim in the code does not fix the guard test that asserts the old
+     claim.** `DrainWiringTest.the stop grace ceiling is applied at one site` still
+     carries the reasoning *"it passes `spec.lifecycle.drain.saveTimeout` as the
+     floor … so the pair travels together exactly as the reconcile path's does"*
+     after the code stopped always passing `saveTimeout`. The test is green because
+     it asserts the enclosing function name, not the argument. When a finding is
+     addressed by changing what a call site passes, re-read every guard whose
+     comment describes what it used to pass.

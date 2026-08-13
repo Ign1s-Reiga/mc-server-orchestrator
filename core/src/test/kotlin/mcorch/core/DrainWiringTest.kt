@@ -395,6 +395,17 @@ internal class DrainWiringTest {
         // it read the grace period from, so the pair travels together exactly as
         // the reconcile path's does.
         //
+        // **What that site does to the first argument is not covered here, and
+        // saying so is the point.** This scan asserts the enclosing function name,
+        // not the arguments — so when the forced stop began raising its *requested*
+        // grace period to a shutdown-save floor, this comment went on describing a
+        // call that no longer existed and stayed green throughout. It is the third
+        // round running in which the justification drifted rather than the code.
+        // The raise itself is pinned by `NodeForcedTerminationTest.a grace period
+        // too short to be the save it would become is raised, not refused`, which
+        // asserts the duration that reaches the node; what lives here is only the
+        // claim that the floor argument comes off the same definition.
+        //
         // Forcing shortens the orchestrator's patience, never the server's. The
         // grace period is the last protection still working when RCON is not, which
         // is why the one path allowed to skip the evidence rule is not allowed to

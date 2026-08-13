@@ -741,6 +741,13 @@ What it does **not** do is skip the save or shorten the grace period. Skipping t
 save would buy tens of seconds in exchange for the data this system exists to
 protect; the grace period is the last protection still working when RCON is not.
 
+**When no save request could be sent at all**, the grace period is *raised* to at
+least the save timeout's default — on that branch the grace period stops being a
+last-resort net and becomes the entire save, so it is given what this orchestrator
+considers a save to be worth. It is never lowered, and a longer declared grace
+period is left alone. A server that finishes early still exits early: the grace
+period is a ceiling on how long containerd waits, not a delay.
+
 ```json
 { "accepted": true, "forced": true,
   "saveAttempted": false, "saveConfirmed": false, "playersOnline": 12,
@@ -757,19 +764,48 @@ those two identically, and they are not the same event.
 not answer a count. Render it as unknown; a client that shows it as an empty
 server is stating something this API did not.
 
+**`playersOnline` is read immediately before the stop**, not when the request
+arrived. The count is taken twice — once to decide, and again after the save wait,
+because that wait can last a whole save timeout and nothing on this path holds a
+player out of the server in the meantime. It is the second reading that is
+reported and the second reading that can refuse.
+
+### `?acknowledgeOccupancy=` takes a number, not `true`
+
+- `?acknowledgeOccupancy=12` — *"I was shown 12 players and still want this."*
+  Refused with `FORCE_REFUSED` if the count is anything but 12 when the stop is
+  about to happen, so the acknowledgement cannot be stale.
+- `?acknowledgeOccupancy=unreadable` — *"I was shown that the server does not
+  answer a count and still want this."* It does **not** cover a server that
+  answered.
+- `?acknowledgeOccupancy=true` is `400 BAD_REQUEST`. It was the old spelling, and
+  it is refused rather than reinterpreted: a caller sending it has not been shown
+  a number.
+
+A server observed with **zero** players needs no acknowledgement at all.
+
+Why a count: a boolean says *"proceed regardless"*, which cannot notice that the
+population changed between an operator deciding and the request landing, and does
+not require them to have looked. It would also be **mandatory on essentially every
+legitimate use** — a wedged server does not answer a ping, so its occupancy is
+always unreadable — which turns it into a fixed string in every runbook and
+carries no information at the one moment it matters.
+
 ### It refuses rather than surprising you
 
+Every refusal below is decided **before the definition is tombstoned**, and that
+is a guarantee rather than an implementation detail: a tombstoned definition
+cannot be edited, so a refusal saying *"correct that field and force again"* would
+leave the server undrainable, unforceable, and reachable only with `crictl`.
+
 - **A populated server** — or one whose occupancy could not be read — is `409
-  FORCE_REFUSED` unless you re-send with `?acknowledgeOccupancy=true`. Forcing
-  disconnects those players without transferring them, and the drain would have
-  moved them.
+  FORCE_REFUSED` unless the acknowledgement above matches. Forcing disconnects
+  those players without transferring them, and the drain would have moved them.
 - **An unusable `spec.lifecycle.drain.saveTimeout`** is `FORCE_REFUSED`: no save
   could be sent, and the field is one edit away from making one possible.
-- **A `stopGracePeriod` too short to be a shutdown save** is `FORCE_REFUSED` when
-  no save request could be sent — on that branch the grace period *is* the save.
 - **A stop already in flight** is `FORCE_NOT_APPLICABLE`. The container is inside
   its grace period running its shutdown save; a second force would send another
-  save into it.
+  save into it. Likewise an **unconfirmed save already outstanding**.
 - **A `VelocityProxy`** is `FORCE_NOT_APPLICABLE` and **is not deleted** — it holds
   no world, so its drain cannot stall on a save.
 

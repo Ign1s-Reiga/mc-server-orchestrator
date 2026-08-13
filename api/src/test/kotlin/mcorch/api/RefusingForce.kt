@@ -2,7 +2,9 @@ package mcorch.api
 
 import mcorch.core.termination.ForcedStopOutcome
 import mcorch.core.termination.ForcedTermination
+import mcorch.core.termination.ForcedTerminationRefused
 import mcorch.core.termination.ForcedTerminationUnavailable
+import mcorch.core.termination.OccupancyAcknowledgement
 import mcorch.schema.PaperServerDefinition
 
 /**
@@ -19,9 +21,19 @@ import mcorch.schema.PaperServerDefinition
 internal class RefusingForce : ForcedTermination {
     val recorded: MutableList<String> = mutableListOf()
 
+    override suspend fun preflight(
+        definition: PaperServerDefinition,
+        acknowledgement: OccupancyAcknowledgement,
+    ) {
+        // The real seam's preflight returns quietly when there is no workload
+        // rather than refusing, because a delete with nothing to stop is an
+        // ordinary delete. Answering any other way here would make these tests
+        // pass against a seam that behaves differently from the one shipped.
+    }
+
     override suspend fun stop(
         definition: PaperServerDefinition,
-        acknowledgeOccupancy: Boolean,
+        acknowledgement: OccupancyAcknowledgement,
     ): ForcedStopOutcome {
         recorded += definition.metadata.name.value
         throw ForcedTerminationUnavailable("`${definition.metadata.name.value}` has no workload in this test")
@@ -36,20 +48,57 @@ internal class StoppingForce(
 ) : ForcedTermination {
     val recorded: MutableList<String> = mutableListOf()
 
-    /** Whether the caller acknowledged occupancy, so a test can assert it was carried through. */
-    val acknowledgements: MutableList<Boolean> = mutableListOf()
+    /** What the caller acknowledged, so a test can assert it was carried through rather than assumed. */
+    val acknowledgements: MutableList<OccupancyAcknowledgement> = mutableListOf()
+
+    /** The same, as seen by [preflight] — which runs before the tombstone and must see it too. */
+    val preflighted: MutableList<OccupancyAcknowledgement> = mutableListOf()
+
+    override suspend fun preflight(
+        definition: PaperServerDefinition,
+        acknowledgement: OccupancyAcknowledgement,
+    ) {
+        preflighted += acknowledgement
+    }
 
     override suspend fun stop(
         definition: PaperServerDefinition,
-        acknowledgeOccupancy: Boolean,
+        acknowledgement: OccupancyAcknowledgement,
     ): ForcedStopOutcome {
         recorded += definition.metadata.name.value
-        acknowledgements += acknowledgeOccupancy
+        acknowledgements += acknowledgement
         return ForcedStopOutcome(
             saveAttempted = saveAttempted,
             saveConfirmed = saveConfirmed,
             playersOnline = playersOnline,
             detail = if (saveConfirmed) "confirmed" else "not confirmed",
         )
+    }
+}
+
+/**
+ * A seam whose [preflight] refuses.
+ *
+ * The shape that matters most: a refusal decided before anything is written. Any
+ * test using this asserts the definition is still there and still editable
+ * afterwards, because a refusal that has already tombstoned the server is the
+ * `crictl`-only state this whole path exists to remove.
+ */
+internal class PreflightRefusingForce(
+    private val because: String = "the seam refused before anything was written",
+) : ForcedTermination {
+    val recorded: MutableList<String> = mutableListOf()
+
+    override suspend fun preflight(
+        definition: PaperServerDefinition,
+        acknowledgement: OccupancyAcknowledgement,
+    ): Unit = throw ForcedTerminationRefused(because)
+
+    override suspend fun stop(
+        definition: PaperServerDefinition,
+        acknowledgement: OccupancyAcknowledgement,
+    ): ForcedStopOutcome {
+        recorded += definition.metadata.name.value
+        error("stop must not be reached when preflight refused")
     }
 }

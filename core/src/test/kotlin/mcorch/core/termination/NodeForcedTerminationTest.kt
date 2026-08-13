@@ -10,7 +10,9 @@ import mcorch.core.StaticNodeRegistry
 import mcorch.core.coreTest
 import mcorch.core.paper.PaperWorkloadPlanner
 import mcorch.core.paperDefinition
+import mcorch.schema.PaperServerDefaults
 import org.junit.jupiter.api.Test
+import kotlin.time.Duration
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 
@@ -47,15 +49,19 @@ internal class NodeForcedTerminationTest {
                 node.defaultExec(command)
             }
 
-            val outcome = terminationOver(node).stop(paperDefinition(), acknowledgeOccupancy = true)
+            val outcome = terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.None)
 
-            // Probe, then save, then stop — and the sequence is the safety content.
-            // The probe first because an unacknowledged population must be refused
+            // Probe, save, probe, then stop — and the sequence is the safety content.
+            // The first probe because an unacknowledged population must be refused
             // before anything is sent; the save before the stop because a stop
-            // recorded first is a world thrown away that could have been written.
-            order shouldHaveSize 2
+            // recorded first is a world thrown away that could have been written;
+            // and the **second probe** because nothing holds the first one's answer.
+            // There is no seal on this path, so between the first reading and the
+            // stop lies a whole `saveTimeout` in which anybody may join.
+            order shouldHaveSize 3
             order[0] shouldContain "mc-monitor"
             order[1] shouldContain "save-all"
+            order[2] shouldContain "mc-monitor"
             node.stops shouldHaveSize 1
             outcome.saveConfirmed shouldBe true
             outcome.detail shouldContain "confirmed"
@@ -66,11 +72,23 @@ internal class NodeForcedTerminationTest {
         coreTest {
             val node = FakeNode()
             running(node)
-            // The server answers, but not with a confirmation — the state this path
-            // exists for, and the one an ordinary drain refuses to stop from.
-            node.onExec = { ExecOutcome(0, "", "") }
+            // The server answers the *save* without a confirmation — the state this
+            // path exists for, and the one an ordinary drain refuses to stop from.
+            // The probe is delegated: answering it the same way would make this a
+            // test of the occupancy refusal wearing a save test's name.
+            node.onExec = { command ->
+                if (command
+                        .joinToString(
+                            " ",
+                        ).contains("save-all")
+                ) {
+                    ExecOutcome(0, "", "")
+                } else {
+                    node.defaultExec(command)
+                }
+            }
 
-            val outcome = terminationOver(node).stop(paperDefinition(), acknowledgeOccupancy = true)
+            val outcome = terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.None)
 
             node.stops shouldHaveSize 1
             outcome.saveConfirmed shouldBe false
@@ -84,13 +102,19 @@ internal class NodeForcedTerminationTest {
         coreTest {
             val node = FakeNode()
             running(node)
-            node.onExec = { ExecOutcome(0, "Saved the game", "") }
+            node.onExec = { command ->
+                if (command.joinToString(" ").contains("save-all")) {
+                    ExecOutcome(0, "Saved the game", "")
+                } else {
+                    node.defaultExec(command)
+                }
+            }
 
             // Forcing shortens the orchestrator's patience, never the server's. The
             // grace period is the last protection still working when RCON is not,
             // so it is the one thing this path must not trim.
             val definition = paperDefinition(saveTimeout = 2.minutes, stopGracePeriod = 5.minutes)
-            terminationOver(node).stop(definition, acknowledgeOccupancy = true)
+            terminationOver(node).stop(definition, OccupancyAcknowledgement.None)
 
             node.stops.single().second shouldBe 5.minutes
         }
@@ -101,7 +125,7 @@ internal class NodeForcedTerminationTest {
             val node = FakeNode()
             // Nothing created, so there is no container.
             shouldThrow<ForcedTerminationUnavailable> {
-                terminationOver(node).stop(paperDefinition(), acknowledgeOccupancy = true)
+                terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.None)
             }
             node.stops shouldHaveSize 0
         }
@@ -116,13 +140,13 @@ internal class NodeForcedTerminationTest {
             // Without the acknowledgement nothing is sent and nothing is stopped:
             // the drain would have transferred these players, and this path cannot.
             shouldThrow<ForcedTerminationRefused> {
-                terminationOver(node).stop(paperDefinition(), acknowledgeOccupancy = false)
+                terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.None)
             }.message.toString() shouldContain "12 player"
             node.stops shouldHaveSize 0
 
             // With it, the count is carried into the outcome rather than lost — the
             // audit record has to be able to say how many sessions were dropped.
-            val outcome = terminationOver(node).stop(paperDefinition(), acknowledgeOccupancy = true)
+            val outcome = terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.Count(12))
             outcome.playersOnline shouldBe 12
             node.stops shouldHaveSize 1
         }
@@ -137,7 +161,7 @@ internal class NodeForcedTerminationTest {
             running(node)
 
             shouldThrow<ForcedTerminationRefused> {
-                terminationOver(node).stop(paperDefinition(), acknowledgeOccupancy = false)
+                terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.None)
             }.message.toString() shouldContain "cannot be shown to be empty"
             node.stops shouldHaveSize 0
         }
@@ -151,13 +175,19 @@ internal class NodeForcedTerminationTest {
             // reported that identically to a save that timed out.
             node.labelOverrides[mcorch.core.Labels.SAVE_CONFIRMABLE] = "false"
             running(node)
-            var execs = 0
-            node.onExec = {
-                execs++
-                ExecOutcome(0, "", "")
+            node.onExec = { command ->
+                if (command
+                        .joinToString(
+                            " ",
+                        ).contains("save-all")
+                ) {
+                    ExecOutcome(0, "", "")
+                } else {
+                    node.defaultExec(command)
+                }
             }
 
-            val outcome = terminationOver(node).stop(paperDefinition(), acknowledgeOccupancy = true)
+            val outcome = terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.None)
 
             // Nothing was sent, and the outcome says so rather than saying
             // "not confirmed", which is what a save that *was* sent reports.
@@ -168,22 +198,166 @@ internal class NodeForcedTerminationTest {
         }
 
     @Test
-    fun `a grace period too short to be the save it would become is refused`() =
+    fun `a grace period too short to be the save it would become is raised, not refused`() =
         coreTest {
             val node = FakeNode()
             node.labelOverrides[mcorch.core.Labels.SAVE_CONFIRMABLE] = "false"
             running(node)
 
-            // No save request will be sent, so the grace period is the entire save.
-            // Ten seconds is not one, and stopping anyway would kill the container
-            // mid-shutdown-save.
-            // The schema already forces grace > saveTimeout + 30s, so this is the
-            // smallest pair it permits — and still under the shutdown-save
-            // allowance, which is the window that matters when nothing was sent.
+            // No save request will be sent, so the grace period is the entire save
+            // rather than a backstop behind one. The schema's own minimum is
+            // saveTimeout + 30s, so this is close to the smallest pair it permits —
+            // and far under what this project says a save takes.
             val definition = paperDefinition(saveTimeout = 5.seconds, stopGracePeriod = 35.seconds)
+            terminationOver(node).stop(definition, OccupancyAcknowledgement.None)
+
+            // Raised to the shutdown-save allowance. The previous version *refused*
+            // here, and that refusal ran below the tombstone the caller had already
+            // written — a definition that cannot be edited, so "raise it and force
+            // again" was advice nobody could take and the server was left reachable
+            // only by `crictl`. Raising costs nothing: the grace period is a ceiling
+            // on containerd's patience, so a server that saves in two seconds exits
+            // in two seconds.
+            node.stops.single().second shouldBe PaperServerDefaults.SAVE_TIMEOUT
+        }
+
+    @Test
+    fun `a declared grace period longer than the allowance is left alone`() =
+        coreTest {
+            val node = FakeNode()
+            node.labelOverrides[mcorch.core.Labels.SAVE_CONFIRMABLE] = "false"
+            running(node)
+
+            // The floor only ever raises. An operator who declared twenty minutes
+            // for a big world must not have it cut to the allowance.
+            val definition = paperDefinition(saveTimeout = 5.minutes, stopGracePeriod = 20.minutes)
+            terminationOver(node).stop(definition, OccupancyAcknowledgement.None)
+
+            node.stops.single().second shouldBe 20.minutes
+        }
+
+    @Test
+    fun `an unbuildable save timeout is refused by preflight, where the definition can still be fixed`() =
+        coreTest {
+            val node = FakeNode()
+            running(node)
+
+            // `ExecRequest`'s own `init` refuses this, and the drain turns that into
+            // a recorded failure saying "correct that field". Below a tombstone that
+            // sentence is uncorrectable, so the check has to run before one is
+            // written — which is what `preflight` is for.
+            val definition = paperDefinition(saveTimeout = Duration.ZERO, stopGracePeriod = 5.minutes)
             shouldThrow<ForcedTerminationRefused> {
-                terminationOver(node).stop(definition, acknowledgeOccupancy = true)
-            }.message.toString() shouldContain "only chance the world has"
+                terminationOver(node).preflight(definition, OccupancyAcknowledgement.None)
+            }.message.toString() shouldContain "saveTimeout"
             node.stops shouldHaveSize 0
+        }
+
+    @Test
+    fun `preflight refuses a population before anything has been written`() =
+        coreTest {
+            val node = FakeNode()
+            node.online = 7
+            running(node)
+
+            shouldThrow<ForcedTerminationRefused> {
+                terminationOver(node).preflight(paperDefinition(), OccupancyAcknowledgement.None)
+            }.message.toString() shouldContain "7 player"
+            node.stops shouldHaveSize 0
+        }
+
+    @Test
+    fun `preflight is silent when there is no workload, because that is an ordinary delete`() =
+        coreTest {
+            val node = FakeNode()
+            // Nothing created. A refusal here would turn "delete a server whose
+            // container is already gone" into a 409 the caller cannot clear.
+            terminationOver(node).preflight(paperDefinition(), OccupancyAcknowledgement.None)
+            node.stops shouldHaveSize 0
+        }
+
+    @Test
+    fun `an acknowledged count that no longer matches is refused`() =
+        coreTest {
+            val node = FakeNode()
+            node.online = 12
+            running(node)
+
+            // The caller was shown 12 and acknowledged 12; by the time the request
+            // lands there are 30. A boolean flag cannot tell those apart, which is
+            // why the acknowledgement is a count.
+            node.online = 30
+            shouldThrow<ForcedTerminationRefused> {
+                terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.Count(12))
+            }.message.toString() shouldContain "30 player"
+            node.stops shouldHaveSize 0
+        }
+
+    @Test
+    fun `acknowledging an unreadable count does not cover a server that answered`() =
+        coreTest {
+            val node = FakeNode()
+            node.online = 4
+            running(node)
+
+            // `Unreadable` is a value, not a wildcard. If it matched anything, the
+            // acknowledgement every wedged server needs would silently authorise
+            // stopping a healthy populated one.
+            shouldThrow<ForcedTerminationRefused> {
+                terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.Unreadable)
+            }.message.toString() shouldContain "4 player"
+            node.stops shouldHaveSize 0
+
+            // And the converse: a count does not cover a server that answered nothing.
+            node.joinable = false
+            shouldThrow<ForcedTerminationRefused> {
+                terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.Count(4))
+            }.message.toString() shouldContain "cannot be shown to be empty"
+            node.stops shouldHaveSize 0
+        }
+
+    @Test
+    fun `players who join during the save are seen, because the count is read again`() =
+        coreTest {
+            val node = FakeNode()
+            running(node)
+
+            // Empty when the decision is made. There is no seal on this path, so
+            // nothing holds that zero: the drain's `requireEmpty` is durable only
+            // because `holdSeal` keeps the proxy from routing joins, and the table
+            // in this seam's KDoc says that step is not done here.
+            //
+            // The window is a whole `saveTimeout` wide — up to an hour, per
+            // `SpecBounds` — and this is the branch that asks the caller for nothing
+            // at all, so a single probe would let it stop a populated server having
+            // reported zero and consulted nobody.
+            node.onExec = { command ->
+                if (command.joinToString(" ").contains("save-all")) node.online = 3
+                node.defaultExec(command)
+            }
+
+            shouldThrow<ForcedTerminationRefused> {
+                terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.None)
+            }.message.toString() shouldContain "3 player"
+            node.stops shouldHaveSize 0
+        }
+
+    @Test
+    fun `the reported count is the one from just before the stop`() =
+        coreTest {
+            val node = FakeNode()
+            node.online = 5
+            running(node)
+            node.onExec = { command ->
+                if (command.joinToString(" ").contains("save-all")) node.online = 5
+                node.defaultExec(command)
+            }
+
+            val outcome = terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.Count(5))
+
+            // An audit record of who was dropped has to be from the instant they
+            // were dropped, not from a probe a save-timeout earlier.
+            outcome.playersOnline shouldBe 5
+            node.stops shouldHaveSize 1
         }
 }

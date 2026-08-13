@@ -15,6 +15,7 @@ import mcorch.api.render.ServerJson
 import mcorch.core.termination.ForcedTermination
 import mcorch.core.termination.ForcedTerminationRefused
 import mcorch.core.termination.ForcedTerminationUnavailable
+import mcorch.core.termination.OccupancyAcknowledgement
 import mcorch.schema.PaperServerDefinition
 import mcorch.schema.PaperServerStatus
 import mcorch.schema.ResourceName
@@ -239,12 +240,19 @@ internal class ServerRoutes(
         val forced = request.queryValue("force") == "true"
         val existing = mustFind(name)
 
-        // Every refusal is decided **before** the tombstone is written. The first
-        // version wrote it first and then answered 409 for a proxy — which for a
-        // proxy is a fleet-wide deletion delivered under a status that says nothing
-        // happened.
+        // Every refusal is decided **before** the tombstone is written, and that is
+        // load-bearing twice over. The first version wrote it first and then
+        // answered 409 for a proxy — which for a proxy is a fleet-wide deletion
+        // delivered under a status that says nothing happened. The second kept the
+        // seam's own refusals below it, and a tombstoned definition cannot be
+        // edited (`ConflictReason.TERMINATING`), so a refusal saying "correct that
+        // field and force again" left the server permanently `crictl`-only.
         val forcible = if (forced) forcible(name, existing) else null
-        if (forced) guardAgainstDispatchedStop(name, existing)
+        val acknowledgement = if (forced) occupancyAcknowledgement(request) else OccupancyAcknowledgement.None
+        if (forcible != null) {
+            guardAgainstDispatchedStop(name, existing)
+            preflight(forcible, acknowledgement)
+        }
 
         if (!forced && ifMatch == Requests.IfMatch.Any && existing.definition.terminating) {
             // Already tombstoned: nothing to do, and reporting it as a conflict
@@ -264,7 +272,7 @@ internal class ServerRoutes(
                     is WriteOutcome.Conflict -> throw ApiException.conflict(outcome)
                 }
             }
-        if (forcible != null) return force(request, forcible, name)
+        if (forcible != null) return force(request, forcible, name, acknowledgement)
         LOG.info("delete requested name={} generation={}", stored.name, stored.generation)
         return accepted(store.getServer(name) ?: StoredServer(stored))
     }
@@ -302,12 +310,71 @@ internal class ServerRoutes(
             )
 
     /**
-     * Refuses a force against a drain that has already dispatched its stop.
+     * The occupancy the caller says they were shown.
      *
-     * The container is inside its grace period, running its shutdown save. A second
-     * force finds it `RUNNING`, sends another `save-all flush` into that, and stops
-     * it again — which is the repeated-save-request the drain's own
-     * never-re-send rule exists to prevent.
+     * A count and not a flag — `ForcedTermination`'s KDoc has the reasoning. The
+     * literal `unreadable` is spelt out rather than allowing a wildcard, so
+     * acknowledging a wedged server cannot cover a server that answered with
+     * players on it. A boolean `true` is refused rather than quietly read as
+     * either, because it is exactly the "proceed regardless" this replaced.
+     */
+    private fun occupancyAcknowledgement(request: Request): OccupancyAcknowledgement {
+        val raw = request.queryValue("acknowledgeOccupancy") ?: return OccupancyAcknowledgement.None
+        if (raw == "unreadable") return OccupancyAcknowledgement.Unreadable
+        val count = raw.toIntOrNull()
+        if (count == null || count < 0) {
+            throw ApiException(
+                ErrorCode.BAD_REQUEST,
+                "acknowledgeOccupancy takes the player count you were shown, or `unreadable` when the " +
+                    "server did not answer one — not `$raw`. Read the server first and acknowledge what it " +
+                    "reported",
+            )
+        }
+        return OccupancyAcknowledgement.Count(count)
+    }
+
+    /**
+     * The seam's own refusals, asked while the definition can still be edited.
+     *
+     * `ForcedTerminationUnavailable` is not a refusal: there is no container, so
+     * the delete below stands on its own and the loop tears down what is left.
+     */
+    private suspend fun preflight(
+        definition: PaperServerDefinition,
+        acknowledgement: OccupancyAcknowledgement,
+    ) {
+        try {
+            forced.preflight(definition, acknowledgement)
+        } catch (unavailable: ForcedTerminationUnavailable) {
+            LOG.debug("force preflight found nothing to stop: {}", unavailable.message)
+        } catch (refused: ForcedTerminationRefused) {
+            throw ApiException(ErrorCode.FORCE_REFUSED, refused.message ?: "the forced stop was refused")
+        }
+    }
+
+    /**
+     * Refuses a force against a drain that already has a save or a stop in flight.
+     *
+     * A dispatched stop means the container is inside its grace period running its
+     * shutdown save. A second force finds it `RUNNING`, sends another
+     * `save-all flush` into that, and stops it again — the repeated-save-request
+     * the drain's own never-re-send rule exists to prevent.
+     *
+     * `saveRequestedAt` is the other half of the same hole and was missed first
+     * time round: it is non-null exactly while a request has gone out and has not
+     * been confirmed (`DrainStatus` keeps it disjoint from `worldSavedAt`), which
+     * is the never-re-send wedge armed. Forcing into it sends the second flush the
+     * rule forbids — no stop needs to have been dispatched for that.
+     *
+     * **This guard is advisory and cannot be made binding here.** `existing` is
+     * read once at `mustFind`, so the loop may dispatch between that read and the
+     * seam's call; and a `status` of null means either "not observed yet" or "the
+     * observation did not decode", which round 30 made indistinguishable at this
+     * layer. Both fall to the permissive side. Refusing on null instead would
+     * block every force against a server the loop has not reached yet — including
+     * the just-created ones — which trades a narrow hole for a wide one. The
+     * binding protection against a second save is the seam's own, which observes
+     * the container rather than a status row.
      */
     private fun guardAgainstDispatchedStop(
         name: ResourceName,
@@ -320,6 +387,14 @@ internal class ServerRoutes(
                 "`${name.value}` already has a stop in flight, dispatched at ${drain.stopDispatchedAt}. " +
                     "It is inside its grace period; forcing again would send a second save into a server " +
                     "already shutting down",
+            )
+        }
+        if (drain.saveRequestedAt != null) {
+            throw ApiException(
+                ErrorCode.FORCE_NOT_APPLICABLE,
+                "`${name.value}` has an unconfirmed world save outstanding, requested at " +
+                    "${drain.saveRequestedAt}. Forcing now would send a second save into a server already " +
+                    "running one; wait for it to confirm or fail",
             )
         }
     }
@@ -339,12 +414,12 @@ internal class ServerRoutes(
         request: Request,
         definition: PaperServerDefinition,
         name: ResourceName,
+        acknowledgement: OccupancyAcknowledgement,
     ): Response {
         val principal = request.principal()
-        val acknowledged = request.queryValue("acknowledgeOccupancy") == "true"
         val outcome =
             try {
-                forced.stop(definition, acknowledged)
+                forced.stop(definition, acknowledgement)
             } catch (unavailable: ForcedTerminationUnavailable) {
                 // Nothing to force, and the tombstone above is already written — so
                 // this degenerates into the ordinary delete, which is exactly right:

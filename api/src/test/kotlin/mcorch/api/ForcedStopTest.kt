@@ -3,6 +3,7 @@ package mcorch.api
 import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
+import mcorch.core.termination.OccupancyAcknowledgement
 import mcorch.schema.fixtures.ExampleDefinitions
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
@@ -152,7 +153,12 @@ class ForcedStopTest {
         started.call("POST", "/api/v1/servers", ExampleDefinitions.valid("full.yaml")).status shouldBe 201
 
         started.call("DELETE", "/api/v1/servers/survival-02?force=true")
-        force.acknowledgements shouldBe listOf(false)
+        force.acknowledgements shouldBe listOf(OccupancyAcknowledgement.None)
+        // And preflight saw it too. It runs above the tombstone and is the only
+        // refusal point where "correct that and force again" is advice the caller
+        // can still act on, so an acknowledgement that reached only `stop` would
+        // move every occupancy refusal below the point of no return.
+        force.preflighted shouldBe listOf(OccupancyAcknowledgement.None)
     }
 
     @Test
@@ -165,10 +171,67 @@ class ForcedStopTest {
         api = started
         started.call("POST", "/api/v1/servers", ExampleDefinitions.valid("full.yaml")).status shouldBe 201
 
-        val forced = started.call("DELETE", "/api/v1/servers/survival-02?force=true&acknowledgeOccupancy=true")
+        val forced = started.call("DELETE", "/api/v1/servers/survival-02?force=true&acknowledgeOccupancy=unreadable")
         forced.json()["saveAttempted"] shouldBe false
         forced.json()["saveConfirmed"] shouldBe false
         // Null, not zero. A client must not render an unknown count as an empty one.
         forced.json()["playersOnline"] shouldBe null
+    }
+
+    @Test
+    fun `a refused force leaves the definition alive and editable`() {
+        val force = PreflightRefusingForce("this server has 12 players online")
+        val started = TestApi.start(forced = force)
+        api = started
+        started.call("POST", "/api/v1/servers", ExampleDefinitions.valid("full.yaml")).status shouldBe 201
+
+        val refused = started.call("DELETE", "/api/v1/servers/survival-02?force=true")
+        refused.errorCode() shouldBe "FORCE_REFUSED"
+        force.recorded.shouldBeEmpty()
+
+        // **The assertion whose absence hid a critical.** `a proxy cannot be forced`
+        // had it; no FORCE_REFUSED test did, and every one of them would have failed
+        // it. A tombstoned definition cannot be edited — the store answers
+        // `TERMINATING` to any write against a deleted row and nothing un-tombstones
+        // it — so a refusal below the tombstone that says "fix it and force again"
+        // freezes the server: undrainable, unforceable, `crictl` only. Which is the
+        // exact state this endpoint exists to remove.
+        val survivor = started.call("GET", "/api/v1/servers/survival-02")
+        survivor.status shouldBe 200
+        (survivor.json()["metadata"] as Map<*, *>)["terminating"] shouldBe false
+
+        // Editable, not merely present. "Still listed" would pass on a tombstoned
+        // row, and being able to edit it is the whole remedy a refusal offers.
+        started
+            .call(
+                "PUT",
+                "/api/v1/servers/survival-02",
+                ExampleDefinitions.valid("full.yaml"),
+                headers = listOf("If-Match" to "*"),
+            ).status shouldBe 200
+    }
+
+    @Test
+    fun `the acknowledgement is a count, and a bare true is refused`() {
+        val force = StoppingForce(saveConfirmed = true)
+        val started = TestApi.start(forced = force)
+        api = started
+        started.call("POST", "/api/v1/servers", ExampleDefinitions.valid("full.yaml")).status shouldBe 201
+
+        // `true` was the old spelling and is refused rather than read as either
+        // value: it is exactly the "proceed regardless" this replaced, and a caller
+        // still sending it has not seen a count. Reading it as `Unreadable` would
+        // silently keep the checkbox.
+        val bare = started.call("DELETE", "/api/v1/servers/survival-02?force=true&acknowledgeOccupancy=true")
+        bare.errorCode() shouldBe "BAD_REQUEST"
+        force.recorded.shouldBeEmpty()
+
+        // And the refusal happened before anything was written.
+        (started.call("GET", "/api/v1/servers/survival-02").json()["metadata"] as Map<*, *>)["terminating"] shouldBe
+            false
+
+        val counted = started.call("DELETE", "/api/v1/servers/survival-02?force=true&acknowledgeOccupancy=12")
+        counted.status shouldBe 202
+        force.acknowledgements shouldBe listOf(OccupancyAcknowledgement.Count(12))
     }
 }
