@@ -568,8 +568,10 @@ class DisplayConformanceTest {
                     ): String = throw ConsoleUnavailable("no workload in this test")
                 },
                 object : ForcedTermination {
-                    override suspend fun stop(definition: PaperServerDefinition): ForcedStopOutcome =
-                        throw ForcedTerminationUnavailable("no workload in this test")
+                    override suspend fun stop(
+                        definition: PaperServerDefinition,
+                        acknowledgeOccupancy: Boolean,
+                    ): ForcedStopOutcome = throw ForcedTerminationUnavailable("no workload in this test")
                 },
             ).use { server ->
                 block(ApiClient("http://127.0.0.1:${server.port}", token))

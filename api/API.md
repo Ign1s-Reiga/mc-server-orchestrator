@@ -246,6 +246,7 @@ API by `PUT`ting a valid definition with `If-Match: *`.
 | `CONSOLE_NOT_APPLICABLE` | 409 | | the console was asked of a `VelocityProxy`, which has no RCON |
 | `CONSOLE_UNAVAILABLE` | 503 | `Retry-After` | the server cannot answer yet. **Retryable**, and nothing was sent |
 | `CONSOLE_TIMEOUT` | 504 | | the command **ran or may have run** and no reply arrived. **Do not retry** |
+| `FORCE_REFUSED` | 409 | | a forced stop that could be made safe — an unacknowledged population, an unusable `saveTimeout`, a grace period too short to be the save it would become |
 | `IDENTITY_EXISTS` | 409 | | `POST /identities/{name}` never overwrites |
 | `LAST_SUPERUSER` | 409 | | the change would leave no enabled superuser |
 | `METHOD_NOT_ALLOWED` | 405 | `Allow` | |
@@ -741,14 +742,47 @@ save would buy tens of seconds in exchange for the data this system exists to
 protect; the grace period is the last protection still working when RCON is not.
 
 ```json
-{ "accepted": true, "forced": true, "saveConfirmed": false,
-  "detail": "the container was stopped without a confirmed world save; unsaved play since the last successful save is lost" }
+{ "accepted": true, "forced": true,
+  "saveAttempted": false, "saveConfirmed": false, "playersOnline": 12,
+  "detail": "no world save could be sent — the container has no channel that could confirm one — so the stop grace period was the only chance the world had to reach disk" }
 ```
 
-**Read `saveConfirmed` first.** It is the difference between retiring a stuck
-server and losing a world, and months later it is the only thing that can tell
-them apart. `409 FORCE_NOT_APPLICABLE` if the server is a `VelocityProxy`, which
-holds no world, or if there is no running container to stop.
+**Read `saveAttempted` and `saveConfirmed` together.** They are different
+questions: a save can be *sent and never confirmed*, or **never sent at all** —
+which is what happens on the very population this endpoint exists for, a container
+with no working save channel. Collapsing them into "not confirmed" would report
+those two identically, and they are not the same event.
+
+**`playersOnline` may be `null`, and null is not zero.** It means the server did
+not answer a count. Render it as unknown; a client that shows it as an empty
+server is stating something this API did not.
+
+### It refuses rather than surprising you
+
+- **A populated server** — or one whose occupancy could not be read — is `409
+  FORCE_REFUSED` unless you re-send with `?acknowledgeOccupancy=true`. Forcing
+  disconnects those players without transferring them, and the drain would have
+  moved them.
+- **An unusable `spec.lifecycle.drain.saveTimeout`** is `FORCE_REFUSED`: no save
+  could be sent, and the field is one edit away from making one possible.
+- **A `stopGracePeriod` too short to be a shutdown save** is `FORCE_REFUSED` when
+  no save request could be sent — on that branch the grace period *is* the save.
+- **A stop already in flight** is `FORCE_NOT_APPLICABLE`. The container is inside
+  its grace period running its shutdown save; a second force would send another
+  save into it.
+- **A `VelocityProxy`** is `FORCE_NOT_APPLICABLE` and **is not deleted** — it holds
+  no world, so its drain cannot stall on a save.
+
+If there is no running container to stop, this is not an error: the tombstone
+stands, the response is the ordinary `202` with `"forced": false`, and the loop
+completes the teardown. A repeated force answers the same way a repeated `DELETE`
+does.
+
+### What it still does not do
+
+It does **not** seal the proxy or attempt a player transfer. The drain does both;
+this path does neither, so players are disconnected and the proxy may route joins
+at a dead address until the loop's next pass deregisters the backend.
 
 ### `POST /api/v1/validate`
 

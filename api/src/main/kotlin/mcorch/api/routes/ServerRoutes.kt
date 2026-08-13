@@ -9,11 +9,14 @@ import mcorch.api.http.Request
 import mcorch.api.http.Requests
 import mcorch.api.http.Response
 import mcorch.api.http.Route
+import mcorch.api.json.Json
 import mcorch.api.json.jsonObject
 import mcorch.api.render.ServerJson
 import mcorch.core.termination.ForcedTermination
+import mcorch.core.termination.ForcedTerminationRefused
 import mcorch.core.termination.ForcedTerminationUnavailable
 import mcorch.schema.PaperServerDefinition
+import mcorch.schema.PaperServerStatus
 import mcorch.schema.ResourceName
 import mcorch.schema.SchemaViolation
 import mcorch.schema.ServerDefinition
@@ -235,16 +238,25 @@ internal class ServerRoutes(
         val ifMatch = Requests.precondition(request)
         val forced = request.queryValue("force") == "true"
         val existing = mustFind(name)
+
+        // Every refusal is decided **before** the tombstone is written. The first
+        // version wrote it first and then answered 409 for a proxy — which for a
+        // proxy is a fleet-wide deletion delivered under a status that says nothing
+        // happened.
+        val forcible = if (forced) forcible(name, existing) else null
+        if (forced) guardAgainstDispatchedStop(name, existing)
+
         if (!forced && ifMatch == Requests.IfMatch.Any && existing.definition.terminating) {
             // Already tombstoned: nothing to do, and reporting it as a conflict
             // would make a retried delete look like a failure.
-            //
-            // Not taken when forcing, because forcing an already-terminating server
-            // is the whole point: the ordinary delete is what stalled.
             return accepted(existing)
         }
         val stored =
             if (existing.definition.terminating) {
+                // Already terminating, so there is no delete to write — but the
+                // precondition still has to be honoured, or a force with a stale
+                // `If-Match` would proceed where an ordinary delete would not.
+                requireVersionMatches(ifMatch, existing)
                 existing.definition
             } else {
                 when (val outcome = store.deleteDefinition(name, ifMatch.toPrecondition())) {
@@ -252,9 +264,64 @@ internal class ServerRoutes(
                     is WriteOutcome.Conflict -> throw ApiException.conflict(outcome)
                 }
             }
-        if (forced) return force(request, stored, name)
+        if (forcible != null) return force(request, forcible, name)
         LOG.info("delete requested name={} generation={}", stored.name, stored.generation)
         return accepted(store.getServer(name) ?: StoredServer(stored))
+    }
+
+    /**
+     * Honours `If-Match` on a path that writes nothing.
+     *
+     * The already-terminating branch skips `deleteDefinition`, and with it the
+     * precondition that call would have checked — so a force carrying a stale
+     * version would proceed where an ordinary delete refuses.
+     */
+    private fun requireVersionMatches(
+        ifMatch: Requests.IfMatch,
+        existing: StoredServer,
+    ) {
+        val required = (ifMatch as? Requests.IfMatch.Version)?.resourceVersion ?: return
+        if (existing.definition.resourceVersion != required) {
+            throw ApiException(
+                ErrorCode.CONFLICT,
+                "the definition has changed since ${required.token}; re-read it before forcing",
+            )
+        }
+    }
+
+    /** The definition a force would act on, or a refusal. Decided before anything is written. */
+    private fun forcible(
+        name: ResourceName,
+        existing: StoredServer,
+    ): PaperServerDefinition =
+        existing.definition.definition as? PaperServerDefinition
+            ?: throw ApiException(
+                ErrorCode.FORCE_NOT_APPLICABLE,
+                "`${name.value}` is not a PaperServer. A VelocityProxy holds no world, so its drain cannot " +
+                    "stall on a save and there is nothing here to force",
+            )
+
+    /**
+     * Refuses a force against a drain that has already dispatched its stop.
+     *
+     * The container is inside its grace period, running its shutdown save. A second
+     * force finds it `RUNNING`, sends another `save-all flush` into that, and stops
+     * it again — which is the repeated-save-request the drain's own
+     * never-re-send rule exists to prevent.
+     */
+    private fun guardAgainstDispatchedStop(
+        name: ResourceName,
+        existing: StoredServer,
+    ) {
+        val drain = (existing.status?.status as? PaperServerStatus)?.drain ?: return
+        if (drain.stopDispatchedAt != null) {
+            throw ApiException(
+                ErrorCode.FORCE_NOT_APPLICABLE,
+                "`${name.value}` already has a stop in flight, dispatched at ${drain.stopDispatchedAt}. " +
+                    "It is inside its grace period; forcing again would send a second save into a server " +
+                    "already shutting down",
+            )
+        }
     }
 
     /**
@@ -262,48 +329,60 @@ internal class ServerRoutes(
      *
      * Tombstoned first, above, and deliberately in that order: a terminating
      * definition keeps reconciling, so the loop is already watching and finishes
-     * the teardown the moment it sees the container stopped. Stopping a server the
-     * loop still wants running would only have it started again.
+     * the teardown the moment it sees the container stopped.
      *
      * The response leads with what was lost rather than with success, because
-     * `saveConfirmed: false` is the only part of it an operator has to read.
+     * `saveAttempted`, `saveConfirmed` and `playersOnline` are the parts of it an
+     * operator has to read.
      */
     private suspend fun force(
         request: Request,
-        stored: StoredDefinition,
+        definition: PaperServerDefinition,
         name: ResourceName,
     ): Response {
-        val definition =
-            stored.definition as? PaperServerDefinition
-                ?: throw ApiException(
-                    ErrorCode.FORCE_NOT_APPLICABLE,
-                    "`${name.value}` is not a PaperServer. A VelocityProxy holds no world, so its drain cannot " +
-                        "stall on a save and there is nothing here to force",
-                )
         val principal = request.principal()
+        val acknowledged = request.queryValue("acknowledgeOccupancy") == "true"
         val outcome =
             try {
-                forced.stop(definition)
+                forced.stop(definition, acknowledged)
             } catch (unavailable: ForcedTerminationUnavailable) {
+                // Nothing to force, and the tombstone above is already written — so
+                // this degenerates into the ordinary delete, which is exactly right:
+                // the loop tears down a stopped container without any of this.
+                //
+                // Answering 409 here would be a refusal that had already deleted the
+                // thing it declined to touch, and would make a retried force fail
+                // where a retried DELETE answers 202.
+                LOG.info("force had nothing to stop name={}; the ordinary teardown carries it", name.value)
+                return accepted(
+                    store.getServer(name) ?: throw ApiException.notFound("no server named `${name.value}`"),
+                    forced = false,
+                )
+            } catch (refused: ForcedTerminationRefused) {
                 throw ApiException(
-                    ErrorCode.FORCE_NOT_APPLICABLE,
-                    unavailable.message ?: "there is no running container to stop",
+                    ErrorCode.FORCE_REFUSED,
+                    refused.message ?: "the forced stop was refused",
                 )
             }
-        // Warn, not info. This is the most consequential thing this API can do, and
-        // `saveConfirmed` is the field an investigator reads first.
+        // Warn, not info, and every field an investigator reads first is on it.
         LOG.warn(
-            "forced stop identity={} server={} saveConfirmed={}",
+            "forced stop identity={} server={} saveAttempted={} saveConfirmed={} playersOnline={}",
             principal.name,
             name.value,
+            outcome.saveAttempted,
             outcome.saveConfirmed,
+            outcome.playersOnline ?: "unknown",
         )
         return Response.json(
             202,
             jsonObject {
                 put("accepted", true)
                 put("forced", true)
+                put("saveAttempted", outcome.saveAttempted)
                 put("saveConfirmed", outcome.saveConfirmed)
+                // Null means the server did not answer a count. It is not zero, and
+                // a client must not render it as one.
+                put("playersOnline", Json.of(outcome.playersOnline))
                 put("detail", outcome.detail)
                 put(
                     "message",
@@ -314,11 +393,18 @@ internal class ServerRoutes(
         )
     }
 
-    private fun accepted(server: StoredServer): Response =
+    private fun accepted(
+        server: StoredServer,
+        forced: Boolean? = null,
+    ): Response =
         Response.json(
             202,
             jsonObject {
                 put("accepted", true)
+                // Only present on a forced request, so an ordinary delete's body is
+                // unchanged. `false` means the force found nothing to stop and the
+                // delete stands on its own.
+                forced?.let { put("forced", it) }
                 put(
                     "message",
                     "the delete was recorded. The reconcile loop drains the server — evacuating players and " +

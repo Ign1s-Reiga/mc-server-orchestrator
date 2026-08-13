@@ -19,7 +19,10 @@ import mcorch.schema.PaperServerDefinition
 internal class RefusingForce : ForcedTermination {
     val recorded: MutableList<String> = mutableListOf()
 
-    override suspend fun stop(definition: PaperServerDefinition): ForcedStopOutcome {
+    override suspend fun stop(
+        definition: PaperServerDefinition,
+        acknowledgeOccupancy: Boolean,
+    ): ForcedStopOutcome {
         recorded += definition.metadata.name.value
         throw ForcedTerminationUnavailable("`${definition.metadata.name.value}` has no workload in this test")
     }
@@ -28,13 +31,24 @@ internal class RefusingForce : ForcedTermination {
 /** A forced stop that succeeds, reporting whether the save was confirmed. */
 internal class StoppingForce(
     private val saveConfirmed: Boolean,
+    private val saveAttempted: Boolean = true,
+    private val playersOnline: Int? = 0,
 ) : ForcedTermination {
     val recorded: MutableList<String> = mutableListOf()
 
-    override suspend fun stop(definition: PaperServerDefinition): ForcedStopOutcome {
+    /** Whether the caller acknowledged occupancy, so a test can assert it was carried through. */
+    val acknowledgements: MutableList<Boolean> = mutableListOf()
+
+    override suspend fun stop(
+        definition: PaperServerDefinition,
+        acknowledgeOccupancy: Boolean,
+    ): ForcedStopOutcome {
         recorded += definition.metadata.name.value
+        acknowledgements += acknowledgeOccupancy
         return ForcedStopOutcome(
+            saveAttempted = saveAttempted,
             saveConfirmed = saveConfirmed,
+            playersOnline = playersOnline,
             detail = if (saveConfirmed) "confirmed" else "not confirmed",
         )
     }

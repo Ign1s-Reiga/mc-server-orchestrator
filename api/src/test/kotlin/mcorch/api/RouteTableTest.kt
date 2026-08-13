@@ -77,7 +77,7 @@ class RouteTableTest {
     }
 
     @Test
-    fun `this module reaches core through one package and no further`() {
+    fun `this module reaches core through two named packages and no further`() {
         // This used to assert that `mcorch.core.Node` and `mcorch.cri.CriClient`
         // were not on the classpath at all — the strongest form of "a handler
         // cannot act on a container, however it is written".
@@ -89,10 +89,16 @@ class RouteTableTest {
         // in", and it was made deliberately.
         //
         // So the rule moves from the classpath to the source, where it can still
-        // fail: this module may name `mcorch.core.console` and nothing else under
-        // `mcorch.core`, and nothing under `mcorch.cri` at all. That is the
-        // property the old test was really protecting — a handler cannot stop a
-        // container — and it is now checked where a future handler would break it.
+        // fail: this module may name `mcorch.core.console` and
+        // `mcorch.core.termination`, nothing else under `mcorch.core`, and nothing
+        // under `mcorch.cri` at all.
+        //
+        // The property the classpath version protected was "a handler cannot stop a
+        // container". That is **no longer true** — `mcorch.core.termination` is the
+        // forced stop, and a superuser can. What this rule protects now is narrower
+        // and still worth having: the exception is *two named packages* wide, so a
+        // handler cannot reach `Node`, the reconciler or the drain, and cannot
+        // invent a third way to end a container without this list changing.
         val imports =
             Path
                 .of("src/main/kotlin")
@@ -117,6 +123,12 @@ class RouteTableTest {
                     (
                         imported.startsWith("mcorch.core.") &&
                             !imported.startsWith("mcorch.core.console.") &&
+                            // Added with the forced stop, and it is the entry that
+                            // makes this test's own name a simplification: two
+                            // packages now, not one. What the rule still buys is
+                            // that both are *named* — a handler cannot reach `Node`,
+                            // the reconciler or the drain, so it cannot invent a
+                            // third way to end a container.
                             !imported.startsWith("mcorch.core.termination.")
                     )
             }
@@ -127,17 +139,30 @@ class RouteTableTest {
     }
 
     @Test
-    fun `the table has no route that could free a name or stop a container`() {
+    fun `exactly one route can stop a container, and the forced form is superuser`() {
         val patterns = table().map { "${it.method} ${it.pattern}" }
-        // purge, force-stop, restart-now: none of them exist, and none of them may.
-        // A name is freed by :core once the drain has finished and the container is
-        // gone; an endpoint that could reach past that guard would orphan a running
-        // container, and one that could stop a container directly could stop one
-        // with players on it.
+
+        // This test used to assert that no pattern contained `force`, and it stayed
+        // green through the change that added `?force=true` — a query parameter is
+        // not part of a pattern. A guard that survives the thing it was written to
+        // catch is worse than no guard, so the claim is narrowed to one it can
+        // actually check.
+        //
+        // These two still hold and still must. A name is freed by :core once the
+        // drain has finished and the container is gone; an endpoint that could reach
+        // past that guard would orphan a running container.
         patterns.none { it.contains("purge", ignoreCase = true) } shouldBe true
-        patterns.none { it.contains("stop", ignoreCase = true) } shouldBe true
         patterns.none { it.contains("kill", ignoreCase = true) } shouldBe true
-        patterns.none { it.contains("force", ignoreCase = true) } shouldBe true
+        // No route *named* for stopping. Ending a server is a delete, and the forced
+        // variant is a parameter on that one route rather than a second way in.
+        patterns.none { it.contains("stop", ignoreCase = true) } shouldBe true
+
+        // The one route that can end a container, and the tier it needs. `DELETE` is
+        // `superuser` whether or not `?force=true` is present, so the forced form is
+        // gated by construction rather than by a check inside the handler.
+        table()
+            .single { it.method == "DELETE" && it.pattern == "/api/v1/servers/{name}" }
+            .access shouldBe Access.AtLeast(Tier.SUPERUSER)
 
         // Control: the table is not empty and does hold the routes it should, so
         // the assertions above are about absence rather than about nothing at all.

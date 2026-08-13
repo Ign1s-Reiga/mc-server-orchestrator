@@ -103,17 +103,72 @@ class ForcedStopTest {
         refused.errorCode() shouldBe "FORCE_NOT_APPLICABLE"
         refused.body shouldContain "holds no world"
         force.recorded.shouldBeEmpty()
+
+        // And it is still there. The first version wrote the tombstone before this
+        // check, so a proxy got a fleet-wide deletion delivered under a status that
+        // said nothing had happened — and this test passed, because it asserted the
+        // status and the message and never that the definition survived.
+        val survivor = started.call("GET", "/api/v1/servers/proxy-02")
+        survivor.status shouldBe 200
+        (survivor.json()["metadata"] as Map<*, *>)["terminating"] shouldBe false
     }
 
     @Test
-    fun `a server with no running container reports that rather than pretending`() {
+    fun `a force reaches the seam rather than being guessed at above it`() {
         val force = RefusingForce()
         val started = start(force)
         started.call("POST", "/api/v1/servers", ExampleDefinitions.valid("full.yaml")).status shouldBe 201
 
-        val refused = started.call("DELETE", "/api/v1/servers/survival-02?force=true")
-        refused.errorCode() shouldBe "FORCE_NOT_APPLICABLE"
-        // It reached the seam — the refusal is the seam's, not a guess made above it.
+        started.call("DELETE", "/api/v1/servers/survival-02?force=true").status shouldBe 202
+        // Whether there is a container to stop is the seam's question, not the
+        // route's: the route cannot see a workload.
         force.recorded shouldBe listOf("survival-02")
+    }
+
+    @Test
+    fun `forcing with nothing to stop degenerates into an ordinary delete`() {
+        val force = RefusingForce()
+        val started = start(force)
+        started.call("POST", "/api/v1/servers", ExampleDefinitions.valid("full.yaml")).status shouldBe 201
+
+        // The seam finds no container. The tombstone is already written and is the
+        // right outcome — the loop tears down a stopped container without any of
+        // this — so the honest answer is the delete's, not a refusal that has
+        // already deleted the thing it declined to touch.
+        val answered = started.call("DELETE", "/api/v1/servers/survival-02?force=true")
+        answered.status shouldBe 202
+        answered.json()["forced"] shouldBe false
+
+        // And it is idempotent in the same way a repeated DELETE is, rather than
+        // turning into a 409 on the second call.
+        started.call("DELETE", "/api/v1/servers/survival-02?force=true").status shouldBe 202
+    }
+
+    @Test
+    fun `the occupancy acknowledgement is carried to the seam rather than assumed`() {
+        val force = StoppingForce(saveConfirmed = true)
+        val started = TestApi.start(forced = force)
+        api = started
+        started.call("POST", "/api/v1/servers", ExampleDefinitions.valid("full.yaml")).status shouldBe 201
+
+        started.call("DELETE", "/api/v1/servers/survival-02?force=true")
+        force.acknowledgements shouldBe listOf(false)
+    }
+
+    @Test
+    fun `the response reports whether a save was even attempted`() {
+        // "not confirmed" covers both a save that timed out and one that was never
+        // sent, and those are different events. The API has to carry both halves or
+        // the audit record cannot tell them apart.
+        val force = StoppingForce(saveConfirmed = false, saveAttempted = false, playersOnline = null)
+        val started = TestApi.start(forced = force)
+        api = started
+        started.call("POST", "/api/v1/servers", ExampleDefinitions.valid("full.yaml")).status shouldBe 201
+
+        val forced = started.call("DELETE", "/api/v1/servers/survival-02?force=true&acknowledgeOccupancy=true")
+        forced.json()["saveAttempted"] shouldBe false
+        forced.json()["saveConfirmed"] shouldBe false
+        // Null, not zero. A client must not render an unknown count as an empty one.
+        forced.json()["playersOnline"] shouldBe null
     }
 }

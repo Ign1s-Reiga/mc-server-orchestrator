@@ -2404,3 +2404,71 @@ Related: [[standalone-paper-drain-shape]]
      one branch, grep every predicate that *reports* that gate's answer to
      another component, and re-derive the exemption there or record why the
      consumer cannot see it.
+
+## Round 49: the escape hatch built beside the drain, not inside it
+
+202. **Refusing to weaken a gate, by writing a second path, drops the whole chain
+     the gate was the last link of.** `NodeForcedTermination` was written outside
+     `DrainController` on the argument that weakening `mayStop` under a flag would
+     corrupt a gate every stop depends on. That argument is sound about `mayStop`
+     and wrong about the *stop*: the drain's stop is preceded by seal, secure a
+     destination, transfer, confirm zero players, confirm the save, deregister —
+     and an isolated path that reimplements only "save, then stop" silently loses
+     the other five. Weakening the gate under a flag would have kept them. So the
+     isolation choice is only safer if the new path re-implements the chain; if it
+     re-implements the last link, it is strictly worse than the design it refused.
+     **Ask of every "we built it separately to keep the gate honest": which steps
+     of the protocol lived *before* that gate, and where are they now?** No test
+     can see their absence, because there is no shared path to diff against.
+203. **"Always requested, always waited out" is falsified by the callee's
+     zero-cost early returns.** `PaperServerAgent.requestSave` has three returns
+     that issue no exec and consume no wall clock: `Unconfirmable` (the
+     container's `SAVE_CONFIRMABLE` label reads false — the exact `operating.md`
+     note-1 population an escape hatch exists for), `unbuildableSave`
+     (`saveTimeout <= 0`, which `SpecBounds` deliberately does not floor and which
+     its KDoc says reaches here by design), and `NotDelivered` from an RCON client
+     that fails to connect in about a second (a refused password — also a
+     documented note-1 arrival path). A caller whose safety story is "the save
+     timeout is always spent, and that wait is what lets an in-flight save land"
+     has that story only on the `Unconfirmed`-by-timeout branch. Enumerate a
+     callee's returns by *cost*, not by outcome type, whenever a caller's argument
+     rests on time elapsing.
+204. **A clamp in `:schema` is justified by a premise about every stop in the
+     system, and a new ungated stop invalidates it from another module.**
+     `SpecBounds`' KDoc argues that clamping is safe because "`MAX_STOP_GRACE_PERIOD`
+     bounds a stop that `mayStop` has already gated on a confirmed save, so the
+     grace period there is the last-resort net and not the save path", and that
+     clamping `saveTimeout` "can only withhold a confirmation, and an unconfirmed
+     save is a container this orchestrator will not stop". Both sentences are
+     load-bearing *behaviour* justifications, not prose, and both become false the
+     moment any path stops without `mayStop`. Before adding a stop anywhere, grep
+     `:schema` and `:cri` for justifications of the form "safe because the drain
+     already confirmed" — they are the invariants the new path inherits without
+     being told.
+205. **`StopGrace.of(stopGracePeriod, saveTimeout)` means something different
+     either side of `mayStop`.** Downstream of the gate the floor is a net over a
+     save that already landed. Upstream of it the grace period *is* the save, and
+     the floor is derived from `saveTimeout` — the very channel that just failed,
+     and a field that is zero or meaningless in precisely the branches where the
+     grace period is doing all the work. A guard test asserting "the pair travels
+     together exactly as the reconcile path's does" checks the syntax of the call
+     and cannot see that the two sites are protecting different things.
+206. **A capability guard keyed on route *patterns* stays green when the
+     capability arrives as a query parameter.** `RouteTableTest.the table has no
+     route that could free a name or stop a container` asserts no pattern contains
+     `stop`/`kill`/`force`/`purge`, reasoning "one that could stop a container
+     directly could stop one with players on it". `DELETE …?force=true` does
+     exactly that and the test passes untouched. The spec authorised and required
+     the rewrite; the change that added the capability did not do it. Whenever a
+     guard is spelled over names, ask what shape of the forbidden capability the
+     spelling cannot reach — and treat a guard that stayed green through the
+     change it was written to catch as a finding in itself.
+207. **A destructive store write placed above the applicability check turns a
+     refusal into a silent delete.** The force handler tombstones the definition
+     and *then* discovers it is a `VelocityProxy` or has no running container,
+     answering `409 FORCE_NOT_APPLICABLE` — "there is nothing here to force" — over
+     a definition it has already marked terminating. For a proxy that is a
+     fleet-wide deletion delivered under an error status. The test asserts the
+     status code and never asserts the definition survived, which is the
+     instrument-that-looks-like-a-result shape. For every error return in a
+     mutating handler, ask what has already been written when it fires.

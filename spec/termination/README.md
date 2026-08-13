@@ -1,6 +1,8 @@
 # Forced termination — specification
 
-> **Status: the forced path is implemented; RCON-as-standard shipped separately.**
+> **Status: the forced path is implemented and has been through `drain-auditor`
+> once. Round 49 returned three criticals; all are addressed and the change has
+> not been re-audited.** RCON-as-standard shipped separately.
 >
 > It is **not** built the way §2 of this document described. The specification
 > called for three exemptions inside the drain; the code said no, and the
@@ -64,6 +66,22 @@ dangerous. So the button is not an immediate kill.
 | True immediate kill | Stays out of band — `crictl stop --force`, which the orchestrator does not offer and cannot see |
 | Reporting an unresponsive RCON | From use and from the drain, never from a poller — [01-mandatory-rcon.md](01-mandatory-rcon.md) §4.1. A probe is tick budget spent on every server forever, to detect what a failed command already reports |
 | `RouteTableTest` | Rewritten, not deleted, in the change that adds the force path — [02-force-stop.md](02-force-stop.md) §5 |
+
+## Owed, and not left in a comment
+
+The forced path drops six drain steps by construction, not by oversight. Two are
+recorded here as work rather than as caveats in a KDoc, because the audit's
+judgement was that they are follow-ups **only if routed**:
+
+- **Seal the proxy before the stop.** The drain's step 2. Until the loop's next
+  pass deregisters the backend, the proxy may route joins at a dead address.
+- **Attempt a player transfer.** The drain's step 4. Forcing currently
+  disconnects, and the API says so rather than implying otherwise.
+
+Four others are deliberate and permanent: `requireEmpty` is replaced by a probe
+plus an explicit acknowledgement, the save is requested but may not be sendable,
+deregistration is left to the loop, and `mayStop` is bypassed — which is the
+feature.
 
 ## Before any of this is implemented
 

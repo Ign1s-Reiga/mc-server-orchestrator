@@ -83,7 +83,19 @@ public data class BoundedDefinition(
  * the handshake ceiling bound how long **this orchestrator waits** for an
  * acknowledgement; cutting that short can only withhold a confirmation, and an
  * unconfirmed save is a container this orchestrator will not stop (CLAUDE.md
- * invariant 3). [MAX_STOP_GRACE_PERIOD] bounds a stop that `mayStop` has already
+ * invariant 3).
+ *
+ * **One site now falls outside that argument, deliberately.**
+ * `NodeForcedTermination` stops without `mayStop`, so on that path clamping
+ * `saveTimeout` withholds a confirmation *and* the container stops anyway. It does
+ * not restore the finding this clamp was reasoned against, because that path does
+ * not derive its grace floor from `saveTimeout` when no save was sent — it uses a
+ * shutdown-save allowance instead, precisely because `saveTimeout` then describes
+ * an RCON exec that never ran. The exception is written here rather than left to be
+ * rediscovered: an argument with an unrecorded exception is the shape this codebase
+ * keeps having to unpick.
+ *
+ * [MAX_STOP_GRACE_PERIOD] bounds a stop that `mayStop` has already
  * gated on a confirmed save, so the grace period there is the last-resort net and
  * not the save path. And every ceiling is borrowed from the widest value a reader
  * accepts, so no definition an operator could legitimately write is shortened by
