@@ -262,6 +262,21 @@ internal class SessionRegistry(
         return Issued(id, session)
     }
 
+    /**
+     * Drops every session belonging to [identityName], returning how many.
+     *
+     * Disabling and rotating both call this, and rotation most urgently: an
+     * operator rotating a credential is usually responding to it having leaked, so
+     * the live sessions are the thing they most want gone. Without it, "disabled"
+     * would mean "disabled at next login" — a session resolves its principal once,
+     * when it is issued.
+     */
+    fun revokeFor(identityName: String): Int {
+        val doomed = sessions.entries.filter { it.value.principal.name == identityName }
+        doomed.forEach { sessions.remove(it.key) }
+        return doomed.size
+    }
+
     fun lookup(id: String): Session? {
         val key = OperatorAuth.hex(OperatorAuth.digest(id))
         val session = sessions[key] ?: return null

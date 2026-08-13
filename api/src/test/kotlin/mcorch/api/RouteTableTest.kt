@@ -43,6 +43,7 @@ class RouteTableTest {
             config = config,
             store = api.store,
             secrets = api.secrets,
+            identities = api.identities,
             auth = OperatorAuth(config.token.digest, sessions, Duration.ZERO, api.identities),
             sessions = sessions,
             streams = StreamRegistry(config.maxStreams),

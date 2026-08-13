@@ -18,6 +18,7 @@ import mcorch.api.http.Route
 import mcorch.api.http.RouteMatch
 import mcorch.api.http.Router
 import mcorch.api.routes.AuthRoutes
+import mcorch.api.routes.IdentityRoutes
 import mcorch.api.routes.MetaRoutes
 import mcorch.api.routes.SecretRoutes
 import mcorch.api.routes.ServerRoutes
@@ -102,7 +103,7 @@ public class ApiServer private constructor(
             val auth = OperatorAuth(config.token.digest, sessions, config.authFailureDelay, identities)
             val dispatcher =
                 Dispatcher(
-                    Router(routeTable(config, store, secrets, auth, sessions, streams)),
+                    Router(routeTable(config, store, secrets, identities, auth, sessions, streams)),
                     auth,
                     Cors(config.allowedOrigins),
                     config,
@@ -146,6 +147,7 @@ public class ApiServer private constructor(
             config: ApiConfig,
             store: Store,
             secrets: SecretStore,
+            identities: IdentityStore,
             auth: OperatorAuth,
             sessions: SessionRegistry,
             streams: StreamRegistry,
@@ -154,6 +156,7 @@ public class ApiServer private constructor(
                 AuthRoutes(auth, sessions, config).routes() +
                 ServerRoutes(store).routes() +
                 SecretRoutes(secrets).routes() +
+                IdentityRoutes(identities, sessions, config.clock).routes() +
                 StreamRoutes(store, config, streams).routes()
     }
 }

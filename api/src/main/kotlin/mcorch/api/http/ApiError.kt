@@ -46,7 +46,22 @@ internal enum class ErrorCode(
      */
     FORBIDDEN(403),
 
+    /** `POST` never overwrites, the same rule `POST /servers` follows. */
+    IDENTITY_EXISTS(409),
+
+    /**
+     * The change would leave no enabled superuser.
+     *
+     * Not because it is unrecoverable — the operator token is — but because that
+     * recovery needs shell access to the host, and an operator who does not
+     * realise it is one click from an orchestrator they can only fix that way.
+     */
+    LAST_SUPERUSER(409),
+
     NOT_FOUND(404),
+
+    /** No identity holds that name. */
+    IDENTITY_NOT_FOUND(404),
     METHOD_NOT_ALLOWED(405),
 
     /**
