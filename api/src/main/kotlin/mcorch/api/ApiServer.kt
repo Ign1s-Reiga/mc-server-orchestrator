@@ -17,6 +17,7 @@ import mcorch.api.http.Response
 import mcorch.api.http.Route
 import mcorch.api.http.RouteMatch
 import mcorch.api.http.Router
+import mcorch.api.http.StaticFiles
 import mcorch.api.routes.AuthRoutes
 import mcorch.api.routes.IdentityRoutes
 import mcorch.api.routes.MetaRoutes
@@ -32,6 +33,7 @@ import mcorch.store.StoreException
 import org.slf4j.LoggerFactory
 import java.io.IOException
 import java.net.InetSocketAddress
+import java.nio.file.Files
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -107,6 +109,7 @@ public class ApiServer private constructor(
                     auth,
                     Cors(config.allowedOrigins),
                     config,
+                    config.staticRoot?.let(::StaticFiles),
                 )
 
             val http = HttpServer.create(InetSocketAddress(config.bindHost, config.bindPort), BACKLOG)
@@ -175,6 +178,7 @@ internal class Dispatcher(
     private val auth: OperatorAuth,
     private val cors: Cors,
     private val config: ApiConfig,
+    private val staticFiles: StaticFiles?,
 ) {
     fun dispatch(exchange: HttpExchange) {
         val method = exchange.requestMethod.uppercase()
@@ -252,6 +256,17 @@ internal class Dispatcher(
         val found =
             when (match) {
                 RouteMatch.NoRoute -> {
+                    // The dashboard bundle, if this deployment serves one. Only
+                    // GET and HEAD: a POST to a path with no route is a client
+                    // error, and answering it with a page would hide that.
+                    val served = if (method == "GET" || method == "HEAD") staticFiles?.resolve(path) else null
+                    if (served != null) {
+                        return Response(
+                            status = 200,
+                            body = if (method == "HEAD") ByteArray(0) else Files.readAllBytes(served.file),
+                            contentType = served.contentType,
+                        )
+                    }
                     throw ApiException.notFound("no such endpoint: $method $path")
                 }
 
