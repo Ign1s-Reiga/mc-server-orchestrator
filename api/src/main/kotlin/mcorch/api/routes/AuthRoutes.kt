@@ -2,6 +2,7 @@ package mcorch.api.routes
 
 import mcorch.api.ApiConfig
 import mcorch.api.auth.OperatorAuth
+import mcorch.api.auth.Principal
 import mcorch.api.auth.SessionRegistry
 import mcorch.api.http.Access
 import mcorch.api.http.ApiException
@@ -47,12 +48,29 @@ internal class AuthRoutes(
      * and a body is the sort of thing that ends up in a har file attached to a
      * bug report.
      */
-    private fun open(request: Request): Response {
-        val supplied = auth.bearerToken(request) ?: auth.reject("send the operator token in `Authorization: Bearer`")
-        if (!auth.matchesOperatorToken(supplied)) auth.reject("the operator token is not correct")
+    private suspend fun open(request: Request): Response {
+        val supplied = auth.bearerToken(request) ?: auth.reject("send a credential in `Authorization: Bearer`")
+        val principal =
+            when {
+                // The bootstrap credential, which is outside the tier system.
+                auth.matchesOperatorToken(supplied) -> {
+                    Principal.BOOTSTRAP
+                }
 
-        val issued = sessions.create()
-        LOG.info("operator session opened expiresAt={} openSessions={}", issued.session.expiresAt, sessions.size())
+                else -> {
+                    auth.resolveIdentity(supplied)?.let(Principal::of)
+                        ?: auth.reject("that credential is not the operator token and not a known identity")
+                }
+            }
+
+        val issued = sessions.create(principal)
+        LOG.info(
+            "operator session opened identity={} tier={} expiresAt={} openSessions={}",
+            principal.name,
+            principal.tier,
+            issued.session.expiresAt,
+            sessions.size(),
+        )
         return Response.json(
             200,
             jsonObject {
@@ -60,6 +78,8 @@ internal class AuthRoutes(
                 put("method", "session")
                 // Readable by script on purpose: it is not a credential on its own,
                 // and the SPA has to echo it in X-CSRF-Token on every mutation.
+                put("identity", principal.name)
+                put("tier", principal.tier.wireValue)
                 put("csrfToken", issued.session.csrfToken)
                 put("expiresAt", issued.session.expiresAt)
             },
@@ -68,14 +88,18 @@ internal class AuthRoutes(
     }
 
     /** Who am I, and what CSRF token should I be sending. The SPA calls this on load. */
-    private fun describe(request: Request): Response {
+    private suspend fun describe(request: Request): Response {
         val credential = auth.authenticate(request)
         return Response.json(
             200,
             jsonObject {
                 put("authenticated", true)
+                // Reported so a dashboard can render the affordances it is allowed
+                // to use, rather than discovering its limits from a scatter of 403s.
+                put("identity", credential.principal.name)
+                put("tier", credential.principal.tier.wireValue)
                 when (credential) {
-                    OperatorAuth.Credential.OperatorToken -> {
+                    OperatorAuth.Credential.OperatorToken, is OperatorAuth.Credential.Bearer -> {
                         put("method", "bearer")
                         put("csrfToken", Json.Null)
                         put("expiresAt", Json.Null)
@@ -99,7 +123,7 @@ internal class AuthRoutes(
      * operator out at will is a nuisance attack, and the exemption would be one
      * more special case in the one place where special cases are expensive.
      */
-    private fun close(request: Request): Response {
+    private suspend fun close(request: Request): Response {
         val credential = auth.authenticate(request)
         if (credential is OperatorAuth.Credential.Session) {
             request.cookie(OperatorAuth.SESSION_COOKIE)?.let(sessions::revoke)
@@ -107,7 +131,7 @@ internal class AuthRoutes(
         } else {
             throw ApiException(
                 ErrorCode.BAD_REQUEST,
-                "there is no session to close: this request authenticated with the operator token",
+                "there is no session to close: this request authenticated with a bearer credential",
             )
         }
         return Response.empty(204, listOf("Set-Cookie" to cookie("", 0)))

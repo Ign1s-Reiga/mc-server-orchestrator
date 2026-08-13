@@ -548,7 +548,7 @@ class DisplayConformanceTest {
                 token = OperatorToken.of(token).getOrThrow(),
                 authFailureDelay = kotlin.time.Duration.ZERO,
             )
-        ApiServer.start(config, embedded.state, embedded.secrets).use { server ->
+        ApiServer.start(config, embedded.state, embedded.secrets, embedded.identities).use { server ->
             block(ApiClient("http://127.0.0.1:${server.port}", token))
         }
     }

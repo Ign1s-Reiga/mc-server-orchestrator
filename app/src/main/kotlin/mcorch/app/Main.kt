@@ -147,7 +147,12 @@ private fun serveApi(
 
         is ApiConfiguration.Listening -> {
             try {
-                ApiServer.start(configuration.config, orchestrator.store, orchestrator.secrets)
+                ApiServer.start(
+                    configuration.config,
+                    orchestrator.store,
+                    orchestrator.secrets,
+                    orchestrator.identities,
+                )
             } catch (failure: IOException) {
                 LOG.error(
                     "cannot start: the dashboard API could not bind {}:{} — {}",
