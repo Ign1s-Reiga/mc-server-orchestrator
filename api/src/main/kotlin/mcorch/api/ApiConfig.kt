@@ -120,6 +120,15 @@ public data class ApiConfig(
      * a failure.
      */
     val maxStreamLifetime: Duration = 30.minutes,
+    /**
+     * The dashboard bundle to serve, or null for an API-only deployment.
+     *
+     * `MCORCH_API_STATIC_ROOT`. Same-origin is what keeps the loopback plain-HTTP
+     * deployment viable — a cross-site dashboard needs `SameSite=None`, which
+     * needs `Secure`, which needs TLS. See
+     * [mcorch.api.http.StaticFiles].
+     */
+    val staticRoot: java.nio.file.Path? = null,
     val clock: Clock = Clock.systemUTC(),
 ) {
     init {
@@ -141,6 +150,7 @@ public data class ApiConfig(
         public const val MAX_BODY_VARIABLE: String = "MCORCH_API_MAX_BODY_BYTES"
         public const val COOKIE_SECURE_VARIABLE: String = "MCORCH_API_COOKIE_SECURE"
         public const val COOKIE_SAMESITE_VARIABLE: String = "MCORCH_API_COOKIE_SAMESITE"
+        public const val STATIC_ROOT_VARIABLE: String = "MCORCH_API_STATIC_ROOT"
 
         public const val DEFAULT_HOST: String = "127.0.0.1"
         public const val DEFAULT_PORT: Int = 8080
@@ -200,6 +210,7 @@ public data class ApiConfig(
                     maxBodyBytes = positiveInt(environment, MAX_BODY_VARIABLE, 1 shl 20),
                     cookieSecure = boolean(environment, COOKIE_SECURE_VARIABLE, secureDefault),
                     cookieSameSite = sameSite(environment, secureDefault),
+                    staticRoot = staticRoot(environment),
                     clock = clock,
                 ),
             )
@@ -280,6 +291,31 @@ public data class ApiConfig(
         internal fun isLoopback(host: String): Boolean =
             host == "127.0.0.1" || host == "::1" || host.equals("localhost", ignoreCase = true) ||
                 host.startsWith("127.")
+
+        /**
+         * The dashboard bundle to serve, or null.
+         *
+         * A directory that is not there is a **startup failure**, not a silently
+         * API-only server: somebody who set this variable meant to serve a
+         * dashboard, and a 404 on every page is a worse way to learn the path was
+         * wrong than a message at boot.
+         */
+        private fun staticRoot(environment: Map<String, String>): java.nio.file.Path? {
+            val raw = environment[STATIC_ROOT_VARIABLE]?.takeIf { it.isNotBlank() }?.trim() ?: return null
+            val path =
+                java.nio.file.Path
+                    .of(raw)
+                    .toAbsolutePath()
+                    .normalize()
+            require(
+                java.nio.file.Files
+                    .isDirectory(path),
+            ) {
+                "$STATIC_ROOT_VARIABLE is `$raw`, which is not a directory. It is the dashboard bundle to serve; " +
+                    "unset it for an API-only server"
+            }
+            return path
+        }
     }
 }
 

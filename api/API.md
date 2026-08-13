@@ -1318,6 +1318,17 @@ with nothing describing it.
 **Stop / kill / force.** See §1. `RouteTableTest` asserts no route matching those
 words exists.
 
+**Serving the dashboard** is no longer absent: set `MCORCH_API_STATIC_ROOT` and
+the bundle is served from this origin, with unmatched paths falling back to
+`index.html` so client-side routing works. `/api/…` and `/healthz` are never
+shadowed by a file, so a mistyped endpoint stays a `404` rather than becoming a
+page a client would parse as JSON.
+
+Same origin is the intended deployment: a cross-site dashboard needs
+`SameSite=None`, which needs `Secure`, which needs TLS. **A TLS-terminating proxy
+in front reinstates the access logs that same-origin removes** — worth knowing
+before adding one.
+
 **Metrics and pagination.** Not needed at this scale. `GET /api/v1/servers`
 returns everything; the change feed is the incremental path.
 
@@ -1340,6 +1351,7 @@ Per-user roles are no longer absent — see §2.1 and §9.
 | `MCORCH_API_MAX_BODY_BYTES` | `1048576` | |
 | `MCORCH_API_COOKIE_SECURE` | `false` on loopback, else `true` | |
 | `MCORCH_API_COOKIE_SAMESITE` | `Strict` | `Lax`, `None` (needs `Secure`) |
+| `MCORCH_API_STATIC_ROOT` | unset | the dashboard bundle to serve. Unset means API-only; a path that is not a directory fails at startup |
 
 There is **no default token**. Starting an unauthenticated API because a variable
 was unset is not something this can do: every mutating endpoint can request a

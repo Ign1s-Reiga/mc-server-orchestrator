@@ -78,9 +78,9 @@ It does not block drafting or implementation.
 - [x] **The RCON connection** — `RconConnection`. Auth handshake, multi-packet
       reassembly, and the per-server serialisation of
       [05-concurrency.md](05-concurrency.md) made structural by a `Mutex`.
-- [ ] **Static serving in `:api`** ([08-origin-and-client.md](08-origin-and-client.md) §1.1).
-      Independent of the console entirely, and the thing that makes same-origin
-      real rather than assumed.
+- [x] **Static serving in `:api`** ([08-origin-and-client.md](08-origin-and-client.md) §1.1).
+      `MCORCH_API_STATIC_ROOT`, off by default, with `/api/` and `/healthz` never
+      shadowed by a file.
 - [x] **The console channel on `Node`** — `Node.console`, shaped after
       `callEndpoint`. Connections are per call; session pooling is the
       optimisation [02-relay.md](02-relay.md) §4 describes and the interface
