@@ -14,6 +14,7 @@ import mcorch.api.render.ServerJson
 import mcorch.schema.ResourceName
 import mcorch.schema.SchemaViolation
 import mcorch.schema.ServerDefinition
+import mcorch.schema.Tier
 import mcorch.store.Precondition
 import mcorch.store.Store
 import mcorch.store.StoreException
@@ -47,13 +48,25 @@ internal class ServerRoutes(
 ) {
     fun routes(): List<Route> =
         listOf(
-            Route("GET", SERVERS, Access.OPERATOR) { request, _ -> HandlerResult.Send(list(request)) },
-            Route("POST", SERVERS, Access.OPERATOR) { request, _ -> HandlerResult.Send(create(request)) },
-            Route("GET", SERVER, Access.OPERATOR) { request, _ -> HandlerResult.Send(get(request)) },
-            Route("PUT", SERVER, Access.OPERATOR) { request, _ -> HandlerResult.Send(replace(request)) },
-            Route("DELETE", SERVER, Access.OPERATOR) { request, _ -> HandlerResult.Send(delete(request)) },
-            Route("GET", "$SERVER/status", Access.OPERATOR) { request, _ -> HandlerResult.Send(status(request)) },
-            Route("POST", "/api/v1/validate", Access.OPERATOR) { request, _ -> HandlerResult.Send(validate(request)) },
+            Route("GET", SERVERS, Access.AtLeast(Tier.MEMBER)) { request, _ -> HandlerResult.Send(list(request)) },
+            Route("POST", SERVERS, Access.AtLeast(Tier.OPERATOR)) { request, _ -> HandlerResult.Send(create(request)) },
+            Route("GET", SERVER, Access.AtLeast(Tier.MEMBER)) { request, _ -> HandlerResult.Send(get(request)) },
+            Route("PUT", SERVER, Access.AtLeast(Tier.OPERATOR)) { request, _ -> HandlerResult.Send(replace(request)) },
+            Route(
+                "DELETE",
+                SERVER,
+                Access.AtLeast(Tier.SUPERUSER),
+            ) { request, _ -> HandlerResult.Send(delete(request)) },
+            Route(
+                "GET",
+                "$SERVER/status",
+                Access.AtLeast(Tier.MEMBER),
+            ) { request, _ -> HandlerResult.Send(status(request)) },
+            Route(
+                "POST",
+                "/api/v1/validate",
+                Access.AtLeast(Tier.MEMBER),
+            ) { request, _ -> HandlerResult.Send(validate(request)) },
         )
 
     /**

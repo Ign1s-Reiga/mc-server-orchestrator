@@ -8,6 +8,7 @@ import mcorch.api.auth.SessionRegistry
 import mcorch.api.http.Access
 import mcorch.api.http.Route
 import mcorch.api.stream.StreamRegistry
+import mcorch.schema.Tier
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -53,7 +54,7 @@ class RouteTableTest {
         val mutatingMethods = setOf("POST", "PUT", "PATCH", "DELETE")
         val unprotected =
             table()
-                .filter { it.method in mutatingMethods && it.access == Access.PUBLIC }
+                .filter { it.method in mutatingMethods && it.access == Access.Public }
                 .map { "${it.method} ${it.pattern}" }
 
         // One exception, and it is the endpoint that *establishes* a credential:
@@ -65,7 +66,7 @@ class RouteTableTest {
     @Test
     fun `the only public read is the liveness probe`() {
         table()
-            .filter { it.method == "GET" && it.access == Access.PUBLIC }
+            .filter { it.method == "GET" && it.access == Access.Public }
             .map { it.pattern } shouldBe listOf("/healthz")
     }
 
@@ -124,7 +125,7 @@ class RouteTableTest {
     @Test
     fun `reading one secret key is routed to a refusal rather than left to a generic 404`() {
         val route = table().single { it.method == "GET" && it.pattern == "/api/v1/secrets/{name}/{key}" }
-        route.access shouldBe Access.OPERATOR
+        route.access shouldBe Access.AtLeast(Tier.SUPERUSER)
 
         val reply = api.call("GET", "/api/v1/secrets/anything/at-all")
         reply.status shouldBe 405
@@ -170,5 +171,55 @@ class RouteTableTest {
             reply.body.contains("My_Secret") shouldBe false
             reply.body.contains("pass!word") shouldBe false
         }
+    }
+
+    /**
+     * Every route states a tier, and the dangerous ones state the right one.
+     *
+     * `Access` is sealed and required, so "somebody forgot" cannot happen — this
+     * asserts the *values*, which the compiler cannot. The two rows that matter are
+     * not access-control decisions: `api/API.md` §12 says every mutating endpoint
+     * can request a drain, and a drain is how a Minecraft server stops.
+     */
+    @Test
+    fun `the routes that can end or replace a server require the tiers they should`() {
+        val tiers = table().associate { "${it.method} ${it.pattern}" to it.access }
+
+        // DELETE ends a server.
+        tiers["DELETE /api/v1/servers/{name}"] shouldBe Access.AtLeast(Tier.SUPERUSER)
+
+        // PUT is not obviously worse than a GET until you read what an edit does: a
+        // spec change makes the loop drain the running server and replace it. It
+        // sits at Operator knowingly — the replacement still drains, so a careless
+        // PUT costs a restart rather than data.
+        tiers["PUT /api/v1/servers/{name}"] shouldBe Access.AtLeast(Tier.OPERATOR)
+
+        // Writing the forwarding secret or an RCON password.
+        tiers["PUT /api/v1/secrets/{name}/{key}"] shouldBe Access.AtLeast(Tier.SUPERUSER)
+        tiers["DELETE /api/v1/secrets/{name}/{key}"] shouldBe Access.AtLeast(Tier.SUPERUSER)
+
+        // Creating cannot stop or replace anything that exists; the failure mode is
+        // a wasted container, which is recoverable.
+        tiers["POST /api/v1/servers"] shouldBe Access.AtLeast(Tier.OPERATOR)
+
+        // Reads.
+        tiers["GET /api/v1/servers"] shouldBe Access.AtLeast(Tier.MEMBER)
+        tiers["GET /api/v1/stream"] shouldBe Access.AtLeast(Tier.MEMBER)
+    }
+
+    @Test
+    fun `only the caller's own session is tier-independent`() {
+        // AnyIdentity is a deliberate choice, not a place to put a route whose tier
+        // nobody decided — so the set of routes using it is asserted whole. Reading
+        // who you are and logging yourself out cannot be tier-gated without locking
+        // the lowest tier out of its own login.
+        table()
+            .filter { it.access == Access.AnyIdentity }
+            .map { "${it.method} ${it.pattern}" }
+            .sorted() shouldBe
+            listOf(
+                "DELETE /api/v1/auth/session",
+                "GET /api/v1/auth/session",
+            )
     }
 }

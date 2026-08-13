@@ -16,6 +16,7 @@ import mcorch.api.stream.SseConnection
 import mcorch.api.stream.StreamClosed
 import mcorch.api.stream.StreamRegistry
 import mcorch.schema.ResourceName
+import mcorch.schema.Tier
 import mcorch.store.ChangeFeed
 import mcorch.store.ResourceVersion
 import mcorch.store.Store
@@ -111,7 +112,7 @@ internal class StreamRoutes(
 ) {
     fun routes(): List<Route> =
         listOf(
-            Route("GET", STREAM, Access.OPERATOR) { request, exchange -> stream(request, exchange) },
+            Route("GET", STREAM, Access.AtLeast(Tier.MEMBER)) { request, exchange -> stream(request, exchange) },
         )
 
     private suspend fun stream(

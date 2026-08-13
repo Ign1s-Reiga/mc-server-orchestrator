@@ -335,6 +335,48 @@ class AuthenticationTest {
                 ).status shouldBe 401
         }
 
+    @Test
+    fun `a tier below what a route requires is refused, and told which tier`() =
+        runTest {
+            // Every other test in this suite authenticates with the operator token,
+            // which is Superuser — so without this one the enforcement added with
+            // the route tiers would be entirely untested and the suite would still
+            // be green.
+            api.identities.put(
+                Identity(
+                    name = ResourceName.of("rin").getOrThrow(),
+                    credentialDigest = OperatorAuth.hex(OperatorAuth.digest(IDENTITY_CREDENTIAL)),
+                    tier = Tier.MEMBER,
+                    enabled = true,
+                    createdAt = Instant.parse("2026-08-13T09:00:00Z"),
+                ),
+            )
+            val asMember = listOf("Authorization" to "Bearer $IDENTITY_CREDENTIAL")
+
+            // A Member may read.
+            api.anonymous("GET", "/api/v1/servers", headers = asMember).status shouldBe 200
+
+            // And may not end a server. DELETE is Superuser because it is the
+            // endpoint that ends one.
+            val refused = api.anonymous("DELETE", "/api/v1/servers/anything", headers = asMember)
+            refused.status shouldBe 403
+            val error = refused.json()["error"] as Map<*, *>
+            error["code"] shouldBe "FORBIDDEN"
+
+            // Named so a dashboard can say "this needs superuser" rather than
+            // "forbidden", and so a client does not retry the login on it and loop.
+            error["requiredTier"] shouldBe "superuser"
+
+            // Nor write a secret.
+            api
+                .anonymous(
+                    "PUT",
+                    "/api/v1/secrets/some-secret/password",
+                    body = "material",
+                    headers = asMember + ("Content-Type" to "text/plain"),
+                ).status shouldBe 403
+        }
+
     private companion object {
         /** Long enough to be a real credential; the value itself is not asserted on. */
         const val IDENTITY_CREDENTIAL = "rin-credential-0123456789abcdef0123456789abcdef"

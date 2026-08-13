@@ -21,6 +21,7 @@ import mcorch.schema.SchemaVersion
 import mcorch.schema.ServerKind
 import mcorch.schema.ServerPhase
 import mcorch.schema.StorageMode
+import mcorch.schema.Tier
 import mcorch.store.StatePart
 
 /**
@@ -41,10 +42,10 @@ internal class MetaRoutes(
 ) {
     fun routes(): List<Route> =
         listOf(
-            Route("GET", "/healthz", Access.PUBLIC) { _, _ ->
+            Route("GET", "/healthz", Access.Public) { _, _ ->
                 HandlerResult.Send(Response.json(200, jsonObject { put("status", "ok") }))
             },
-            Route("GET", "/api/v1/meta", Access.OPERATOR) { _, _ -> HandlerResult.Send(meta()) },
+            Route("GET", "/api/v1/meta", Access.AtLeast(Tier.MEMBER)) { _, _ -> HandlerResult.Send(meta()) },
         )
 
     private fun meta(): Response =

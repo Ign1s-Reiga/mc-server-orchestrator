@@ -35,9 +35,9 @@ internal class AuthRoutes(
             // PUBLIC in the router's sense only: this is where a credential is
             // *established*, so the generic authenticator cannot run first. The
             // handler does the check itself, and does nothing else until it passes.
-            Route("POST", SESSION, Access.PUBLIC) { request, _ -> HandlerResult.Send(open(request)) },
-            Route("GET", SESSION, Access.OPERATOR) { request, _ -> HandlerResult.Send(describe(request)) },
-            Route("DELETE", SESSION, Access.OPERATOR) { request, _ -> HandlerResult.Send(close(request)) },
+            Route("POST", SESSION, Access.Public) { request, _ -> HandlerResult.Send(open(request)) },
+            Route("GET", SESSION, Access.AnyIdentity) { request, _ -> HandlerResult.Send(describe(request)) },
+            Route("DELETE", SESSION, Access.AnyIdentity) { request, _ -> HandlerResult.Send(close(request)) },
         )
 
     /**
