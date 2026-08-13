@@ -3,6 +3,7 @@ package mcorch.schema.yaml
 import io.kotest.matchers.collections.shouldContainExactly
 import io.kotest.matchers.nulls.shouldBeNull
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.types.shouldBeInstanceOf
 import mcorch.schema.DrainPolicy
 import mcorch.schema.ImageRef
@@ -16,6 +17,8 @@ import mcorch.schema.ResourceName
 import mcorch.schema.SchemaVersion
 import mcorch.schema.ServerKind
 import mcorch.schema.StorageSpec
+import mcorch.schema.Tier
+import mcorch.schema.fixtures.ExampleDefinitions
 import mcorch.schema.getOrThrow
 import mcorch.schema.violations
 import org.junit.jupiter.api.Test
@@ -175,5 +178,32 @@ class PaperServerParseTest {
         // The store and the loop compare specs to decide whether anything
         // changed; parsing has to be a pure function for that to work.
         parse("valid/full.yaml") shouldBe parse("valid/full.yaml")
+    }
+
+    @Test
+    fun `the console ceiling parses, and defaults to the most restrictive tier`() {
+        parse("valid/full.yaml").spec.console.maxTier shouldBe Tier.OPERATOR
+
+        // A definition that says nothing gets the least. Same side holdsWorldData
+        // and persistent storage default to: the server whose author never
+        // considered the console is where an unconsidered default should do least.
+        parse("valid/minimal.yaml").spec.console.maxTier shouldBe Tier.MEMBER
+    }
+
+    @Test
+    fun `a tier the schema does not know is a violation rather than a fallback`() {
+        val result =
+            ServerDefinitionParser.parse(
+                parse("valid/minimal.yaml")
+                    .let { "" } +
+                    ExampleDefinitions.valid("minimal.yaml").replace(
+                        "spec:",
+                        "spec:\n  console:\n    maxTier: emperor",
+                    ),
+                "console-tier.yaml",
+            )
+        val violations = result.shouldBeInstanceOf<ParseResult.Invalid>().violations
+        violations.single().field shouldBe "spec.console.maxTier"
+        violations.single().problem shouldContain "member, operator, superuser"
     }
 }

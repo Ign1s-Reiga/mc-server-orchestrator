@@ -103,6 +103,7 @@ within it — but the HTTP API takes **one document per request**.
 | `spec.network` | — | **required**, because `rcon.passwordSecret` is |
 | `spec.network.rcon.port` | `25575` | must differ from `network.port` |
 | `spec.network.rcon.passwordSecret` | — | **required**. There is no `enabled` field |
+| `spec.console.maxTier` | `member` | `member`, `operator` or `superuser` |
 | `spec.storage.mode` | `persistent` | `persistent` or `ephemeral` |
 | `spec.storage.mountPath` | `/data` | absolute, not a system path |
 | `spec.storage.volume.name` | `metadata.name` | persistent only |
@@ -178,6 +179,24 @@ password all leave a fully configured server unable to confirm a save.
 *Configured* and *responsive* are different properties —
 [failure-modes.md](failure-modes.md) is where the consequences live, and
 [operating.md](operating.md) note 1 is what an operator meets.
+
+### The console ceiling clamps, it never grants
+
+`spec.console.maxTier` is the highest tier the remote console accepts **on this
+server**. It does not give anybody anything: the effective tier of a console
+request is the lesser of what the caller holds and what this says, so a
+`superuser` is an `operator` on a server declaring `operator`, and a `member` is
+still a `member` on one declaring `superuser`.
+
+It defaults to `member` — read-only commands and nothing that changes the world.
+That is the same side persistent storage and drain-before-stop default to: the
+server whose author never thought about the console is exactly where an
+unconsidered default should do the least. Opening it is one line, and an operator
+writing that line has decided to.
+
+A tier this build does not recognise is a violation, not a fallback. Choosing a
+privilege level on an author's behalf is not something a parser should do, and the
+safe-looking choice is still a choice.
 
 ### Ephemeral storage is opt-in and means what it says
 

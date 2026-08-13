@@ -95,13 +95,15 @@ It does not block drafting or implementation.
       Nothing in Gate 2 can be built before it, and per
       [auth/03-authorization.md](auth/03-authorization.md) §5 the console's tier
       gate ships after the API-wide tier assignment, not before.
-- [ ] **Tier allow-lists and the audit sink** ([04-output.md](04-output.md)).
-      Gated by multi-identity auth. No parsers: `Superuser` is unrestricted below
-      Gate 1, and the two lower tiers carry explicit sets.
-- [ ] **`spec.console`** — `maxTier` and `auditCommandText`, `:schema` plus
-      consumers in one change, per the `add-server-kind` procedure. Lands *with*
-      the audit sink and the tier gate, never before them: a field the loop does
-      not honour is the first failure that procedure names.
+- [x] **Tier allow-lists** — `ConsolePolicy`. `Superuser` is unrestricted below
+      Gate 1; the two lower tiers carry explicit sets.
+- [ ] **The audit sink** ([04-output.md](04-output.md) §3), which lands with
+      `spec.console.auditCommandText` — the field and its only consumer together.
+- [x] **`spec.console.maxTier`** — landed with `ConsolePolicy`, which is what
+      honours it. `auditCommandText` waits for the sink, for the same reason:
+      a field nothing honours is the first failure `add-server-kind` names.
+- [ ] **The console endpoint** — `POST /api/v1/servers/{name}/console`
+      ([07-api.md](07-api.md)), which is what makes any of this reachable.
 - [ ] **The contract into `api/API.md`** — §11 amended as roles and the audit log
       arrive, and **§13 amended to carve out the console**, which is the one
       endpoint that returns player names, UUIDs and client addresses.
