@@ -22,6 +22,7 @@ import mcorch.schema.PaperServerDefaults
 import mcorch.schema.PaperServerDefinition
 import mcorch.schema.PaperServerStatus
 import mcorch.schema.ResourceName
+import mcorch.store.Precondition
 import mcorch.store.Store
 import mcorch.store.StoreException
 import mcorch.store.WriteOutcome
@@ -29,6 +30,7 @@ import org.slf4j.LoggerFactory
 import java.time.Clock
 import java.time.Instant
 import kotlin.time.Duration
+import kotlin.time.toJavaDuration
 
 /**
  * Stopping a server whose drain cannot finish.
@@ -210,11 +212,17 @@ public sealed interface OccupancyAcknowledgement {
  * identically to a save that was issued and timed out. They are the two halves an
  * audit record needs to tell "retired a stuck server" from "lost a world".
  *
- * [playersOnline] is the count read **immediately before the stop**, not the one
- * the caller acknowledged: an audit record of who was dropped has to be from the
- * instant they were dropped. It is null when that probe did not answer. **Null is
- * not zero** — reading it as zero is how this path would come to stop a populated
- * server while reporting that it did not.
+ * [playersOnline] is the count this stop was decided on, never the one the caller
+ * acknowledged. It is null when the probe did not answer. **Null is not zero** —
+ * reading it as zero is how this path would come to stop a populated server while
+ * reporting that it did not.
+ *
+ * On a **sealed** server it is the reading taken before the save, which may have
+ * run for a save timeout since. That is deliberate and is not worth another probe:
+ * under the seal the number can only fall, so the record over-states who was
+ * dropped, and over-stating is the safe direction for a field an investigator
+ * reads after a world is lost. On an **unsealed** one it is re-read immediately
+ * before the stop, because there the number can rise.
  */
 public data class ForcedStopOutcome(
     val saveAttempted: Boolean,
@@ -305,7 +313,7 @@ public class NodeForcedTermination(
         // a mismatch costs the caller neither a flush nor a save timeout.
         val players = occupancy(agent, node, observation)
         refuseOccupancy(name, players, acknowledgement)
-        refuseUnsealedPopulation(name, seal, players)
+        refuseUnsealedPopulation(name, seal, players, acknowledgement)
 
         val save = requestSave(agent, node, observation)
         val attempted = save !is SaveOutcome.Unconfirmable && save !is SaveOutcome.NotDelivered
@@ -407,10 +415,24 @@ public class NodeForcedTermination(
             when (val fleet = ProxyFleet.resolve(store, stored)) {
                 is ProxyFleet.Resolution.Behind -> fleet.binding
 
-                // Standalone: no proxy routes to it, so there is no door. Conflicted:
-                // two proxies claim it and sealing one leaves the other admitting, so
-                // sealing is not something this can do — the same degradation the
-                // reconcile path takes rather than picking one.
+                // Two proxies claim it, and sealing one leaves the other admitting —
+                // the same degradation the reconcile path takes rather than picking
+                // one. **[SealResult.FAILED], not [SealResult.NOTHING_TO_SEAL]:**
+                // there are two doors and neither can be shut, which is strictly
+                // worse than having none.
+                //
+                // Filing it under "no door" inverted the ladder, because
+                // [refuseUnsealedPopulation] only bites on `FAILED` — a populated
+                // backend behind *one* unreachable proxy was refused, and one behind
+                // *two* wide-open proxies was stopped. The worse case treated more
+                // permissively than the milder one, off a comment that reasoned
+                // about it correctly and then routed it to the value whose
+                // documented meaning is the opposite.
+                is ProxyFleet.Resolution.Conflicted -> return SealResult.FAILED
+
+                // Standalone: no proxy routes to it at all, so players reach it
+                // directly and there is no door. The pre-stop re-probe is what
+                // stands in for one.
                 else -> return SealResult.NOTHING_TO_SEAL
             }
         val runtime = (stored.status?.status as? PaperServerStatus)?.runtime
@@ -445,8 +467,25 @@ public class NodeForcedTermination(
         name: ResourceName,
         seal: SealResult,
         players: Int?,
+        acknowledgement: OccupancyAcknowledgement,
     ) {
         if (seal != SealResult.FAILED || players == 0) return
+        // **An acknowledged unreadable count is let through, and this is the branch
+        // that had no way out.**
+        //
+        // The refusal's whole basis is protecting a *count* from decaying between
+        // the reading and the `SIGTERM`. When there is no count there is nothing to
+        // protect, and the operator has already said in the request that they know
+        // it cannot be read.
+        //
+        // Without this the endpoint refused exactly the population it exists for.
+        // A wedged server does not answer a Server List Ping, so `players` is null,
+        // and `null == 0` is false — so "wait for the server to empty" could never
+        // be taken: the count never reads zero, it reads unknown, forever. Pair
+        // that with a proxy that will not answer, which is not an exotic pairing
+        // when a node is having a bad minute, and the definition was tombstoned,
+        // frozen, undrainable and `crictl`-only.
+        if (players == null && acknowledgement == OccupancyAcknowledgement.Unreadable) return
         throw ForcedTerminationRefused(
             "`${name.value}` could not have its login path shut at the proxy, and it is not empty, so nothing " +
                 "stops a player joining between the count this stop is based on and the stop itself. Restore " +
@@ -473,11 +512,25 @@ public class NodeForcedTermination(
      */
     private suspend fun refuseSecondSideEffect(name: ResourceName) {
         val drain = (store.getServer(name)?.status?.status as? PaperServerStatus)?.drain ?: return
-        if (drain.stopDispatchedAt != null) {
+        val dispatched = drain.stopDispatchedAt
+        // **Bounded by the grace period, not by the stamp's existence.**
+        //
+        // The reason to refuse is that the container is *inside* its grace period
+        // running a shutdown save. Once that window has passed the reason is gone,
+        // and `DrainController.awaitStopped` already holds the licence this borrows:
+        // it re-issues a stop that did not take, with the same grace period.
+        //
+        // Keying on the stamp alone locked the hatch permanently. `stop` records the
+        // dispatch *before* `stopWorkload` — correct, and the field's KDoc argues
+        // that asymmetry — so a `NodeException` from the stop leaves the stamp
+        // written and the container running. The caller is told "nothing was
+        // stopped", every retry then meets this refusal, the definition is
+        // tombstoned so nothing can be edited, and the drain cannot finish for the
+        // population this path exists for. One transient CRI failure was enough.
+        if (dispatched != null && clock.instant() < dispatched.plus(graceWindow(name))) {
             throw ForcedTerminationRefused(
-                "`${name.value}` already has a stop in flight, dispatched at ${drain.stopDispatchedAt}. It is " +
-                    "inside its grace period; forcing again would send a second save into a server already " +
-                    "shutting down",
+                "`${name.value}` already has a stop in flight, dispatched at $dispatched. It is inside its " +
+                    "grace period; forcing again would send a second save into a server already shutting down",
             )
         }
         if (drain.saveRequestedAt != null) {
@@ -487,6 +540,21 @@ public class NodeForcedTermination(
                     "running one; wait for it to confirm or fail",
             )
         }
+    }
+
+    /**
+     * How long a dispatched stop is still "in flight" for.
+     *
+     * The declared grace period, raised by the shutdown-save allowance so it can
+     * never be shorter than the window [stop] itself might have given the
+     * container. A definition that will not read falls back to the allowance
+     * rather than to zero: a window of zero would make the refusal above vanish
+     * entirely, which is the failure this bound was added to avoid in reverse.
+     */
+    private suspend fun graceWindow(name: ResourceName): java.time.Duration {
+        val definition = (store.getServer(name)?.definition?.definition as? PaperServerDefinition)
+        val declared = definition?.spec?.lifecycle?.stopGracePeriod ?: SHUTDOWN_SAVE_ALLOWANCE
+        return maxOf(declared, SHUTDOWN_SAVE_ALLOWANCE).toJavaDuration()
     }
 
     /**
@@ -536,20 +604,27 @@ public class NodeForcedTermination(
                             )
                             return@withContext
                         }
+                val held = stored.status ?: return@withContext
                 val next = status.copy(drain = status.drain?.dispatchingStop(now) ?: forcedStopDrain(now))
-                when (val outcome = store.putStatus(next)) {
-                    is WriteOutcome.Applied -> {
-                        Unit
-                    }
-
-                    is WriteOutcome.Conflict -> {
-                        LOG.error(
-                            "could not record a forced stop dispatch server={} reason={} — the loop may start a " +
-                                "drain over a container already shutting down",
-                            name.value,
-                            outcome,
-                        )
-                    }
+                // **Conditional, because this is no longer the only writer of
+                // observed state.**
+                //
+                // `SqliteStore.putStatus` is an unconditional upsert without a
+                // precondition, and `next` is built from a snapshot two store calls
+                // old. A reconcile pass overlapping this request — the ordinary
+                // case, since the tombstone hits the change feed and queues the
+                // server — would have had its own fields overwritten away by this
+                // write. Losing `saveRequestedAt` disarms the never-re-send wedge;
+                // losing `sealRequestedAt` leaves a backend sealed with nothing
+                // knowing to restore it.
+                //
+                // Retried once on a conflict rather than logged: a conflict means a
+                // pass wrote in between, and a re-read resolves it. The
+                // log-and-carry posture below is for a store that is *down*, which
+                // a second read would not fix either.
+                when (store.putStatus(next, Precondition.AtVersion(held.resourceVersion))) {
+                    is WriteOutcome.Applied -> Unit
+                    is WriteOutcome.Conflict -> retryStopDispatched(name, now)
                 }
             } catch (failure: StoreException) {
                 LOG.error(
@@ -560,6 +635,31 @@ public class NodeForcedTermination(
                 )
             }
         }
+    }
+
+    /**
+     * One re-read and one more attempt, then the log line.
+     *
+     * Not a loop. A second conflict means passes are landing faster than this can
+     * read, and spinning under [NonCancellable] would hold a shutdown open; the
+     * container still has to be stopped either way, and the stop is what the
+     * caller is waiting on.
+     */
+    private suspend fun retryStopDispatched(
+        name: ResourceName,
+        now: Instant,
+    ) {
+        val stored = store.getServer(name)
+        val status = stored?.status?.status as? PaperServerStatus
+        val held = stored?.status
+        if (status == null || held == null) return
+        val next = status.copy(drain = status.drain?.dispatchingStop(now) ?: forcedStopDrain(now))
+        if (store.putStatus(next, Precondition.AtVersion(held.resourceVersion)) is WriteOutcome.Applied) return
+        LOG.error(
+            "could not record a forced stop dispatch server={} — a reconcile pass wrote twice underneath it. " +
+                "The loop may start a drain over a container already shutting down",
+            name.value,
+        )
     }
 
     private fun forcedStopDrain(now: Instant): DrainStatus =

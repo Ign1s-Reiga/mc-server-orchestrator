@@ -2590,3 +2590,58 @@ Related: [[standalone-paper-drain-shape]]
      it binding without `:core` writing desired state" is usually answerable:
      reading observed state is not writing desired state, and the field in
      question is one `:core` already owns.
+
+## Round 52: two writers of observed state, neither of them compare-and-swapping
+
+219. **"The loop is the only writer of observed state" is a premise, not a
+     comment, and the second writer invalidates three things at once.**
+     `SqliteStore.putStatus` says it deliberately does not append to the change
+     feed *because* the loop is the only writer — so a status written from
+     anywhere else never reaches the SSE stream. Worse, neither writer uses a
+     precondition: `Reconciler` passes `observedDefinition` but no
+     `Precondition`, and a new caller passing `Precondition.None` performs a
+     read-modify-write with no CAS. The two clobber each other in **both**
+     directions — an outside write can erase the drain's `saveRequestedAt` (the
+     never-re-send wedge, item 6) or `sealRequestedAt` (item 32), and the loop's
+     next pass, building its status from a snapshot read before the outside write,
+     erases the outside record. When a second writer is introduced to a field the
+     loop owns, grep the store for sentences justifying anything *by* the single
+     writer, and give both sides `Precondition.AtVersion`.
+220. **A stamp written before the side effect locks the retry out when the side
+     effect fails.** `stopDispatchedAt` is deliberately written before
+     `stopWorkload` — right, and the field's KDoc argues the asymmetry. But a
+     guard that refuses a *new* force while `stopDispatchedAt != null` then turns a
+     transient `NodeException` from that same call into a permanent lockout: the
+     error says "Nothing was stopped", the record says a stop is in flight, the
+     definition is already tombstoned so nothing can be edited, and the drain
+     cannot finish for the population the path exists for. `awaitStopped` has the
+     licence this needs — it re-issues a stop that did not take — so a refusal
+     keyed on the stamp must be bounded by the grace period, not by the stamp's
+     existence.
+221. **`null` is not zero, and a bypass written `== 0` therefore excludes exactly
+     the population the feature is for.** `refuseUnsealedPopulation` lets an
+     *empty* server through when the seal fails, on the drain's own
+     `sealIsPrecondition` trade. A wedged server does not answer a probe, so its
+     count is `null`, so it is never "empty" — and a wedged backend behind an
+     unreachable proxy is refused for ever, below the tombstone, with both stated
+     remedies ("fix the proxy, or wait for it to empty") outside the caller's
+     reach. Whenever a refusal has an escape hatch keyed on a count, evaluate the
+     hatch at `null` before believing the refusal is recoverable.
+222. **A three-valued seal result whose "nothing to seal" arm has two producers
+     inverts the safety ordering.** `Standalone` (no proxy routes here) and
+     `Conflicted` (two proxies claim it and both are admitting) collapse into one
+     `NOTHING_TO_SEAL`, so the populated-and-unsealable refusal never fires for
+     `Conflicted` — the case with *two* open doors is treated more permissively
+     than the case with one door that would not shut. When an enum arm is reached
+     by an `else ->` over a sealed hierarchy, name the members rather than the
+     remainder, and check that each one satisfies the arm's own KDoc sentence.
+223. **A drain step re-implemented outside the loop inherits the loop's
+     re-assertion, and `DRAIN_FAILED` declines to re-assert.** "The seal I left
+     behind is fine because the drain re-asserts it" holds only while the drain is
+     advancing. For a permanently parked drain — the population an escape hatch
+     exists for — `DRAIN_FAILED` deliberately does not re-assert, and
+     `assertBackends` is unreachable because every pass on a terminating
+     definition drains. The seal then survives as unpersisted proxy state until
+     the proxy restarts (item 46). Not a harm, but the justification is false, and
+     a false justification beside a correct decision is what this project keeps
+     having to unpick.

@@ -7,6 +7,7 @@ import io.kotest.matchers.string.shouldContain
 import mcorch.core.ProxyHarness
 import mcorch.core.backendDefinition
 import mcorch.core.coreTest
+import mcorch.core.proxyDefinition
 import org.junit.jupiter.api.Test
 
 /**
@@ -94,6 +95,76 @@ internal class ForcedSealTest {
             // the acknowledgement is a compare-and-swap and nothing is holding the
             // value it swapped against. Recoverable: fix the proxy, or wait for the
             // server to empty, and force again.
+            node.stops shouldHaveSize 0
+        }
+
+    @Test
+    fun `a wedged server behind a dead proxy can still be forced, once the operator says so`() =
+        coreTest {
+            val harness = harness()
+            harness.bringUp()
+            val node = harness.nodeOf(backend)
+            // Both halves of one bad minute, which is how they usually arrive: the
+            // backend has stopped answering a Server List Ping — the note-1
+            // population, and the only reason this endpoint exists — and the proxy's
+            // control channel is down too.
+            node.joinable = false
+            harness.plugin.ready = false
+
+            terminationOver(harness).stop(backend, OccupancyAcknowledgement.Unreadable)
+
+            // **The branch that had no way out.** The unsealed-population refusal
+            // reads `players == 0` to mean "nothing to protect", and an unanswered
+            // probe is null, not zero — so "wait for the server to empty" could
+            // never be taken by a server that never answers a count. The only other
+            // remedy was another system's health. Tombstoned, frozen, `crictl` only:
+            // the exact state this path exists to remove, reached by the exact
+            // population it was built for.
+            //
+            // Letting an *acknowledged* unreadable count through is not a hole. The
+            // refusal protects a count from decaying between the reading and the
+            // `SIGTERM`, and here there is no count to protect — the operator has
+            // said in the request that they know it cannot be read.
+            node.stops shouldHaveSize 1
+        }
+
+    @Test
+    fun `an unacknowledged wedged server behind a dead proxy is still refused`() =
+        coreTest {
+            val harness = harness()
+            harness.bringUp()
+            val node = harness.nodeOf(backend)
+            node.joinable = false
+            harness.plugin.ready = false
+
+            // The escape above is opened by the acknowledgement and by nothing else.
+            shouldThrow<ForcedTerminationRefused> {
+                terminationOver(harness).stop(backend, OccupancyAcknowledgement.None)
+            }
+            node.stops shouldHaveSize 0
+        }
+
+    @Test
+    fun `a backend two proxies both claim is refused, not treated as having no proxy`() =
+        coreTest {
+            // Two proxies whose selectors both match, so `ProxyFleet.resolve` answers
+            // `Conflicted` and neither door can be shut.
+            val harness = ProxyHarness(backends = listOf(backend))
+            harness.bringUp()
+            harness.declare(proxyDefinition(name = "front-02", node = "proxy-node"))
+            val node = harness.nodeOf(backend)
+            node.online = 4
+
+            shouldThrow<ForcedTerminationRefused> {
+                terminationOver(harness).stop(backend, OccupancyAcknowledgement.Count(4))
+            }.message.toString() shouldContain "could not have its login path shut"
+
+            // The first version filed `Conflicted` under `NOTHING_TO_SEAL`, whose own
+            // KDoc says "nothing routes to this server, so there is no door to shut"
+            // — the opposite of what is true here, where two proxies are both
+            // admitting. That inverted the ladder: a populated backend behind ONE
+            // unreachable proxy was refused, and one behind TWO wide-open proxies was
+            // stopped. The worse case treated more permissively than the milder one.
             node.stops shouldHaveSize 0
         }
 

@@ -407,7 +407,10 @@ internal class NodeForcedTerminationTest {
         coreTest {
             val node = FakeNode()
             running(node)
-            val first = Instant.parse("2020-01-01T00:00:00Z")
+            // Inside the grace window, so the stop really is still in flight. The
+            // refusal is bounded by that window rather than by the stamp existing —
+            // see the test below for why.
+            val first = Instant.now()
             observed(
                 drain =
                     DrainStatus(
@@ -426,6 +429,41 @@ internal class NodeForcedTerminationTest {
             }.message.toString() shouldContain "already has a stop in flight"
             node.stops shouldHaveSize 0
             recordedDrain()?.stopDispatchedAt shouldBe first
+        }
+
+    @Test
+    fun `a stop dispatched longer ago than the grace period no longer bars a force`() =
+        coreTest {
+            val node = FakeNode()
+            running(node)
+            // Long past any grace period a definition can carry.
+            val ancient = Instant.parse("2020-01-01T00:00:00Z")
+            observed(
+                drain =
+                    DrainStatus(
+                        state = DrainState.STOPPING,
+                        startedAt = ancient,
+                        enteredStateAt = ancient,
+                        stopDispatchedAt = ancient,
+                    ),
+            )
+
+            terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.None)
+
+            // **The escape hatch had a lock on it.** `stop` records the dispatch
+            // *before* calling the node — correct, and the field's KDoc argues that
+            // asymmetry — so a `NodeException` from the stop leaves the stamp
+            // written and the container still running. Keying the refusal on the
+            // stamp's existence then refused every retry, forever: the definition is
+            // tombstoned so nothing can be edited, the drain cannot finish for the
+            // population this path exists for, and one transient CRI failure was
+            // enough to make a server `crictl`-only.
+            //
+            // Bounding it by the grace period matches `DrainController.awaitStopped`,
+            // which already re-issues a stop that did not take. Once the window has
+            // passed, the reason to refuse — the container is mid-shutdown-save — has
+            // passed with it.
+            node.stops shouldHaveSize 1
         }
 
     @Test
