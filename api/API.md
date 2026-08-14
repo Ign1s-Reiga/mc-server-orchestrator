@@ -784,6 +784,14 @@ reported and the second reading that can refuse.
 
 A server observed with **zero** players needs no acknowledgement at all.
 
+**Poll, don't stream, if you want to see a forced stop promptly.** The message
+above offers both, and for this one path they are not equivalent: the drain
+transition a forced stop writes does not append to the change feed, because status
+writes never do. `GET` reads the row directly and sees it immediately; a stream
+consumer sees it when the reconcile loop next writes a status, within one loop
+step. The stream is **late here, not wrong** — nothing is dropped, and the loop
+converges on the stopped container regardless.
+
 Why a count: a boolean says *"proceed regardless"*, which cannot notice that the
 population changed between an operator deciding and the request landing, and does
 not require them to have looked. It would also be **mandatory on essentially every

@@ -246,7 +246,15 @@ internal class TestStore(
      * test that writes between passes proves nothing about that window, because
      * the next pass simply reads the newer value.
      *
-     * Cleared when it fires, so one arming interleaves one read.
+     * Cleared when it fires, so one arming interleaves one read — and **which**
+     * read it lands on is load-bearing, not incidental. It is meant to follow the
+     * *pass's own snapshot read*, so the callback's write lands inside the window
+     * between that snapshot and the pass's write. `Reconciler.preservingDispatch`
+     * also calls `getServer`; had the hook attached to that re-read instead, the
+     * writer would land in the residual window after it and a test asserting the
+     * carry-forward would be red against correct code. It follows the snapshot only
+     * because the pass reads first, so an extra read added anywhere earlier in a
+     * pass moves this silently.
      */
     var afterNextRead: (suspend () -> Unit)? = null
 

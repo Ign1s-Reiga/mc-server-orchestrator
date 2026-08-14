@@ -3046,9 +3046,44 @@ public class Reconciler(
      * synthesised: the stamp needs a drain to hang on, and inventing one here would
      * be this function authoring drain state instead of preserving it.
      *
-     * **Read only for a terminating definition.** The forced path cannot run
-     * against anything else — the API tombstones before it calls the seam — so
-     * nothing on the steady-state hot path pays for this.
+     * ## The `terminating` gate is load-bearing for correctness, not only for cost
+     *
+     * It was added as an optimisation — the forced path cannot run against a live
+     * definition, because the API tombstones before it calls the seam, so nothing on
+     * the steady-state hot path pays for the re-read. **That is its lesser job.**
+     *
+     * The safety argument is not "the drain owns `stopDispatchedAt` on non-terminating
+     * paths": every `REPLACEMENT` and `RELOCATION` drain stamps it on a live
+     * definition, so that claim is simply false. It is narrower and it is checkable
+     * by enumerating writers of `PaperServerStatus` — **the only second writer of
+     * observed state requires a tombstone**, and a sole writer cannot lose its own
+     * stamp to itself.
+     *
+     * What the gate also does, silently, is keep this function away from the one
+     * place where a draft's `null` drain is a **decision** rather than staleness.
+     * `clearedDrainRecord` returns null deliberately, and `Reconciler.ProxyPass`
+     * re-derives `sealed` and `letGo` from the stored record every proxy pass — so a
+     * record that vanishes un-seals and re-registers the backend, level-triggered.
+     * The `?: current` arm below would suppress that undo and leave a backend sealed
+     * and deregistered for good. The same goes for a `CREATED` observation, whose
+     * surviving record `stopIsInFlight` says once *"made the next pass drain the
+     * replacement that had just been built, for ever"*.
+     *
+     * Both are unreachable today, and precisely because of this gate: neither
+     * `clearedDrainRecord` call site is on a path a terminating definition takes —
+     * `forbiddenTransition` never refuses a delete, and `converge` is the
+     * non-draining path while a terminating definition always drains.
+     *
+     * **So widening this condition is not a performance decision.** A second force
+     * path, or someone reasonably concluding the re-read is cheap, breaks two
+     * unrelated correctness properties with nothing to say so.
+     *
+     * `DrainWiringTest.every drain record this loop retires is retired through the
+     * one rule` does not cover that hazard and must not be read as covering it: it
+     * enumerates *retirements*, and this function never retires a record — it
+     * un-retires one, which is the opposite operation. What it does catch is the
+     * addition of a new `drain = <value>` assignment, which is how it caught this
+     * one.
      */
     private suspend fun preservingDispatch(
         stored: StoredServer,
