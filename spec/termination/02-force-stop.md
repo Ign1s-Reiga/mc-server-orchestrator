@@ -19,6 +19,23 @@ the name-freeing guard all working exactly as they do now.
 
 ## 2. Semantics: it skips the patience, not the save
 
+> **As built, this is not a change to the drain — and that is a correction to what
+> this section originally specified.**
+>
+> The exemptions below were written as behaviour inside `DrainController`. Two
+> things in that file refuse them. `DrainPass.cause` carries an explicit rule —
+> *"what a drain does is the same whatever asked for it, and a cause consulted at a
+> gate is how a delete comes to take a path a replacement was written for"* — and
+> force-as-exemptions is exactly a per-drain variation read at gates.
+> `DrainStatus.mayStop` is the single precondition for every stop in the file,
+> carrying a comment saying it exists to catch *"a future edit that routes into
+> the stop without a current save"*.
+>
+> So `NodeForcedTermination` does what `docs/operating.md` note 1 already tells an
+> operator to do by hand — save, stop, let the teardown observe it — and the drain
+> is untouched. The table below still describes the *effect*; it no longer
+> describes where the code lives.
+
 This is the whole design, and it follows from *when the button gets used*.
 
 An operator reaches for Force Stop when an ordinary delete did not finish — which
@@ -45,15 +62,69 @@ likely to do permanent damage. An immediate kill is therefore not what it does.
 
 Two of those rows are the ones that matter.
 
-**The save is always requested and always waited for.** Skipping it would save an
-operator the save timeout — tens of seconds — in exchange for the data the whole
-system exists to protect. That is not a trade worth offering. In the common case
-(RCON wedged but the server still writing) the wait is what lets an in-flight save
-finish.
+**The save is requested wherever a request can be sent, and always waited for.**
+Skipping it would save an operator the save timeout — tens of seconds — in
+exchange for the data the whole system exists to protect. That is not a trade
+worth offering. In the common case (RCON wedged but the server still writing) the
+wait is what lets an in-flight save finish.
 
-**The grace period is unchanged.** `spec.lifecycle.stopGracePeriod` is the
-last-resort net that lets a server flush on `SIGTERM`. Shortening it under
-"force" would remove the one protection that still works when RCON does not.
+> An earlier draft of this file said *always requested*, and the implementation
+> repeated the claim. It was false on three branches, one of which is the very
+> population this feature is named for: a container with no save channel returns
+> before an exec is built. The response therefore carries `saveAttempted` beside
+> `saveConfirmed` — *"never sent"* and *"sent and not confirmed"* are different
+> events and must not be reported as one.
+
+**The grace period is never shortened, and on one branch it is lengthened.**
+`spec.lifecycle.stopGracePeriod` is the last-resort net that lets a server flush
+on `SIGTERM`. Shortening it under "force" would remove the one protection that
+still works when RCON does not.
+
+When **no save request could be sent**, that net is not a net — it is the entire
+save, with nothing watching it. On that branch the grace period is raised to at
+least `PaperServerDefaults.SAVE_TIMEOUT`, which is already this orchestrator's
+model of how long a world save takes. Accepting less there than the drain accepts
+for a save it can watch would put the lower bar on the more dangerous path. The
+schema's own minimum permits as little as 31 seconds.
+
+It is a **raise, not a refusal**, and that distinction is load-bearing. The stop
+runs after the definition has been tombstoned, and a tombstoned definition cannot
+be edited — so a refusal reading *"raise it and force again"* is advice nobody can
+take, and it strands the server: undrainable, unforceable, `crictl` only, which is
+the exact state this feature exists to remove. Every refusal on this path is
+either decided **before** the tombstone or answerable by re-sending the same
+request.
+
+**The login path is sealed first, and the acknowledgement is a count.**
+`requireEmpty`'s zero is durable in the drain because the **seal** holds it: from
+`SEALED` onward the proxy will not route a join, so nobody arrives between the
+observation and the stop. Two drafts of this path dropped step 2 and tried to make
+a bare probe carry the same weight; neither could. One probe let players join
+across the save wait — an hour, at the `SpecBounds` ceiling — and the branch that
+exposed was the one that looks safest, since a server observed empty is asked for
+no acknowledgement at all. Two probes only narrowed that, and made the counted
+acknowledgement livelock on a busy server: nothing owned the number between the
+409 that named it and the re-send that quoted it.
+
+So this path performs drain step 2 before it reads anything. Under the seal the
+count can only fall, which is the direction that is safe to be wrong about. A
+door that cannot be shut is decided against the count rather than on its own —
+the same trade the drain makes — so an empty server is still stopped and a
+populated one is refused until the proxy is repaired or the server empties.
+
+A **standalone** server has no door. The count is re-read immediately before the
+stop there instead, which narrows the window without closing it; see the residual
+note in [README.md](README.md).
+
+`?acknowledgeOccupancy=` therefore takes **the number the operator was shown**, or
+the literal `unreadable`. A boolean would say *"proceed regardless"*: it cannot
+notice the population changing between the decision and the request, does not
+require anyone to have looked, and — because a wedged server never answers a ping
+— would be mandatory on essentially every legitimate use of this endpoint. A
+confirmation that fires on every correct invocation is noise within a week, and
+carries nothing at the one moment it matters. `unreadable` is a distinct value
+rather than a wildcard, so the acknowledgement a stuck server needs cannot quietly
+authorise stopping a healthy populated one.
 
 ## 3. What it costs, stated plainly
 
@@ -114,7 +185,8 @@ API, so it is recorded whether or not the console's audit sink exists yet:
 | identity | Who pressed it |
 | server | The declared name |
 | at | Timestamp |
-| playersOnline | As last observed, **a count** — the logging rule is unchanged |
+| playersOnline | **A count, read immediately before the stop** — never the one the operator acknowledged, and null when the server did not answer. The logging rule is unchanged |
+| acknowledged | The count the operator stated they had been shown |
 | saveConfirmed | Whether the save was confirmed before the stop. **This is the field that says whether data was lost** |
 | drainState | What the drain had reached when force was applied |
 

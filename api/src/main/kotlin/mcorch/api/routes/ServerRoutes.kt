@@ -9,8 +9,14 @@ import mcorch.api.http.Request
 import mcorch.api.http.Requests
 import mcorch.api.http.Response
 import mcorch.api.http.Route
+import mcorch.api.json.Json
 import mcorch.api.json.jsonObject
 import mcorch.api.render.ServerJson
+import mcorch.core.termination.ForcedTermination
+import mcorch.core.termination.ForcedTerminationRefused
+import mcorch.core.termination.ForcedTerminationUnavailable
+import mcorch.core.termination.OccupancyAcknowledgement
+import mcorch.schema.PaperServerDefinition
 import mcorch.schema.ResourceName
 import mcorch.schema.SchemaViolation
 import mcorch.schema.ServerDefinition
@@ -18,6 +24,7 @@ import mcorch.schema.Tier
 import mcorch.store.Precondition
 import mcorch.store.Store
 import mcorch.store.StoreException
+import mcorch.store.StoredDefinition
 import mcorch.store.StoredServer
 import mcorch.store.UnreadableServer
 import mcorch.store.WriteOutcome
@@ -45,6 +52,7 @@ import org.slf4j.LoggerFactory
  */
 internal class ServerRoutes(
     private val store: Store,
+    private val forced: ForcedTermination,
 ) {
     fun routes(): List<Route> =
         listOf(
@@ -228,26 +236,203 @@ internal class ServerRoutes(
     private suspend fun delete(request: Request): Response {
         val name = Requests.name(request)
         val ifMatch = Requests.precondition(request)
+        val forced = request.queryValue("force") == "true"
         val existing = mustFind(name)
-        if (ifMatch == Requests.IfMatch.Any && existing.definition.terminating) {
+
+        // Every refusal is decided **before** the tombstone is written, and that is
+        // load-bearing twice over. The first version wrote it first and then
+        // answered 409 for a proxy — which for a proxy is a fleet-wide deletion
+        // delivered under a status that says nothing happened. The second kept the
+        // seam's own refusals below it, and a tombstoned definition cannot be
+        // edited (`ConflictReason.TERMINATING`), so a refusal saying "correct that
+        // field and force again" left the server permanently `crictl`-only.
+        val forcible = if (forced) forcible(name, existing) else null
+        val acknowledgement = if (forced) occupancyAcknowledgement(request) else OccupancyAcknowledgement.None
+        // The dispatched-stop and outstanding-save guards used to live here. They
+        // moved into the seam in round 51: here they protected this route and
+        // nothing else, and a second caller of `ForcedTermination` got none of
+        // them. `preflight` runs both, still above the tombstone.
+        if (forcible != null) preflight(forcible, acknowledgement)
+
+        if (!forced && ifMatch == Requests.IfMatch.Any && existing.definition.terminating) {
             // Already tombstoned: nothing to do, and reporting it as a conflict
             // would make a retried delete look like a failure.
             return accepted(existing)
         }
         val stored =
-            when (val outcome = store.deleteDefinition(name, ifMatch.toPrecondition())) {
-                is WriteOutcome.Applied -> outcome.value
-                is WriteOutcome.Conflict -> throw ApiException.conflict(outcome)
+            if (existing.definition.terminating) {
+                // Already terminating, so there is no delete to write — but the
+                // precondition still has to be honoured, or a force with a stale
+                // `If-Match` would proceed where an ordinary delete would not.
+                requireVersionMatches(ifMatch, existing)
+                existing.definition
+            } else {
+                when (val outcome = store.deleteDefinition(name, ifMatch.toPrecondition())) {
+                    is WriteOutcome.Applied -> outcome.value
+                    is WriteOutcome.Conflict -> throw ApiException.conflict(outcome)
+                }
             }
+        if (forcible != null) return force(request, forcible, name, acknowledgement)
         LOG.info("delete requested name={} generation={}", stored.name, stored.generation)
         return accepted(store.getServer(name) ?: StoredServer(stored))
     }
 
-    private fun accepted(server: StoredServer): Response =
+    /**
+     * Honours `If-Match` on a path that writes nothing.
+     *
+     * The already-terminating branch skips `deleteDefinition`, and with it the
+     * precondition that call would have checked — so a force carrying a stale
+     * version would proceed where an ordinary delete refuses.
+     */
+    private fun requireVersionMatches(
+        ifMatch: Requests.IfMatch,
+        existing: StoredServer,
+    ) {
+        val required = (ifMatch as? Requests.IfMatch.Version)?.resourceVersion ?: return
+        if (existing.definition.resourceVersion != required) {
+            throw ApiException(
+                ErrorCode.CONFLICT,
+                "the definition has changed since ${required.token}; re-read it before forcing",
+            )
+        }
+    }
+
+    /** The definition a force would act on, or a refusal. Decided before anything is written. */
+    private fun forcible(
+        name: ResourceName,
+        existing: StoredServer,
+    ): PaperServerDefinition =
+        existing.definition.definition as? PaperServerDefinition
+            ?: throw ApiException(
+                ErrorCode.FORCE_NOT_APPLICABLE,
+                "`${name.value}` is not a PaperServer. A VelocityProxy holds no world, so its drain cannot " +
+                    "stall on a save and there is nothing here to force",
+            )
+
+    /**
+     * The occupancy the caller says they were shown.
+     *
+     * A count and not a flag — `ForcedTermination`'s KDoc has the reasoning. The
+     * literal `unreadable` is spelt out rather than allowing a wildcard, so
+     * acknowledging a wedged server cannot cover a server that answered with
+     * players on it. A boolean `true` is refused rather than quietly read as
+     * either, because it is exactly the "proceed regardless" this replaced.
+     */
+    private fun occupancyAcknowledgement(request: Request): OccupancyAcknowledgement {
+        val raw = request.queryValue("acknowledgeOccupancy") ?: return OccupancyAcknowledgement.None
+        if (raw == "unreadable") return OccupancyAcknowledgement.Unreadable
+        val count = raw.toIntOrNull()
+        if (count == null || count < 0) {
+            throw ApiException(
+                ErrorCode.BAD_REQUEST,
+                "acknowledgeOccupancy takes the player count you were shown, or `unreadable` when the " +
+                    "server did not answer one — not `$raw`. Read the server first and acknowledge what it " +
+                    "reported",
+            )
+        }
+        return OccupancyAcknowledgement.Count(count)
+    }
+
+    /**
+     * The seam's own refusals, asked while the definition can still be edited.
+     *
+     * `ForcedTerminationUnavailable` is not a refusal: there is no container, so
+     * the delete below stands on its own and the loop tears down what is left.
+     */
+    private suspend fun preflight(
+        definition: PaperServerDefinition,
+        acknowledgement: OccupancyAcknowledgement,
+    ) {
+        try {
+            forced.preflight(definition, acknowledgement)
+        } catch (unavailable: ForcedTerminationUnavailable) {
+            LOG.debug("force preflight found nothing to stop: {}", unavailable.message)
+        } catch (refused: ForcedTerminationRefused) {
+            throw ApiException(ErrorCode.FORCE_REFUSED, refused.message ?: "the forced stop was refused")
+        }
+    }
+
+    /**
+     * Stops the container without waiting for the drain to be satisfied.
+     *
+     * Tombstoned first, above, and deliberately in that order: a terminating
+     * definition keeps reconciling, so the loop is already watching and finishes
+     * the teardown the moment it sees the container stopped.
+     *
+     * The response leads with what was lost rather than with success, because
+     * `saveAttempted`, `saveConfirmed` and `playersOnline` are the parts of it an
+     * operator has to read.
+     */
+    private suspend fun force(
+        request: Request,
+        definition: PaperServerDefinition,
+        name: ResourceName,
+        acknowledgement: OccupancyAcknowledgement,
+    ): Response {
+        val principal = request.principal()
+        val outcome =
+            try {
+                forced.stop(definition, acknowledgement)
+            } catch (unavailable: ForcedTerminationUnavailable) {
+                // Nothing to force, and the tombstone above is already written — so
+                // this degenerates into the ordinary delete, which is exactly right:
+                // the loop tears down a stopped container without any of this.
+                //
+                // Answering 409 here would be a refusal that had already deleted the
+                // thing it declined to touch, and would make a retried force fail
+                // where a retried DELETE answers 202.
+                LOG.info("force had nothing to stop name={}; the ordinary teardown carries it", name.value)
+                return accepted(
+                    store.getServer(name) ?: throw ApiException.notFound("no server named `${name.value}`"),
+                    forced = false,
+                )
+            } catch (refused: ForcedTerminationRefused) {
+                throw ApiException(
+                    ErrorCode.FORCE_REFUSED,
+                    refused.message ?: "the forced stop was refused",
+                )
+            }
+        // Warn, not info, and every field an investigator reads first is on it.
+        LOG.warn(
+            "forced stop identity={} server={} saveAttempted={} saveConfirmed={} playersOnline={}",
+            principal.name,
+            name.value,
+            outcome.saveAttempted,
+            outcome.saveConfirmed,
+            outcome.playersOnline ?: "unknown",
+        )
+        return Response.json(
+            202,
+            jsonObject {
+                put("accepted", true)
+                put("forced", true)
+                put("saveAttempted", outcome.saveAttempted)
+                put("saveConfirmed", outcome.saveConfirmed)
+                // Null means the server did not answer a count. It is not zero, and
+                // a client must not render it as one.
+                put("playersOnline", Json.of(outcome.playersOnline))
+                put("detail", outcome.detail)
+                put(
+                    "message",
+                    "the container was stopped. The reconcile loop completes the teardown and frees the name " +
+                        "once it observes the stopped container; poll this server until it reports 404",
+                )
+            },
+        )
+    }
+
+    private fun accepted(
+        server: StoredServer,
+        forced: Boolean? = null,
+    ): Response =
         Response.json(
             202,
             jsonObject {
                 put("accepted", true)
+                // Only present on a forced request, so an ordinary delete's body is
+                // unchanged. `false` means the force found nothing to stop and the
+                // delete stands on its own.
+                forced?.let { put("forced", it) }
                 put(
                     "message",
                     "the delete was recorded. The reconcile loop drains the server — evacuating players and " +

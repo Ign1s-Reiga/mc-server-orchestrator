@@ -290,7 +290,7 @@ public class Reconciler(
                     ),
             )
         return try {
-            store.putStatus(status, observedDefinition = stored.definition.resourceVersion)
+            store.putStatus(preservingDispatch(stored, status), observedDefinition = stored.definition.resourceVersion)
             ReconcileOutcome.Retry(conflict.message)
         } catch (storeFailure: StoreException) {
             storeOutcome(stored.name, storeFailure)
@@ -1622,6 +1622,10 @@ public class Reconciler(
                     ),
             )
         return try {
+            // No carry-forward: this is the proxy path, and a `VelocityProxy` cannot
+            // be force-stopped at all — the API answers `FORCE_NOT_APPLICABLE`, since a
+            // proxy holds no world and its drain cannot stall on a save. There is no
+            // second writer of its `stopDispatchedAt` to lose one to.
             store.putStatus(status, observedDefinition = stored.definition.resourceVersion)
             ReconcileOutcome.Failed(message)
         } catch (storeFailure: StoreException) {
@@ -1899,7 +1903,7 @@ public class Reconciler(
                     ),
             )
         return try {
-            store.putStatus(status, observedDefinition = stored.definition.resourceVersion)
+            store.putStatus(preservingDispatch(stored, status), observedDefinition = stored.definition.resourceVersion)
             ReconcileOutcome.Failed(message)
         } catch (storeFailure: StoreException) {
             storeOutcome(stored.name, storeFailure)
@@ -2991,7 +2995,12 @@ public class Reconciler(
                 "the side effect is not repeated",
             pass.name,
         )
-        when (val outcome = store.putStatus(status)) {
+        // Unguarded on the *definition*, still carrying a stop dispatch forward.
+        // The guard this bypasses is the anti-lost-update one; the carry-forward is
+        // not a guard at all, it is this write declining to un-stamp a record it did
+        // not write. Skipping it here would have left the one path that exists to
+        // never lose a side effect quietly destroying another one's.
+        when (val outcome = store.putStatus(preservingDispatch(pass.stored, status))) {
             is WriteOutcome.Applied -> {
                 Unit
             }
@@ -3004,6 +3013,68 @@ public class Reconciler(
                 )
             }
         }
+    }
+
+    /**
+     * [status], with a stop dispatch this pass could not have known about carried
+     * forward.
+     *
+     * **The loop is no longer the only writer of observed state**, and this is what
+     * makes that safe. `NodeForcedTermination` stamps
+     * `DrainStatus.stopDispatchedAt` immediately before it issues a `SIGTERM`, from
+     * an HTTP request that runs concurrently with a pass over the same server —
+     * concurrently by construction, since the tombstone that precedes it hits the
+     * change feed and queues exactly this pass. A pass that read its snapshot before
+     * that write and lands after it would carry the snapshot's drain, with no stamp,
+     * and put it back.
+     *
+     * What that costs is the whole of `DrainStatus.stopDispatchedAt`'s argument.
+     * With the record gone `stopIsInFlight` answers false, the next pass takes a
+     * `RUNNING` container under a terminating definition for a drain that has not
+     * started, and walks seal → destination → transfer → `requireEmpty` → **save**
+     * into a process already running its shutdown save. A precondition alone does
+     * not fix it either: [forceRecord] deliberately writes unguarded so that an
+     * issued side effect is never lost, and that write would clobber it too.
+     *
+     * So the rule is the field's own — **set once, never un-stamped** — enforced
+     * where a stale draft meets the store. `restoreRegistration`'s note calls an
+     * un-stamp *"a second writer on it"* and routes even a justified one through
+     * `drain-auditor`; a pass silently dropping one is that same second writer with
+     * no justification at all.
+     *
+     * A drain the draft does not have at all is taken wholesale rather than
+     * synthesised: the stamp needs a drain to hang on, and inventing one here would
+     * be this function authoring drain state instead of preserving it.
+     *
+     * **Read only for a terminating definition.** The forced path cannot run
+     * against anything else — the API tombstones before it calls the seam — so
+     * nothing on the steady-state hot path pays for this.
+     */
+    private suspend fun preservingDispatch(
+        stored: StoredServer,
+        status: PaperServerStatus,
+    ): PaperServerStatus {
+        if (!stored.definition.terminating) return status
+        if (status.drain?.stopDispatchedAt != null) return status
+        val current =
+            try {
+                (store.getServer(stored.name)?.status?.status as? PaperServerStatus)?.drain
+            } catch (failure: StoreException) {
+                // The write below will fail on the same store and be classified
+                // there. Losing the carry-forward is the lesser harm and is the
+                // outcome that already applied before this function existed.
+                LOG.warn("could not re-read {} to preserve a stop dispatch: {}", stored.name, failure.message)
+                null
+            }
+        val dispatched = current?.stopDispatchedAt ?: return status
+        LOG.info(
+            "server={} carrying forward a stop dispatched at {} that this pass did not observe",
+            stored.name,
+            dispatched,
+        )
+        return status.copy(
+            drain = status.drain?.copy(stopDispatchedAt = dispatched) ?: current,
+        )
     }
 
     /**
@@ -3034,7 +3105,7 @@ public class Reconciler(
         // the server look settled at a generation nobody asked for.
         val outcome =
             store.putStatus(
-                status = status,
+                status = preservingDispatch(pass.stored, status),
                 observedDefinition = pass.stored.definition.resourceVersion,
             )
         return when (outcome) {

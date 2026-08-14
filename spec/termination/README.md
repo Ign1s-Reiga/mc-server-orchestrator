@@ -1,6 +1,13 @@
 # Forced termination — specification
 
-> **Status: proposed. Nothing here is implemented.**
+> **Status: the forced path is implemented and has been through `drain-auditor`
+> once. Round 49 returned three criticals; all are addressed and the change has
+> not been re-audited.** RCON-as-standard shipped separately.
+>
+> It is **not** built the way §2 of this document described. The specification
+> called for three exemptions inside the drain; the code said no, and the
+> implementation note in `02-force-stop.md` §2 records why and what was built
+> instead.
 >
 > This specification describes a path that **can lose world data**. That is its
 > purpose, and every document here is written so that nobody can adopt it without
@@ -59,6 +66,38 @@ dangerous. So the button is not an immediate kill.
 | True immediate kill | Stays out of band — `crictl stop --force`, which the orchestrator does not offer and cannot see |
 | Reporting an unresponsive RCON | From use and from the drain, never from a poller — [01-mandatory-rcon.md](01-mandatory-rcon.md) §4.1. A probe is tick budget spent on every server forever, to detect what a failed command already reports |
 | `RouteTableTest` | Rewritten, not deleted, in the change that adds the force path — [02-force-stop.md](02-force-stop.md) §5 |
+
+## Owed, and not left in a comment
+
+The forced path drops drain steps by construction, not by oversight. Two were
+recorded here as work rather than as caveats in a KDoc. One has since been done,
+and **the reason it stopped being optional is the interesting part**:
+
+- ~~**Seal the proxy before the stop.**~~ **Done.** It was listed as a follow-up
+  on the reading that it only cost availability — the proxy routing joins at an
+  address that is going away. That reading was wrong. Once the occupancy check
+  became a counted acknowledgement, the seal became the thing that check *rests
+  on*: a compare-and-swap is only a compare-and-swap if something owns the value
+  between the read and the write, and on an unsealed server nothing owns the
+  player count for a millisecond. The mechanism was not implementable without
+  step 2. A follow-up that turns out to be a premise is not a follow-up.
+- **Attempt a player transfer.** The drain's step 4. Still owed. Forcing
+  disconnects, and the API says so plainly rather than implying otherwise — which
+  is the difference between this and the seal: an operator who has acknowledged a
+  count knows those sessions are being dropped, and nothing else in the path
+  quietly depends on the transfer having happened.
+
+The rest are deliberate and permanent: `requireEmpty` is replaced by a counted
+acknowledgement read under the seal, the save is requested but may not be
+sendable, deregistration is left to the loop, and `mayStop` is bypassed — which
+is the feature.
+
+**One residual, stated rather than buried.** A *standalone* server has no proxy,
+so there is no door to shut and the seal cannot help it. The count is re-read
+immediately before the stop there, which narrows the window to milliseconds but
+does not close it. The drain does not close it either — it declines to stop
+instead — and an operator forcing an unproxied server with a live population is
+told to let it empty rather than handed a guarantee that does not exist.
 
 ## Before any of this is implemented
 

@@ -1,5 +1,6 @@
 package mcorch.api
 
+import mcorch.core.termination.ForcedTermination
 import mcorch.store.IdentityStore
 import mcorch.store.SecretStore
 import mcorch.store.Store
@@ -35,6 +36,8 @@ class TestApi private constructor(
     val store: Store,
     val secrets: SecretStore,
     val identities: IdentityStore,
+    /** The forced-stop seam this harness was built with, so a test can assert on it. */
+    val forced: ForcedTermination,
     val directory: Path,
     val token: String,
     private val onClose: () -> Unit,
@@ -179,7 +182,7 @@ class TestApi private constructor(
      * closes only [other]; this harness still owns the store and the directory.
      */
     fun sharing(other: ApiServer): TestApi =
-        TestApi(other, store, secrets, identities, directory, token) { other.close() }
+        TestApi(other, store, secrets, identities, forced, directory, token) { other.close() }
 
     override fun close(): Unit = onClose()
 
@@ -221,6 +224,8 @@ class TestApi private constructor(
 
         fun start(
             changeLogRetention: Int = 10_000,
+            /** Defaults to the seam with nothing behind it, which is this harness's real state. */
+            forced: ForcedTermination = RefusingForce(),
             configure: (ApiConfig) -> ApiConfig = { it },
         ): TestApi {
             val directory = Files.createTempDirectory("mcorch-api-test")
@@ -264,11 +269,13 @@ class TestApi private constructor(
                         embedded.secrets,
                         embedded.identities,
                         RefusingConsole,
+                        forced,
                     )
                 TestApi(
                     server = server,
                     store = embedded.state,
                     identities = embedded.identities,
+                    forced = forced,
                     secrets = embedded.secrets,
                     directory = directory,
                     token = token,

@@ -83,7 +83,32 @@ public data class BoundedDefinition(
  * the handshake ceiling bound how long **this orchestrator waits** for an
  * acknowledgement; cutting that short can only withhold a confirmation, and an
  * unconfirmed save is a container this orchestrator will not stop (CLAUDE.md
- * invariant 3). [MAX_STOP_GRACE_PERIOD] bounds a stop that `mayStop` has already
+ * invariant 3).
+ *
+ * **One site now falls outside that argument, deliberately, and the exception is
+ * narrower than a first draft of this paragraph claimed.**
+ * `NodeForcedTermination` stops without `mayStop`, so on that path clamping
+ * `saveTimeout` withholds a confirmation *and* the container stops anyway. That
+ * splits by branch, and only one half is covered:
+ *
+ * - **No save was sent** (`Unconfirmable`, or an undeliverable request). Covered.
+ *   The grace period there is raised to a shutdown-save allowance taken from
+ *   [PaperServerDefaults.SAVE_TIMEOUT], not derived from the definition's own
+ *   `saveTimeout` — precisely because that number then describes an RCON exec that
+ *   never ran. A clamp cannot shorten what it does not feed.
+ * - **A save was sent and timed out.** **Not covered, and this is the branch the
+ *   thirtieth audit's finding named.** The stop carries the declared grace period,
+ *   and `SpecInvariants.stopGraceProblem` only relates that to the *clamped*
+ *   `saveTimeout` — so a definition asking for a three-hour save and a
+ *   three-and-a-half-hour grace is stopped after two hours with the save still
+ *   running. The container stops regardless, because that is what forcing is.
+ *
+ * What bounds the damage is the size of the clamp rather than the reasoning: an
+ * hour of saving, and two hours of grace, are past any world a single host holds.
+ * A deployment that outgrows those numbers has to raise these constants, and the
+ * force path is the reason it cannot be talked out of it.
+ *
+ * [MAX_STOP_GRACE_PERIOD] bounds a stop that `mayStop` has already
  * gated on a confirmed save, so the grace period there is the last-resort net and
  * not the save path. And every ceiling is borrowed from the widest value a reader
  * accepts, so no definition an operator could legitimately write is shortened by

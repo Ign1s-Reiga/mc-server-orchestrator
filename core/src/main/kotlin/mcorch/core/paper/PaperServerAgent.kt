@@ -328,6 +328,9 @@ internal class PaperServerAgent(
                         "the RCON client exited ${result.exitCode} without reaching the server " +
                             "(${result.diagnose()}); no save request was delivered" + rconHint(contract),
                     retryable = true,
+                    // The exec ran to completion and its own output says it never
+                    // reached the server. Not an inference about a subclass.
+                    neverDispatched = true,
                 )
             }
         }
@@ -394,6 +397,8 @@ internal class PaperServerAgent(
                     "command can be run with: ${rejected.message}. Nothing was sent to the server, which keeps " +
                     "running with its players on it. Correct that field and the drain carries on from here",
             retryable = false,
+            // `ExecRequest`'s `init` refused it, so nothing was built and nothing ran.
+            neverDispatched = true,
         )
 
     /**
@@ -520,10 +525,26 @@ internal sealed interface SaveOutcome {
         val detail: String,
     ) : SaveOutcome
 
-    /** The request never went out. Safe to try again later. */
+    /**
+     * The request never went out. Safe to try again later.
+     *
+     * [neverDispatched] separates the branches on which "never went out" is a
+     * **fact** — nothing was built, or the RCON client exited without ever
+     * reaching the server — from the ones where it is an **assumption**. The
+     * `NodeException` `else ->` arm above is the assumption: a
+     * `CriException.RuntimeFailure` on an `ExecSync` arrives as `Busy` and says
+     * nothing about whether the command ran.
+     *
+     * The drain reads neither field for this, because it re-sends a pass apart
+     * either way and one extra flush a pass apart is cheap. A caller that would
+     * re-send **immediately and then stop the container** cannot afford the
+     * assumption, so [ForcedTermination][mcorch.core.termination.ForcedTermination]
+     * retries only when this is true.
+     */
     data class NotDelivered(
         val detail: String,
         val retryable: Boolean,
+        val neverDispatched: Boolean = false,
     ) : SaveOutcome
 
     /** There is no channel through which a save could be confirmed. A human has to change the definition. */

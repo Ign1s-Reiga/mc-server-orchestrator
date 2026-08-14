@@ -389,7 +389,32 @@ internal class DrainWiringTest {
                     .map { source.path to source.enclosing(it).name }
             }
 
-        built shouldBe listOf(CONTROLLER_PATH to "stopGrace")
+        // Two sites now. The second is the forced stop, and it satisfies this
+        // test's own condition rather than being excused from it: it passes
+        // `spec.lifecycle.drain.saveTimeout` as the floor, off the same definition
+        // it read the grace period from, so the pair travels together exactly as
+        // the reconcile path's does.
+        //
+        // **What that site does to the first argument is not covered here, and
+        // saying so is the point.** This scan asserts the enclosing function name,
+        // not the arguments — so when the forced stop began raising its *requested*
+        // grace period to a shutdown-save floor, this comment went on describing a
+        // call that no longer existed and stayed green throughout. It is the third
+        // round running in which the justification drifted rather than the code.
+        // The raise itself is pinned by `NodeForcedTerminationTest.a grace period
+        // too short to be the save it would become is raised, not refused`, which
+        // asserts the duration that reaches the node; what lives here is only the
+        // claim that the floor argument comes off the same definition.
+        //
+        // Forcing shortens the orchestrator's patience, never the server's. The
+        // grace period is the last protection still working when RCON is not, which
+        // is why the one path allowed to skip the evidence rule is not allowed to
+        // trim this.
+        built shouldBe
+            listOf(
+                CONTROLLER_PATH to "stopGrace",
+                FORCED_TERMINATION_PATH to "stop",
+            )
     }
 
     /**
@@ -598,7 +623,24 @@ internal class DrainWiringTest {
         naming("stopWorkload").size shouldBeGreaterThan decidingFiles("stopWorkload").size
         naming("removeWorkload").size shouldBeGreaterThan decidingFiles("removeWorkload").size
 
-        deciding("stopWorkload") shouldBe listOf(CONTROLLER_PATH to "stop", CONTROLLER_PATH to "awaitStopped")
+        // Three now, and the third is the one this list exists to make visible.
+        //
+        // `NodeForcedTermination.stop` ends a container **without** the drain's
+        // evidence rule — no `mayStop`, no zero-player gate, no retry. That is
+        // CLAUDE.md's first invariant being spent, deliberately and once, so that a
+        // server whose drain cannot finish can still be retired through the API
+        // instead of by hand with `crictl` (`spec/termination/`).
+        //
+        // It is on this list rather than exempted from it because that is the point:
+        // a fourth entry appearing here should be as hard to add as this one was,
+        // and an entry that disappeared would mean the path stopped going through
+        // the Node abstraction.
+        deciding("stopWorkload") shouldBe
+            listOf(
+                CONTROLLER_PATH to "stop",
+                CONTROLLER_PATH to "awaitStopped",
+                FORCED_TERMINATION_PATH to "stop",
+            )
         // Both teardowns, and nothing else. A removal decided anywhere else — a
         // rescheduling path, a node drain — is the case this test's own motivation
         // names, and `Reconciler.kt` is where that case is written, which is why the
@@ -960,7 +1002,30 @@ internal class DrainWiringTest {
         // A count of assignments rather than of call sites: what must not happen is
         // a scan that found none, and a new phase legitimately raises it.
         written.count { it.startsWith("clearedDrainRecord(") } shouldBeGreaterThan 8
-        written.filterNot { it.startsWith("clearedDrainRecord(") }.toSet() shouldBe setOf("progress.drain", "drain")
+        written.filterNot { it.startsWith("clearedDrainRecord(") }.toSet() shouldBe
+            setOf(
+                "progress.drain",
+                "drain",
+                // `preservingDispatch`, and it is listed rather than exempted.
+                //
+                // It is the only assignment here that writes a drain this pass did
+                // not compute: the loop is no longer the only writer of observed
+                // state, and a pass whose snapshot predates a forced stop's
+                // `stopDispatchedAt` would otherwise put the pre-stamp record back.
+                //
+                // What this test guards is a record being *retired*, and neither
+                // branch of that expression can retire one. `copy(stopDispatchedAt =
+                // dispatched)` only ever fills the field — `dispatched` is non-null
+                // by the time it is reached — and the elvis arm takes the stored
+                // record wholesale. A non-null drain cannot come out of it null.
+                //
+                // Spelled out in full rather than matched loosely, for the same
+                // reason the `clearedDrainRecord` arguments are pinned: a shape that
+                // follows a rename and refuses a substitution. An edit that turned
+                // that `copy` into anything capable of clearing a field would change
+                // this string and land here.
+                "status.drain?.copy(stopDispatchedAt = dispatched) ?: current",
+            )
         written.filter { it.startsWith("clearedDrainRecord(") }.forEach { call ->
             withClue("a drain record is retired on something other than this pass's own record: $call") {
                 call shouldMatch ASKS_THE_RULE
@@ -2358,6 +2423,7 @@ internal class DrainWiringTest {
             )
 
         const val CONTROLLER_PATH: String = "src/main/kotlin/mcorch/core/DrainController.kt"
+        const val FORCED_TERMINATION_PATH: String = "src/main/kotlin/mcorch/core/termination/ForcedTermination.kt"
 
         const val RECONCILER_PATH: String = "src/main/kotlin/mcorch/core/Reconciler.kt"
 

@@ -97,7 +97,14 @@ class StoreFailureTest {
             )
         val broken =
             healthy.sharing(
-                ApiServer.start(config, FailingStore(failure), healthy.secrets, healthy.identities, RefusingConsole),
+                ApiServer.start(
+                    config,
+                    FailingStore(failure),
+                    healthy.secrets,
+                    healthy.identities,
+                    RefusingConsole,
+                    healthy.forced,
+                ),
             )
         try {
             block(broken)
@@ -354,7 +361,14 @@ class StoreFailureTest {
             val store = PartlyUnreadableStore(stored.shouldNotBeNull())
             val partial =
                 healthy.sharing(
-                    ApiServer.start(config, store, healthy.secrets, healthy.identities, RefusingConsole),
+                    ApiServer.start(
+                        config,
+                        store,
+                        healthy.secrets,
+                        healthy.identities,
+                        RefusingConsole,
+                        healthy.forced,
+                    ),
                 )
             try {
                 block(partial, store)

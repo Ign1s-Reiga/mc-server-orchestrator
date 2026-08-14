@@ -2404,3 +2404,244 @@ Related: [[standalone-paper-drain-shape]]
      one branch, grep every predicate that *reports* that gate's answer to
      another component, and re-derive the exemption there or record why the
      consumer cannot see it.
+
+## Round 49: the escape hatch built beside the drain, not inside it
+
+202. **Refusing to weaken a gate, by writing a second path, drops the whole chain
+     the gate was the last link of.** `NodeForcedTermination` was written outside
+     `DrainController` on the argument that weakening `mayStop` under a flag would
+     corrupt a gate every stop depends on. That argument is sound about `mayStop`
+     and wrong about the *stop*: the drain's stop is preceded by seal, secure a
+     destination, transfer, confirm zero players, confirm the save, deregister —
+     and an isolated path that reimplements only "save, then stop" silently loses
+     the other five. Weakening the gate under a flag would have kept them. So the
+     isolation choice is only safer if the new path re-implements the chain; if it
+     re-implements the last link, it is strictly worse than the design it refused.
+     **Ask of every "we built it separately to keep the gate honest": which steps
+     of the protocol lived *before* that gate, and where are they now?** No test
+     can see their absence, because there is no shared path to diff against.
+203. **"Always requested, always waited out" is falsified by the callee's
+     zero-cost early returns.** `PaperServerAgent.requestSave` has three returns
+     that issue no exec and consume no wall clock: `Unconfirmable` (the
+     container's `SAVE_CONFIRMABLE` label reads false — the exact `operating.md`
+     note-1 population an escape hatch exists for), `unbuildableSave`
+     (`saveTimeout <= 0`, which `SpecBounds` deliberately does not floor and which
+     its KDoc says reaches here by design), and `NotDelivered` from an RCON client
+     that fails to connect in about a second (a refused password — also a
+     documented note-1 arrival path). A caller whose safety story is "the save
+     timeout is always spent, and that wait is what lets an in-flight save land"
+     has that story only on the `Unconfirmed`-by-timeout branch. Enumerate a
+     callee's returns by *cost*, not by outcome type, whenever a caller's argument
+     rests on time elapsing.
+204. **A clamp in `:schema` is justified by a premise about every stop in the
+     system, and a new ungated stop invalidates it from another module.**
+     `SpecBounds`' KDoc argues that clamping is safe because "`MAX_STOP_GRACE_PERIOD`
+     bounds a stop that `mayStop` has already gated on a confirmed save, so the
+     grace period there is the last-resort net and not the save path", and that
+     clamping `saveTimeout` "can only withhold a confirmation, and an unconfirmed
+     save is a container this orchestrator will not stop". Both sentences are
+     load-bearing *behaviour* justifications, not prose, and both become false the
+     moment any path stops without `mayStop`. Before adding a stop anywhere, grep
+     `:schema` and `:cri` for justifications of the form "safe because the drain
+     already confirmed" — they are the invariants the new path inherits without
+     being told.
+205. **`StopGrace.of(stopGracePeriod, saveTimeout)` means something different
+     either side of `mayStop`.** Downstream of the gate the floor is a net over a
+     save that already landed. Upstream of it the grace period *is* the save, and
+     the floor is derived from `saveTimeout` — the very channel that just failed,
+     and a field that is zero or meaningless in precisely the branches where the
+     grace period is doing all the work. A guard test asserting "the pair travels
+     together exactly as the reconcile path's does" checks the syntax of the call
+     and cannot see that the two sites are protecting different things.
+206. **A capability guard keyed on route *patterns* stays green when the
+     capability arrives as a query parameter.** `RouteTableTest.the table has no
+     route that could free a name or stop a container` asserts no pattern contains
+     `stop`/`kill`/`force`/`purge`, reasoning "one that could stop a container
+     directly could stop one with players on it". `DELETE …?force=true` does
+     exactly that and the test passes untouched. The spec authorised and required
+     the rewrite; the change that added the capability did not do it. Whenever a
+     guard is spelled over names, ask what shape of the forbidden capability the
+     spelling cannot reach — and treat a guard that stayed green through the
+     change it was written to catch as a finding in itself.
+207. **A destructive store write placed above the applicability check turns a
+     refusal into a silent delete.** The force handler tombstones the definition
+     and *then* discovers it is a `VelocityProxy` or has no running container,
+     answering `409 FORCE_NOT_APPLICABLE` — "there is nothing here to force" — over
+     a definition it has already marked terminating. For a proxy that is a
+     fleet-wide deletion delivered under an error status. The test asserts the
+     status code and never asserts the definition survived, which is the
+     instrument-that-looks-like-a-result shape. For every error return in a
+     mutating handler, ask what has already been written when it fires.
+
+## Round 50: the refusals that fix a stop by making it unreachable
+
+208. **A refusal added on a delete path inherits the tombstone that was already
+     written, and `putDefinition` refuses a terminating row.** `SqliteStore`
+     returns `ConflictReason.TERMINATING` for *any* write to a definition with
+     `deleted_at` set, and there is no un-tombstone anywhere — `purge` is the only
+     other operation and the loop reaches it only from an `Absent` observation. So
+     a refusal whose message says "correct that field and force again" is advice
+     the operator cannot follow the moment it fires below a `deleteDefinition`
+     call: the row is frozen, the drain still cannot stop the server, and the
+     escape hatch refuses on every retry. Erring safe **and** unrecoverable
+     without `crictl` is item 13's rule, and a validation moved *into* the stop
+     path is the newest way to reach it. Any refusal on a delete path must be
+     decided above the tombstone write, or must not be a refusal.
+209. **`StopGrace.of`'s second argument only ever raises a ceiling, so passing a
+     "floor" to it is inert.** `StopGraceCeiling.ceilingFor` returns
+     `maxOf(MAX = 2h, saveTimeout + 30s)` and `bound` only caps — it can never
+     raise a requested duration, and it can never cap below two hours, which
+     `SpecBounds` already caps `stopGracePeriod` at. So `StopGrace.of(declared, X)`
+     produces `declared` for every `X` any definition can carry. A change that
+     introduces a new floor "so `ceilingFor` cannot cap the window the world has
+     left" has written a comment describing a mechanism that does not exist; the
+     real protection is whatever separate `if` sits beside it. When a fix is
+     expressed as an argument to an existing bounding function, evaluate the
+     function at the reachable range before believing the argument does anything.
+210. **A zero-player observation means something only while a seal holds it.**
+     `requireEmpty`'s freshly-observed zero is durable because every state from
+     `SEALED` onward re-asserts `holdSeal`, and `saveEvidenceMaxGap` (30 s) voids
+     it when the chain breaks. A probe on an *unsealed* server decays the instant
+     it is taken. Any new path that substitutes "probe once, then act" for
+     `requireEmpty` has a window between the probe and the stop as wide as the save
+     timeout plus the grace period — up to an hour — during which players join a
+     server nothing is holding shut. The probe returning zero is then not a
+     licence; it is a measurement with no shelf life. Ask of every occupancy check
+     outside the drain: what keeps this true until the stop?
+211. **An acknowledgement flag that carries no value is a checkbox, and one that
+     the target population always trips is a constant.** A boolean
+     `acknowledgeOccupancy` says "proceed regardless", not "I acknowledge *n*",
+     so it cannot detect that the population changed between the operator's
+     decision and the request — the compare-and-swap shape (acknowledge the
+     count, refuse on mismatch) is the one that protects anybody. Worse, the
+     population this path exists for is wedged servers, whose probe never answers,
+     so the count is `null`, so the acknowledgement is *mandatory* on every real
+     use and becomes a fixed string in the runbook. A confirmation that fires on
+     every legitimate invocation has been designed into noise.
+212. **A guard reading stored observed status treats "cannot read" as "not
+     happening".** `guardAgainstDispatchedStop` is
+     `(existing.status?.status as? PaperServerStatus)?.drain ?: return` — an
+     unreadable status row (round 30 made those `status = null` rather than a
+     fleet-wide failure) and a stop dispatched since the last status write both
+     fall to the permissive side of a guard whose entire purpose is preventing a
+     second stop and a second `save-all flush`. Same family as item 200: absence
+     of evidence read as evidence of absence, on the one branch where the cost is
+     a flush into a container already shutting down.
+213. **Fixing a claim in the code does not fix the guard test that asserts the old
+     claim.** `DrainWiringTest.the stop grace ceiling is applied at one site` still
+     carries the reasoning *"it passes `spec.lifecycle.drain.saveTimeout` as the
+     floor … so the pair travels together exactly as the reconcile path's does"*
+     after the code stopped always passing `saveTimeout`. The test is green because
+     it asserts the enclosing function name, not the argument. When a finding is
+     addressed by changing what a call site passes, re-read every guard whose
+     comment describes what it used to pass.
+
+## Round 51: the side effects the system has no memory of
+
+214. **A stop dispatched outside the reconcile loop stamps nothing, so every
+     mechanism built to make a dispatched stop safe is blind to it.**
+     `DrainStatus.stopDispatchedAt` is what `stopIsInFlight` answers on, and that
+     predicate's own KDoc names the critical it exists for: *"or the loop
+     converges over the top of its own stop and a proxy re-admits players to a
+     process whose shutdown save has run."* `NodeForcedTermination` holds only a
+     `NodeRegistry` — no store, no status — so its `stopWorkload` leaves no trace
+     but a log line. For the whole grace period the loop sees a `RUNNING`
+     container under a terminating definition, starts a drain from scratch over a
+     process already running its shutdown save, and only `requireEmpty`'s probe
+     accidentally keeps step 5 from putting a second `save-all flush` into it.
+     Whenever a component outside the loop performs an action the loop records
+     when *it* performs it, the missing record is the finding — not the action.
+215. **A compare-and-swap against a quantity nothing holds still can livelock, and
+     each turn costs a side effect.** Replacing a boolean acknowledgement with a
+     counted one (`acknowledgeOccupancy=12`, refuse on mismatch) is the right
+     shape and is unimplementable without the thing that freezes the number. With
+     no proxy seal, the population moves between the refusal and the operator's
+     re-send, so the CAS can refuse indefinitely on a busy server — and because
+     the deciding probe sits *after* `requestSave`, every attempt spends a whole
+     `saveTimeout` and delivers another `save-all flush`. A CAS is only a CAS if
+     something owns the value between read and write; on an unsealed server
+     nothing does. This is the concrete argument that the seal is a blocker rather
+     than a follow-up, and it is stronger than the abstract "the probe borrows
+     credibility from the seal" version.
+216. **"The binding protection is the seam's own" has to name which observation
+     binds it.** The forced path's `guardAgainstDispatchedStop` lives in `:api`,
+     and its KDoc excuses being advisory on the ground that *"the binding
+     protection against a second save is the seam's own, which observes the
+     container rather than a status row"*. The seam observes `WorkloadState`,
+     which says `RUNNING` — it says nothing about whether a save is outstanding.
+     There is no binding protection; the sentence invents one. When a guard is
+     documented as advisory-because-something-else-is-binding, go and read the
+     something else.
+217. **Raising a grace period is right and is not free, and the cost is not the
+     wait.** `maxOf(declared, SHUTDOWN_SAVE_ALLOWANCE)` on the no-save branch is
+     correct — a server that finishes early exits early, so the extra ceiling
+     costs wall clock only for a process that ignores `SIGTERM`. What it does cost
+     is *window*: every hazard that lives between the dispatch and the container's
+     exit gets multiplied by the same factor. Before accepting "raising a timeout
+     is free", enumerate what is unguarded during the interval, not what is waited
+     for.
+218. **A `preflight`/`act` split is honest only where `act` re-runs the check, and
+     the residue is what `act` cannot re-derive.** Splitting refusals into a
+     pre-write phase genuinely fixes the tombstone-strands-the-row problem when
+     `act` repeats the checks (occupancy) or degrades safely without them (an
+     unbuildable `saveTimeout` falling through to a raised grace period). The
+     order-dependence that survives is whatever only the *caller* can see —
+     here the drain status, which `:core`'s seam is not given. "I could not make
+     it binding without `:core` writing desired state" is usually answerable:
+     reading observed state is not writing desired state, and the field in
+     question is one `:core` already owns.
+
+## Round 52: two writers of observed state, neither of them compare-and-swapping
+
+219. **"The loop is the only writer of observed state" is a premise, not a
+     comment, and the second writer invalidates three things at once.**
+     `SqliteStore.putStatus` says it deliberately does not append to the change
+     feed *because* the loop is the only writer — so a status written from
+     anywhere else never reaches the SSE stream. Worse, neither writer uses a
+     precondition: `Reconciler` passes `observedDefinition` but no
+     `Precondition`, and a new caller passing `Precondition.None` performs a
+     read-modify-write with no CAS. The two clobber each other in **both**
+     directions — an outside write can erase the drain's `saveRequestedAt` (the
+     never-re-send wedge, item 6) or `sealRequestedAt` (item 32), and the loop's
+     next pass, building its status from a snapshot read before the outside write,
+     erases the outside record. When a second writer is introduced to a field the
+     loop owns, grep the store for sentences justifying anything *by* the single
+     writer, and give both sides `Precondition.AtVersion`.
+220. **A stamp written before the side effect locks the retry out when the side
+     effect fails.** `stopDispatchedAt` is deliberately written before
+     `stopWorkload` — right, and the field's KDoc argues the asymmetry. But a
+     guard that refuses a *new* force while `stopDispatchedAt != null` then turns a
+     transient `NodeException` from that same call into a permanent lockout: the
+     error says "Nothing was stopped", the record says a stop is in flight, the
+     definition is already tombstoned so nothing can be edited, and the drain
+     cannot finish for the population the path exists for. `awaitStopped` has the
+     licence this needs — it re-issues a stop that did not take — so a refusal
+     keyed on the stamp must be bounded by the grace period, not by the stamp's
+     existence.
+221. **`null` is not zero, and a bypass written `== 0` therefore excludes exactly
+     the population the feature is for.** `refuseUnsealedPopulation` lets an
+     *empty* server through when the seal fails, on the drain's own
+     `sealIsPrecondition` trade. A wedged server does not answer a probe, so its
+     count is `null`, so it is never "empty" — and a wedged backend behind an
+     unreachable proxy is refused for ever, below the tombstone, with both stated
+     remedies ("fix the proxy, or wait for it to empty") outside the caller's
+     reach. Whenever a refusal has an escape hatch keyed on a count, evaluate the
+     hatch at `null` before believing the refusal is recoverable.
+222. **A three-valued seal result whose "nothing to seal" arm has two producers
+     inverts the safety ordering.** `Standalone` (no proxy routes here) and
+     `Conflicted` (two proxies claim it and both are admitting) collapse into one
+     `NOTHING_TO_SEAL`, so the populated-and-unsealable refusal never fires for
+     `Conflicted` — the case with *two* open doors is treated more permissively
+     than the case with one door that would not shut. When an enum arm is reached
+     by an `else ->` over a sealed hierarchy, name the members rather than the
+     remainder, and check that each one satisfies the arm's own KDoc sentence.
+223. **A drain step re-implemented outside the loop inherits the loop's
+     re-assertion, and `DRAIN_FAILED` declines to re-assert.** "The seal I left
+     behind is fine because the drain re-asserts it" holds only while the drain is
+     advancing. For a permanently parked drain — the population an escape hatch
+     exists for — `DRAIN_FAILED` deliberately does not re-assert, and
+     `assertBackends` is unreachable because every pass on a terminating
+     definition drains. The seal then survives as unpersisted proxy state until
+     the proxy restarts (item 46). Not a harm, but the justification is false, and
+     a false justification beside a correct decision is what this project keeps
+     having to unpick.

@@ -29,6 +29,21 @@ internal class FakeNode(
     // ── what the runtime currently holds ─────────────────────────────────────
 
     var workload: WorkloadObservation = WorkloadObservation.Absent
+
+    /**
+     * Which server [workload] belongs to, once one has been built through
+     * [ensureWorkload].
+     *
+     * Null for a workload a test assigned directly, and [observe] then answers for
+     * any name — which is what this double did for every name before round 51.
+     * That was harmless while the only caller was a reconcile pass, which already
+     * knows the node it is talking to. `NodeForcedTermination.locate` is the first
+     * code in `:core` that *searches* the registry, and against the old double it
+     * found the proxy's container when asked about a backend and would have stopped
+     * it. A real `LocalNode` keys by name; a double that does not turns that
+     * contract into an untested assumption.
+     */
+    var hosts: ResourceName? = null
     val images: MutableSet<String> = mutableSetOf()
 
     /**
@@ -197,7 +212,8 @@ internal class FakeNode(
 
     override suspend fun observe(server: ResourceName): WorkloadObservation {
         check(NodeOperation.OBSERVE)
-        return workload
+        val held = hosts ?: return workload
+        return if (held == server) workload else WorkloadObservation.Absent
     }
 
     override suspend fun ensureImage(image: ImageRef): ImageAvailability {
@@ -249,6 +265,7 @@ internal class FakeNode(
             return existing
         }
         creates += spec
+        hosts = spec.server
         (spec.storage as? StorageRequest.Persistent)?.let { volumes += it.volume }
         containersCreated++
         val created =

@@ -246,6 +246,7 @@ API by `PUT`ting a valid definition with `If-Match: *`.
 | `CONSOLE_NOT_APPLICABLE` | 409 | | the console was asked of a `VelocityProxy`, which has no RCON |
 | `CONSOLE_UNAVAILABLE` | 503 | `Retry-After` | the server cannot answer yet. **Retryable**, and nothing was sent |
 | `CONSOLE_TIMEOUT` | 504 | | the command **ran or may have run** and no reply arrived. **Do not retry** |
+| `FORCE_REFUSED` | 409 | | a forced stop that could be made safe — an unacknowledged population, an unusable `saveTimeout`, a grace period too short to be the save it would become |
 | `IDENTITY_EXISTS` | 409 | | `POST /identities/{name}` never overwrites |
 | `LAST_SUPERUSER` | 409 | | the change would leave no enabled superuser |
 | `METHOD_NOT_ALLOWED` | 405 | `Allow` | |
@@ -704,7 +705,9 @@ its generation, and a `metadata.labels` edit that crosses a `VelocityProxy`'s
 
 - `202 Accepted` + `ETag`. Repeating it is a no-op that answers `202` again.
 - `404` if the name is unknown. `409` if `If-Match` was sent and does not match.
-- **No force flag.** There is no way to make this stop a server faster.
+- **`?force=true` stops it anyway.** `superuser` only, and it is not a way to make
+  an ordinary delete faster — it is the way out of a delete that **cannot
+  finish**. See below.
 
 What a client should do afterwards:
 
@@ -716,8 +719,116 @@ What a client should do afterwards:
    confirmed the containers are gone and freed the name — **the API cannot do it
    and does not expose a way to.**
 4. `status.drain.state: "DRAIN_FAILED"` means the drain aborted **and the server
-   is still running**. There is no edge from there to a stop. It needs an
-   operator.
+   is still running**. There is no edge from there to a stop within the drain —
+   `?force=true` is the edge, and it is an operator decision rather than something
+   the loop reaches on its own.
+
+#### `DELETE /api/v1/servers/{name}?force=true`
+
+**This can lose the last several minutes of play.** It exists because the
+alternative — a server that cannot be retired at all — is worse.
+
+`superuser` only. It is for the state note 1 of `docs/operating.md` describes: a
+persistent server whose world save cannot be confirmed, whose drain therefore
+aborts, and which otherwise has to be stopped by hand.
+
+What it does, in order: tombstone the definition, **request a world save and wait
+the declared save timeout**, then stop the container with its **full declared
+grace period** regardless of whether the save was confirmed. The reconcile loop
+then observes the stopped container and completes the teardown as it always does.
+
+What it does **not** do is skip the save or shorten the grace period. Skipping the
+save would buy tens of seconds in exchange for the data this system exists to
+protect; the grace period is the last protection still working when RCON is not.
+
+**When no save request could be sent at all**, the grace period is *raised* to at
+least the save timeout's default — on that branch the grace period stops being a
+last-resort net and becomes the entire save, so it is given what this orchestrator
+considers a save to be worth. It is never lowered, and a longer declared grace
+period is left alone. A server that finishes early still exits early: the grace
+period is a ceiling on how long containerd waits, not a delay.
+
+```json
+{ "accepted": true, "forced": true,
+  "saveAttempted": false, "saveConfirmed": false, "playersOnline": 12,
+  "detail": "no world save could be sent — the container has no channel that could confirm one — so the stop grace period was the only chance the world had to reach disk" }
+```
+
+**Read `saveAttempted` and `saveConfirmed` together.** They are different
+questions: a save can be *sent and never confirmed*, or **never sent at all** —
+which is what happens on the very population this endpoint exists for, a container
+with no working save channel. Collapsing them into "not confirmed" would report
+those two identically, and they are not the same event.
+
+**`playersOnline` may be `null`, and null is not zero.** It means the server did
+not answer a count. Render it as unknown; a client that shows it as an empty
+server is stating something this API did not.
+
+**`playersOnline` is read immediately before the stop**, not when the request
+arrived. The count is taken twice — once to decide, and again after the save wait,
+because that wait can last a whole save timeout and nothing on this path holds a
+player out of the server in the meantime. It is the second reading that is
+reported and the second reading that can refuse.
+
+### `?acknowledgeOccupancy=` takes a number, not `true`
+
+- `?acknowledgeOccupancy=12` — *"I was shown 12 players and still want this."*
+  Refused with `FORCE_REFUSED` if the count is anything but 12 when the stop is
+  about to happen, so the acknowledgement cannot be stale.
+- `?acknowledgeOccupancy=unreadable` — *"I was shown that the server does not
+  answer a count and still want this."* It does **not** cover a server that
+  answered.
+- `?acknowledgeOccupancy=true` is `400 BAD_REQUEST`. It was the old spelling, and
+  it is refused rather than reinterpreted: a caller sending it has not been shown
+  a number.
+
+A server observed with **zero** players needs no acknowledgement at all.
+
+Why a count: a boolean says *"proceed regardless"*, which cannot notice that the
+population changed between an operator deciding and the request landing, and does
+not require them to have looked. It would also be **mandatory on essentially every
+legitimate use** — a wedged server does not answer a ping, so its occupancy is
+always unreadable — which turns it into a fixed string in every runbook and
+carries no information at the one moment it matters.
+
+### It refuses rather than surprising you
+
+Every refusal below is decided **before the definition is tombstoned**, and that
+is a guarantee rather than an implementation detail: a tombstoned definition
+cannot be edited, so a refusal saying *"correct that field and force again"* would
+leave the server undrainable, unforceable, and reachable only with `crictl`.
+
+- **A populated server** — or one whose occupancy could not be read — is `409
+  FORCE_REFUSED` unless the acknowledgement above matches. Forcing disconnects
+  those players without transferring them, and the drain would have moved them.
+- **An unusable `spec.lifecycle.drain.saveTimeout`** is `FORCE_REFUSED`: no save
+  could be sent, and the field is one edit away from making one possible.
+- **A stop already in flight** is `FORCE_NOT_APPLICABLE`. The container is inside
+  its grace period running its shutdown save; a second force would send another
+  save into it. Likewise an **unconfirmed save already outstanding**.
+- **A `VelocityProxy`** is `FORCE_NOT_APPLICABLE` and **is not deleted** — it holds
+  no world, so its drain cannot stall on a save.
+
+If there is no running container to stop, this is not an error: the tombstone
+stands, the response is the ordinary `202` with `"forced": false`, and the loop
+completes the teardown. A repeated force answers the same way a repeated `DELETE`
+does.
+
+### What it still does not do
+
+It does **not** attempt a player transfer. The drain does; this path does not, so
+players are disconnected. That is the one dropped step the response states to your
+face rather than leaving you to discover.
+
+It **does** seal the login path at the proxy first, so nobody new is routed to a
+server that is about to stop — which is also what makes `acknowledgeOccupancy` a
+real check rather than a snapshot of a number that has already moved. A server
+that is not behind a proxy has no door to shut, and there the count is re-read
+immediately before the stop instead: narrower, not closed.
+
+Deregistration is left to the reconcile loop's next pass. Until then the proxy
+holds a registration at an address that is going away, which is harmless because
+nothing new is being routed to it.
 
 ### `POST /api/v1/validate`
 

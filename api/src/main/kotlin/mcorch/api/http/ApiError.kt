@@ -70,6 +70,23 @@ internal enum class ErrorCode(
     CONSOLE_NOT_APPLICABLE(409),
 
     /**
+     * A forced stop was asked of something it cannot help.
+     *
+     * A `VelocityProxy` holds no world, so its drain cannot stall on a save; a
+     * server with no running container has nothing to stop.
+     */
+    FORCE_NOT_APPLICABLE(409),
+
+    /**
+     * A forced stop that could have been made safe, refused so it can be.
+     *
+     * An unacknowledged population, a `saveTimeout` no command can run with, or a
+     * grace period too short to be the save it would become. Each names something
+     * the caller can change and then force again.
+     */
+    FORCE_REFUSED(409),
+
+    /**
      * The command **ran or may have run** and no reply arrived in time.
      *
      * `retryable = false` on purpose. RCON offers no way to tell "never ran" from
