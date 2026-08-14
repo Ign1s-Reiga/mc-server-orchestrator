@@ -17,7 +17,6 @@ import mcorch.core.termination.ForcedTerminationRefused
 import mcorch.core.termination.ForcedTerminationUnavailable
 import mcorch.core.termination.OccupancyAcknowledgement
 import mcorch.schema.PaperServerDefinition
-import mcorch.schema.PaperServerStatus
 import mcorch.schema.ResourceName
 import mcorch.schema.SchemaViolation
 import mcorch.schema.ServerDefinition
@@ -249,10 +248,11 @@ internal class ServerRoutes(
         // field and force again" left the server permanently `crictl`-only.
         val forcible = if (forced) forcible(name, existing) else null
         val acknowledgement = if (forced) occupancyAcknowledgement(request) else OccupancyAcknowledgement.None
-        if (forcible != null) {
-            guardAgainstDispatchedStop(name, existing)
-            preflight(forcible, acknowledgement)
-        }
+        // The dispatched-stop and outstanding-save guards used to live here. They
+        // moved into the seam in round 51: here they protected this route and
+        // nothing else, and a second caller of `ForcedTermination` got none of
+        // them. `preflight` runs both, still above the tombstone.
+        if (forcible != null) preflight(forcible, acknowledgement)
 
         if (!forced && ifMatch == Requests.IfMatch.Any && existing.definition.terminating) {
             // Already tombstoned: nothing to do, and reporting it as a conflict
@@ -349,53 +349,6 @@ internal class ServerRoutes(
             LOG.debug("force preflight found nothing to stop: {}", unavailable.message)
         } catch (refused: ForcedTerminationRefused) {
             throw ApiException(ErrorCode.FORCE_REFUSED, refused.message ?: "the forced stop was refused")
-        }
-    }
-
-    /**
-     * Refuses a force against a drain that already has a save or a stop in flight.
-     *
-     * A dispatched stop means the container is inside its grace period running its
-     * shutdown save. A second force finds it `RUNNING`, sends another
-     * `save-all flush` into that, and stops it again — the repeated-save-request
-     * the drain's own never-re-send rule exists to prevent.
-     *
-     * `saveRequestedAt` is the other half of the same hole and was missed first
-     * time round: it is non-null exactly while a request has gone out and has not
-     * been confirmed (`DrainStatus` keeps it disjoint from `worldSavedAt`), which
-     * is the never-re-send wedge armed. Forcing into it sends the second flush the
-     * rule forbids — no stop needs to have been dispatched for that.
-     *
-     * **This guard is advisory and cannot be made binding here.** `existing` is
-     * read once at `mustFind`, so the loop may dispatch between that read and the
-     * seam's call; and a `status` of null means either "not observed yet" or "the
-     * observation did not decode", which round 30 made indistinguishable at this
-     * layer. Both fall to the permissive side. Refusing on null instead would
-     * block every force against a server the loop has not reached yet — including
-     * the just-created ones — which trades a narrow hole for a wide one. The
-     * binding protection against a second save is the seam's own, which observes
-     * the container rather than a status row.
-     */
-    private fun guardAgainstDispatchedStop(
-        name: ResourceName,
-        existing: StoredServer,
-    ) {
-        val drain = (existing.status?.status as? PaperServerStatus)?.drain ?: return
-        if (drain.stopDispatchedAt != null) {
-            throw ApiException(
-                ErrorCode.FORCE_NOT_APPLICABLE,
-                "`${name.value}` already has a stop in flight, dispatched at ${drain.stopDispatchedAt}. " +
-                    "It is inside its grace period; forcing again would send a second save into a server " +
-                    "already shutting down",
-            )
-        }
-        if (drain.saveRequestedAt != null) {
-            throw ApiException(
-                ErrorCode.FORCE_NOT_APPLICABLE,
-                "`${name.value}` has an unconfirmed world save outstanding, requested at " +
-                    "${drain.saveRequestedAt}. Forcing now would send a second save into a server already " +
-                    "running one; wait for it to confirm or fail",
-            )
         }
     }
 

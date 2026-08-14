@@ -201,7 +201,7 @@ public class Orchestrator private constructor(
                     secrets = embedded.secrets,
                     identities = embedded.identities,
                     console = NodeServerConsole(registry, CONSOLE_TIMEOUT),
-                    forcedTermination = NodeForcedTermination(registry),
+                    forcedTermination = NodeForcedTermination(registry, embedded.state),
                     nodes = registry,
                     reconciler = reconciler,
                     loop = ReconcileLoop(embedded.state, reconciler, loopConfig),

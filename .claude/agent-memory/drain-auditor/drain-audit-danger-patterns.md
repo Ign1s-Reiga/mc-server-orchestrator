@@ -2535,3 +2535,58 @@ Related: [[standalone-paper-drain-shape]]
      it asserts the enclosing function name, not the argument. When a finding is
      addressed by changing what a call site passes, re-read every guard whose
      comment describes what it used to pass.
+
+## Round 51: the side effects the system has no memory of
+
+214. **A stop dispatched outside the reconcile loop stamps nothing, so every
+     mechanism built to make a dispatched stop safe is blind to it.**
+     `DrainStatus.stopDispatchedAt` is what `stopIsInFlight` answers on, and that
+     predicate's own KDoc names the critical it exists for: *"or the loop
+     converges over the top of its own stop and a proxy re-admits players to a
+     process whose shutdown save has run."* `NodeForcedTermination` holds only a
+     `NodeRegistry` — no store, no status — so its `stopWorkload` leaves no trace
+     but a log line. For the whole grace period the loop sees a `RUNNING`
+     container under a terminating definition, starts a drain from scratch over a
+     process already running its shutdown save, and only `requireEmpty`'s probe
+     accidentally keeps step 5 from putting a second `save-all flush` into it.
+     Whenever a component outside the loop performs an action the loop records
+     when *it* performs it, the missing record is the finding — not the action.
+215. **A compare-and-swap against a quantity nothing holds still can livelock, and
+     each turn costs a side effect.** Replacing a boolean acknowledgement with a
+     counted one (`acknowledgeOccupancy=12`, refuse on mismatch) is the right
+     shape and is unimplementable without the thing that freezes the number. With
+     no proxy seal, the population moves between the refusal and the operator's
+     re-send, so the CAS can refuse indefinitely on a busy server — and because
+     the deciding probe sits *after* `requestSave`, every attempt spends a whole
+     `saveTimeout` and delivers another `save-all flush`. A CAS is only a CAS if
+     something owns the value between read and write; on an unsealed server
+     nothing does. This is the concrete argument that the seal is a blocker rather
+     than a follow-up, and it is stronger than the abstract "the probe borrows
+     credibility from the seal" version.
+216. **"The binding protection is the seam's own" has to name which observation
+     binds it.** The forced path's `guardAgainstDispatchedStop` lives in `:api`,
+     and its KDoc excuses being advisory on the ground that *"the binding
+     protection against a second save is the seam's own, which observes the
+     container rather than a status row"*. The seam observes `WorkloadState`,
+     which says `RUNNING` — it says nothing about whether a save is outstanding.
+     There is no binding protection; the sentence invents one. When a guard is
+     documented as advisory-because-something-else-is-binding, go and read the
+     something else.
+217. **Raising a grace period is right and is not free, and the cost is not the
+     wait.** `maxOf(declared, SHUTDOWN_SAVE_ALLOWANCE)` on the no-save branch is
+     correct — a server that finishes early exits early, so the extra ceiling
+     costs wall clock only for a process that ignores `SIGTERM`. What it does cost
+     is *window*: every hazard that lives between the dispatch and the container's
+     exit gets multiplied by the same factor. Before accepting "raising a timeout
+     is free", enumerate what is unguarded during the interval, not what is waited
+     for.
+218. **A `preflight`/`act` split is honest only where `act` re-runs the check, and
+     the residue is what `act` cannot re-derive.** Splitting refusals into a
+     pre-write phase genuinely fixes the tombstone-strands-the-row problem when
+     `act` repeats the checks (occupancy) or degrades safely without them (an
+     unbuildable `saveTimeout` falling through to a raised grace period). The
+     order-dependence that survives is whatever only the *caller* can see —
+     here the drain status, which `:core`'s seam is not given. "I could not make
+     it binding without `:core` writing desired state" is usually answerable:
+     reading observed state is not writing desired state, and the field in
+     question is one `:core` already owns.

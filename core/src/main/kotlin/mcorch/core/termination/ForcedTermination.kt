@@ -1,18 +1,29 @@
 package mcorch.core.termination
 
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import mcorch.core.Node
 import mcorch.core.NodeException
 import mcorch.core.NodeRegistry
 import mcorch.core.StopGrace
 import mcorch.core.WorkloadObservation
 import mcorch.core.WorkloadState
+import mcorch.core.dispatchingStop
 import mcorch.core.paper.PaperServerAgent
 import mcorch.core.paper.ProbeOutcome
 import mcorch.core.paper.SaveOutcome
+import mcorch.schema.DrainState
+import mcorch.schema.DrainStatus
 import mcorch.schema.PaperServerDefaults
 import mcorch.schema.PaperServerDefinition
+import mcorch.schema.PaperServerStatus
 import mcorch.schema.ResourceName
+import mcorch.store.Store
+import mcorch.store.StoreException
+import mcorch.store.WriteOutcome
 import org.slf4j.LoggerFactory
+import java.time.Clock
+import java.time.Instant
 import kotlin.time.Duration
 
 /**
@@ -202,12 +213,15 @@ public class ForcedTerminationRefused(
 /** [ForcedTermination] over the nodes this orchestrator knows. */
 public class NodeForcedTermination(
     private val nodes: NodeRegistry,
+    private val store: Store,
+    private val clock: Clock = Clock.systemUTC(),
 ) : ForcedTermination {
     override suspend fun preflight(
         definition: PaperServerDefinition,
         acknowledgement: OccupancyAcknowledgement,
     ) {
         val name = definition.metadata.name
+        refuseSecondSideEffect(name)
 
         // Decidable from the definition alone, and refused here rather than from
         // `requestSave`'s `unbuildableSave` — whose own wording is "correct that
@@ -236,6 +250,13 @@ public class NodeForcedTermination(
         val (node, observation) = locate(name)
         val agent = PaperServerAgent(definition)
 
+        // Re-asserted here and not left to `preflight`. It lived in `:api` until
+        // round 51, where it protected this route and nothing else: a second caller
+        // of this seam got none of it, and the KDoc excusing that claimed a
+        // "binding protection … which observes the container rather than a status
+        // row". There was no such protection. `WorkloadState` reports `RUNNING` and
+        // says nothing about whether a save is outstanding.
+        refuseSecondSideEffect(name)
         refuseOccupancy(name, occupancy(agent, node, observation), acknowledgement)
 
         val save = requestSave(agent, node, observation)
@@ -267,6 +288,23 @@ public class NodeForcedTermination(
             players ?: "unknown",
             grace.period.inWholeSeconds,
         )
+        // **Stamped before the call, and this is the record the first three
+        // versions of this file did not keep.** `DrainStatus.stopDispatchedAt` is
+        // what `stopIsInFlight` answers on, and a stop nobody recorded leaves that
+        // predicate false for the whole grace period: the loop's next pass sees a
+        // `RUNNING` container under a terminating definition, takes it for a drain
+        // that has not started, and walks the ladder — seal, destination, transfer,
+        // `requireEmpty`, **save** — into a process already running its shutdown
+        // save. The only thing that had been standing between that and a second
+        // `save-all flush` was whether a dying server still answers a ping with
+        // zero, which is a coincidence and not a guard.
+        //
+        // Before rather than after, for the reason the field's own KDoc gives:
+        // over-reporting costs availability that recovers on its own, losing the
+        // record costs a player's session and no later pass repairs it. Under
+        // `NonCancellable` for the same asymmetry — a shutdown landing between the
+        // write and the stop must not be able to drop it.
+        recordStopDispatched(name)
         try {
             node.stopWorkload(observation.handle, grace)
         } catch (failure: NodeException) {
@@ -286,6 +324,129 @@ public class NodeForcedTermination(
             detail = describe(attempted, confirmed),
         )
     }
+
+    /**
+     * Refuses a force into a drain that already has a save or a stop outstanding.
+     *
+     * A dispatched stop means the container is inside its grace period running its
+     * shutdown save; forcing finds it `RUNNING`, sends another `save-all flush`
+     * into that, and stops it again. `saveRequestedAt` is the same hole one step
+     * earlier — it is non-null exactly while a request has gone out and has not
+     * been confirmed, which is the drain's never-re-send wedge armed.
+     *
+     * **Advisory, and the limits are stated rather than argued away.** The read is
+     * a moment before the seam acts, so the loop may dispatch in between; and a
+     * status that will not decode is indistinguishable here from one not yet
+     * written, so both fall to the permissive side. Refusing on the unreadable case
+     * would block every force against a server the loop has not reached, which
+     * trades a narrow hole for a wide one. What makes a *repeat* of this path safe
+     * is [recordStopDispatched], not this.
+     */
+    private suspend fun refuseSecondSideEffect(name: ResourceName) {
+        val drain = (store.getServer(name)?.status?.status as? PaperServerStatus)?.drain ?: return
+        if (drain.stopDispatchedAt != null) {
+            throw ForcedTerminationRefused(
+                "`${name.value}` already has a stop in flight, dispatched at ${drain.stopDispatchedAt}. It is " +
+                    "inside its grace period; forcing again would send a second save into a server already " +
+                    "shutting down",
+            )
+        }
+        if (drain.saveRequestedAt != null) {
+            throw ForcedTerminationRefused(
+                "`${name.value}` has an unconfirmed world save outstanding, requested at " +
+                    "${drain.saveRequestedAt}. Forcing now would send a second save into a server already " +
+                    "running one; wait for it to confirm or fail",
+            )
+        }
+    }
+
+    /**
+     * Records that a `SIGTERM` is about to leave this process.
+     *
+     * The same record `DrainController.stop` keeps, written the same way round, so
+     * that `stopIsInFlight` answers the same for a forced stop as for a drained
+     * one. This is **observed** state and not desired: it says what happened, and
+     * the definition it hangs off is already tombstoned by the caller.
+     *
+     * A server with no drain status yet gets one in `STOPPING`, because that is
+     * what is true — a stop has been dispatched and nothing else about a drain has.
+     * The state is not a claim that the ladder above it ran; the stamp beside it is
+     * what readers gate on, and `DrainStatus.stopDispatchedAt` says so: *"a producer
+     * of this state that dispatched nothing writes no stamp, so `STOPPING` is not
+     * evidence of a request having gone out and the stamp is."*
+     *
+     * A failed write is logged and not raised. The stop still has to happen — the
+     * caller has tombstoned the definition and this path is the last resort — and
+     * an exception here would leave a server that could only be retired by hand,
+     * which is the state this file exists to remove. What it costs is the record,
+     * and the log line is the compensation available.
+     */
+    private suspend fun recordStopDispatched(name: ResourceName) {
+        withContext(NonCancellable) {
+            try {
+                val stored = store.getServer(name) ?: return@withContext
+                val now = clock.instant()
+                // Only ever an *edit* of an observation the loop already made.
+                // Drafting one from nothing would mean this path inventing a
+                // `phase`, an `observedGeneration` and an `observedAt` for a
+                // container it looked at once — an observation the loop did not
+                // make, written into the field the loop reads to decide what to do
+                // next. `draftStatus` is the one thing allowed to author those, and
+                // it belongs to a reconcile pass.
+                //
+                // The gap this leaves is a server the loop has never observed. It is
+                // narrow — a force needs a `RUNNING` container, which the loop
+                // created — and the log line below is what covers it.
+                val status =
+                    stored.status?.status as? PaperServerStatus
+                        ?: run {
+                            LOG.error(
+                                "no observation to record a forced stop dispatch against server={} — the loop " +
+                                    "may start a drain over a container already shutting down",
+                                name.value,
+                            )
+                            return@withContext
+                        }
+                val next = status.copy(drain = status.drain?.dispatchingStop(now) ?: forcedStopDrain(now))
+                when (val outcome = store.putStatus(next)) {
+                    is WriteOutcome.Applied -> {
+                        Unit
+                    }
+
+                    is WriteOutcome.Conflict -> {
+                        LOG.error(
+                            "could not record a forced stop dispatch server={} reason={} — the loop may start a " +
+                                "drain over a container already shutting down",
+                            name.value,
+                            outcome,
+                        )
+                    }
+                }
+            } catch (failure: StoreException) {
+                LOG.error(
+                    "could not record a forced stop dispatch server={} — the loop may start a drain over a " +
+                        "container already shutting down",
+                    name.value,
+                    failure,
+                )
+            }
+        }
+    }
+
+    private fun forcedStopDrain(now: Instant): DrainStatus =
+        DrainStatus(
+            // The state and the record are written in one expression, which is what
+            // `StatusReconstruction`'s decode rule needs of every producer of this
+            // state: it reconstructs a missing `stopDispatchedAt` from
+            // `enteredStateAt` for anything sitting in `STOPPING` without one, and a
+            // producer that leaves the record off makes that reconstruction a guess.
+            // Here there is nothing to reconstruct — the stamp is set on the same
+            // line as everything else, from the same instant.
+            state = DrainState.STOPPING,
+            startedAt = now,
+            enteredStateAt = now,
+            stopDispatchedAt = now,
+        )
 
     /**
      * Refuses unless the acknowledgement matches what was just observed.

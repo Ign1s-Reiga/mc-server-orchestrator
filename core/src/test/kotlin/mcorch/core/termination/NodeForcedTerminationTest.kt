@@ -3,15 +3,23 @@ package mcorch.core.termination
 import io.kotest.assertions.throwables.shouldThrow
 import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.string.shouldContain
 import mcorch.core.ExecOutcome
 import mcorch.core.FakeNode
 import mcorch.core.StaticNodeRegistry
+import mcorch.core.TestStore
 import mcorch.core.coreTest
 import mcorch.core.paper.PaperWorkloadPlanner
 import mcorch.core.paperDefinition
+import mcorch.schema.DrainState
+import mcorch.schema.DrainStatus
 import mcorch.schema.PaperServerDefaults
+import mcorch.schema.PaperServerDefinition
+import mcorch.schema.PaperServerStatus
+import mcorch.schema.ServerPhase
 import org.junit.jupiter.api.Test
+import java.time.Instant
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
@@ -33,7 +41,30 @@ internal class NodeForcedTerminationTest {
             node.startWorkload((node.workload as mcorch.core.WorkloadObservation.Present).handle)
         }
 
-    private fun terminationOver(node: FakeNode) = NodeForcedTermination(StaticNodeRegistry(listOf(node)))
+    private val store = TestStore()
+
+    private fun terminationOver(node: FakeNode) = NodeForcedTermination(StaticNodeRegistry(listOf(node)), store)
+
+    /** A server the loop has observed, which is what the dispatch record hangs off. */
+    private suspend fun observed(
+        definition: PaperServerDefinition = paperDefinition(),
+        drain: DrainStatus? = null,
+    ) {
+        store.putDefinition(definition)
+        store.putStatus(
+            PaperServerStatus(
+                name = definition.metadata.name,
+                observedGeneration = 1,
+                phase = ServerPhase.RUNNING,
+                observedAt = Instant.EPOCH,
+                lastTransitionAt = Instant.EPOCH,
+                drain = drain,
+            ),
+        )
+    }
+
+    private suspend fun recordedDrain(definition: PaperServerDefinition = paperDefinition()): DrainStatus? =
+        (store.getServer(definition.metadata.name)?.status?.status as? PaperServerStatus)?.drain
 
     @Test
     fun `the save is requested before the container is stopped`() =
@@ -339,6 +370,80 @@ internal class NodeForcedTerminationTest {
             shouldThrow<ForcedTerminationRefused> {
                 terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.None)
             }.message.toString() shouldContain "3 player"
+            node.stops shouldHaveSize 0
+        }
+
+    @Test
+    fun `the stop is recorded before it is dispatched, so the loop does not drain over it`() =
+        coreTest {
+            val node = FakeNode()
+            running(node)
+            observed()
+
+            terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.None)
+
+            // `DrainStatus.stopDispatchedAt` is what `stopIsInFlight` answers on.
+            // Without it the loop's next pass sees a RUNNING container under a
+            // terminating definition, reads it as a drain that has not started, and
+            // walks the ladder — seal, destination, transfer, requireEmpty, **save**
+            // — into a process already running its shutdown save. The only thing
+            // that stood between that and a second `save-all flush` was whether a
+            // dying server still answers a ping with zero, which is a coincidence.
+            //
+            // This went unrecorded through three commits of this feature.
+            val drain = recordedDrain()
+            drain?.stopDispatchedAt shouldNotBe null
+            drain?.state shouldBe DrainState.STOPPING
+        }
+
+    @Test
+    fun `an existing drain keeps its first dispatch instant rather than being restamped`() =
+        coreTest {
+            val node = FakeNode()
+            running(node)
+            val first = Instant.parse("2020-01-01T00:00:00Z")
+            observed(
+                drain =
+                    DrainStatus(
+                        state = DrainState.SAVING,
+                        startedAt = first,
+                        enteredStateAt = first,
+                        stopDispatchedAt = first,
+                    ),
+            )
+
+            // Refused, because a dispatched stop is already in flight — and the
+            // record is left exactly as it was. "May a SIGTERM already be in that
+            // container" is the question readers ask; the most recent one is not.
+            shouldThrow<ForcedTerminationRefused> {
+                terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.None)
+            }.message.toString() shouldContain "already has a stop in flight"
+            node.stops shouldHaveSize 0
+            recordedDrain()?.stopDispatchedAt shouldBe first
+        }
+
+    @Test
+    fun `a force into an outstanding save is refused rather than sending a second one`() =
+        coreTest {
+            val node = FakeNode()
+            running(node)
+            val requested = Instant.parse("2020-01-01T00:00:00Z")
+            observed(
+                drain =
+                    DrainStatus(
+                        state = DrainState.SAVING,
+                        startedAt = requested,
+                        enteredStateAt = requested,
+                        saveRequestedAt = requested,
+                    ),
+            )
+
+            // The never-re-send wedge armed: a request went out and has not
+            // confirmed. This guard lived in `:api` until round 51, where it
+            // protected one route and no other caller of this seam.
+            shouldThrow<ForcedTerminationRefused> {
+                terminationOver(node).preflight(paperDefinition(), OccupancyAcknowledgement.None)
+            }.message.toString() shouldContain "unconfirmed world save"
             node.stops shouldHaveSize 0
         }
 
