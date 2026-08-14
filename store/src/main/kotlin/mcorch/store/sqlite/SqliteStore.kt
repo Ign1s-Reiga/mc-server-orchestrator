@@ -291,9 +291,23 @@ internal class SqliteStore(
                 val drainState = StatusCodec.drainStateOf(status)
                 if (drainState == null) setNull(8, java.sql.Types.VARCHAR) else setString(8, drainState.name)
             }
-            // Status writes deliberately do not append to the change feed: the loop is
-            // the only writer of observed state, and feeding it back to itself is a
-            // self-loop, not a notification.
+            // Status writes deliberately do not append to the change feed: feeding
+            // the loop's own observations back to itself is a self-loop, not a
+            // notification.
+            //
+            // **The reason used to be "the loop is the only writer of observed
+            // state", and that is no longer true.** `NodeForcedTermination` stamps
+            // `DrainStatus.stopDispatchedAt` from an HTTP request. The self-loop
+            // argument survives that — a write nobody but the loop reads still needs
+            // no wake-up, and the loop is already queued for a forced stop by the
+            // tombstone that had to precede it.
+            //
+            // What does *not* survive is the implication that nothing is missed. A
+            // dashboard following the force response's own advice to poll sees the
+            // transition into `STOPPING` only when the next pass writes. Whether
+            // that should reach the stream is an open question rather than a
+            // settled one; it is recorded here because the sentence that used to
+            // stand in its place made it invisible.
             WriteOutcome.Applied(StoredStatus(status, ResourceVersion(revision.toString()), now))
         }
 

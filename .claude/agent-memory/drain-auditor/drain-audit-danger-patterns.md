@@ -2645,3 +2645,67 @@ Related: [[standalone-paper-drain-shape]]
      the proxy restarts (item 46). Not a harm, but the justification is false, and
      a false justification beside a correct decision is what this project keeps
      having to unpick.
+
+## Round 53: the fix that answered one direction of a two-direction race
+
+224. **A read-modify-write race has two directions, and a fix aimed at one can be
+     declined for the other on a reason that does not apply.** Round 52 found that
+     `Reconciler` and `NodeForcedTermination` both write observed state without a
+     precondition, so each can clobber the other. `preservingDispatch` closes the
+     loop→force direction. The force→loop direction was dropped on the argument
+     *"a precondition would not help, because `forceRecord` writes unguarded
+     anyway"* — but `forceRecord` is a **loop** write, and the recommendation was a
+     precondition on the **force's** write. The window there is not sub-millisecond:
+     `refuseSecondSideEffect` reads `saveRequestedAt` at entry and
+     `recordStopDispatched` writes minutes later, after a seal, a probe and a save,
+     so a `saveRequestedAt` the loop stamps in between is erased — the never-re-send
+     wedge disarmed, and the second `save-all flush` lands on a container being
+     `SIGTERM`ed. When a race is reported in both directions, check that the fix
+     and the rebuttal are talking about the same write.
+225. **A `?: storedValue` fallback silently outranks whatever site deliberately
+     wrote null.** `preservingDispatch` takes the stored drain wholesale when the
+     draft has none, which suppresses `clearedDrainRecord` — the one rule for
+     retiring a drain record, whose own KDoc documents the downstream effect
+     (`ProxyPass.backends` re-derives `sealed` and `letGo` from the record, so a
+     vanished record un-seals and re-registers, level-triggered). Unreachable today
+     only because both `clearedDrainRecord` sites sit on paths a terminating
+     definition never takes. Before adding a "the draft's null must be staleness"
+     fallback, enumerate the sites that write that null on purpose and what
+     downstream re-derives from its absence.
+226. **A gate written as a performance optimisation can be the only thing holding
+     a correctness property, and only the performance reason gets documented.**
+     `preservingDispatch`'s `if (!terminating) return` is justified as "no extra
+     read on the steady-state path". It is *also* what keeps the function away from
+     `clearedDrainRecord` (item 225) and away from the `CREATED` observation whose
+     surviving record once "made the next pass drain the replacement that had just
+     been built, for ever". Widen the gate for a good reason — a second force path,
+     or someone deciding the read is cheap — and two unrelated properties break
+     with no test to say so. When a cheap guard has a cheap justification, ask what
+     else it happens to exclude.
+227. **A guard that enumerates retirements cannot see a resurrection.**
+     `every drain record this loop retires is retired through the one rule` scans
+     for `drain = <value>` assignments and was cited as having caught the new code
+     "on the way in". It caught the *addition*; it is structurally incapable of
+     catching the hazard, because `preservingDispatch` never retires a record — it
+     un-retires one. A guard's scan predicate is its blast radius; when a change
+     introduces the inverse of the operation a guard enumerates, the guard's green
+     is evidence about the old operation only.
+228. **Confirm a discrimination test by reverting the fix, not by reasoning about
+     the hook.** `StopDispatchDurabilityTest` depends on `TestStore.afterNextRead`
+     firing on the *pass's* snapshot read rather than on `preservingDispatch`'s own
+     re-read — the hook self-clears, so which read it lands on is load-bearing and
+     undocumented. Reverting the four call sites in a scratch worktree and running
+     the test took two minutes and turned "I believe it would be green against the
+     broken code" into a fact: it **fails**. Do this whenever a test's value rests
+     on an interleaving hook; the reasoning is exactly as reliable as the reasoning
+     that put the bug there.
+229. **A set-once field enforced at every call site belongs in the store's
+     transaction instead.** `stopDispatchedAt` is documented "set once, never
+     un-stamped", and enforcing that in `:core` produced an enumeration of write
+     sites, a `terminating` gate, an extra non-atomic read, and a residual window
+     nobody closed. `SqliteStore.putStatus` already runs `readStatusRow(connection,
+     name)` inside its own `write { }` transaction — preserving a non-null stamp
+     there is atomic by construction and covers every present and future writer.
+     The tension to state rather than skip: CLAUDE.md says policy in the store is
+     policy in two places. A field-level invariant the field's own KDoc declares is
+     not policy, and `:store` already knows `drain_state`.
