@@ -1002,7 +1002,30 @@ internal class DrainWiringTest {
         // A count of assignments rather than of call sites: what must not happen is
         // a scan that found none, and a new phase legitimately raises it.
         written.count { it.startsWith("clearedDrainRecord(") } shouldBeGreaterThan 8
-        written.filterNot { it.startsWith("clearedDrainRecord(") }.toSet() shouldBe setOf("progress.drain", "drain")
+        written.filterNot { it.startsWith("clearedDrainRecord(") }.toSet() shouldBe
+            setOf(
+                "progress.drain",
+                "drain",
+                // `preservingDispatch`, and it is listed rather than exempted.
+                //
+                // It is the only assignment here that writes a drain this pass did
+                // not compute: the loop is no longer the only writer of observed
+                // state, and a pass whose snapshot predates a forced stop's
+                // `stopDispatchedAt` would otherwise put the pre-stamp record back.
+                //
+                // What this test guards is a record being *retired*, and neither
+                // branch of that expression can retire one. `copy(stopDispatchedAt =
+                // dispatched)` only ever fills the field — `dispatched` is non-null
+                // by the time it is reached — and the elvis arm takes the stored
+                // record wholesale. A non-null drain cannot come out of it null.
+                //
+                // Spelled out in full rather than matched loosely, for the same
+                // reason the `clearedDrainRecord` arguments are pinned: a shape that
+                // follows a rename and refuses a substitution. An edit that turned
+                // that `copy` into anything capable of clearing a field would change
+                // this string and land here.
+                "status.drain?.copy(stopDispatchedAt = dispatched) ?: current",
+            )
         written.filter { it.startsWith("clearedDrainRecord(") }.forEach { call ->
             withClue("a drain record is retired on something other than this pass's own record: $call") {
                 call shouldMatch ASKS_THE_RULE

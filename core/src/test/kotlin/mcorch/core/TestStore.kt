@@ -238,8 +238,31 @@ internal class TestStore(
         }
     }
 
-    override suspend fun getServer(name: ResourceName): StoredServer? =
-        guarded { definitions[name]?.let { StoredServer(it, statuses[name]) } }
+    /**
+     * Runs once, after the next [getServer] has taken its snapshot.
+     *
+     * The only way to reproduce a *concurrent writer*: a reconcile pass reads its
+     * snapshot, spends real time in node calls, and lands its write afterwards. A
+     * test that writes between passes proves nothing about that window, because
+     * the next pass simply reads the newer value.
+     *
+     * Cleared when it fires, so one arming interleaves one read.
+     */
+    var afterNextRead: (suspend () -> Unit)? = null
+
+    /** Every [getServer] call. Lets a test assert that a guard costs no extra read. */
+    var serverReads: Int = 0
+        private set
+
+    override suspend fun getServer(name: ResourceName): StoredServer? {
+        serverReads++
+        val snapshot = guarded { definitions[name]?.let { StoredServer(it, statuses[name]) } }
+        afterNextRead?.let {
+            afterNextRead = null
+            it()
+        }
+        return snapshot
+    }
 
     override suspend fun listServers(): List<StoredServer> =
         guarded {

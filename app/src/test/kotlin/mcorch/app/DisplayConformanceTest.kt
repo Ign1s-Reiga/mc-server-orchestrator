@@ -16,6 +16,7 @@ import mcorch.core.console.ServerConsole
 import mcorch.core.termination.ForcedStopOutcome
 import mcorch.core.termination.ForcedTermination
 import mcorch.core.termination.ForcedTerminationUnavailable
+import mcorch.core.termination.OccupancyAcknowledgement
 import mcorch.schema.DrainStatus
 import mcorch.schema.PaperServerDefinition
 import mcorch.schema.PaperServerStatus
@@ -568,9 +569,14 @@ class DisplayConformanceTest {
                     ): String = throw ConsoleUnavailable("no workload in this test")
                 },
                 object : ForcedTermination {
+                    override suspend fun preflight(
+                        definition: PaperServerDefinition,
+                        acknowledgement: OccupancyAcknowledgement,
+                    ): Unit = Unit
+
                     override suspend fun stop(
                         definition: PaperServerDefinition,
-                        acknowledgeOccupancy: Boolean,
+                        acknowledgement: OccupancyAcknowledgement,
                     ): ForcedStopOutcome = throw ForcedTerminationUnavailable("no workload in this test")
                 },
             ).use { server ->
