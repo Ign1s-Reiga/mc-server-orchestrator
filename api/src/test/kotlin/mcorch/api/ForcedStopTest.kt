@@ -7,6 +7,7 @@ import mcorch.core.termination.OccupancyAcknowledgement
 import mcorch.schema.fixtures.ExampleDefinitions
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
+import java.time.Instant
 
 /**
  * Forcing a stop.
@@ -176,6 +177,27 @@ class ForcedStopTest {
         forced.json()["saveConfirmed"] shouldBe false
         // Null, not zero. A client must not render an unknown count as an empty one.
         forced.json()["playersOnline"] shouldBe null
+        // No save was outstanding, so this really is "nothing ever reached it".
+        forced.json()["saveOutstandingSince"] shouldBe null
+    }
+
+    @Test
+    fun `a skipped save is distinguishable from one that could never be sent`() {
+        // `saveAttempted: false` covers both, and they are not the same event: here a
+        // request demonstrably *did* go out — the drain sent it — and was never
+        // confirmed, so the world may well be on disk. An investigator reading the
+        // boolean alone would conclude nothing was ever sent and be wrong.
+        val outstanding = Instant.parse("2026-02-01T12:00:00Z")
+        val force = StoppingForce(saveConfirmed = false, saveAttempted = false, saveOutstandingSince = outstanding)
+        val started = TestApi.start(forced = force)
+        api = started
+        started.call("POST", "/api/v1/servers", ExampleDefinitions.valid("full.yaml")).status shouldBe 201
+
+        val forced = started.call("DELETE", "/api/v1/servers/survival-02?force=true")
+
+        forced.json()["saveAttempted"] shouldBe false
+        // The instant, not a flag: how long ago is what decides whether it landed.
+        forced.json()["saveOutstandingSince"] shouldBe outstanding.toString()
     }
 
     @Test

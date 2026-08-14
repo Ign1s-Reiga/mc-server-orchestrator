@@ -408,6 +408,11 @@ internal class ServerRoutes(
                 put("forced", true)
                 put("saveAttempted", outcome.saveAttempted)
                 put("saveConfirmed", outcome.saveConfirmed)
+                // Non-null means the *drain* already had a save outstanding, so this
+                // stop deliberately sent none. Without it `saveAttempted: false`
+                // reads as "no save was ever sent" on a branch where one demonstrably
+                // was — just not by this operation, and not confirmed.
+                put("saveOutstandingSince", Json.of(outcome.saveOutstandingSince?.toString()))
                 // Null means the server did not answer a count. It is not zero, and
                 // a client must not render it as one.
                 put("playersOnline", Json.of(outcome.playersOnline))

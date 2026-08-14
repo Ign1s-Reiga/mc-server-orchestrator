@@ -6,6 +6,7 @@ import mcorch.core.termination.ForcedTerminationRefused
 import mcorch.core.termination.ForcedTerminationUnavailable
 import mcorch.core.termination.OccupancyAcknowledgement
 import mcorch.schema.PaperServerDefinition
+import java.time.Instant
 
 /**
  * A forced stop with no container behind it.
@@ -45,6 +46,7 @@ internal class StoppingForce(
     private val saveConfirmed: Boolean,
     private val saveAttempted: Boolean = true,
     private val playersOnline: Int? = 0,
+    private val saveOutstandingSince: Instant? = null,
 ) : ForcedTermination {
     val recorded: MutableList<String> = mutableListOf()
 
@@ -70,6 +72,7 @@ internal class StoppingForce(
         return ForcedStopOutcome(
             saveAttempted = saveAttempted,
             saveConfirmed = saveConfirmed,
+            saveOutstandingSince = saveOutstandingSince,
             playersOnline = playersOnline,
             detail = if (saveConfirmed) "confirmed" else "not confirmed",
         )

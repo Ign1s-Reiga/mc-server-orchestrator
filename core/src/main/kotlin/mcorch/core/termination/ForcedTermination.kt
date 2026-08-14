@@ -64,7 +64,7 @@ import kotlin.time.toJavaDuration
  * | Seal the proxy (2) | **Done.** Asserted through the same `ProxyFleet.linkFor` channel the drain uses. See below |
  * | Transfer players (4) | **Not done.** Players are disconnected |
  * | `requireEmpty` — zero players (5) | Replaced by a counted acknowledgement, read under the seal. See below |
- * | Save (5) | Requested, and **[ForcedStopOutcome.saveAttempted] says whether it really was** |
+ * | Save (5) | Requested unless the drain already has one outstanding, and **[ForcedStopOutcome.saveAttempted] with [ForcedStopOutcome.saveOutstandingSince] say which** |
  * | Deregister (6) | **Not done.** The loop's next pass does it; until then the proxy holds a registration at an address that is going away |
  * | `mayStop` (7) | Deliberately bypassed. That is the feature |
  *
@@ -227,6 +227,22 @@ public sealed interface OccupancyAcknowledgement {
 public data class ForcedStopOutcome(
     val saveAttempted: Boolean,
     val saveConfirmed: Boolean,
+    /**
+     * When the *drain* last issued a save it never got confirmed for, if one was
+     * outstanding when this stop ran — in which case no save was sent from here.
+     *
+     * **This is what stops [saveAttempted] lying by omission.** Its three original
+     * meanings were all *"nothing ever reached the server"*: no save channel, a
+     * client that never connected, an unusable `saveTimeout`. This branch is
+     * different in kind — `DrainStatus.saveRequestedAt` means, by its own
+     * definition, that **a request did go out** — so an investigator reading
+     * `saveAttempted: false` alone would conclude no save was ever sent and be
+     * wrong. The world may well be on disk.
+     *
+     * Carried as the instant rather than a fourth flag because *how long ago* is
+     * the part that decides whether it plausibly landed.
+     */
+    val saveOutstandingSince: Instant? = null,
     val playersOnline: Int?,
     /** Operator-facing, and never a player name or an address. */
     val detail: String,
@@ -334,8 +350,24 @@ public class NodeForcedTermination(
         // a second `save-all flush` landing on a main thread already running one;
         // declining to send it achieves that in full. Refusing the whole stop
         // achieves nothing further, and the stop is what the caller cannot get any
-        // other way. `saveAttempted` reports it, and the grace period is raised to
-        // the shutdown-save allowance exactly as it is for any other unsent save.
+        // other way.
+        //
+        // **And skipping is not a new policy — it is this path stopping being the
+        // exception.** `DrainController.save()` already refuses to re-send on an
+        // outstanding request and aborts permanently instead; the drain will never
+        // send a second one. The force doing so was the anomaly, so this closes a
+        // hole where the escape hatch broke the very wedge the drain stalls itself
+        // to maintain. (The raised grace period and Paper's own `SIGTERM` save are
+        // *not* the argument: on a genuinely wedged main thread neither runs, which
+        // is exactly where the skip bites hardest.)
+        //
+        // The residual, stated rather than papered over: a server that has since
+        // recovered, carrying a stale wedge nothing will ever clear, has a world
+        // that could be saved and no automated path that will try — not the drain,
+        // not this. The escape is the console: `save-all flush` through
+        // `POST /api/v1/servers/{name}/console`, confirmed by eye, then force. That
+        // does not clear the wedge either, so this still skips; it just no longer
+        // matters, because the world is already on disk.
         //
         // Re-read here rather than trusted from entry: `refuseSecondSideEffect` ran
         // before the seal, a probe and possibly a save timeout ago.
@@ -413,6 +445,7 @@ public class NodeForcedTermination(
         return ForcedStopOutcome(
             saveAttempted = attempted,
             saveConfirmed = confirmed,
+            saveOutstandingSince = outstanding,
             playersOnline = atStop,
             detail = describe(attempted, confirmed, outstanding),
         )
@@ -586,9 +619,24 @@ public class NodeForcedTermination(
      *
      * Read fresh immediately before [stop] would send its own, because
      * [refuseSecondSideEffect] ran a seal, a probe and possibly a save timeout ago.
-     * A store that will not answer reports null: the alternative is failing a stop
-     * over a read, and the cost of guessing wrong here is one extra flush against a
-     * container that is about to take a `SIGTERM` anyway.
+     *
+     * **A store that will not answer reports null, which fails toward sending.** The
+     * tempting justification — *"one extra flush against a container about to take a
+     * `SIGTERM` anyway"* — is wrong, because the flush lands **before** the stop, on
+     * a live server, which is exactly the case the wedge protects. The real reason is
+     * that `save-all flush` is idempotent on the game side: the redundant action
+     * costs a stall, the omitted one costs a save outright, so guessing wrong toward
+     * the repeat is the cheaper mistake.
+     *
+     * Only a *transient* store failure reaches this catch. `Store.getServer` fails
+     * rather than returning a hole when either half will not decode, so an
+     * undecodable row throws out of [preflight] into a 500 above the tombstone and
+     * never gets here.
+     *
+     * The gap between this read and the exec cannot be closed, only shrunk — one
+     * half is a store read and the other is a command against a game server, and no
+     * layer can make those atomic. That is the honest floor rather than an open
+     * item: what makes it acceptable is the same idempotence as above.
      */
     private suspend fun outstandingSave(name: ResourceName): Instant? =
         try {

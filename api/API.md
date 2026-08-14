@@ -750,15 +750,25 @@ period is a ceiling on how long containerd waits, not a delay.
 
 ```json
 { "accepted": true, "forced": true,
-  "saveAttempted": false, "saveConfirmed": false, "playersOnline": 12,
+  "saveAttempted": false, "saveConfirmed": false, "saveOutstandingSince": null,
+  "playersOnline": 12,
   "detail": "no world save could be sent — the container has no channel that could confirm one — so the stop grace period was the only chance the world had to reach disk" }
 ```
 
-**Read `saveAttempted` and `saveConfirmed` together.** They are different
-questions: a save can be *sent and never confirmed*, or **never sent at all** —
-which is what happens on the very population this endpoint exists for, a container
-with no working save channel. Collapsing them into "not confirmed" would report
-those two identically, and they are not the same event.
+**Read `saveAttempted`, `saveConfirmed` and `saveOutstandingSince` together.**
+They are different questions: a save can be *sent and never confirmed*, or **never
+sent at all** — which is what happens on the very population this endpoint exists
+for, a container with no working save channel. Collapsing them into "not
+confirmed" would report those two identically, and they are not the same event.
+
+**`saveOutstandingSince` is the one that stops `saveAttempted: false` misleading
+you.** When it is non-null, the *drain* already had a save outstanding and this
+stop deliberately sent none rather than putting a second `save-all flush` on a main
+thread already running one. So a request demonstrably did go out — at that
+instant — and the world may well be on disk. Without this field, that case is
+indistinguishable from "no save channel existed", and the two point at opposite
+conclusions. How long ago it was is what decides whether it plausibly landed, which
+is why it is a timestamp rather than a flag.
 
 **`playersOnline` may be `null`, and null is not zero.** It means the server did
 not answer a count. Render it as unknown; a client that shows it as an empty
