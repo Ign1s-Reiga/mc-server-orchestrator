@@ -5,6 +5,10 @@ import kotlinx.coroutines.withContext
 import mcorch.core.Node
 import mcorch.core.NodeException
 import mcorch.core.NodeRegistry
+import mcorch.core.ProxyFleet
+import mcorch.core.ReconcilerConfig
+import mcorch.core.Scheduler
+import mcorch.core.SealOutcome
 import mcorch.core.StopGrace
 import mcorch.core.WorkloadObservation
 import mcorch.core.WorkloadState
@@ -55,27 +59,47 @@ import kotlin.time.Duration
  *
  * | Drain step | Here |
  * |---|---|
- * | Seal the proxy (2) | **Not done.** The loop's next pass deregisters; until then the proxy may route joins at a dead address |
+ * | Seal the proxy (2) | **Done.** Asserted through the same `ProxyFleet.linkFor` channel the drain uses. See below |
  * | Transfer players (4) | **Not done.** Players are disconnected |
- * | `requireEmpty` — zero players (5) | Replaced by two probes and a counted acknowledgement. See below |
+ * | `requireEmpty` — zero players (5) | Replaced by a counted acknowledgement, read under the seal. See below |
  * | Save (5) | Requested, and **[ForcedStopOutcome.saveAttempted] says whether it really was** |
- * | Deregister (6) | **Not done.** As the seal |
+ * | Deregister (6) | **Not done.** The loop's next pass does it; until then the proxy holds a registration at an address that is going away |
  * | `mayStop` (7) | Deliberately bypassed. That is the feature |
  *
- * ## Why the occupancy is read twice
+ * ## The seal is what makes the count mean something
  *
- * `requireEmpty`'s zero is durable because the seal holds it: every drain state
- * from `SEALED` onward re-asserts `holdSeal`, so nobody can join between the
- * observation and the stop. There is no seal here — the table above says so — and
- * a single probe therefore decays the instant it is taken. The gap between the
- * first probe and the stop is a whole `saveTimeout` wide, which `SpecBounds` caps
- * at an hour.
+ * `requireEmpty`'s zero is durable in the drain because the seal holds it: from
+ * `SEALED` onward every state re-asserts `holdSeal`, so nobody can join between
+ * the observation and the stop. Two earlier versions of this file dropped step 2
+ * and tried to make a bare probe carry the same weight. Neither could:
  *
- * The branch that made this urgent is the one that looks safest: a server probing
- * zero needs **no acknowledgement at all**, so an hour-long window on that branch
- * is a stop that drops live sessions while reporting `playersOnline: 0` and having
- * asked nobody anything. So the count is read again immediately before the stop,
- * and it is the second reading that decides — and that the outcome reports.
+ * - One probe, and the reading decayed across the save wait — a whole
+ *   `saveTimeout`, which `SpecBounds` caps at an hour. Worst on the branch that
+ *   looks safest, since a server probing zero is asked for no acknowledgement at
+ *   all and would have been stopped with players who arrived during the wait.
+ * - Two probes, and the second only narrowed the window. It also made the counted
+ *   acknowledgement livelock: with nothing owning the number between the 409 that
+ *   names it and the re-send that quotes it, a busy server could refuse forever,
+ *   each turn spending a save timeout and a `save-all flush` on a definition
+ *   already tombstoned.
+ *
+ * **A compare-and-swap is only a compare-and-swap if something owns the value
+ * between the read and the write.** So step 2 is done here, first, and the reading
+ * is taken under it. The count can then only fall — players leave, none arrive —
+ * which is the direction that is safe to be wrong about, and which makes a retry
+ * terminate instead of oscillating.
+ *
+ * **The second probe survives where the seal does not reach.** A standalone server
+ * has no proxy to seal and players connect to it directly, so there is no door and
+ * nothing owns the count; the reading is taken again before the stop there, and
+ * the race is honestly still a race. That is not a defect this path can fix — the
+ * drain does not fix it either, it declines to stop instead — and an operator
+ * forcing an unproxied server with a live population is being told to let it empty
+ * rather than being handed a guarantee that does not exist.
+ *
+ * When there *is* a door and it cannot be shut, [refuseUnsealedPopulation] decides
+ * that against the count rather than on its own, which is the trade
+ * `DrainController.abortSeal` already makes: an empty server needs no door held.
  *
  * ## The acknowledgement is a count, not a flag
  *
@@ -145,9 +169,9 @@ public interface ForcedTermination {
      * The definition must already be tombstoned. This does not delete it: the
      * teardown that frees the name belongs to the reconcile loop.
      *
-     * Re-runs the occupancy check itself rather than trusting [preflight]'s, both
-     * because the population moves and because a seam whose safety depends on
-     * having been called in the right order has none.
+     * Seals the login path first, then reads the count under it, then saves, then
+     * stops. Re-runs every check [preflight] made rather than trusting it: a seam
+     * whose safety depends on having been called in the right order has none.
      *
      * @throws ForcedTerminationUnavailable when there is no running workload.
      * @throws ForcedTerminationRefused only for reasons re-sending can answer.
@@ -214,8 +238,22 @@ public class ForcedTerminationRefused(
 public class NodeForcedTermination(
     private val nodes: NodeRegistry,
     private val store: Store,
+    private val scheduler: Scheduler,
+    private val config: ReconcilerConfig = ReconcilerConfig(),
     private val clock: Clock = Clock.systemUTC(),
 ) : ForcedTermination {
+    /** What drain step 2 achieved here. Three answers, as the drain's own [SealHold] has. */
+    private enum class SealResult {
+        /** The proxy confirmed the workload no longer admits new players. */
+        ASSERTED,
+
+        /** Nothing routes to this server, so there is no door to shut. */
+        NOTHING_TO_SEAL,
+
+        /** There is a door and it could not be shut. Decided against the count, not on its own. */
+        FAILED,
+    }
+
     override suspend fun preflight(
         definition: PaperServerDefinition,
         acknowledgement: OccupancyAcknowledgement,
@@ -257,18 +295,36 @@ public class NodeForcedTermination(
         // row". There was no such protection. `WorkloadState` reports `RUNNING` and
         // says nothing about whether a save is outstanding.
         refuseSecondSideEffect(name)
-        refuseOccupancy(name, occupancy(agent, node, observation), acknowledgement)
+
+        // Drain step 2, and it comes **first**. Everything below reads a player
+        // count and acts on it, and a count nobody is holding still is not a
+        // reading — see "The seal is what makes the count mean something".
+        val seal = sealOff(name)
+
+        // Read under the seal, and refused before the save rather than after it, so
+        // a mismatch costs the caller neither a flush nor a save timeout.
+        val players = occupancy(agent, node, observation)
+        refuseOccupancy(name, players, acknowledgement)
+        refuseUnsealedPopulation(name, seal, players)
 
         val save = requestSave(agent, node, observation)
         val attempted = save !is SaveOutcome.Unconfirmable && save !is SaveOutcome.NotDelivered
         val confirmed = save is SaveOutcome.Confirmed
 
-        // The reading that decides. The one above is a whole `saveTimeout` old by
-        // now, and without a seal nothing held it — see "Why the occupancy is read
-        // twice". Refusing here is recoverable: the caller re-sends with the number
-        // this refusal names.
-        val players = occupancy(agent, node, observation)
-        refuseOccupancy(name, players, acknowledgement)
+        // **One more reading, and only when nothing is holding the last one.**
+        //
+        // With the door shut the count can only fall, so the reading above stays
+        // good enough: a second probe would cost a wedged server another 10s to
+        // learn something the seal already guarantees.
+        //
+        // Without one it does not, and `NOTHING_TO_SEAL` is not a rare case — a
+        // standalone server has no proxy to seal and players reach it directly.
+        // Dropping this probe outright, as the seal's first draft did, would have
+        // widened that window from milliseconds to a whole save timeout for exactly
+        // the servers with no door. So the probe follows the guarantee rather than
+        // the other way round.
+        val atStop = if (seal == SealResult.ASSERTED) players else occupancy(agent, node, observation)
+        refuseOccupancy(name, atStop, acknowledgement)
 
         val declared = definition.spec.lifecycle.stopGracePeriod
         // Raised, never lowered, and never a refusal. When no save request was
@@ -285,7 +341,7 @@ public class NodeForcedTermination(
             name.value,
             attempted,
             confirmed,
-            players ?: "unknown",
+            atStop ?: "unknown",
             grace.period.inWholeSeconds,
         )
         // **Stamped before the call, and this is the record the first three
@@ -320,8 +376,81 @@ public class NodeForcedTermination(
         return ForcedStopOutcome(
             saveAttempted = attempted,
             saveConfirmed = confirmed,
-            playersOnline = players,
+            playersOnline = atStop,
             detail = describe(attempted, confirmed),
+        )
+    }
+
+    /**
+     * Drain step 2: stop new joins at the proxy.
+     *
+     * Asserted rather than assumed, exactly as `DrainController.holdSeal` does, and
+     * through the same `ProxyFleet.linkFor` channel so there is one derivation of a
+     * backend's address rather than two.
+     *
+     * Unlike the drain this does not park on a failure, because there is no next
+     * pass to park for — the caller is holding an HTTP request open and the
+     * definition is already tombstoned. A failure is carried to
+     * [refuseUnsealedPopulation], which decides it against the count, the same
+     * trade `DrainController.abortSeal` makes through `sealIsPrecondition`: an
+     * empty server needs no door held, and a populated one does.
+     *
+     * A proxy that cannot be reached is **not** a failure of the backend. That is
+     * `linkFor`'s own rule — *"the proxy being down is the proxy's problem, and a
+     * backend that refused to drain because of it would be undeletable for as long
+     * as the proxy was"* — and it applies with more force here, on the path whose
+     * whole purpose is that a server can always be retired.
+     */
+    private suspend fun sealOff(name: ResourceName): SealResult {
+        val stored = store.getServer(name) ?: return SealResult.NOTHING_TO_SEAL
+        val binding =
+            when (val fleet = ProxyFleet.resolve(store, stored)) {
+                is ProxyFleet.Resolution.Behind -> fleet.binding
+
+                // Standalone: no proxy routes to it, so there is no door. Conflicted:
+                // two proxies claim it and sealing one leaves the other admitting, so
+                // sealing is not something this can do — the same degradation the
+                // reconcile path takes rather than picking one.
+                else -> return SealResult.NOTHING_TO_SEAL
+            }
+        val runtime = (stored.status?.status as? PaperServerStatus)?.runtime
+        val link =
+            ProxyFleet.linkFor(binding, name, nodes, scheduler, runtime?.node ?: return SealResult.FAILED, config)
+                ?: return SealResult.FAILED
+        return try {
+            when (val outcome = link.assertAdmission(admits = false)) {
+                is SealOutcome.Asserted -> if (outcome.admits) SealResult.FAILED else SealResult.ASSERTED
+                is SealOutcome.Refused -> SealResult.FAILED
+                is SealOutcome.Unavailable -> SealResult.FAILED
+            }
+        } catch (failure: NodeException) {
+            LOG.debug("the login seal could not be asserted for a forced stop", failure)
+            SealResult.FAILED
+        }
+    }
+
+    /**
+     * Refuses a populated server whose login path could not be shut.
+     *
+     * `DrainController.abortSeal` makes the same call through `sealIsPrecondition`:
+     * a server with nobody on it needs no door held, and the zero-player gate is
+     * what decides. A populated one is different — the count below is the whole
+     * basis for stopping, and an unsealed proxy can put a player behind it between
+     * the reading and the `SIGTERM`.
+     *
+     * Recoverable, so it may sit below the tombstone: the operator fixes the proxy,
+     * or waits for the server to empty, and forces again.
+     */
+    private fun refuseUnsealedPopulation(
+        name: ResourceName,
+        seal: SealResult,
+        players: Int?,
+    ) {
+        if (seal != SealResult.FAILED || players == 0) return
+        throw ForcedTerminationRefused(
+            "`${name.value}` could not have its login path shut at the proxy, and it is not empty, so nothing " +
+                "stops a player joining between the count this stop is based on and the stop itself. Restore " +
+                "the proxy's control channel, or wait for the server to empty, and force again",
         )
     }
 

@@ -7,6 +7,7 @@ import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.string.shouldContain
 import mcorch.core.ExecOutcome
 import mcorch.core.FakeNode
+import mcorch.core.SingleNodeScheduler
 import mcorch.core.StaticNodeRegistry
 import mcorch.core.TestStore
 import mcorch.core.coreTest
@@ -43,7 +44,12 @@ internal class NodeForcedTerminationTest {
 
     private val store = TestStore()
 
-    private fun terminationOver(node: FakeNode) = NodeForcedTermination(StaticNodeRegistry(listOf(node)), store)
+    private fun terminationOver(node: FakeNode) =
+        NodeForcedTermination(
+            StaticNodeRegistry(listOf(node)),
+            store,
+            SingleNodeScheduler(StaticNodeRegistry(listOf(node))),
+        )
 
     /** A server the loop has observed, which is what the dispatch record hangs off. */
     private suspend fun observed(
