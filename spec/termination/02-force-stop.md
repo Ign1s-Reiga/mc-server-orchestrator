@@ -95,18 +95,26 @@ the exact state this feature exists to remove. Every refusal on this path is
 either decided **before** the tombstone or answerable by re-sending the same
 request.
 
-**The occupancy is read twice, and the acknowledgement is a count.**
+**The login path is sealed first, and the acknowledgement is a count.**
 `requireEmpty`'s zero is durable in the drain because the **seal** holds it: from
 `SEALED` onward the proxy will not route a join, so nobody arrives between the
-observation and the stop. This path does not seal — see §"What it still does not
-do" — so a single reading decays the moment it is taken, and the gap between it
-and the stop is a whole save timeout, which `SpecBounds` caps at an hour.
+observation and the stop. Two drafts of this path dropped step 2 and tried to make
+a bare probe carry the same weight; neither could. One probe let players join
+across the save wait — an hour, at the `SpecBounds` ceiling — and the branch that
+exposed was the one that looks safest, since a server observed empty is asked for
+no acknowledgement at all. Two probes only narrowed that, and made the counted
+acknowledgement livelock on a busy server: nothing owned the number between the
+409 that named it and the re-send that quoted it.
 
-The branch that made this urgent is the one that looks safest: a server observed
-empty needs no acknowledgement at all, so a single probe would let this endpoint
-stop a populated server having reported zero and asked nobody anything. So the
-count is taken again immediately before the stop, and it is that reading which
-decides and which the audit record carries.
+So this path performs drain step 2 before it reads anything. Under the seal the
+count can only fall, which is the direction that is safe to be wrong about. A
+door that cannot be shut is decided against the count rather than on its own —
+the same trade the drain makes — so an empty server is still stopped and a
+populated one is refused until the proxy is repaired or the server empties.
+
+A **standalone** server has no door. The count is re-read immediately before the
+stop there instead, which narrows the window without closing it; see the residual
+note in [README.md](README.md).
 
 `?acknowledgeOccupancy=` therefore takes **the number the operator was shown**, or
 the literal `unreadable`. A boolean would say *"proceed regardless"*: it cannot

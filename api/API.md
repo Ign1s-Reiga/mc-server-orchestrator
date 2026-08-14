@@ -816,9 +816,19 @@ does.
 
 ### What it still does not do
 
-It does **not** seal the proxy or attempt a player transfer. The drain does both;
-this path does neither, so players are disconnected and the proxy may route joins
-at a dead address until the loop's next pass deregisters the backend.
+It does **not** attempt a player transfer. The drain does; this path does not, so
+players are disconnected. That is the one dropped step the response states to your
+face rather than leaving you to discover.
+
+It **does** seal the login path at the proxy first, so nobody new is routed to a
+server that is about to stop — which is also what makes `acknowledgeOccupancy` a
+real check rather than a snapshot of a number that has already moved. A server
+that is not behind a proxy has no door to shut, and there the count is re-read
+immediately before the stop instead: narrower, not closed.
+
+Deregistration is left to the reconcile loop's next pass. Until then the proxy
+holds a registration at an address that is going away, which is harmless because
+nothing new is being routed to it.
 
 ### `POST /api/v1/validate`
 

@@ -69,19 +69,35 @@ dangerous. So the button is not an immediate kill.
 
 ## Owed, and not left in a comment
 
-The forced path drops six drain steps by construction, not by oversight. Two are
-recorded here as work rather than as caveats in a KDoc, because the audit's
-judgement was that they are follow-ups **only if routed**:
+The forced path drops drain steps by construction, not by oversight. Two were
+recorded here as work rather than as caveats in a KDoc. One has since been done,
+and **the reason it stopped being optional is the interesting part**:
 
-- **Seal the proxy before the stop.** The drain's step 2. Until the loop's next
-  pass deregisters the backend, the proxy may route joins at a dead address.
-- **Attempt a player transfer.** The drain's step 4. Forcing currently
-  disconnects, and the API says so rather than implying otherwise.
+- ~~**Seal the proxy before the stop.**~~ **Done.** It was listed as a follow-up
+  on the reading that it only cost availability — the proxy routing joins at an
+  address that is going away. That reading was wrong. Once the occupancy check
+  became a counted acknowledgement, the seal became the thing that check *rests
+  on*: a compare-and-swap is only a compare-and-swap if something owns the value
+  between the read and the write, and on an unsealed server nothing owns the
+  player count for a millisecond. The mechanism was not implementable without
+  step 2. A follow-up that turns out to be a premise is not a follow-up.
+- **Attempt a player transfer.** The drain's step 4. Still owed. Forcing
+  disconnects, and the API says so plainly rather than implying otherwise — which
+  is the difference between this and the seal: an operator who has acknowledged a
+  count knows those sessions are being dropped, and nothing else in the path
+  quietly depends on the transfer having happened.
 
-Four others are deliberate and permanent: `requireEmpty` is replaced by a probe
-plus an explicit acknowledgement, the save is requested but may not be sendable,
-deregistration is left to the loop, and `mayStop` is bypassed — which is the
-feature.
+The rest are deliberate and permanent: `requireEmpty` is replaced by a counted
+acknowledgement read under the seal, the save is requested but may not be
+sendable, deregistration is left to the loop, and `mayStop` is bypassed — which
+is the feature.
+
+**One residual, stated rather than buried.** A *standalone* server has no proxy,
+so there is no door to shut and the seal cannot help it. The count is re-read
+immediately before the stop there, which narrows the window to milliseconds but
+does not close it. The drain does not close it either — it declines to stop
+instead — and an operator forcing an unproxied server with a live population is
+told to let it empty rather than handed a guarantee that does not exist.
 
 ## Before any of this is implemented
 
