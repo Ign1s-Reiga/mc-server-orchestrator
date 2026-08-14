@@ -1768,7 +1768,34 @@ public class Reconciler(
                 val status = row.status?.status as? PaperServerStatus
                 MatchedBackend(
                     server = backend.metadata.name,
-                    sealed = status?.drain?.state?.sealsBackend() == true,
+                    // **Or a `SIGTERM` has already left this process for it.**
+                    //
+                    // `sealsBackend()` answers from the drain's *state*, and
+                    // `DrainState.DRAIN_FAILED` deliberately answers false: a parked
+                    // drain is not going to move those players, so holding a running
+                    // server out of routing buys nothing. That reasoning is right and
+                    // is unchanged — for a server that is still running.
+                    //
+                    // It stops being right the moment a stop has been dispatched, and
+                    // `DrainStatus.stopDispatchedAt` is the record that says so. Its
+                    // whole argument is *"a proxy re-admits players to a process whose
+                    // shutdown save has run"*, and this derivation was the one place
+                    // that never consulted it.
+                    //
+                    // The drain's own aborts were covered by accident: it deregisters
+                    // at step 6, before it stops, so `letGo` below already keeps the
+                    // sweep off it. `NodeForcedTermination` seals and stops **without
+                    // deregistering** — the step is on its documented not-done list —
+                    // so it had neither guard, and the seal it asserts lasted exactly
+                    // one proxy pass before this line handed the door back for the
+                    // remaining ~178 seconds of a raised grace period.
+                    //
+                    // Set-once and never cleared, so this never re-opens on its own.
+                    // That matches `restoreRegistration`, which already declines to
+                    // re-register on the same record and for the same sentence.
+                    sealed =
+                        status?.drain?.state?.sealsBackend() == true ||
+                            status?.drain?.stopDispatchedAt != null,
                     // Null until the loop knows which node the workload is on.
                     // **Not asserted under a guessed hostname**: a registration at a
                     // name that does not resolve is one the protocol will refuse to

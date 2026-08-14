@@ -8,6 +8,8 @@ import mcorch.core.ProxyHarness
 import mcorch.core.backendDefinition
 import mcorch.core.coreTest
 import mcorch.core.proxyDefinition
+import mcorch.schema.DrainState
+import mcorch.schema.DrainStatus
 import org.junit.jupiter.api.Test
 
 /**
@@ -166,6 +168,49 @@ internal class ForcedSealTest {
             // unreachable proxy was refused, and one behind TWO wide-open proxies was
             // stopped. The worse case treated more permissively than the milder one.
             node.stops shouldHaveSize 0
+        }
+
+    @Test
+    fun `the proxy sweep does not hand the door back after a forced stop`() =
+        coreTest {
+            val harness = harness()
+            harness.bringUp()
+            val name = backend.metadata.name
+            // The note-1 population: a drain that aborted permanently on an
+            // unconfirmed save. `DRAIN_FAILED` is where the force finds it.
+            val failed = harness.clock.instant()
+            val current = harness.status(name)
+            if (current != null) {
+                harness.store.putStatus(
+                    current.copy(
+                        drain =
+                            DrainStatus(
+                                state = DrainState.DRAIN_FAILED,
+                                startedAt = failed,
+                                enteredStateAt = failed,
+                                saveRequestedAt = failed,
+                            ),
+                    ),
+                )
+            }
+
+            terminationOver(harness).stop(backend, OccupancyAcknowledgement.Unreadable)
+            harness.plugin.backend(name.value)?.admits shouldBe false
+
+            // **One proxy pass used to undo the whole thing.** `assertBackends` is a
+            // level trigger: it re-states admission from `sealsBackend()`, and
+            // `DRAIN_FAILED` answers false on purpose, because a parked drain should
+            // not hold a running server out of routing.
+            //
+            // That reasoning stops applying the instant a `SIGTERM` has been sent,
+            // and the record saying so is `stopDispatchedAt` — which this derivation
+            // never consulted. The drain's own aborts escaped by accident, since it
+            // deregisters before it stops; the forced path does neither, so it had
+            // no guard at all and the door reopened for the rest of a 180s grace
+            // period, onto a container running its shutdown save.
+            harness.pass(harness.proxyDefinition.metadata.name)
+
+            harness.plugin.backend(name.value)?.admits shouldBe false
         }
 
     @Test

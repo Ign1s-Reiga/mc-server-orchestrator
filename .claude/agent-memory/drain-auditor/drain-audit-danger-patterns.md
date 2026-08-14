@@ -2712,3 +2712,48 @@ Related: [[standalone-paper-drain-shape]]
      The tension to state rather than skip: CLAUDE.md says policy in the store is
      policy in two places. A field-level invariant the field's own KDoc declares is
      not policy, and `:store` already knows `drain_state`.
+
+## Round 54: the seal a level trigger undoes
+
+230. **A seal asserted directly at the proxy is undone by `assertBackends` unless
+     the drain *state* says it should be held.** `assertBackends` runs on every
+     proxy pass and computes `admitsNewPlayers` as the negation of
+     `DrainState.sealsBackend()` — by design, so that a backend whose drain aborted
+     permanently takes players again. `DRAIN_FAILED.sealsBackend()` is false. So a
+     path that calls `link.assertAdmission(admits = false)` and then leaves the
+     record in `DRAIN_FAILED` has its door reopened within one `stepInterval`.
+     `stopDispatchedAt` does not save it: `stopIsInFlight` reads the stamp, but the
+     admission derivation reads the **state**. The drain's own stop is safe only
+     because `letGoAndStop` moves to `STOPPING`, which seals. Whenever a component
+     outside the loop asserts a level-triggered fact, find the expression the level
+     trigger re-derives it from and make *that* true, rather than asserting the
+     fact once.
+231. **"The count can only fall while the door is shut" is a premise about the
+     door staying shut.** The forced path skips its second occupancy probe when the
+     seal was asserted, on exactly that reasoning. If the seal lapses (item 230)
+     the premise fails silently and the skipped probe is the one that would have
+     noticed. An optimisation justified by a guarantee has the guarantee's lifetime,
+     not the guarantee's existence at the moment it was taken.
+232. **A boolean that meant "nothing could be sent" quietly gains a "we chose not
+     to" member.** `saveAttempted = false` covered *no channel* and *never went
+     out*; skipping a save the drain already has outstanding is a third meaning,
+     and the difference matters forensically in the optimistic direction — a
+     `saveRequestedAt` record means a request **did** reach the server, so the
+     world may be on disk, where the other two mean nothing ever did. Prose in
+     `detail` is not a field. The fix is usually not a fourth boolean but surfacing
+     the value that already discriminates — here the `Instant`, which also says how
+     long ago and therefore whether it plausibly landed.
+233. **Read-then-act windows are an honest floor only when both halves could have
+     shared a transaction.** Round 53's store-vs-store race had a lower layer that
+     could close it (`SqliteStore.putStatus` already reads inside its own `write`
+     block). A store read followed by an exec against a game server has no such
+     layer, so the residual really is the floor — and the right question becomes
+     whether the residual action is idempotent, not whether the window can shrink.
+     Distinguish the two before accepting or rejecting "honest floor".
+234. **A guard whose failure direction is "do the idempotent thing again" should
+     fail toward doing it.** `outstandingSave` returning null when the store throws
+     converts skip into send, and that is correct — `save-all flush` is idempotent
+     on the game side (the ruling behind item 23) and the alternative direction
+     loses a save outright. The reasoning to check is not "which way is safe" in
+     the abstract but *what the redundant action costs* versus *what the omitted
+     action costs*.
