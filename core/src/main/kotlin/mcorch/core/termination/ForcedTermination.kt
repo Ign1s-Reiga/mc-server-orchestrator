@@ -315,8 +315,33 @@ public class NodeForcedTermination(
         refuseOccupancy(name, players, acknowledgement)
         refuseUnsealedPopulation(name, seal, players, acknowledgement)
 
-        val save = requestSave(agent, node, observation)
-        val attempted = save !is SaveOutcome.Unconfirmable && save !is SaveOutcome.NotDelivered
+        // **A save the drain already issued is skipped, never refused.**
+        //
+        // `DrainStatus.saveRequestedAt` is the never-re-send wedge: a request went
+        // out and was not confirmed, and only a confirmation or a pass that has
+        // *observed a player* clears it — `forgetSaveEvidence` is reachable from
+        // nowhere else. A wedged server answers no probe, so no pass ever observes
+        // a player, so the wedge never lifts.
+        //
+        // That is not an edge case, it is `docs/operating.md` note 1 exactly: the
+        // `SaveOutcome.Unconfirmed` arm sets this field alongside
+        // `DRAIN_SAVE_TIMEOUT` and `PERMANENT`. An earlier version *refused* on it,
+        // which meant the operator hit note 1, reached for the hatch built for note
+        // 1, and was told to "wait for it to confirm or fail" — for something that
+        // cannot do either, below a tombstone, forever.
+        //
+        // Skipping is what the refusal was actually for. The harm being prevented is
+        // a second `save-all flush` landing on a main thread already running one;
+        // declining to send it achieves that in full. Refusing the whole stop
+        // achieves nothing further, and the stop is what the caller cannot get any
+        // other way. `saveAttempted` reports it, and the grace period is raised to
+        // the shutdown-save allowance exactly as it is for any other unsent save.
+        //
+        // Re-read here rather than trusted from entry: `refuseSecondSideEffect` ran
+        // before the seal, a probe and possibly a save timeout ago.
+        val outstanding = outstandingSave(name)
+        val save = if (outstanding == null) requestSave(agent, node, observation) else null
+        val attempted = save != null && save !is SaveOutcome.Unconfirmable && save !is SaveOutcome.NotDelivered
         val confirmed = save is SaveOutcome.Confirmed
 
         // **One more reading, and only when nothing is holding the last one.**
@@ -376,7 +401,11 @@ public class NodeForcedTermination(
             // "500" re-fires, which would send a second `save-all flush` into a
             // server that already took one.
             throw ForcedTerminationRefused(
-                "the save reported ${describe(attempted, confirmed)}, and the stop was then refused by the " +
+                "the save reported ${describe(
+                    attempted,
+                    confirmed,
+                    outstanding,
+                )}, and the stop was then refused by the " +
                     "node: ${failure.message}. Nothing was stopped",
             )
         }
@@ -385,7 +414,7 @@ public class NodeForcedTermination(
             saveAttempted = attempted,
             saveConfirmed = confirmed,
             playersOnline = atStop,
-            detail = describe(attempted, confirmed),
+            detail = describe(attempted, confirmed, outstanding),
         )
     }
 
@@ -533,14 +562,41 @@ public class NodeForcedTermination(
                     "grace period; forcing again would send a second save into a server already shutting down",
             )
         }
-        if (drain.saveRequestedAt != null) {
-            throw ForcedTerminationRefused(
-                "`${name.value}` has an unconfirmed world save outstanding, requested at " +
-                    "${drain.saveRequestedAt}. Forcing now would send a second save into a server already " +
-                    "running one; wait for it to confirm or fail",
-            )
-        }
+        // **`saveRequestedAt` is deliberately not a refusal here**, and used to be.
+        //
+        // It is the never-re-send wedge, and only a confirmation or a pass that has
+        // *observed a player* clears it — `forgetSaveEvidence` is reachable from
+        // nowhere else. A wedged server answers no probe, so no pass ever observes a
+        // player, so the wedge never lifts. Meanwhile the `SaveOutcome.Unconfirmed`
+        // arm sets it beside `DRAIN_SAVE_TIMEOUT` and `PERMANENT`, which is
+        // `docs/operating.md` note 1 exactly.
+        //
+        // So the refusal fired on the population this path was built for, telling
+        // the operator to "wait for it to confirm or fail" — for something that can
+        // do neither — below a tombstone, forever. Third lockout of this shape in
+        // this function; the sibling branch above was bounded in round 52 and this
+        // one was missed because the report named only that half.
+        //
+        // [stop] reads the same field and **skips its own save** instead, which is
+        // the whole of what the refusal was protecting.
     }
+
+    /**
+     * When the drain last issued a save it never got confirmed for, or null.
+     *
+     * Read fresh immediately before [stop] would send its own, because
+     * [refuseSecondSideEffect] ran a seal, a probe and possibly a save timeout ago.
+     * A store that will not answer reports null: the alternative is failing a stop
+     * over a read, and the cost of guessing wrong here is one extra flush against a
+     * container that is about to take a `SIGTERM` anyway.
+     */
+    private suspend fun outstandingSave(name: ResourceName): Instant? =
+        try {
+            (store.getServer(name)?.status?.status as? PaperServerStatus)?.drain?.saveRequestedAt
+        } catch (failure: StoreException) {
+            LOG.warn("could not check {} for an outstanding save before forcing: {}", name.value, failure.message)
+            null
+        }
 
     /**
      * How long a dispatched stop is still "in flight" for.
@@ -770,8 +826,15 @@ public class NodeForcedTermination(
     private fun describe(
         attempted: Boolean,
         confirmed: Boolean,
+        outstanding: Instant? = null,
     ): String =
         when {
+            outstanding != null -> {
+                "no world save was sent, because one requested at $outstanding had not been confirmed and a " +
+                    "second would have landed on a main thread already running the first; the stop grace " +
+                    "period was the only chance the world had to reach disk"
+            }
+
             confirmed -> {
                 "the world save was confirmed before the container was stopped"
             }

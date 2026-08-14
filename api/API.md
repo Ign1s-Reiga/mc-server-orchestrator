@@ -811,9 +811,14 @@ leave the server undrainable, unforceable, and reachable only with `crictl`.
   those players without transferring them, and the drain would have moved them.
 - **An unusable `spec.lifecycle.drain.saveTimeout`** is `FORCE_REFUSED`: no save
   could be sent, and the field is one edit away from making one possible.
-- **A stop already in flight** is `FORCE_NOT_APPLICABLE`. The container is inside
-  its grace period running its shutdown save; a second force would send another
-  save into it. Likewise an **unconfirmed save already outstanding**.
+- **A stop already in flight** is `FORCE_NOT_APPLICABLE`, while the container is
+  still inside its grace period running its shutdown save; a second force would
+  send another save into it. Once that window has passed the refusal lifts, so a
+  stop the runtime refused does not lock the endpoint.
+- An **unconfirmed save already outstanding** is *not* a refusal. The force skips
+  its own save instead and reports `saveAttempted: false` — see above. Refusing
+  would turn away exactly the wedged servers this endpoint exists for, because
+  nothing clears that record on a server that answers no probe.
 - **A `VelocityProxy`** is `FORCE_NOT_APPLICABLE` and **is not deleted** — it holds
   no world, so its drain cannot stall on a save.
 

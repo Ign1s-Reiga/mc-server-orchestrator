@@ -467,28 +467,48 @@ internal class NodeForcedTerminationTest {
         }
 
     @Test
-    fun `a force into an outstanding save is refused rather than sending a second one`() =
+    fun `a force into an outstanding save skips its own rather than refusing`() =
         coreTest {
             val node = FakeNode()
             running(node)
-            val requested = Instant.parse("2020-01-01T00:00:00Z")
+            val requested = Instant.now()
             observed(
                 drain =
                     DrainStatus(
-                        state = DrainState.SAVING,
+                        state = DrainState.DRAIN_FAILED,
                         startedAt = requested,
                         enteredStateAt = requested,
                         saveRequestedAt = requested,
                     ),
             )
+            var saves = 0
+            node.onExec = { command ->
+                if (command.joinToString(" ").contains("save-all")) saves++
+                node.defaultExec(command)
+            }
 
-            // The never-re-send wedge armed: a request went out and has not
-            // confirmed. This guard lived in `:api` until round 51, where it
-            // protected one route and no other caller of this seam.
-            shouldThrow<ForcedTerminationRefused> {
-                terminationOver(node).preflight(paperDefinition(), OccupancyAcknowledgement.None)
-            }.message.toString() shouldContain "unconfirmed world save"
-            node.stops shouldHaveSize 0
+            val outcome = terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.None)
+
+            // **This state is `docs/operating.md` note 1, and it used to be
+            // refused.** `saveRequestedAt` beside `DRAIN_FAILED` is what the
+            // `SaveOutcome.Unconfirmed` arm writes, and only a confirmation or a
+            // pass that has *observed a player* clears it — `forgetSaveEvidence` is
+            // reachable from nowhere else. A wedged server answers no probe, so no
+            // pass observes a player, so it never lifts. The operator was told to
+            // "wait for it to confirm or fail" about something that can do neither,
+            // below a tombstone, forever.
+            //
+            // Skipping is what the refusal was actually protecting: the harm is a
+            // second `save-all flush` on a main thread already running one, and not
+            // sending it prevents that in full. Refusing on top bought nothing and
+            // cost the one operation the caller cannot get any other way.
+            saves shouldBe 0
+            node.stops shouldHaveSize 1
+
+            // And it says so rather than reporting a save that was never sent.
+            outcome.saveAttempted shouldBe false
+            outcome.saveConfirmed shouldBe false
+            outcome.detail shouldContain "had not been confirmed"
         }
 
     @Test

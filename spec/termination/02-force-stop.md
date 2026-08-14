@@ -75,6 +75,22 @@ wait is what lets an in-flight save finish.
 > `saveConfirmed` — *"never sent"* and *"sent and not confirmed"* are different
 > events and must not be reported as one.
 
+**A save the drain already has outstanding is skipped, not repeated — and not
+refused.** `status.drain.saveRequestedAt` is the never-re-send wedge, and only a
+confirmation or a pass that has *observed a player* clears it. A wedged server
+answers no probe, so no pass observes a player, so it never lifts — while the
+state that sets it (`Unconfirmed` + `DRAIN_SAVE_TIMEOUT` + `PERMANENT`) is note 1
+itself. Refusing on it, as one version did, meant the hatch turned away the
+population it was built for and told the operator to wait for something that
+cannot happen.
+
+The harm being prevented is a second `save-all flush` landing on a main thread
+already running one. Declining to send it prevents that in full; refusing the stop
+as well prevents nothing further and costs the one operation the caller cannot get
+any other way. So the force skips its own save, reports `saveAttempted: false`
+with that reason, and the grace period is raised as it is for any other unsent
+save.
+
 **The grace period is never shortened, and on one branch it is lengthened.**
 `spec.lifecycle.stopGracePeriod` is the last-resort net that lets a server flush
 on `SIGTERM`. Shortening it under "force" would remove the one protection that

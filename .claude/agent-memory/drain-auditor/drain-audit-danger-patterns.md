@@ -2648,20 +2648,23 @@ Related: [[standalone-paper-drain-shape]]
 
 ## Round 53: the fix that answered one direction of a two-direction race
 
-224. **A read-modify-write race has two directions, and a fix aimed at one can be
-     declined for the other on a reason that does not apply.** Round 52 found that
-     `Reconciler` and `NodeForcedTermination` both write observed state without a
-     precondition, so each can clobber the other. `preservingDispatch` closes the
-     loop→force direction. The force→loop direction was dropped on the argument
-     *"a precondition would not help, because `forceRecord` writes unguarded
-     anyway"* — but `forceRecord` is a **loop** write, and the recommendation was a
-     precondition on the **force's** write. The window there is not sub-millisecond:
-     `refuseSecondSideEffect` reads `saveRequestedAt` at entry and
-     `recordStopDispatched` writes minutes later, after a seal, a probe and a save,
-     so a `saveRequestedAt` the loop stamps in between is erased — the never-re-send
-     wedge disarmed, and the second `save-all flush` lands on a container being
-     `SIGTERM`ed. When a race is reported in both directions, check that the fix
-     and the rebuttal are talking about the same write.
+224. **A refusal keyed on a wedge field is unbounded exactly where the wedge is
+     permanent.** `refuseSecondSideEffect` refuses a force while
+     `drain.saveRequestedAt != null`, telling the operator to *"wait for it to
+     confirm or fail"*. `DrainStatus`' own KDoc says that field is *"the wedge that
+     stops a second `save-all flush` reaching a live server, and **only a human, or
+     a pass that has observed a player**, may clear it"* — and `save()`'s
+     `Unconfirmed` arm sets it alongside a `PERMANENT` `DRAIN_SAVE_TIMEOUT`. That
+     pair *is* `operating.md` note 1. A wedged server never answers a probe, so no
+     pass ever observes a player, so nothing ever clears it: the escape hatch
+     refuses the state it was built for, permanently, below a tombstone. The sibling
+     branch keyed on `stopDispatchedAt` was bounded by the grace window for exactly
+     this reason and this one was not. Whenever a guard is keyed on a field, read
+     that field's *clearing* rule before believing the guard's remedy is reachable.
+     **Corrected from a wrong version of this item**: the original claimed
+     `recordStopDispatched` wrote without a precondition. It does not — `08f62fb`
+     added `Precondition.AtVersion` with a re-read-and-retry-once on both writes.
+     See [[audit-process-verify-before-citing]].
 225. **A `?: storedValue` fallback silently outranks whatever site deliberately
      wrote null.** `preservingDispatch` takes the stored drain wholesale when the
      draft has none, which suppresses `clearedDrainRecord` — the one rule for
