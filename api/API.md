@@ -815,10 +815,14 @@ leave the server undrainable, unforceable, and reachable only with `crictl`.
   still inside its grace period running its shutdown save; a second force would
   send another save into it. Once that window has passed the refusal lifts, so a
   stop the runtime refused does not lock the endpoint.
-- An **unconfirmed save already outstanding** is *not* a refusal. The force skips
-  its own save instead and reports `saveAttempted: false` — see above. Refusing
-  would turn away exactly the wedged servers this endpoint exists for, because
-  nothing clears that record on a server that answers no probe.
+- An **unconfirmed save already outstanding** is neither a refusal nor a reason to
+  send nothing. The force requests its own save regardless, so `saveAttempted`
+  describes *this* request. Refusing would turn away exactly the wedged servers
+  this endpoint exists for, since nothing clears that record on a server that
+  answers no probe — and skipping would decline a save on a backend the proxy may
+  have re-admitted, where a whole session can have come and gone unobserved. A
+  redundant flush queues behind the one already running; a save not sent is play
+  that nothing recovers.
 - **A `VelocityProxy`** is `FORCE_NOT_APPLICABLE` and **is not deleted** — it holds
   no world, so its drain cannot stall on a save.
 

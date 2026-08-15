@@ -16,7 +16,9 @@ import mcorch.core.termination.ForcedTermination
 import mcorch.core.termination.ForcedTerminationRefused
 import mcorch.core.termination.ForcedTerminationUnavailable
 import mcorch.core.termination.OccupancyAcknowledgement
+import mcorch.schema.DrainState
 import mcorch.schema.PaperServerDefinition
+import mcorch.schema.PaperServerStatus
 import mcorch.schema.ResourceName
 import mcorch.schema.SchemaViolation
 import mcorch.schema.ServerDefinition
@@ -272,7 +274,9 @@ internal class ServerRoutes(
                     is WriteOutcome.Conflict -> throw ApiException.conflict(outcome)
                 }
             }
-        if (forcible != null) return force(request, forcible, name, acknowledgement)
+        if (forcible != null) {
+            return force(request, forcible, name, acknowledgement, drainStateOf(existing))
+        }
         LOG.info("delete requested name={} generation={}", stored.name, stored.generation)
         return accepted(store.getServer(name) ?: StoredServer(stored))
     }
@@ -308,6 +312,10 @@ internal class ServerRoutes(
                 "`${name.value}` is not a PaperServer. A VelocityProxy holds no world, so its drain cannot " +
                     "stall on a save and there is nothing here to force",
             )
+
+    /** What the drain had reached when force was applied, for the audit record. */
+    private fun drainStateOf(existing: StoredServer): DrainState? =
+        (existing.status?.status as? PaperServerStatus)?.drain?.state
 
     /**
      * The occupancy the caller says they were shown.
@@ -352,6 +360,14 @@ internal class ServerRoutes(
         }
     }
 
+    /** Operator-facing, and never a player name: a count, or the fact there was none. */
+    private fun describeAcknowledgement(acknowledgement: OccupancyAcknowledgement): String =
+        when (acknowledgement) {
+            is OccupancyAcknowledgement.None -> "none"
+            is OccupancyAcknowledgement.Unreadable -> "unreadable"
+            is OccupancyAcknowledgement.Count -> acknowledgement.players.toString()
+        }
+
     /**
      * Stops the container without waiting for the drain to be satisfied.
      *
@@ -368,6 +384,7 @@ internal class ServerRoutes(
         definition: PaperServerDefinition,
         name: ResourceName,
         acknowledgement: OccupancyAcknowledgement,
+        drainState: DrainState?,
     ): Response {
         val principal = request.principal()
         val outcome =
@@ -394,9 +411,19 @@ internal class ServerRoutes(
             }
         // Warn, not info, and every field an investigator reads first is on it.
         LOG.warn(
-            "forced stop identity={} server={} saveAttempted={} saveConfirmed={} playersOnline={}",
+            // Every field `spec/termination/02-force-stop.md` §6 lists, because
+            // until that sink exists this line *is* the audit record — and a claim
+            // that it carries them all is only worth making if it does. `acknowledged`
+            // and `drainState` were the two it did not: without the first, nothing
+            // says what population the operator signed off; without the second,
+            // nothing says how far the drain had got when they gave up on it. The
+            // status row that would answer either is purged by teardown.
+            "forced stop identity={} server={} acknowledged={} drainState={} saveAttempted={} " +
+                "saveConfirmed={} playersOnline={}",
             principal.name,
             name.value,
+            describeAcknowledgement(acknowledgement),
+            drainState ?: "none",
             outcome.saveAttempted,
             outcome.saveConfirmed,
             outcome.playersOnline ?: "unknown",

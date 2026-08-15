@@ -3045,12 +3045,44 @@ public class Reconciler(
                 "the side effect is not repeated",
             pass.name,
         )
-        // Unguarded on the *definition*, still carrying a stop dispatch forward.
-        // The guard this bypasses is the anti-lost-update one; the carry-forward is
-        // not a guard at all, it is this write declining to un-stamp a record it did
-        // not write. Skipping it here would have left the one path that exists to
-        // never lose a side effect quietly destroying another one's.
-        when (val outcome = store.putStatus(preservingDispatch(pass.stored, status))) {
+        // Unguarded on the *definition*, which is the guard this exists to bypass.
+        //
+        // **But conditional on the status version first**, and that is not a
+        // contradiction. Losing this record costs a repeated side effect — a second
+        // world save on a live server — so the write must land. Landing it on top of
+        // a concurrent forced retry costs a different record: the retry's fresh
+        // `stopLastDispatchedAt`, whose loss reopens the proxy onto a container in
+        // its shutdown. Neither is acceptable, and they are not in tension, because
+        // a conflict here is resolvable by re-reading rather than by giving up.
+        //
+        // So: try conditionally, and on a conflict re-merge against what landed and
+        // try again. The unguarded write stays as the final fallback — the record
+        // still has to land — but it carries values re-read a round trip earlier
+        // rather than a whole pass earlier.
+        // Two conditional attempts, because a conflict means a concurrent writer
+        // landed and a re-read resolves it. A third would be waiting on a writer
+        // landing faster than this can read, and the record still has to go down.
+        repeat(2) {
+            var mergedAgainst: ResourceVersion? = null
+            val merged = preservingDispatch(pass.stored, status) { version -> mergedAgainst = version }
+            val precondition = mergedAgainst?.let { Precondition.AtVersion(it) } ?: Precondition.None
+            when (val outcome = store.putStatus(merged, precondition)) {
+                is WriteOutcome.Applied -> {
+                    return
+                }
+
+                is WriteOutcome.Conflict -> {
+                    LOG.info(
+                        "server={} re-reading before forcing an issued side effect's record ({})",
+                        pass.name,
+                        outcome.reason,
+                    )
+                }
+            }
+        }
+        var mergedAgainst: ResourceVersion? = null
+        val merged = preservingDispatch(pass.stored, status) { version -> mergedAgainst = version }
+        when (val outcome = store.putStatus(merged)) {
             is WriteOutcome.Applied -> {
                 Unit
             }
