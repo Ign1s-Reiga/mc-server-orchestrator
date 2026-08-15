@@ -5,6 +5,7 @@ import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.string.shouldContain
+import io.kotest.matchers.string.shouldNotContain
 import mcorch.core.ExecOutcome
 import mcorch.core.FakeNode
 import mcorch.core.SingleNodeScheduler
@@ -596,6 +597,83 @@ internal class NodeForcedTerminationTest {
             // and the audit log says the same, rather than a non-null instant beside
             // `saveAttempted: true`.
             outcome.saveOutstandingSince shouldBe null
+        }
+
+    @Test
+    fun `a population arriving during the late save is seen before the stop`() =
+        coreTest {
+            val node = FakeNode()
+            running(node)
+            val requested = Instant.now()
+            observed(
+                drain =
+                    DrainStatus(
+                        state = DrainState.DRAIN_FAILED,
+                        startedAt = requested,
+                        enteredStateAt = requested,
+                        saveRequestedAt = requested,
+                    ),
+            )
+            var probes = 0
+            // Zero, then 3 — which authorises the late save — then 9 while that save
+            // is running.
+            node.onExec = { command ->
+                if (command.joinToString(" ").contains("mc-monitor")) {
+                    probes++
+                    node.online =
+                        when (probes) {
+                            1 -> 0
+                            2 -> 3
+                            else -> 9
+                        }
+                }
+                node.defaultExec(command)
+            }
+
+            // The late save spends its own save timeout, so the reading that
+            // authorised it is that much older by the time the stop would go out.
+            // A branch added to protect a late-arriving population must not itself
+            // be unprotected against one.
+            shouldThrow<ForcedTerminationRefused> {
+                terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.Count(3))
+            }.message.toString() shouldContain "9 player"
+            node.stops shouldHaveSize 0
+        }
+
+    @Test
+    fun `a stop the node refuses reports the save that actually ran`() =
+        coreTest {
+            val node = FakeNode()
+            node.online = 6
+            running(node)
+            val requested = Instant.now()
+            observed(
+                drain =
+                    DrainStatus(
+                        state = DrainState.DRAIN_FAILED,
+                        startedAt = requested,
+                        enteredStateAt = requested,
+                        saveRequestedAt = requested,
+                    ),
+            )
+            node.failOnce(mcorch.core.NodeOperation.STOP, node.rejected(mcorch.core.NodeOperation.STOP))
+
+            // The occupancy voided the stale record, so a save really was sent. The
+            // failure branch used to quote the outstanding instant, and `describe`
+            // reads that as "no world save was sent" regardless of `attempted` — so
+            // the one message the caller gets was wrong about the side effect that
+            // had just happened on their server.
+            val message =
+                shouldThrow<ForcedTerminationRefused> {
+                    terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.Count(6))
+                }.message.toString()
+            // Discriminating, and the first version of this assertion was not:
+            // `shouldContain "confirmed"` also passes against the skipped-save
+            // wording, which says a request "had not been confirmed". The phrase
+            // below belongs to one branch only.
+            message shouldContain "the world save was confirmed before the container was stopped"
+            message shouldNotContain "no world save was sent"
+            message shouldContain "Nothing was stopped"
         }
 
     @Test

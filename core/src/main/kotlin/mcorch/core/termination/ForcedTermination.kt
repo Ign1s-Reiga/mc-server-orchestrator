@@ -422,8 +422,7 @@ public class NodeForcedTermination(
         // widened that window from milliseconds to a whole save timeout for exactly
         // the servers with no door. So the probe follows the guarantee rather than
         // the other way round.
-        val atStop = if (seal == SealResult.ASSERTED) players else occupancy(agent, node, observation)
-        refuseOccupancy(name, atStop, acknowledgement)
+        val afterFirstSave = readingBeforeStop(name, agent, node, observation, seal, players, acknowledgement)
 
         // **The final reading can void a record the first one did not**, and on the
         // unsealed path it regularly will.
@@ -440,7 +439,7 @@ public class NodeForcedTermination(
         // above it would put the deciding reading a whole save timeout from the stop,
         // which is the window round 50's critical was about.
         val lateSave =
-            if (firstSave == null && voidsOutstanding(outstanding, atStop)) {
+            if (firstSave == null && voidsOutstanding(outstanding, afterFirstSave)) {
                 requestSave(agent, node, observation)
             } else {
                 null
@@ -452,6 +451,21 @@ public class NodeForcedTermination(
         val skipped = if (save == null) outstanding else null
         val attempted = save != null && save !is SaveOutcome.Unconfirmable && save !is SaveOutcome.NotDelivered
         val confirmed = save is SaveOutcome.Confirmed
+
+        // A late save spends its own save timeout, so the reading that authorised it
+        // is that much older by the time the stop would go out. **Every save is
+        // followed by a reading, and every reading is refused against the
+        // acknowledgement** — otherwise the branch added to protect a late-arriving
+        // population is itself unprotected against one.
+        //
+        // This terminates rather than regressing: at most one late save, and the
+        // reading after it decides the stop rather than authorising a third.
+        val atStop =
+            if (lateSave == null) {
+                afterFirstSave
+            } else {
+                readingBeforeStop(name, agent, node, observation, seal, afterFirstSave, acknowledgement)
+            }
 
         val declared = definition.spec.lifecycle.stopGracePeriod
         // Raised, never lowered, and never a refusal. When no save request was
@@ -503,7 +517,7 @@ public class NodeForcedTermination(
                 "the save reported ${describe(
                     attempted,
                     confirmed,
-                    outstanding,
+                    skipped,
                 )}, and the stop was then refused by the " +
                     "node: ${failure.message}. Nothing was stopped",
             )
@@ -874,6 +888,29 @@ public class NodeForcedTermination(
             stopDispatchedAt = now,
             stopLastDispatchedAt = now,
         )
+
+    /**
+     * The occupancy a stop would be dispatched on, refused if it has moved.
+     *
+     * Under an asserted seal the count cannot rise, so the previous reading stands
+     * and no probe is spent — against a wedged server, which is this endpoint's
+     * population, a probe costs a full timeout to learn what the shut door already
+     * guarantees. Without a seal nothing owns the number and it is read again.
+     */
+    private suspend fun readingBeforeStop(
+        name: ResourceName,
+        agent: PaperServerAgent,
+        node: Node,
+        observation: WorkloadObservation.Present,
+        seal: SealResult,
+        previous: Int?,
+        acknowledgement: OccupancyAcknowledgement,
+    ): Int? {
+        if (seal == SealResult.ASSERTED) return previous
+        val reading = occupancy(agent, node, observation)
+        refuseOccupancy(name, reading, acknowledgement)
+        return reading
+    }
 
     /**
      * Whether a save should be sent despite an outstanding request.
