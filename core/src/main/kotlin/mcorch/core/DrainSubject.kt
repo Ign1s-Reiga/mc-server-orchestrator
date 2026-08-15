@@ -188,7 +188,10 @@ internal fun DrainStatus?.sealsBackendAt(
     now: Instant,
 ): Boolean {
     if (this?.state?.sealsBackend() == true) return true
-    val dispatched = this?.stopDispatchedAt ?: return false
+    // The **latest** dispatch, not the first: a retried stop restamps only that
+    // half, and bounding on the first would expire a signal that has just been
+    // sent. Falling back for rows written before the field existed.
+    val dispatched = this?.stopLastDispatchedAt ?: this?.stopDispatchedAt ?: return false
     return now < dispatched.plus(forcedStopWindow(definition).toJavaDuration())
 }
 

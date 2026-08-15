@@ -301,6 +301,60 @@ internal class ForcedSealTest {
         }
 
     @Test
+    fun `a re-issued forced stop gets a fresh seal window, not the first one`() =
+        coreTest {
+            val harness = harness()
+            harness.bringUp()
+            val name = backend.metadata.name
+            val node = harness.nodeOf(backend)
+            // A drain that already aborted permanently — the note-1 population, and
+            // the only case where this matters: with no prior drain the force writes
+            // a `STOPPING` record, and `STOPPING.sealsBackend()` is true regardless
+            // of any window. `DRAIN_FAILED` is where the window is load-bearing.
+            val failed = harness.clock.instant()
+            harness.status(name)?.let {
+                harness.store.putStatus(
+                    it.copy(
+                        drain =
+                            DrainStatus(
+                                state = DrainState.DRAIN_FAILED,
+                                startedAt = failed,
+                                enteredStateAt = failed,
+                            ),
+                    ),
+                )
+            }
+
+            // First attempt: the node refuses the stop, so the stamp is written and
+            // the container keeps running. That is the state the bounded refusal was
+            // added for in round 52.
+            node.failOnce(mcorch.core.NodeOperation.STOP, node.rejected(mcorch.core.NodeOperation.STOP))
+            shouldThrow<ForcedTerminationRefused> {
+                terminationOver(harness).stop(backend, OccupancyAcknowledgement.None)
+            }
+
+            // Wait the window out. The seal lapses, correctly — nothing is shutting
+            // down, so the backend should take players again.
+            harness.clock.advance(forcedStopWindow(backend) + 1.minutes)
+            harness.pass(harness.proxyDefinition.metadata.name)
+            harness.plugin.backend(name.value)?.admits shouldBe true
+
+            // Now force again, and this time it lands.
+            terminationOver(harness).stop(backend, OccupancyAcknowledgement.None)
+            node.stops shouldHaveSize 1
+
+            // **The retry must not be born already expired.** `dispatchingStop` keeps
+            // the *first* instant on purpose — "may a SIGTERM already be in that
+            // container" only ever becomes true — but a bounded reader needs the
+            // latest. With one set-once field carrying both questions, this second
+            // `SIGTERM` would have been outside its own window the moment it was
+            // sent: the next proxy sweep reopens the backend while that shutdown
+            // runs, and a third force would not see this one as overlapping either.
+            harness.pass(harness.proxyDefinition.metadata.name)
+            harness.plugin.backend(name.value)?.admits shouldBe false
+        }
+
+    @Test
     fun `an empty server whose proxy will not answer is still stopped`() =
         coreTest {
             val harness = harness()

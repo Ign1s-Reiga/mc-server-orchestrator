@@ -597,7 +597,7 @@ public class NodeForcedTermination(
      */
     private suspend fun refuseSecondSideEffect(name: ResourceName): Instant? {
         val drain = (store.getServer(name)?.status?.status as? PaperServerStatus)?.drain ?: return null
-        val dispatched = drain.stopDispatchedAt
+        val dispatched = drain.stopLastDispatchedAt ?: drain.stopDispatchedAt
         // **Bounded by the grace period, not by the stamp's existence.**
         //
         // The reason to refuse is that the container is *inside* its grace period
@@ -828,6 +828,7 @@ public class NodeForcedTermination(
             startedAt = now,
             enteredStateAt = now,
             stopDispatchedAt = now,
+            stopLastDispatchedAt = now,
         )
 
     /**
