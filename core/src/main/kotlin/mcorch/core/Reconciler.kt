@@ -3139,7 +3139,19 @@ public class Reconciler(
         status: PaperServerStatus,
     ): PaperServerStatus {
         if (!stored.definition.terminating) return status
-        if (status.drain?.stopDispatchedAt != null) return status
+        // **Both records, and no early return on the first one.**
+        //
+        // This used to bail when the draft already carried a `stopDispatchedAt`, on
+        // the reasoning that there was then nothing to carry forward. That was true
+        // while one field answered everything. It stopped being true when the
+        // dispatch record split in two: a *re-issued* forced stop keeps the original
+        // `stopDispatchedAt` — set-once, by design — and restamps only
+        // `stopLastDispatchedAt`. So a stale draft satisfies the old condition on
+        // the strength of a stamp that has not moved, returns, and its write puts
+        // the *expired* window back. The seal then anchors to it, the next proxy
+        // sweep reopens the backend, and another force does not see the retried stop
+        // as overlapping — while that stop is still inside its grace period.
+        val draft = status.drain
         val current =
             try {
                 (store.getServer(stored.name)?.status?.status as? PaperServerStatus)?.drain
@@ -3149,17 +3161,40 @@ public class Reconciler(
                 // outcome that already applied before this function existed.
                 LOG.warn("could not re-read {} to preserve a stop dispatch: {}", stored.name, failure.message)
                 null
-            }
-        val dispatched = current?.stopDispatchedAt ?: return status
+            } ?: return status
+        // Set-once: the earlier of the two wins, so a draft that already has one
+        // keeps it and one that does not adopts the stored record.
+        val dispatched = draft?.stopDispatchedAt ?: current.stopDispatchedAt
+        // Restamped: the *later* wins, because it answers "is a signal still on its
+        // way" and the freshest answer is the true one.
+        val last = latest(draft?.stopLastDispatchedAt, current.stopLastDispatchedAt)
+        if (dispatched == null && last == null) return status
+        if (draft == null) {
+            LOG.info("server={} carrying forward a drain record this pass did not observe", stored.name)
+            return status.copy(drain = current)
+        }
+        if (draft.stopDispatchedAt == dispatched && draft.stopLastDispatchedAt == last) return status
         LOG.info(
-            "server={} carrying forward a stop dispatched at {} that this pass did not observe",
+            "server={} carrying forward a stop dispatched at {} (latest {}) that this pass did not observe",
             stored.name,
             dispatched,
+            last,
         )
         return status.copy(
-            drain = status.drain?.copy(stopDispatchedAt = dispatched) ?: current,
+            drain = draft.copy(stopDispatchedAt = dispatched, stopLastDispatchedAt = last),
         )
     }
+
+    /** The later of two instants, either of which may be absent. */
+    private fun latest(
+        a: Instant?,
+        b: Instant?,
+    ): Instant? =
+        when {
+            a == null -> b
+            b == null -> a
+            else -> if (a.isAfter(b)) a else b
+        }
 
     /**
      * Records an observation, unless it says exactly what the stored one

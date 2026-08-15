@@ -91,6 +91,66 @@ internal class StopDispatchDurabilityTest {
         }
 
     @Test
+    fun `a re-issued stop's fresh window survives a pass holding a pre-retry snapshot`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.store.deleteDefinition(name)
+
+            val first = Instant.parse("2026-01-01T00:00:00Z")
+            val retried = Instant.parse("2026-01-01T02:00:00Z")
+            // The state a failed forced stop leaves: both stamps at the first
+            // attempt, container still running.
+            harness.status(name)?.let {
+                harness.store.putStatus(
+                    it.copy(
+                        drain =
+                            DrainStatus(
+                                state = DrainState.DRAIN_FAILED,
+                                startedAt = first,
+                                enteredStateAt = first,
+                                stopDispatchedAt = first,
+                                stopLastDispatchedAt = first,
+                            ),
+                    ),
+                )
+            }
+
+            // The retry lands mid-pass: `stopDispatchedAt` is unchanged, because it
+            // is set-once, and only `stopLastDispatchedAt` moves.
+            harness.store.afterNextRead = {
+                val current = harness.status(name)
+                if (current != null) {
+                    harness.store.putStatus(
+                        current.copy(drain = current.drain?.copy(stopLastDispatchedAt = retried)),
+                    )
+                }
+            }
+
+            harness.pass(name)
+
+            // **The old guard bailed on the unchanged stamp.** It returned as soon as
+            // the draft carried a `stopDispatchedAt`, which a stale draft does — so
+            // the pass wrote the pre-retry record back and the fresh window was lost.
+            // The seal then anchors to an expired instant while the retried stop is
+            // still inside its grace period: the proxy reopens the backend, and
+            // another force does not see this one as overlapping.
+            val drain =
+                (
+                    harness.store
+                        .getServer(name)
+                        ?.status
+                        ?.status as? PaperServerStatus
+                )?.drain
+            drain?.stopLastDispatchedAt shouldBe retried
+            // And the set-once half is still the first attempt, not the retry.
+            drain?.stopDispatchedAt shouldBe first
+        }
+
+    @Test
     fun `a server that is not terminating pays nothing for the guard`() =
         coreTest {
             val harness = Harness()

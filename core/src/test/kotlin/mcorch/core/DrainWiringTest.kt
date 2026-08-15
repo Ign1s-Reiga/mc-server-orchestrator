@@ -1023,8 +1023,9 @@ internal class DrainWiringTest {
                 // reason the `clearedDrainRecord` arguments are pinned: a shape that
                 // follows a rename and refuses a substitution. An edit that turned
                 // that `copy` into anything capable of clearing a field would change
-                // this string and land here.
-                "status.drain?.copy(stopDispatchedAt = dispatched) ?: current",
+                // this string and land here — as it did when the dispatch record
+                // split in two and this had to carry both halves.
+                "draft.copy(stopDispatchedAt = dispatched, stopLastDispatchedAt = last)",
             )
         written.filter { it.startsWith("clearedDrainRecord(") }.forEach { call ->
             withClue("a drain record is retired on something other than this pass's own record: $call") {
