@@ -468,52 +468,7 @@ internal class NodeForcedTerminationTest {
         }
 
     @Test
-    fun `a force into an outstanding save skips its own rather than refusing`() =
-        coreTest {
-            val node = FakeNode()
-            running(node)
-            val requested = Instant.now()
-            observed(
-                drain =
-                    DrainStatus(
-                        state = DrainState.DRAIN_FAILED,
-                        startedAt = requested,
-                        enteredStateAt = requested,
-                        saveRequestedAt = requested,
-                    ),
-            )
-            var saves = 0
-            node.onExec = { command ->
-                if (command.joinToString(" ").contains("save-all")) saves++
-                node.defaultExec(command)
-            }
-
-            val outcome = terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.None)
-
-            // **This state is `docs/operating.md` note 1, and it used to be
-            // refused.** `saveRequestedAt` beside `DRAIN_FAILED` is what the
-            // `SaveOutcome.Unconfirmed` arm writes, and only a confirmation or a
-            // pass that has *observed a player* clears it — `forgetSaveEvidence` is
-            // reachable from nowhere else. A wedged server answers no probe, so no
-            // pass observes a player, so it never lifts. The operator was told to
-            // "wait for it to confirm or fail" about something that can do neither,
-            // below a tombstone, forever.
-            //
-            // Skipping is what the refusal was actually protecting: the harm is a
-            // second `save-all flush` on a main thread already running one, and not
-            // sending it prevents that in full. Refusing on top bought nothing and
-            // cost the one operation the caller cannot get any other way.
-            saves shouldBe 0
-            node.stops shouldHaveSize 1
-
-            // And it says so rather than reporting a save that was never sent.
-            outcome.saveAttempted shouldBe false
-            outcome.saveConfirmed shouldBe false
-            outcome.detail shouldContain "had not been confirmed"
-        }
-
-    @Test
-    fun `an observed player voids the outstanding save, so one is sent after all`() =
+    fun `an outstanding save from the drain does not stop this path sending its own`() =
         coreTest {
             val node = FakeNode()
             node.online = 6
@@ -536,108 +491,21 @@ internal class NodeForcedTerminationTest {
 
             val outcome = terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.Count(6))
 
-            // **The record stopped describing the world the moment a player logged
-            // in.** `DRAIN_FAILED` is deliberately not a sealing state, so a drain
-            // parked on an unconfirmed save has its backend admitted again and
-            // people play on it. `forgetSaveEvidence` is how the drain handles that:
-            // any pass reading a positive count clears `saveRequestedAt`, because
-            // the request no longer says what is on disk.
+            // **`saveRequestedAt` is not consulted, and four rounds of trying to
+            // consult it safely are why.** Only a confirmation or a pass that
+            // observed a player clears it, and `DRAIN_FAILED` is deliberately not a
+            // sealing state — so the proxy re-admits, a whole session can arrive and
+            // leave between two probes, and every reading this path can take still
+            // says zero. No condition on that record can be made sound here.
             //
-            // Skipping here regardless would have inherited the wedge's protection
-            // without its discipline, and stopped the container having sent no save
-            // at all — losing every change made since that stale request.
+            // The drain never re-sends either, but only because it never stops: it
+            // stalls and the world stays on a running server. This path stops, so it
+            // takes the trade the other way. A redundant flush queues behind the one
+            // already running and costs a stall; a save not sent costs play nothing
+            // recovers.
             saves shouldBe 1
             node.stops shouldHaveSize 1
             outcome.saveAttempted shouldBe true
-            // Nothing was skipped, so there is nothing to report as outstanding.
-            outcome.saveOutstandingSince shouldBe null
-        }
-
-    @Test
-    fun `players who arrive during the save wait still void a stale outstanding save`() =
-        coreTest {
-            val node = FakeNode()
-            running(node)
-            val requested = Instant.now()
-            observed(
-                drain =
-                    DrainStatus(
-                        state = DrainState.DRAIN_FAILED,
-                        startedAt = requested,
-                        enteredStateAt = requested,
-                        saveRequestedAt = requested,
-                    ),
-            )
-            var saves = 0
-            var probes = 0
-            // Empty on the first reading; three players by the second. Standalone, so
-            // there is no seal holding the count and both probes really happen.
-            node.onExec = { command ->
-                val text = command.joinToString(" ")
-                if (text.contains("save-all")) saves++
-                if (text.contains("mc-monitor")) {
-                    probes++
-                    if (probes > 1) node.online = 3
-                }
-                node.defaultExec(command)
-            }
-
-            val outcome = terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.Count(3))
-
-            // **A `Count(3)` gets past a first probe of zero**, because
-            // `refuseOccupancy` returns early on an observed zero without consulting
-            // the acknowledgement at all — there is nobody to acknowledge. So the
-            // save decision cannot be taken from the first reading alone: these three
-            // joined while the stop was being prepared, changed the world after the
-            // outstanding request, and would have been stopped with no save at all.
-            saves shouldBe 1
-            node.stops shouldHaveSize 1
-            outcome.saveAttempted shouldBe true
-            // Nothing was skipped in the end, so nothing is reported as outstanding —
-            // and the audit log says the same, rather than a non-null instant beside
-            // `saveAttempted: true`.
-            outcome.saveOutstandingSince shouldBe null
-        }
-
-    @Test
-    fun `a population arriving during the late save is seen before the stop`() =
-        coreTest {
-            val node = FakeNode()
-            running(node)
-            val requested = Instant.now()
-            observed(
-                drain =
-                    DrainStatus(
-                        state = DrainState.DRAIN_FAILED,
-                        startedAt = requested,
-                        enteredStateAt = requested,
-                        saveRequestedAt = requested,
-                    ),
-            )
-            var probes = 0
-            // Zero, then 3 — which authorises the late save — then 9 while that save
-            // is running.
-            node.onExec = { command ->
-                if (command.joinToString(" ").contains("mc-monitor")) {
-                    probes++
-                    node.online =
-                        when (probes) {
-                            1 -> 0
-                            2 -> 3
-                            else -> 9
-                        }
-                }
-                node.defaultExec(command)
-            }
-
-            // The late save spends its own save timeout, so the reading that
-            // authorised it is that much older by the time the stop would go out.
-            // A branch added to protect a late-arriving population must not itself
-            // be unprotected against one.
-            shouldThrow<ForcedTerminationRefused> {
-                terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.Count(3))
-            }.message.toString() shouldContain "9 player"
-            node.stops shouldHaveSize 0
         }
 
     @Test
@@ -674,40 +542,6 @@ internal class NodeForcedTerminationTest {
             message shouldContain "the world save was confirmed before the container was stopped"
             message shouldNotContain "no world save was sent"
             message shouldContain "Nothing was stopped"
-        }
-
-    @Test
-    fun `an unreadable count is not an observed player, so the skip stands`() =
-        coreTest {
-            val node = FakeNode()
-            node.joinable = false
-            running(node)
-            val requested = Instant.now()
-            observed(
-                drain =
-                    DrainStatus(
-                        state = DrainState.DRAIN_FAILED,
-                        startedAt = requested,
-                        enteredStateAt = requested,
-                        saveRequestedAt = requested,
-                    ),
-            )
-            var saves = 0
-            node.onExec = { command ->
-                if (command.joinToString(" ").contains("save-all")) saves++
-                node.defaultExec(command)
-            }
-
-            val outcome = terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.Unreadable)
-
-            // Unknown is not zero and it is not a player either. Reading an
-            // unanswered probe as evidence that somebody is on would send the second
-            // flush the wedge exists to prevent, into the wedged server that is this
-            // endpoint's whole population.
-            saves shouldBe 0
-            node.stops shouldHaveSize 1
-            outcome.saveAttempted shouldBe false
-            outcome.saveOutstandingSince shouldBe requested
         }
 
     @Test

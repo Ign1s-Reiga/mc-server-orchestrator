@@ -75,21 +75,24 @@ wait is what lets an in-flight save finish.
 > `saveConfirmed` — *"never sent"* and *"sent and not confirmed"* are different
 > events and must not be reported as one.
 
-**A save the drain already has outstanding is skipped, not repeated — and not
-refused.** `status.drain.saveRequestedAt` is the never-re-send wedge, and only a
-confirmation or a pass that has *observed a player* clears it. A wedged server
-answers no probe, so no pass observes a player, so it never lifts — while the
-state that sets it (`Unconfirmed` + `DRAIN_SAVE_TIMEOUT` + `PERMANENT`) is note 1
-itself. Refusing on it, as one version did, meant the hatch turned away the
-population it was built for and told the operator to wait for something that
-cannot happen.
+**The save is always requested — there is no skip.** One version of this path
+declined to send when `status.drain.saveRequestedAt` was set, on the argument that
+`DrainController.save()` never re-sends either. The analogy does not hold: the
+drain never re-sends *because it never stops*. It stalls, permanently, and the
+world stays on a running server. Declining the save and stopping anyway is a trade
+the drain never makes.
 
-The harm being prevented is a second `save-all flush` landing on a main thread
-already running one. Declining to send it prevents that in full; refusing the stop
-as well prevents nothing further and costs the one operation the caller cannot get
-any other way. So the force skips its own save, reports `saveAttempted: false`
-with that reason, and the grace period is raised as it is for any other unsent
-save.
+Nor can that record be made trustworthy here. Only a confirmation or a pass that
+has observed a player clears it, and `DRAIN_FAILED` is deliberately not a sealing
+state — so the proxy re-admits the backend, a whole session can arrive and leave
+between two orchestrator probes, and every reading this path can take still reads
+zero. Four successive conditions were tried and each was individually correct;
+none could cover a session nobody saw.
+
+So the trade is taken the other way, on the asymmetry CLAUDE.md states first: a
+redundant `save-all flush` queues behind the one already running and costs a
+stall, bounded by a grace period already floored at the save timeout. A save not
+sent costs play that no later pass recovers.
 
 **The grace period is never shortened, and on one branch it is lengthened.**
 `spec.lifecycle.stopGracePeriod` is the last-resort net that lets a server flush
@@ -204,7 +207,6 @@ API, so it is recorded whether or not the console's audit sink exists yet:
 | playersOnline | **A count, read immediately before the stop** — never the one the operator acknowledged, and null when the server did not answer. The logging rule is unchanged |
 | acknowledged | The count the operator stated they had been shown |
 | saveConfirmed | Whether the save was confirmed before the stop. **This is the field that says whether data was lost** |
-| saveOutstandingSince | When the *drain* had a save outstanding, if it did — in which case this stop sent none. **Required beside `saveAttempted`, never without it**: alone, `saveAttempted: false` says "nothing ever reached the server", and on this branch something demonstrably did |
 | drainState | What the drain had reached when force was applied |
 
 Until that sink exists, the `forced stop …` log line **is** the audit record, and

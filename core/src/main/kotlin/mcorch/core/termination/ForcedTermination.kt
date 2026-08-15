@@ -64,7 +64,7 @@ import kotlin.time.toJavaDuration
  * | Seal the proxy (2) | **Done.** Asserted through the same `ProxyFleet.linkFor` channel the drain uses. See below |
  * | Transfer players (4) | **Not done.** Players are disconnected |
  * | `requireEmpty` — zero players (5) | Replaced by a counted acknowledgement, read under the seal. See below |
- * | Save (5) | Requested unless the drain already has one outstanding, and **[ForcedStopOutcome.saveAttempted] with [ForcedStopOutcome.saveOutstandingSince] say which** |
+ * | Save (5) | **Always requested**, and [ForcedStopOutcome.saveAttempted] says whether one could be sent |
  * | Deregister (6) | **Not done.** The loop's next pass does it; until then the proxy holds a registration at an address that is going away |
  * | `mayStop` (7) | Deliberately bypassed. That is the feature |
  *
@@ -227,22 +227,6 @@ public sealed interface OccupancyAcknowledgement {
 public data class ForcedStopOutcome(
     val saveAttempted: Boolean,
     val saveConfirmed: Boolean,
-    /**
-     * When the *drain* last issued a save it never got confirmed for, if one was
-     * outstanding when this stop ran — in which case no save was sent from here.
-     *
-     * **This is what stops [saveAttempted] lying by omission.** Its three original
-     * meanings were all *"nothing ever reached the server"*: no save channel, a
-     * client that never connected, an unusable `saveTimeout`. This branch is
-     * different in kind — `DrainStatus.saveRequestedAt` means, by its own
-     * definition, that **a request did go out** — so an investigator reading
-     * `saveAttempted: false` alone would conclude no save was ever sent and be
-     * wrong. The world may well be on disk.
-     *
-     * Carried as the instant rather than a fourth flag because *how long ago* is
-     * the part that decides whether it plausibly landed.
-     */
-    val saveOutstandingSince: Instant? = null,
     val playersOnline: Int?,
     /** Operator-facing, and never a player name or an address. */
     val detail: String,
@@ -299,8 +283,6 @@ public class NodeForcedTermination(
         acknowledgement: OccupancyAcknowledgement,
     ) {
         val name = definition.metadata.name
-        // Return value unused here: `preflight` only refuses, and the outstanding-save
-        // record is [stop]'s to act on.
         refuseSecondSideEffect(name)
 
         // Decidable from the definition alone, and refused here rather than from
@@ -336,7 +318,7 @@ public class NodeForcedTermination(
         // "binding protection … which observes the container rather than a status
         // row". There was no such protection. `WorkloadState` reports `RUNNING` and
         // says nothing about whether a save is outstanding.
-        val outstandingAtEntry = refuseSecondSideEffect(name)
+        refuseSecondSideEffect(name)
 
         // Drain step 2, and it comes **first**. Everything below reads a player
         // count and acts on it, and a count nobody is holding still is not a
@@ -349,123 +331,39 @@ public class NodeForcedTermination(
         refuseOccupancy(name, players, acknowledgement)
         refuseUnsealedPopulation(name, seal, players, acknowledgement)
 
-        // **A save the drain already issued is skipped, never refused.**
+        // **The save is always requested, and the skip that used to sit here is
+        // gone.**
         //
-        // `DrainStatus.saveRequestedAt` is the never-re-send wedge: a request went
-        // out and was not confirmed, and only a confirmation or a pass that has
-        // *observed a player* clears it — `forgetSaveEvidence` is reachable from
-        // nowhere else. A wedged server answers no probe, so no pass ever observes
-        // a player, so the wedge never lifts.
+        // It skipped when `DrainStatus.saveRequestedAt` was set, on the argument
+        // that `DrainController.save()` never re-sends either, so the force sending
+        // one was the anomaly. The analogy does not hold: the drain never re-sends
+        // *because it never stops* — it stalls, permanently, and the world stays on
+        // a running server. This path stops. Declining the save and stopping anyway
+        // is a trade the drain never makes.
         //
-        // That is not an edge case, it is `docs/operating.md` note 1 exactly: the
-        // `SaveOutcome.Unconfirmed` arm sets this field alongside
-        // `DRAIN_SAVE_TIMEOUT` and `PERMANENT`. An earlier version *refused* on it,
-        // which meant the operator hit note 1, reached for the hatch built for note
-        // 1, and was told to "wait for it to confirm or fail" — for something that
-        // cannot do either, below a tombstone, forever.
+        // And the record cannot be made trustworthy here. Only a confirmation or a
+        // pass that has observed a player clears it, and `DRAIN_FAILED` is
+        // deliberately not a sealing state — so the proxy re-admits, a whole session
+        // can arrive and leave between two orchestrator probes, and every reading
+        // this path can take still says zero. Four rounds of conditionals tried to
+        // decide when the record was stale: an observed player voids it, then the
+        // *second* reading voids it, then a re-probe after the late save. Each was
+        // correct and none could cover a session nobody saw.
         //
-        // Skipping is what the refusal was actually for. The harm being prevented is
-        // a second `save-all flush` landing on a main thread already running one;
-        // declining to send it achieves that in full. Refusing the whole stop
-        // achieves nothing further, and the stop is what the caller cannot get any
-        // other way.
-        //
-        // **And skipping is not a new policy — it is this path stopping being the
-        // exception.** `DrainController.save()` already refuses to re-send on an
-        // outstanding request and aborts permanently instead; the drain will never
-        // send a second one. The force doing so was the anomaly, so this closes a
-        // hole where the escape hatch broke the very wedge the drain stalls itself
-        // to maintain. (The raised grace period and Paper's own `SIGTERM` save are
-        // *not* the argument: on a genuinely wedged main thread neither runs, which
-        // is exactly where the skip bites hardest.)
-        //
-        // The residual, stated rather than papered over: a server that has since
-        // recovered, carrying a stale wedge nothing will ever clear, has a world
-        // that could be saved and no automated path that will try — not the drain,
-        // not this. The escape is the console: `save-all flush` through
-        // `POST /api/v1/servers/{name}/console`, confirmed by eye, then force. That
-        // does not clear the wedge either, so this still skips; it just no longer
-        // matters, because the world is already on disk.
-        //
-        // Re-read here rather than trusted from entry: `refuseSecondSideEffect` ran
-        // before the seal, a probe and possibly a save timeout ago.
-        val outstanding = outstandingSave(name, fallback = outstandingAtEntry)
-        // **An observed player voids the record**, exactly as it does for the drain.
-        //
-        // `forgetSaveEvidence` clears `saveRequestedAt` on any pass that reads a
-        // positive count, and the reason is that the player has changed the world
-        // since that request went out — so the request no longer describes what is
-        // on disk. This path has to obey the same rule or it inherits the wedge's
-        // protection without the wedge's discipline.
-        //
-        // The case is ordinary rather than exotic. An unconfirmed save parks the
-        // drain in `DRAIN_FAILED`, which is deliberately *not* a sealing state, so
-        // the proxy admits players again and they play. A force that acknowledges
-        // that population and skipped anyway would stop the container having sent no
-        // save at all, losing every change made since a request that stopped
-        // describing the world the moment the first of them logged in.
-        //
-        // Null occupancy is not a licence: an unreadable count is not an observed
-        // player, and skipping stays the answer there. That matches
-        // `ProbeOutcome.Unanswered`'s rule everywhere else in this file.
-        val firstSave = if (voidsOutstanding(outstanding, players)) requestSave(agent, node, observation) else null
-
-        // **One more reading, and only when nothing is holding the last one.**
-        //
-        // With the door shut the count can only fall, so the reading above stays
-        // good enough: a second probe would cost a wedged server another 10s to
-        // learn something the seal already guarantees.
-        //
-        // Without one it does not, and `NOTHING_TO_SEAL` is not a rare case — a
-        // standalone server has no proxy to seal and players reach it directly.
-        // Dropping this probe outright, as the seal's first draft did, would have
-        // widened that window from milliseconds to a whole save timeout for exactly
-        // the servers with no door. So the probe follows the guarantee rather than
-        // the other way round.
-        val afterFirstSave = readingBeforeStop(name, agent, node, observation, seal, players, acknowledgement)
-
-        // **The final reading can void a record the first one did not**, and on the
-        // unsealed path it regularly will.
-        //
-        // `refuseOccupancy` returns early on a freshly observed zero *without
-        // consulting the acknowledgement at all* — there is nobody to acknowledge —
-        // so a caller may hold `Count(3)` while the first probe reads zero, skip the
-        // save on a record no player had yet voided, and then have the pre-stop probe
-        // read the 3 who joined during the save wait. That reading matches, so the
-        // stop proceeds; and those three changed the world after the outstanding
-        // request. Deciding the save from the first probe alone loses their play.
-        //
-        // So the save is re-decided here rather than earlier: moving both probes
-        // above it would put the deciding reading a whole save timeout from the stop,
-        // which is the window round 50's critical was about.
-        val lateSave =
-            if (firstSave == null && voidsOutstanding(outstanding, afterFirstSave)) {
-                requestSave(agent, node, observation)
-            } else {
-                null
-            }
-        val save = lateSave ?: firstSave
-        // Only a save this operation really declined to send. A record voided by an
-        // observed player was not skipped — it was superseded — and reporting it
-        // would contradict the field's own meaning.
-        val skipped = if (save == null) outstanding else null
-        val attempted = save != null && save !is SaveOutcome.Unconfirmable && save !is SaveOutcome.NotDelivered
+        // So the trade is taken the other way round, on the asymmetry CLAUDE.md
+        // states: a redundant `save-all flush` queues behind the one already running
+        // and costs a stall, bounded by a grace period already floored at
+        // `SAVE_TIMEOUT`; a save not sent costs play that no later pass recovers.
+        // `ForcedStopOutcome.saveAttempted` now means what it says on every branch.
+        val save = requestSave(agent, node, observation)
+        val attempted = save !is SaveOutcome.Unconfirmable && save !is SaveOutcome.NotDelivered
         val confirmed = save is SaveOutcome.Confirmed
 
-        // A late save spends its own save timeout, so the reading that authorised it
-        // is that much older by the time the stop would go out. **Every save is
-        // followed by a reading, and every reading is refused against the
-        // acknowledgement** — otherwise the branch added to protect a late-arriving
-        // population is itself unprotected against one.
-        //
-        // This terminates rather than regressing: at most one late save, and the
-        // reading after it decides the stop rather than authorising a third.
-        val atStop =
-            if (lateSave == null) {
-                afterFirstSave
-            } else {
-                readingBeforeStop(name, agent, node, observation, seal, afterFirstSave, acknowledgement)
-            }
+        // The reading the stop is dispatched on, taken after the save so it is not a
+        // save timeout old. Under an asserted seal the count cannot rise and the
+        // earlier reading stands; without one it is read again and refused if it has
+        // moved.
+        val atStop = readingBeforeStop(name, agent, node, observation, seal, players, acknowledgement)
 
         val declared = definition.spec.lifecycle.stopGracePeriod
         // Raised, never lowered, and never a refusal. When no save request was
@@ -477,16 +375,11 @@ public class NodeForcedTermination(
         val grace = StopGrace.of(requested, definition.spec.lifecycle.drain.saveTimeout)
 
         LOG.warn(
-            "forced stop server={} saveAttempted={} saveConfirmed={} saveOutstandingSince={} playersOnline={} " +
-                "gracePeriodSeconds={} — this bypasses the drain's evidence rule",
+            "forced stop server={} saveAttempted={} saveConfirmed={} playersOnline={} gracePeriodSeconds={} " +
+                "— this bypasses the drain's evidence rule",
             name.value,
             attempted,
             confirmed,
-            // Beside `saveAttempted` and never without it. `spec/termination`'s audit
-            // sink does not exist yet, so this line *is* the audit record — and
-            // `saveAttempted: false` alone says "nothing ever reached the server" on
-            // a branch where a request demonstrably did.
-            skipped ?: "none",
             atStop ?: "unknown",
             grace.period.inWholeSeconds,
         )
@@ -514,11 +407,7 @@ public class NodeForcedTermination(
             // "500" re-fires, which would send a second `save-all flush` into a
             // server that already took one.
             throw ForcedTerminationRefused(
-                "the save reported ${describe(
-                    attempted,
-                    confirmed,
-                    skipped,
-                )}, and the stop was then refused by the " +
+                "the save reported ${describe(attempted, confirmed)}, and the stop was then refused by the " +
                     "node: ${failure.message}. Nothing was stopped",
             )
         }
@@ -526,9 +415,8 @@ public class NodeForcedTermination(
         return ForcedStopOutcome(
             saveAttempted = attempted,
             saveConfirmed = confirmed,
-            saveOutstandingSince = skipped,
             playersOnline = atStop,
-            detail = describe(attempted, confirmed, skipped),
+            detail = describe(attempted, confirmed),
         )
     }
 
@@ -653,8 +541,8 @@ public class NodeForcedTermination(
      * trades a narrow hole for a wide one. What makes a *repeat* of this path safe
      * is [recordStopDispatched], not this.
      */
-    private suspend fun refuseSecondSideEffect(name: ResourceName): Instant? {
-        val drain = (store.getServer(name)?.status?.status as? PaperServerStatus)?.drain ?: return null
+    private suspend fun refuseSecondSideEffect(name: ResourceName) {
+        val drain = (store.getServer(name)?.status?.status as? PaperServerStatus)?.drain ?: return
         val dispatched = drain.stopLastDispatchedAt ?: drain.stopDispatchedAt
         // **Bounded by the grace period, not by the stamp's existence.**
         //
@@ -691,64 +579,10 @@ public class NodeForcedTermination(
         // this function; the sibling branch above was bounded in round 52 and this
         // one was missed because the report named only that half.
         //
-        // [stop] reads the same field and **skips its own save** instead, which is
-        // the whole of what the refusal was protecting — and it is returned here so
-        // a later read that fails cannot forget what this one already saw.
-        return drain.saveRequestedAt
+        // [stop] does not consult it either. It requests its save unconditionally —
+        // see the note at the save for why the record cannot be made trustworthy on
+        // a backend the proxy has re-admitted.
     }
-
-    /**
-     * When the drain last issued a save it never got confirmed for, or null.
-     *
-     * Read fresh immediately before [stop] would send its own, because
-     * [refuseSecondSideEffect] ran a seal, a probe and possibly a save timeout ago.
-     *
-     * **A store that will not answer falls back to what this operation already
-     * observed**, rather than to null.
-     *
-     * Two earlier justifications for null-on-failure were both wrong. *"One extra
-     * flush against a container about to take a `SIGTERM` anyway"* is wrong because
-     * the flush lands **before** the stop, on a live server — exactly the case the
-     * wedge protects. *"`save-all flush` is idempotent, so err toward the repeat"* is
-     * wrong here too: this project does not treat a second flush as free, which is
-     * the whole reason `DrainController.save()` refuses to re-send and aborts
-     * permanently instead. Erring toward the repeat is erring against the rule the
-     * rest of the system stalls itself to keep.
-     *
-     * And the fallback costs nothing, because the information is already in hand:
-     * [refuseSecondSideEffect] read the same field at entry. Forgetting it on a
-     * transient store failure would have put a second flush on a main thread already
-     * running one, milliseconds before a `SIGTERM` — the corruption window this path
-     * documents in `spec/termination/02-force-stop.md` §3.
-     *
-     * Null is still the answer when nothing was observed at entry either.
-     *
-     * Only a *transient* store failure reaches this catch. `Store.getServer` fails
-     * rather than returning a hole when either half will not decode, so an
-     * undecodable row throws out of [preflight] into a 500 above the tombstone and
-     * never gets here.
-     *
-     * The gap between this read and the exec cannot be closed, only shrunk — one
-     * half is a store read and the other is a command against a game server, and no
-     * layer can make those atomic. That is the honest floor rather than an open
-     * item: what makes it acceptable is the same idempotence as above.
-     */
-    private suspend fun outstandingSave(
-        name: ResourceName,
-        fallback: Instant?,
-    ): Instant? =
-        try {
-            (store.getServer(name)?.status?.status as? PaperServerStatus)?.drain?.saveRequestedAt
-        } catch (failure: StoreException) {
-            LOG.warn(
-                "could not re-check {} for an outstanding save before forcing; falling back to what this " +
-                    "operation already observed ({}): {}",
-                name.value,
-                fallback ?: "none",
-                failure.message,
-            )
-            fallback
-        }
 
     /**
      * How long a dispatched stop is still "in flight" for.
@@ -913,25 +747,6 @@ public class NodeForcedTermination(
     }
 
     /**
-     * Whether a save should be sent despite an outstanding request.
-     *
-     * True when there is no outstanding record at all, and true when one exists but
-     * a reading has **observed a player** — because `forgetSaveEvidence` clears
-     * `saveRequestedAt` on exactly that condition, for exactly that reason: the
-     * player has changed the world since the request, so it no longer describes what
-     * is on disk. This path obeys the drain's rule rather than inheriting the
-     * wedge's protection without its discipline.
-     *
-     * A **null** count is not an observed player. An unanswered probe is unknown,
-     * and the wedged server that answers no ping is this endpoint's whole
-     * population — sending into it is the second flush the wedge exists to prevent.
-     */
-    private fun voidsOutstanding(
-        outstanding: Instant?,
-        observed: Int?,
-    ): Boolean = outstanding == null || (observed ?: 0) > 0
-
-    /**
      * Refuses unless the acknowledgement matches what was just observed.
      *
      * A freshly observed zero needs no acknowledgement — there is nobody to
@@ -1024,15 +839,8 @@ public class NodeForcedTermination(
     private fun describe(
         attempted: Boolean,
         confirmed: Boolean,
-        outstanding: Instant? = null,
     ): String =
         when {
-            outstanding != null -> {
-                "no world save was sent, because one requested at $outstanding had not been confirmed and a " +
-                    "second would have landed on a main thread already running the first; the stop grace " +
-                    "period was the only chance the world had to reach disk"
-            }
-
             confirmed -> {
                 "the world save was confirmed before the container was stopped"
             }
