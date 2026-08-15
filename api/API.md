@@ -761,6 +761,11 @@ sent at all** — which is what happens on the very population this endpoint exi
 for, a container with no working save channel. Collapsing them into "not
 confirmed" would report those two identically, and they are not the same event.
 
+If the server is **observed with players on it**, the outstanding record is treated
+as void and a save *is* sent — a player has changed the world since that request,
+so it no longer describes what is on disk. `saveOutstandingSince` is then null,
+because nothing was skipped.
+
 **`saveOutstandingSince` is the one that stops `saveAttempted: false` misleading
 you.** When it is non-null, the *drain* already had a save outstanding and this
 stop deliberately sent none rather than putting a second `save-all flush` on a main

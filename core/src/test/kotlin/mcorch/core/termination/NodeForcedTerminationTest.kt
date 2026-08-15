@@ -512,6 +512,81 @@ internal class NodeForcedTerminationTest {
         }
 
     @Test
+    fun `an observed player voids the outstanding save, so one is sent after all`() =
+        coreTest {
+            val node = FakeNode()
+            node.online = 6
+            running(node)
+            val requested = Instant.now()
+            observed(
+                drain =
+                    DrainStatus(
+                        state = DrainState.DRAIN_FAILED,
+                        startedAt = requested,
+                        enteredStateAt = requested,
+                        saveRequestedAt = requested,
+                    ),
+            )
+            var saves = 0
+            node.onExec = { command ->
+                if (command.joinToString(" ").contains("save-all")) saves++
+                node.defaultExec(command)
+            }
+
+            val outcome = terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.Count(6))
+
+            // **The record stopped describing the world the moment a player logged
+            // in.** `DRAIN_FAILED` is deliberately not a sealing state, so a drain
+            // parked on an unconfirmed save has its backend admitted again and
+            // people play on it. `forgetSaveEvidence` is how the drain handles that:
+            // any pass reading a positive count clears `saveRequestedAt`, because
+            // the request no longer says what is on disk.
+            //
+            // Skipping here regardless would have inherited the wedge's protection
+            // without its discipline, and stopped the container having sent no save
+            // at all — losing every change made since that stale request.
+            saves shouldBe 1
+            node.stops shouldHaveSize 1
+            outcome.saveAttempted shouldBe true
+            // Nothing was skipped, so there is nothing to report as outstanding.
+            outcome.saveOutstandingSince shouldBe null
+        }
+
+    @Test
+    fun `an unreadable count is not an observed player, so the skip stands`() =
+        coreTest {
+            val node = FakeNode()
+            node.joinable = false
+            running(node)
+            val requested = Instant.now()
+            observed(
+                drain =
+                    DrainStatus(
+                        state = DrainState.DRAIN_FAILED,
+                        startedAt = requested,
+                        enteredStateAt = requested,
+                        saveRequestedAt = requested,
+                    ),
+            )
+            var saves = 0
+            node.onExec = { command ->
+                if (command.joinToString(" ").contains("save-all")) saves++
+                node.defaultExec(command)
+            }
+
+            val outcome = terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.Unreadable)
+
+            // Unknown is not zero and it is not a player either. Reading an
+            // unanswered probe as evidence that somebody is on would send the second
+            // flush the wedge exists to prevent, into the wedged server that is this
+            // endpoint's whole population.
+            saves shouldBe 0
+            node.stops shouldHaveSize 1
+            outcome.saveAttempted shouldBe false
+            outcome.saveOutstandingSince shouldBe requested
+        }
+
+    @Test
     fun `the reported count is the one from just before the stop`() =
         coreTest {
             val node = FakeNode()

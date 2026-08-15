@@ -390,7 +390,27 @@ public class NodeForcedTermination(
         // Re-read here rather than trusted from entry: `refuseSecondSideEffect` ran
         // before the seal, a probe and possibly a save timeout ago.
         val outstanding = outstandingSave(name, fallback = outstandingAtEntry)
-        val save = if (outstanding == null) requestSave(agent, node, observation) else null
+        // **An observed player voids the record**, exactly as it does for the drain.
+        //
+        // `forgetSaveEvidence` clears `saveRequestedAt` on any pass that reads a
+        // positive count, and the reason is that the player has changed the world
+        // since that request went out — so the request no longer describes what is
+        // on disk. This path has to obey the same rule or it inherits the wedge's
+        // protection without the wedge's discipline.
+        //
+        // The case is ordinary rather than exotic. An unconfirmed save parks the
+        // drain in `DRAIN_FAILED`, which is deliberately *not* a sealing state, so
+        // the proxy admits players again and they play. A force that acknowledges
+        // that population and skipped anyway would stop the container having sent no
+        // save at all, losing every change made since a request that stopped
+        // describing the world the moment the first of them logged in.
+        //
+        // Null occupancy is not a licence: an unreadable count is not an observed
+        // player, and skipping stays the answer there. That matches
+        // `ProbeOutcome.Unanswered`'s rule everywhere else in this file.
+        val voidedByPlayers = outstanding != null && (players ?: 0) > 0
+        val skipped = if (voidedByPlayers) null else outstanding
+        val save = if (skipped == null) requestSave(agent, node, observation) else null
         val attempted = save != null && save !is SaveOutcome.Unconfirmable && save !is SaveOutcome.NotDelivered
         val confirmed = save is SaveOutcome.Confirmed
 
@@ -468,9 +488,9 @@ public class NodeForcedTermination(
         return ForcedStopOutcome(
             saveAttempted = attempted,
             saveConfirmed = confirmed,
-            saveOutstandingSince = outstanding,
+            saveOutstandingSince = skipped,
             playersOnline = atStop,
-            detail = describe(attempted, confirmed, outstanding),
+            detail = describe(attempted, confirmed, skipped),
         )
     }
 
