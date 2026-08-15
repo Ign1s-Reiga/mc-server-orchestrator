@@ -151,6 +151,65 @@ internal class StopDispatchDurabilityTest {
         }
 
     @Test
+    fun `a retry landing between the merge and the write is not overwritten`() =
+        coreTest {
+            val harness = Harness()
+            val definition = paperDefinition()
+            val name = definition.metadata.name
+            harness.declare(definition)
+            harness.settle(name)
+            harness.store.deleteDefinition(name)
+
+            val first = Instant.parse("2026-01-01T00:00:00Z")
+            val retried = Instant.parse("2026-01-01T02:00:00Z")
+            harness.status(name)?.let {
+                harness.store.putStatus(
+                    it.copy(
+                        drain =
+                            DrainStatus(
+                                state = DrainState.DRAIN_FAILED,
+                                startedAt = first,
+                                enteredStateAt = first,
+                                stopDispatchedAt = first,
+                                stopLastDispatchedAt = first,
+                            ),
+                    ),
+                )
+            }
+
+            // The merge closes the window between the pass's snapshot and its write.
+            // It does not close the window between the merge's own re-read and that
+            // write — two store calls, with a forced retry free to land between them.
+            // So the writer is armed for the *second* read of the pass, which is
+            // `preservingDispatch`'s.
+            harness.store.afterNextRead = {
+                harness.store.afterNextRead = {
+                    harness.status(name)?.let {
+                        harness.store.putStatus(
+                            it.copy(drain = it.drain?.copy(stopLastDispatchedAt = retried)),
+                        )
+                    }
+                }
+            }
+
+            harness.pass(name)
+
+            // The merge picked the stale value because that was all it could see, so
+            // the write has to be refused rather than trusted: conditional on the
+            // version the merge was true of, and a conflict re-reads. Otherwise the
+            // seal anchors to an expired instant while the retried stop is still
+            // inside its grace period.
+            val drain =
+                (
+                    harness.store
+                        .getServer(name)
+                        ?.status
+                        ?.status as? PaperServerStatus
+                )?.drain
+            drain?.stopLastDispatchedAt shouldBe retried
+        }
+
+    @Test
     fun `a server that is not terminating pays nothing for the guard`() =
         coreTest {
             val harness = Harness()

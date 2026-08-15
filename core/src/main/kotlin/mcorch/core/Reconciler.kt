@@ -36,6 +36,7 @@ import mcorch.schema.VelocityProxyDefinition
 import mcorch.schema.VelocityProxyStatus
 import mcorch.store.ConflictReason
 import mcorch.store.Precondition
+import mcorch.store.ResourceVersion
 import mcorch.store.ServerListing
 import mcorch.store.Store
 import mcorch.store.StoreException
@@ -3137,6 +3138,7 @@ public class Reconciler(
     private suspend fun preservingDispatch(
         stored: StoredServer,
         status: PaperServerStatus,
+        mergedAgainst: (ResourceVersion?) -> Unit = {},
     ): PaperServerStatus {
         if (!stored.definition.terminating) return status
         // **Both records, and no early return on the first one.**
@@ -3154,7 +3156,15 @@ public class Reconciler(
         val draft = status.drain
         val current =
             try {
-                (store.getServer(stored.name)?.status?.status as? PaperServerStatus)?.drain
+                val held = store.getServer(stored.name)?.status
+                // The version this merge is true of. Reported back so the write can
+                // be made conditional on it: the re-read and the write are two store
+                // calls, and a forced retry landing between them would otherwise have
+                // its fresh `stopLastDispatchedAt` overwritten by the stale value
+                // chosen here — the seal then looks expired while that stop is still
+                // inside its grace period.
+                mergedAgainst(held?.resourceVersion)
+                (held?.status as? PaperServerStatus)?.drain
             } catch (failure: StoreException) {
                 // The write below will fail on the same store and be classified
                 // there. Losing the carry-forward is the lesser harm and is the
@@ -3222,9 +3232,22 @@ public class Reconciler(
         // replaced the definition while this pass ran, this observation
         // describes a spec nobody wants any more, and recording it would make
         // the server look settled at a generation nobody asked for.
+        // Conditional **only** where the merge ran, which is the terminating path.
+        // Elsewhere the loop is the sole writer and a precondition would add
+        // conflicts with nothing to resolve. A conflict here routes to the existing
+        // `Retry`, which re-reads and re-derives — the resolution this needs.
+        var mergedAgainst: ResourceVersion? = null
+        val merged = preservingDispatch(pass.stored, status) { mergedAgainst = it }
         val outcome =
             store.putStatus(
-                status = preservingDispatch(pass.stored, status),
+                status = merged,
+                // Whenever the merge **ran**, not only when it changed something.
+                // A merge that finds nothing to carry forward has still read a
+                // version, and the draft it is about to write is just as stale
+                // against a retry landing after that read — which is exactly the
+                // case where the values happen to agree, so an identity check
+                // waves through the write that clobbers.
+                precondition = mergedAgainst?.let { Precondition.AtVersion(it) } ?: Precondition.None,
                 observedDefinition = pass.stored.definition.resourceVersion,
             )
         return when (outcome) {
