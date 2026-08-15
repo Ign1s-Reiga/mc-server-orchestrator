@@ -553,6 +553,52 @@ internal class NodeForcedTerminationTest {
         }
 
     @Test
+    fun `players who arrive during the save wait still void a stale outstanding save`() =
+        coreTest {
+            val node = FakeNode()
+            running(node)
+            val requested = Instant.now()
+            observed(
+                drain =
+                    DrainStatus(
+                        state = DrainState.DRAIN_FAILED,
+                        startedAt = requested,
+                        enteredStateAt = requested,
+                        saveRequestedAt = requested,
+                    ),
+            )
+            var saves = 0
+            var probes = 0
+            // Empty on the first reading; three players by the second. Standalone, so
+            // there is no seal holding the count and both probes really happen.
+            node.onExec = { command ->
+                val text = command.joinToString(" ")
+                if (text.contains("save-all")) saves++
+                if (text.contains("mc-monitor")) {
+                    probes++
+                    if (probes > 1) node.online = 3
+                }
+                node.defaultExec(command)
+            }
+
+            val outcome = terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.Count(3))
+
+            // **A `Count(3)` gets past a first probe of zero**, because
+            // `refuseOccupancy` returns early on an observed zero without consulting
+            // the acknowledgement at all — there is nobody to acknowledge. So the
+            // save decision cannot be taken from the first reading alone: these three
+            // joined while the stop was being prepared, changed the world after the
+            // outstanding request, and would have been stopped with no save at all.
+            saves shouldBe 1
+            node.stops shouldHaveSize 1
+            outcome.saveAttempted shouldBe true
+            // Nothing was skipped in the end, so nothing is reported as outstanding —
+            // and the audit log says the same, rather than a non-null instant beside
+            // `saveAttempted: true`.
+            outcome.saveOutstandingSince shouldBe null
+        }
+
+    @Test
     fun `an unreadable count is not an observed player, so the skip stands`() =
         coreTest {
             val node = FakeNode()

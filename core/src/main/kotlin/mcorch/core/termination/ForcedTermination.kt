@@ -408,11 +408,7 @@ public class NodeForcedTermination(
         // Null occupancy is not a licence: an unreadable count is not an observed
         // player, and skipping stays the answer there. That matches
         // `ProbeOutcome.Unanswered`'s rule everywhere else in this file.
-        val voidedByPlayers = outstanding != null && (players ?: 0) > 0
-        val skipped = if (voidedByPlayers) null else outstanding
-        val save = if (skipped == null) requestSave(agent, node, observation) else null
-        val attempted = save != null && save !is SaveOutcome.Unconfirmable && save !is SaveOutcome.NotDelivered
-        val confirmed = save is SaveOutcome.Confirmed
+        val firstSave = if (voidsOutstanding(outstanding, players)) requestSave(agent, node, observation) else null
 
         // **One more reading, and only when nothing is holding the last one.**
         //
@@ -428,6 +424,34 @@ public class NodeForcedTermination(
         // the other way round.
         val atStop = if (seal == SealResult.ASSERTED) players else occupancy(agent, node, observation)
         refuseOccupancy(name, atStop, acknowledgement)
+
+        // **The final reading can void a record the first one did not**, and on the
+        // unsealed path it regularly will.
+        //
+        // `refuseOccupancy` returns early on a freshly observed zero *without
+        // consulting the acknowledgement at all* — there is nobody to acknowledge —
+        // so a caller may hold `Count(3)` while the first probe reads zero, skip the
+        // save on a record no player had yet voided, and then have the pre-stop probe
+        // read the 3 who joined during the save wait. That reading matches, so the
+        // stop proceeds; and those three changed the world after the outstanding
+        // request. Deciding the save from the first probe alone loses their play.
+        //
+        // So the save is re-decided here rather than earlier: moving both probes
+        // above it would put the deciding reading a whole save timeout from the stop,
+        // which is the window round 50's critical was about.
+        val lateSave =
+            if (firstSave == null && voidsOutstanding(outstanding, atStop)) {
+                requestSave(agent, node, observation)
+            } else {
+                null
+            }
+        val save = lateSave ?: firstSave
+        // Only a save this operation really declined to send. A record voided by an
+        // observed player was not skipped — it was superseded — and reporting it
+        // would contradict the field's own meaning.
+        val skipped = if (save == null) outstanding else null
+        val attempted = save != null && save !is SaveOutcome.Unconfirmable && save !is SaveOutcome.NotDelivered
+        val confirmed = save is SaveOutcome.Confirmed
 
         val declared = definition.spec.lifecycle.stopGracePeriod
         // Raised, never lowered, and never a refusal. When no save request was
@@ -448,7 +472,7 @@ public class NodeForcedTermination(
             // sink does not exist yet, so this line *is* the audit record — and
             // `saveAttempted: false` alone says "nothing ever reached the server" on
             // a branch where a request demonstrably did.
-            outstanding ?: "none",
+            skipped ?: "none",
             atStop ?: "unknown",
             grace.period.inWholeSeconds,
         )
@@ -850,6 +874,25 @@ public class NodeForcedTermination(
             stopDispatchedAt = now,
             stopLastDispatchedAt = now,
         )
+
+    /**
+     * Whether a save should be sent despite an outstanding request.
+     *
+     * True when there is no outstanding record at all, and true when one exists but
+     * a reading has **observed a player** — because `forgetSaveEvidence` clears
+     * `saveRequestedAt` on exactly that condition, for exactly that reason: the
+     * player has changed the world since the request, so it no longer describes what
+     * is on disk. This path obeys the drain's rule rather than inheriting the
+     * wedge's protection without its discipline.
+     *
+     * A **null** count is not an observed player. An unanswered probe is unknown,
+     * and the wedged server that answers no ping is this endpoint's whole
+     * population — sending into it is the second flush the wedge exists to prevent.
+     */
+    private fun voidsOutstanding(
+        outstanding: Instant?,
+        observed: Int?,
+    ): Boolean = outstanding == null || (observed ?: 0) > 0
 
     /**
      * Refuses unless the acknowledgement matches what was just observed.
