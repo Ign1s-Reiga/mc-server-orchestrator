@@ -145,7 +145,7 @@ public class Reconciler(
         // forwarding secret out of it.
         val fleet =
             try {
-                ProxyFleet.resolve(store, stored)
+                ProxyFleet.resolve(store, stored, now)
             } catch (failure: StoreException) {
                 return storeOutcome(stored.name, failure)
             }
@@ -1817,11 +1817,7 @@ public class Reconciler(
                     // this and the forced path's own stop-in-flight refusal cannot
                     // drift into disagreeing about whether the same container is
                     // still shutting down.
-                    sealed =
-                        status?.drain?.state?.sealsBackend() == true ||
-                            status?.drain?.stopDispatchedAt?.let {
-                                now < it.plus(forcedStopWindow(backend).toJavaDuration())
-                            } == true,
+                    sealed = status?.drain.sealsBackendAt(backend, now),
                     // Null until the loop knows which node the workload is on.
                     // **Not asserted under a guessed hostname**: a registration at a
                     // name that does not resolve is one the protocol will refuse to

@@ -302,12 +302,11 @@ internal class SqliteStore(
             // no wake-up, and the loop is already queued for a forced stop by the
             // tombstone that had to precede it.
             //
-            // What does *not* survive is the implication that nothing is missed. A
-            // dashboard following the force response's own advice to poll sees the
-            // transition into `STOPPING` only when the next pass writes. Whether
-            // that should reach the stream is an open question rather than a
-            // settled one; it is recorded here because the sentence that used to
-            // stand in its place made it invisible.
+            // What does *not* survive is the implication that this is the only
+            // delivery path. The event stream does not depend on the feed for status:
+            // it re-reads every server on its own poll interval and emits any version
+            // that moved, so a write from a second writer is delivered on that cadence
+            // without an entry here. Bounded, and not waiting on the loop.
             WriteOutcome.Applied(StoredStatus(status, ResourceVersion(revision.toString()), now))
         }
 

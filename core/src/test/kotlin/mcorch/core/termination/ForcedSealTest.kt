@@ -256,6 +256,51 @@ internal class ForcedSealTest {
         }
 
     @Test
+    fun `the fleet's sibling view agrees with the sweep about a forced backend`() =
+        coreTest {
+            val other = backendDefinition("survival-02", hostPort = 30002)
+            val harness = ProxyHarness(backends = listOf(backend, other))
+            harness.bringUp()
+            val forced = backend.metadata.name
+            val dispatched = harness.clock.instant()
+            val current = harness.status(forced)
+            if (current != null) {
+                harness.store.putStatus(
+                    current.copy(
+                        drain =
+                            DrainStatus(
+                                state = DrainState.DRAIN_FAILED,
+                                startedAt = dispatched,
+                                enteredStateAt = dispatched,
+                                stopDispatchedAt = dispatched,
+                            ),
+                    ),
+                )
+            }
+
+            // **Two derivations of one question, and for a round they disagreed.**
+            // The proxy sweep was taught to treat a dispatched stop as sealing;
+            // `ProxyFleet.resolve`'s sibling view was not. `BackendLink.lastAdmitting`
+            // is computed from these siblings, so it would have believed the forced
+            // backend still admitted, skipped sealing the proxy before sealing
+            // another backend, and left the plugin's admit-anyway path free to route
+            // a login onto an all-sealed fleet — including the server already
+            // shutting down.
+            val stored = harness.store.getServer(other.metadata.name)
+            val fleet = mcorch.core.ProxyFleet.resolve(harness.store, stored!!, harness.clock.instant())
+            val siblings = (fleet as mcorch.core.ProxyFleet.Resolution.Behind).binding.siblings
+
+            siblings.single { it.server == forced }.sealed shouldBe true
+
+            // …and it lapses on the same window as the sweep, rather than pinning the
+            // fleet's view open for ever.
+            harness.clock.advance(forcedStopWindow(backend) + 1.minutes)
+            val later = mcorch.core.ProxyFleet.resolve(harness.store, stored, harness.clock.instant())
+            val laterSiblings = (later as mcorch.core.ProxyFleet.Resolution.Behind).binding.siblings
+            laterSiblings.single { it.server == forced }.sealed shouldBe false
+        }
+
+    @Test
     fun `an empty server whose proxy will not answer is still stopped`() =
         coreTest {
             val harness = harness()

@@ -299,6 +299,8 @@ public class NodeForcedTermination(
         acknowledgement: OccupancyAcknowledgement,
     ) {
         val name = definition.metadata.name
+        // Return value unused here: `preflight` only refuses, and the outstanding-save
+        // record is [stop]'s to act on.
         refuseSecondSideEffect(name)
 
         // Decidable from the definition alone, and refused here rather than from
@@ -334,7 +336,7 @@ public class NodeForcedTermination(
         // "binding protection … which observes the container rather than a status
         // row". There was no such protection. `WorkloadState` reports `RUNNING` and
         // says nothing about whether a save is outstanding.
-        refuseSecondSideEffect(name)
+        val outstandingAtEntry = refuseSecondSideEffect(name)
 
         // Drain step 2, and it comes **first**. Everything below reads a player
         // count and acts on it, and a count nobody is holding still is not a
@@ -387,7 +389,7 @@ public class NodeForcedTermination(
         //
         // Re-read here rather than trusted from entry: `refuseSecondSideEffect` ran
         // before the seal, a probe and possibly a save timeout ago.
-        val outstanding = outstandingSave(name)
+        val outstanding = outstandingSave(name, fallback = outstandingAtEntry)
         val save = if (outstanding == null) requestSave(agent, node, observation) else null
         val attempted = save != null && save !is SaveOutcome.Unconfirmable && save !is SaveOutcome.NotDelivered
         val confirmed = save is SaveOutcome.Confirmed
@@ -495,7 +497,7 @@ public class NodeForcedTermination(
     private suspend fun sealOff(name: ResourceName): SealResult {
         val stored = store.getServer(name) ?: return SealResult.NOTHING_TO_SEAL
         val binding =
-            when (val fleet = ProxyFleet.resolve(store, stored)) {
+            when (val fleet = ProxyFleet.resolve(store, stored, clock.instant())) {
                 is ProxyFleet.Resolution.Behind -> fleet.binding
 
                 // Two proxies claim it, and sealing one leaves the other admitting —
@@ -593,8 +595,8 @@ public class NodeForcedTermination(
      * trades a narrow hole for a wide one. What makes a *repeat* of this path safe
      * is [recordStopDispatched], not this.
      */
-    private suspend fun refuseSecondSideEffect(name: ResourceName) {
-        val drain = (store.getServer(name)?.status?.status as? PaperServerStatus)?.drain ?: return
+    private suspend fun refuseSecondSideEffect(name: ResourceName): Instant? {
+        val drain = (store.getServer(name)?.status?.status as? PaperServerStatus)?.drain ?: return null
         val dispatched = drain.stopDispatchedAt
         // **Bounded by the grace period, not by the stamp's existence.**
         //
@@ -632,7 +634,9 @@ public class NodeForcedTermination(
         // one was missed because the report named only that half.
         //
         // [stop] reads the same field and **skips its own save** instead, which is
-        // the whole of what the refusal was protecting.
+        // the whole of what the refusal was protecting — and it is returned here so
+        // a later read that fails cannot forget what this one already saw.
+        return drain.saveRequestedAt
     }
 
     /**
@@ -641,13 +645,25 @@ public class NodeForcedTermination(
      * Read fresh immediately before [stop] would send its own, because
      * [refuseSecondSideEffect] ran a seal, a probe and possibly a save timeout ago.
      *
-     * **A store that will not answer reports null, which fails toward sending.** The
-     * tempting justification — *"one extra flush against a container about to take a
-     * `SIGTERM` anyway"* — is wrong, because the flush lands **before** the stop, on
-     * a live server, which is exactly the case the wedge protects. The real reason is
-     * that `save-all flush` is idempotent on the game side: the redundant action
-     * costs a stall, the omitted one costs a save outright, so guessing wrong toward
-     * the repeat is the cheaper mistake.
+     * **A store that will not answer falls back to what this operation already
+     * observed**, rather than to null.
+     *
+     * Two earlier justifications for null-on-failure were both wrong. *"One extra
+     * flush against a container about to take a `SIGTERM` anyway"* is wrong because
+     * the flush lands **before** the stop, on a live server — exactly the case the
+     * wedge protects. *"`save-all flush` is idempotent, so err toward the repeat"* is
+     * wrong here too: this project does not treat a second flush as free, which is
+     * the whole reason `DrainController.save()` refuses to re-send and aborts
+     * permanently instead. Erring toward the repeat is erring against the rule the
+     * rest of the system stalls itself to keep.
+     *
+     * And the fallback costs nothing, because the information is already in hand:
+     * [refuseSecondSideEffect] read the same field at entry. Forgetting it on a
+     * transient store failure would have put a second flush on a main thread already
+     * running one, milliseconds before a `SIGTERM` — the corruption window this path
+     * documents in `spec/termination/02-force-stop.md` §3.
+     *
+     * Null is still the answer when nothing was observed at entry either.
      *
      * Only a *transient* store failure reaches this catch. `Store.getServer` fails
      * rather than returning a hole when either half will not decode, so an
@@ -659,12 +675,21 @@ public class NodeForcedTermination(
      * layer can make those atomic. That is the honest floor rather than an open
      * item: what makes it acceptable is the same idempotence as above.
      */
-    private suspend fun outstandingSave(name: ResourceName): Instant? =
+    private suspend fun outstandingSave(
+        name: ResourceName,
+        fallback: Instant?,
+    ): Instant? =
         try {
             (store.getServer(name)?.status?.status as? PaperServerStatus)?.drain?.saveRequestedAt
         } catch (failure: StoreException) {
-            LOG.warn("could not check {} for an outstanding save before forcing: {}", name.value, failure.message)
-            null
+            LOG.warn(
+                "could not re-check {} for an outstanding save before forcing; falling back to what this " +
+                    "operation already observed ({}): {}",
+                name.value,
+                fallback ?: "none",
+                failure.message,
+            )
+            fallback
         }
 
     /**

@@ -3,9 +3,14 @@ package mcorch.core
 import mcorch.core.paper.ProbeOutcome
 import mcorch.core.paper.SaveOutcome
 import mcorch.core.paper.WorkloadContract
+import mcorch.core.termination.forcedStopWindow
 import mcorch.schema.DrainState
+import mcorch.schema.DrainStatus
+import mcorch.schema.PaperServerDefinition
 import mcorch.schema.ResourceName
+import java.time.Instant
 import kotlin.time.Duration
+import kotlin.time.toJavaDuration
 
 /**
  * The workload a drain is being conducted against, and the two counterparties it
@@ -161,6 +166,31 @@ internal fun DrainState.sealsBackend(): Boolean =
 
         DrainState.DRAIN_FAILED -> false
     }
+
+/**
+ * Whether a backend's login path should be held shut **right now**.
+ *
+ * [sealsBackend] answers from the drain's state alone, and `DRAIN_FAILED` answers
+ * false there on purpose. That is right for a server that is still running and
+ * wrong the moment a `SIGTERM` has left this process for it — so this adds the
+ * record that says so, bounded by the window that stop is still inside.
+ *
+ * **One predicate, every consumer**, and that is the point rather than tidiness.
+ * `Reconciler.ProxyPass.backends` and `ProxyFleet.resolve`'s sibling derivation
+ * both answer this question, and for one round they disagreed: the sweep sealed a
+ * forced backend while `Sibling.sealed` still called it admitting, so
+ * `BackendLink.lastAdmitting` skipped the proxy-wide seal and the plugin's
+ * admit-anyway path could route a login onto an all-sealed fleet — including the
+ * server already shutting down.
+ */
+internal fun DrainStatus?.sealsBackendAt(
+    definition: PaperServerDefinition,
+    now: Instant,
+): Boolean {
+    if (this?.state?.sealsBackend() == true) return true
+    val dispatched = this?.stopDispatchedAt ?: return false
+    return now < dispatched.plus(forcedStopWindow(definition).toJavaDuration())
+}
 
 /**
  * Drain step 2, and the reason it is spelled as an assertion rather than an
