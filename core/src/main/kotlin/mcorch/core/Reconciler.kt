@@ -3080,6 +3080,26 @@ public class Reconciler(
                 }
             }
         }
+        // **Unconditional, and a known residual rather than an oversight.**
+        //
+        // This last attempt can still clobber a forced retry that lands between its
+        // merge and its write, reverting `stopLastDispatchedAt` and letting the proxy
+        // reopen a backend inside its shutdown. Making it conditional would not fix
+        // that — it would trade it for the failure this whole function exists to
+        // prevent, a lost side-effect record and therefore a second world save on a
+        // live server. One of the two has to give, and losing a save is worse than
+        // losing a seal.
+        //
+        // The window is narrow twice over: this runs only when a guarded write was
+        // already rejected *after* a side effect was issued, and only a retry landing
+        // inside one store round trip of it is lost.
+        //
+        // **What would actually close it is an atomic merge**, enforcing
+        // `stopDispatchedAt`'s set-once rule inside `SqliteStore.putStatus`'s own
+        // transaction, where the read and the write are one operation. That is
+        // recorded as an open decision on this change rather than taken here,
+        // because it puts a field-level invariant into `:store` and CLAUDE.md warns
+        // about policy living in two places.
         var mergedAgainst: ResourceVersion? = null
         val merged = preservingDispatch(pass.stored, status) { version -> mergedAgainst = version }
         when (val outcome = store.putStatus(merged)) {
