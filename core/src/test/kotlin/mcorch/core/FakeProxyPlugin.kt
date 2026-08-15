@@ -51,6 +51,16 @@ internal class FakeProxyPlugin(
     /** Registrations that actually created a routing-table entry. A repeat does not count. */
     val registrations: MutableList<String> = mutableListOf()
 
+    /**
+     * Runs on every `POST .../transfer` **after** it is recorded, so a test can let
+     * a sweep land between polls.
+     *
+     * `transfer` is start-or-join, and a caller that polls it reads progress rather
+     * than starting anything again — so "the sweep finished while we were waiting"
+     * is only expressible from inside the handler.
+     */
+    var onTransfer: () -> Unit = {}
+
     /** Every `POST .../transfer` that started or joined a sweep. */
     val transfers: MutableList<Pair<String, String>> = mutableListOf()
 
@@ -267,12 +277,16 @@ internal class FakeProxyPlugin(
             // Start-or-join: a repeat while a sweep is running asks nobody to move
             // again. Not counted in `sweepsStarted`, which is what an idempotency
             // assertion reads.
-            return ok(sweepJson(running, source.players))
+            return ok(sweepJson(running, source.players)).also { onTransfer() }
         }
         val sweep = Sweep(destinationName, startedAtEpochMs, source.players, finished = source.players == 0)
         source.sweep = sweep
         sweepsStarted += name
-        return ok(sweepJson(sweep, source.players))
+        // **After the answer is built.** A hook that ran first would complete the
+        // sweep this call is still describing, and the next poll would then start a
+        // second one rather than joining the first — an artefact of the double, not
+        // of anything `:core` does.
+        return ok(sweepJson(sweep, source.players)).also { onTransfer() }
     }
 
     private fun state(): EndpointResponse =

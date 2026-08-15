@@ -1,6 +1,7 @@
 package mcorch.core.termination
 
 import io.kotest.assertions.throwables.shouldThrow
+import io.kotest.matchers.collections.shouldBeEmpty
 import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
@@ -352,6 +353,87 @@ internal class ForcedSealTest {
             // runs, and a third force would not see this one as overlapping either.
             harness.pass(harness.proxyDefinition.metadata.name)
             harness.plugin.backend(name.value)?.admits shouldBe false
+        }
+
+    @Test
+    fun `players are transferred before the container is stopped`() =
+        coreTest {
+            val destination = backendDefinition("survival-02", hostPort = 30002)
+            val harness = ProxyHarness(backends = listOf(backend, destination))
+            harness.bringUp()
+            val name = backend.metadata.name
+            val node = harness.nodeOf(backend)
+            node.online = 4
+            harness.plugin.backend(name.value)?.players = 4
+            // The sweep lands as soon as it is asked, which is what a proxy with a
+            // healthy destination does.
+            harness.plugin.onTransfer = { harness.plugin.completeSweep(name.value) }
+            node.onExec = { command ->
+                if (command.joinToString(" ").contains("mc-monitor")) node.online = 0
+                node.defaultExec(command)
+            }
+
+            val outcome = terminationOver(harness).stop(backend, OccupancyAcknowledgement.Count(4))
+
+            // **Drain step 4, which this path used to skip outright.** Forcing a
+            // populated server disconnected every session on it; the ones the proxy
+            // can move are now moved first, and the stop happens after.
+            //
+            // Asserted from the proxy's own record rather than from the outcome:
+            // `:core` believing it asked is not the same as the sweep having run.
+            // Only this backend was swept, and its players are on the destination.
+            //
+            // Not a count of sweeps: polling re-asks a start-or-join call, and once
+            // a sweep has finished the proxy answers a fresh one — against a server
+            // that is now empty, so it moves nobody. That is the plugin's own
+            // behaviour and the drain re-asks the same way once per pass; counting
+            // it here would assert the double's bookkeeping rather than anything
+            // about players.
+            harness.plugin.transfers
+                .map { it.first }
+                .distinct() shouldBe listOf(name.value)
+            harness.plugin.backend(name.value)?.players shouldBe 0
+            harness.plugin.backend(destination.metadata.name.value)?.players shouldBe 4
+            outcome.transfer.attempted shouldBe true
+            node.stops shouldHaveSize 1
+        }
+
+    @Test
+    fun `a fleet with nowhere to put them still stops the server`() =
+        coreTest {
+            // One backend, so the only candidate is the server being drained.
+            val harness = harness()
+            harness.bringUp()
+            val node = harness.nodeOf(backend)
+            node.online = 2
+
+            val outcome = terminationOver(harness).stop(backend, OccupancyAcknowledgement.Count(2))
+
+            // No destination is not a refusal. A transfer that cannot be attempted
+            // leaves the endpoint doing exactly what it did before step 4 existed —
+            // which is the whole reason it is "attempt, then proceed" rather than a
+            // precondition.
+            harness.plugin.transfers.shouldBeEmpty()
+            outcome.transfer.attempted shouldBe false
+            node.stops shouldHaveSize 1
+        }
+
+    @Test
+    fun `an unsealed proxy is not swept, because the sweep would race logins`() =
+        coreTest {
+            val destination = backendDefinition("survival-02", hostPort = 30002)
+            val harness = ProxyHarness(backends = listOf(backend, destination))
+            harness.bringUp()
+            val node = harness.nodeOf(backend)
+            harness.plugin.ready = false
+
+            terminationOver(harness).stop(backend, OccupancyAcknowledgement.Unreadable)
+
+            // The door could not be shut, so the server is still admitting. Sweeping
+            // then races logins the sweep cannot see the end of, which is why the
+            // drain never reaches step 4 from a state that has not held the seal.
+            harness.plugin.transfers.shouldBeEmpty()
+            node.stops shouldHaveSize 1
         }
 
     @Test
