@@ -11,6 +11,7 @@ import mcorch.schema.VelocityProxyDefinition
 import mcorch.schema.VelocityProxyStatus
 import mcorch.store.Store
 import mcorch.store.StoredServer
+import java.time.Instant
 
 /**
  * Which proxy fronts which server, worked out from the fleet.
@@ -159,6 +160,7 @@ internal object ProxyFleet {
     suspend fun resolve(
         store: Store,
         stored: StoredServer,
+        now: Instant,
     ): Resolution {
         val definition = stored.definition.definition as? PaperServerDefinition ?: return Resolution.Standalone
         val labels = definition.metadata.labels
@@ -202,7 +204,7 @@ internal object ProxyFleet {
                     maxPlayers = backend.spec.maxPlayers,
                     online = status?.players?.online,
                     ready = status?.ready == true,
-                    sealed = status?.drain?.state?.sealsBackend() == true,
+                    sealed = status?.drain.sealsBackendAt(backend, now),
                     // A tombstoned definition is a server on its way out even
                     // before its drain record exists, and handing players to one is
                     // handing them to a container about to be removed.

@@ -488,6 +488,7 @@ internal object StatusCodec {
         // A document that predates the field carries no such key, which is why the
         // decode does not read the absence at face value. See `decode`.
         scope.put("stopDispatchedAt", drain.stopDispatchedAt)
+        scope.put("stopLastDispatchedAt", drain.stopLastDispatchedAt)
         // The anchor drain step 4's allowance is measured from. Set once, never
         // cleared, and losing it is not cosmetic: a drain that came back without it
         // would re-stamp on the next pass and be handed its full allowance again,
@@ -556,6 +557,7 @@ internal object StatusCodec {
             resaveForcedAt = reader.instant("$prefix.resaveForcedAt"),
             deregisteredAt = reader.instant("$prefix.deregisteredAt"),
             stopDispatchedAt = reader.instant("$prefix.stopDispatchedAt"),
+            stopLastDispatchedAt = reader.instant("$prefix.stopLastDispatchedAt"),
             transferStartedAt = reader.instant("$prefix.transferStartedAt"),
             transferAttempts = reader.requireInt("$prefix.transferAttempts"),
             destination = reader.value("$prefix.destination", ResourceName::of),

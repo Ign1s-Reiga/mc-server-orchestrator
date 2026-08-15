@@ -4902,7 +4902,15 @@ internal fun DrainStatus.forgetSaveConfirmation(): DrainStatus = unconfirmWorldS
  * moved below the call would look identical to a reviewer.
  */
 internal fun DrainStatus.dispatchingStop(now: Instant): DrainStatus =
-    if (stopDispatchedAt != null) this else copy(stopDispatchedAt = now)
+    copy(
+        // Set once, as the field's own KDoc argues: there is no un-dispatch, and
+        // "may a `SIGTERM` already be in that container" only ever becomes true.
+        stopDispatchedAt = stopDispatchedAt ?: now,
+        // Restamped every time, because a *bounded* reader needs the latest and not
+        // the first — see `DrainStatus.stopLastDispatchedAt`. A re-issued stop that
+        // kept the original instant would be born already outside its own window.
+        stopLastDispatchedAt = now,
+    )
 
 /** Moves to a new state, stamping the transition. Re-entering the same state does not restamp. */
 private fun DrainStatus.moveTo(

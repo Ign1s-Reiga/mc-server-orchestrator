@@ -11,6 +11,7 @@ import mcorch.core.proxy.ProxySelfLink
 import mcorch.core.proxy.VelocityProxyAgent
 import mcorch.core.proxy.VelocityWorkloadPlanner
 import mcorch.core.proxy.credentialVerdict
+import mcorch.core.termination.forcedStopWindow
 import mcorch.schema.BackendRegistration
 import mcorch.schema.BackendRoutingStatus
 import mcorch.schema.BackendStatus
@@ -35,6 +36,7 @@ import mcorch.schema.VelocityProxyDefinition
 import mcorch.schema.VelocityProxyStatus
 import mcorch.store.ConflictReason
 import mcorch.store.Precondition
+import mcorch.store.ResourceVersion
 import mcorch.store.ServerListing
 import mcorch.store.Store
 import mcorch.store.StoreException
@@ -47,6 +49,7 @@ import java.time.Instant
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.toJavaDuration
 import kotlin.time.toKotlinDuration
 import java.time.Duration as JavaDuration
 
@@ -143,7 +146,7 @@ public class Reconciler(
         // forwarding secret out of it.
         val fleet =
             try {
-                ProxyFleet.resolve(store, stored)
+                ProxyFleet.resolve(store, stored, now)
             } catch (failure: StoreException) {
                 return storeOutcome(stored.name, failure)
             }
@@ -1768,7 +1771,54 @@ public class Reconciler(
                 val status = row.status?.status as? PaperServerStatus
                 MatchedBackend(
                     server = backend.metadata.name,
-                    sealed = status?.drain?.state?.sealsBackend() == true,
+                    // **Or a `SIGTERM` has already left this process for it.**
+                    //
+                    // `sealsBackend()` answers from the drain's *state*, and
+                    // `DrainState.DRAIN_FAILED` deliberately answers false: a parked
+                    // drain is not going to move those players, so holding a running
+                    // server out of routing buys nothing. That reasoning is right and
+                    // is unchanged — for a server that is still running.
+                    //
+                    // It stops being right the moment a stop has been dispatched, and
+                    // `DrainStatus.stopDispatchedAt` is the record that says so. Its
+                    // whole argument is *"a proxy re-admits players to a process whose
+                    // shutdown save has run"*, and this derivation was the one place
+                    // that never consulted it.
+                    //
+                    // The drain's own aborts were covered by accident: it deregisters
+                    // at step 6, before it stops, so `letGo` below already keeps the
+                    // sweep off it. `NodeForcedTermination` seals and stops **without
+                    // deregistering** — the step is on its documented not-done list —
+                    // so it had neither guard, and the seal it asserts lasted exactly
+                    // one proxy pass before this line handed the door back for the
+                    // remaining ~178 seconds of a raised grace period.
+                    //
+                    // **Bounded by the stop's own window**, because set-once is the
+                    // argument for the clause and the whole danger of it: a level
+                    // trigger re-states its fact every pass, so an input that never
+                    // clears makes the fact permanent.
+                    //
+                    // The reason to seal is that the container is inside its grace
+                    // period running a shutdown save. Past that the reason is gone —
+                    // either the container went and the record retires with it, or
+                    // the stop never landed and the server should take players again.
+                    // `stopDispatchedAt`'s own KDoc concedes it "reads true for a
+                    // stop that never reached the runtime", which is exactly what a
+                    // `NodeException` out of `stopWorkload` leaves behind: stamp
+                    // written, container running, caller told nothing was stopped.
+                    // Unbounded, this sealed that server out of routing for ever.
+                    //
+                    // It would also have removed a repair the sweep exists to
+                    // perform — `DRAIN_FAILED` is deliberately not a sealing state,
+                    // because holding a parked backend out of routing "costs a
+                    // running server no player can reach". Bounding restores that
+                    // once the window has passed rather than inverting it.
+                    //
+                    // Through `forcedStopWindow` rather than a second derivation, so
+                    // this and the forced path's own stop-in-flight refusal cannot
+                    // drift into disagreeing about whether the same container is
+                    // still shutting down.
+                    sealed = status?.drain.sealsBackendAt(backend, now),
                     // Null until the loop knows which node the workload is on.
                     // **Not asserted under a guessed hostname**: a registration at a
                     // name that does not resolve is one the protocol will refuse to
@@ -2995,12 +3045,64 @@ public class Reconciler(
                 "the side effect is not repeated",
             pass.name,
         )
-        // Unguarded on the *definition*, still carrying a stop dispatch forward.
-        // The guard this bypasses is the anti-lost-update one; the carry-forward is
-        // not a guard at all, it is this write declining to un-stamp a record it did
-        // not write. Skipping it here would have left the one path that exists to
-        // never lose a side effect quietly destroying another one's.
-        when (val outcome = store.putStatus(preservingDispatch(pass.stored, status))) {
+        // Unguarded on the *definition*, which is the guard this exists to bypass.
+        //
+        // **But conditional on the status version first**, and that is not a
+        // contradiction. Losing this record costs a repeated side effect — a second
+        // world save on a live server — so the write must land. Landing it on top of
+        // a concurrent forced retry costs a different record: the retry's fresh
+        // `stopLastDispatchedAt`, whose loss reopens the proxy onto a container in
+        // its shutdown. Neither is acceptable, and they are not in tension, because
+        // a conflict here is resolvable by re-reading rather than by giving up.
+        //
+        // So: try conditionally, and on a conflict re-merge against what landed and
+        // try again. The unguarded write stays as the final fallback — the record
+        // still has to land — but it carries values re-read a round trip earlier
+        // rather than a whole pass earlier.
+        // Two conditional attempts, because a conflict means a concurrent writer
+        // landed and a re-read resolves it. A third would be waiting on a writer
+        // landing faster than this can read, and the record still has to go down.
+        repeat(2) {
+            var mergedAgainst: ResourceVersion? = null
+            val merged = preservingDispatch(pass.stored, status) { version -> mergedAgainst = version }
+            val precondition = mergedAgainst?.let { Precondition.AtVersion(it) } ?: Precondition.None
+            when (val outcome = store.putStatus(merged, precondition)) {
+                is WriteOutcome.Applied -> {
+                    return
+                }
+
+                is WriteOutcome.Conflict -> {
+                    LOG.info(
+                        "server={} re-reading before forcing an issued side effect's record ({})",
+                        pass.name,
+                        outcome.reason,
+                    )
+                }
+            }
+        }
+        // **Unconditional, and a known residual rather than an oversight.**
+        //
+        // This last attempt can still clobber a forced retry that lands between its
+        // merge and its write, reverting `stopLastDispatchedAt` and letting the proxy
+        // reopen a backend inside its shutdown. Making it conditional would not fix
+        // that — it would trade it for the failure this whole function exists to
+        // prevent, a lost side-effect record and therefore a second world save on a
+        // live server. One of the two has to give, and losing a save is worse than
+        // losing a seal.
+        //
+        // The window is narrow twice over: this runs only when a guarded write was
+        // already rejected *after* a side effect was issued, and only a retry landing
+        // inside one store round trip of it is lost.
+        //
+        // **What would actually close it is an atomic merge**, enforcing
+        // `stopDispatchedAt`'s set-once rule inside `SqliteStore.putStatus`'s own
+        // transaction, where the read and the write are one operation. That is
+        // recorded as an open decision on this change rather than taken here,
+        // because it puts a field-level invariant into `:store` and CLAUDE.md warns
+        // about policy living in two places.
+        var mergedAgainst: ResourceVersion? = null
+        val merged = preservingDispatch(pass.stored, status) { version -> mergedAgainst = version }
+        when (val outcome = store.putStatus(merged)) {
             is WriteOutcome.Applied -> {
                 Unit
             }
@@ -3046,36 +3148,115 @@ public class Reconciler(
      * synthesised: the stamp needs a drain to hang on, and inventing one here would
      * be this function authoring drain state instead of preserving it.
      *
-     * **Read only for a terminating definition.** The forced path cannot run
-     * against anything else — the API tombstones before it calls the seam — so
-     * nothing on the steady-state hot path pays for this.
+     * ## The `terminating` gate is load-bearing for correctness, not only for cost
+     *
+     * It was added as an optimisation — the forced path cannot run against a live
+     * definition, because the API tombstones before it calls the seam, so nothing on
+     * the steady-state hot path pays for the re-read. **That is its lesser job.**
+     *
+     * The safety argument is not "the drain owns `stopDispatchedAt` on non-terminating
+     * paths": every `REPLACEMENT` and `RELOCATION` drain stamps it on a live
+     * definition, so that claim is simply false. It is narrower and it is checkable
+     * by enumerating writers of `PaperServerStatus` — **the only second writer of
+     * observed state requires a tombstone**, and a sole writer cannot lose its own
+     * stamp to itself.
+     *
+     * What the gate also does, silently, is keep this function away from the one
+     * place where a draft's `null` drain is a **decision** rather than staleness.
+     * `clearedDrainRecord` returns null deliberately, and `Reconciler.ProxyPass`
+     * re-derives `sealed` and `letGo` from the stored record every proxy pass — so a
+     * record that vanishes un-seals and re-registers the backend, level-triggered.
+     * The `?: current` arm below would suppress that undo and leave a backend sealed
+     * and deregistered for good. The same goes for a `CREATED` observation, whose
+     * surviving record `stopIsInFlight` says once *"made the next pass drain the
+     * replacement that had just been built, for ever"*.
+     *
+     * Both are unreachable today, and precisely because of this gate: neither
+     * `clearedDrainRecord` call site is on a path a terminating definition takes —
+     * `forbiddenTransition` never refuses a delete, and `converge` is the
+     * non-draining path while a terminating definition always drains.
+     *
+     * **So widening this condition is not a performance decision.** A second force
+     * path, or someone reasonably concluding the re-read is cheap, breaks two
+     * unrelated correctness properties with nothing to say so.
+     *
+     * `DrainWiringTest.every drain record this loop retires is retired through the
+     * one rule` does not cover that hazard and must not be read as covering it: it
+     * enumerates *retirements*, and this function never retires a record — it
+     * un-retires one, which is the opposite operation. What it does catch is the
+     * addition of a new `drain = <value>` assignment, which is how it caught this
+     * one.
      */
     private suspend fun preservingDispatch(
         stored: StoredServer,
         status: PaperServerStatus,
+        mergedAgainst: (ResourceVersion?) -> Unit = {},
     ): PaperServerStatus {
         if (!stored.definition.terminating) return status
-        if (status.drain?.stopDispatchedAt != null) return status
+        // **Both records, and no early return on the first one.**
+        //
+        // This used to bail when the draft already carried a `stopDispatchedAt`, on
+        // the reasoning that there was then nothing to carry forward. That was true
+        // while one field answered everything. It stopped being true when the
+        // dispatch record split in two: a *re-issued* forced stop keeps the original
+        // `stopDispatchedAt` — set-once, by design — and restamps only
+        // `stopLastDispatchedAt`. So a stale draft satisfies the old condition on
+        // the strength of a stamp that has not moved, returns, and its write puts
+        // the *expired* window back. The seal then anchors to it, the next proxy
+        // sweep reopens the backend, and another force does not see the retried stop
+        // as overlapping — while that stop is still inside its grace period.
+        val draft = status.drain
         val current =
             try {
-                (store.getServer(stored.name)?.status?.status as? PaperServerStatus)?.drain
+                val held = store.getServer(stored.name)?.status
+                // The version this merge is true of. Reported back so the write can
+                // be made conditional on it: the re-read and the write are two store
+                // calls, and a forced retry landing between them would otherwise have
+                // its fresh `stopLastDispatchedAt` overwritten by the stale value
+                // chosen here — the seal then looks expired while that stop is still
+                // inside its grace period.
+                mergedAgainst(held?.resourceVersion)
+                (held?.status as? PaperServerStatus)?.drain
             } catch (failure: StoreException) {
                 // The write below will fail on the same store and be classified
                 // there. Losing the carry-forward is the lesser harm and is the
                 // outcome that already applied before this function existed.
                 LOG.warn("could not re-read {} to preserve a stop dispatch: {}", stored.name, failure.message)
                 null
-            }
-        val dispatched = current?.stopDispatchedAt ?: return status
+            } ?: return status
+        // Set-once: the earlier of the two wins, so a draft that already has one
+        // keeps it and one that does not adopts the stored record.
+        val dispatched = draft?.stopDispatchedAt ?: current.stopDispatchedAt
+        // Restamped: the *later* wins, because it answers "is a signal still on its
+        // way" and the freshest answer is the true one.
+        val last = latest(draft?.stopLastDispatchedAt, current.stopLastDispatchedAt)
+        if (dispatched == null && last == null) return status
+        if (draft == null) {
+            LOG.info("server={} carrying forward a drain record this pass did not observe", stored.name)
+            return status.copy(drain = current)
+        }
+        if (draft.stopDispatchedAt == dispatched && draft.stopLastDispatchedAt == last) return status
         LOG.info(
-            "server={} carrying forward a stop dispatched at {} that this pass did not observe",
+            "server={} carrying forward a stop dispatched at {} (latest {}) that this pass did not observe",
             stored.name,
             dispatched,
+            last,
         )
         return status.copy(
-            drain = status.drain?.copy(stopDispatchedAt = dispatched) ?: current,
+            drain = draft.copy(stopDispatchedAt = dispatched, stopLastDispatchedAt = last),
         )
     }
+
+    /** The later of two instants, either of which may be absent. */
+    private fun latest(
+        a: Instant?,
+        b: Instant?,
+    ): Instant? =
+        when {
+            a == null -> b
+            b == null -> a
+            else -> if (a.isAfter(b)) a else b
+        }
 
     /**
      * Records an observation, unless it says exactly what the stored one
@@ -3103,9 +3284,22 @@ public class Reconciler(
         // replaced the definition while this pass ran, this observation
         // describes a spec nobody wants any more, and recording it would make
         // the server look settled at a generation nobody asked for.
+        // Conditional **only** where the merge ran, which is the terminating path.
+        // Elsewhere the loop is the sole writer and a precondition would add
+        // conflicts with nothing to resolve. A conflict here routes to the existing
+        // `Retry`, which re-reads and re-derives — the resolution this needs.
+        var mergedAgainst: ResourceVersion? = null
+        val merged = preservingDispatch(pass.stored, status) { mergedAgainst = it }
         val outcome =
             store.putStatus(
-                status = preservingDispatch(pass.stored, status),
+                status = merged,
+                // Whenever the merge **ran**, not only when it changed something.
+                // A merge that finds nothing to carry forward has still read a
+                // version, and the draft it is about to write is just as stale
+                // against a retry landing after that read — which is exactly the
+                // case where the values happen to agree, so an identity check
+                // waves through the write that clobbers.
+                precondition = mergedAgainst?.let { Precondition.AtVersion(it) } ?: Precondition.None,
                 observedDefinition = pass.stored.definition.resourceVersion,
             )
         return when (outcome) {

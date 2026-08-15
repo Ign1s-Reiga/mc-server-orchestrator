@@ -8,7 +8,10 @@ import mcorch.core.ProxyHarness
 import mcorch.core.backendDefinition
 import mcorch.core.coreTest
 import mcorch.core.proxyDefinition
+import mcorch.schema.DrainState
+import mcorch.schema.DrainStatus
 import org.junit.jupiter.api.Test
+import kotlin.time.Duration.Companion.minutes
 
 /**
  * Drain step 2 on the forced path, against a real proxy.
@@ -166,6 +169,189 @@ internal class ForcedSealTest {
             // unreachable proxy was refused, and one behind TWO wide-open proxies was
             // stopped. The worse case treated more permissively than the milder one.
             node.stops shouldHaveSize 0
+        }
+
+    @Test
+    fun `the proxy sweep does not hand the door back after a forced stop`() =
+        coreTest {
+            val harness = harness()
+            harness.bringUp()
+            val name = backend.metadata.name
+            // The note-1 population: a drain that aborted permanently on an
+            // unconfirmed save. `DRAIN_FAILED` is where the force finds it.
+            val failed = harness.clock.instant()
+            val current = harness.status(name)
+            if (current != null) {
+                harness.store.putStatus(
+                    current.copy(
+                        drain =
+                            DrainStatus(
+                                state = DrainState.DRAIN_FAILED,
+                                startedAt = failed,
+                                enteredStateAt = failed,
+                                saveRequestedAt = failed,
+                            ),
+                    ),
+                )
+            }
+
+            terminationOver(harness).stop(backend, OccupancyAcknowledgement.Unreadable)
+            harness.plugin.backend(name.value)?.admits shouldBe false
+
+            // **One proxy pass used to undo the whole thing.** `assertBackends` is a
+            // level trigger: it re-states admission from `sealsBackend()`, and
+            // `DRAIN_FAILED` answers false on purpose, because a parked drain should
+            // not hold a running server out of routing.
+            //
+            // That reasoning stops applying the instant a `SIGTERM` has been sent,
+            // and the record saying so is `stopDispatchedAt` — which this derivation
+            // never consulted. The drain's own aborts escaped by accident, since it
+            // deregisters before it stops; the forced path does neither, so it had
+            // no guard at all and the door reopened for the rest of a 180s grace
+            // period, onto a container running its shutdown save.
+            harness.pass(harness.proxyDefinition.metadata.name)
+
+            harness.plugin.backend(name.value)?.admits shouldBe false
+        }
+
+    @Test
+    fun `a stop that never landed stops sealing the backend once its window passes`() =
+        coreTest {
+            val harness = harness()
+            harness.bringUp()
+            val name = backend.metadata.name
+            val dispatched = harness.clock.instant()
+            val current = harness.status(name)
+            if (current != null) {
+                harness.store.putStatus(
+                    current.copy(
+                        drain =
+                            DrainStatus(
+                                state = DrainState.DRAIN_FAILED,
+                                startedAt = dispatched,
+                                enteredStateAt = dispatched,
+                                stopDispatchedAt = dispatched,
+                            ),
+                    ),
+                )
+            }
+
+            // Inside the window, the door stays shut.
+            harness.pass(harness.proxyDefinition.metadata.name)
+            harness.plugin.backend(name.value)?.admits shouldBe false
+
+            // **Set-once is the argument for the clause and the danger of it.** A
+            // level trigger re-states its fact every pass, so an input that never
+            // clears makes the fact permanent — and `stopDispatchedAt` reads true
+            // for a stop that never reached the runtime, which is exactly what a
+            // `NodeException` out of `stopWorkload` leaves: stamp written, container
+            // running, caller told nothing was stopped. Unbounded, that server was
+            // sealed out of routing for ever, and `DRAIN_FAILED` is deliberately not
+            // a sealing state precisely because holding a parked backend out of
+            // routing costs a running server no player can reach.
+            harness.clock.advance(forcedStopWindow(backend) + 1.minutes)
+            harness.pass(harness.proxyDefinition.metadata.name)
+
+            harness.plugin.backend(name.value)?.admits shouldBe true
+        }
+
+    @Test
+    fun `the fleet's sibling view agrees with the sweep about a forced backend`() =
+        coreTest {
+            val other = backendDefinition("survival-02", hostPort = 30002)
+            val harness = ProxyHarness(backends = listOf(backend, other))
+            harness.bringUp()
+            val forced = backend.metadata.name
+            val dispatched = harness.clock.instant()
+            val current = harness.status(forced)
+            if (current != null) {
+                harness.store.putStatus(
+                    current.copy(
+                        drain =
+                            DrainStatus(
+                                state = DrainState.DRAIN_FAILED,
+                                startedAt = dispatched,
+                                enteredStateAt = dispatched,
+                                stopDispatchedAt = dispatched,
+                            ),
+                    ),
+                )
+            }
+
+            // **Two derivations of one question, and for a round they disagreed.**
+            // The proxy sweep was taught to treat a dispatched stop as sealing;
+            // `ProxyFleet.resolve`'s sibling view was not. `BackendLink.lastAdmitting`
+            // is computed from these siblings, so it would have believed the forced
+            // backend still admitted, skipped sealing the proxy before sealing
+            // another backend, and left the plugin's admit-anyway path free to route
+            // a login onto an all-sealed fleet — including the server already
+            // shutting down.
+            val stored = harness.store.getServer(other.metadata.name)
+            val fleet = mcorch.core.ProxyFleet.resolve(harness.store, stored!!, harness.clock.instant())
+            val siblings = (fleet as mcorch.core.ProxyFleet.Resolution.Behind).binding.siblings
+
+            siblings.single { it.server == forced }.sealed shouldBe true
+
+            // …and it lapses on the same window as the sweep, rather than pinning the
+            // fleet's view open for ever.
+            harness.clock.advance(forcedStopWindow(backend) + 1.minutes)
+            val later = mcorch.core.ProxyFleet.resolve(harness.store, stored, harness.clock.instant())
+            val laterSiblings = (later as mcorch.core.ProxyFleet.Resolution.Behind).binding.siblings
+            laterSiblings.single { it.server == forced }.sealed shouldBe false
+        }
+
+    @Test
+    fun `a re-issued forced stop gets a fresh seal window, not the first one`() =
+        coreTest {
+            val harness = harness()
+            harness.bringUp()
+            val name = backend.metadata.name
+            val node = harness.nodeOf(backend)
+            // A drain that already aborted permanently — the note-1 population, and
+            // the only case where this matters: with no prior drain the force writes
+            // a `STOPPING` record, and `STOPPING.sealsBackend()` is true regardless
+            // of any window. `DRAIN_FAILED` is where the window is load-bearing.
+            val failed = harness.clock.instant()
+            harness.status(name)?.let {
+                harness.store.putStatus(
+                    it.copy(
+                        drain =
+                            DrainStatus(
+                                state = DrainState.DRAIN_FAILED,
+                                startedAt = failed,
+                                enteredStateAt = failed,
+                            ),
+                    ),
+                )
+            }
+
+            // First attempt: the node refuses the stop, so the stamp is written and
+            // the container keeps running. That is the state the bounded refusal was
+            // added for in round 52.
+            node.failOnce(mcorch.core.NodeOperation.STOP, node.rejected(mcorch.core.NodeOperation.STOP))
+            shouldThrow<ForcedTerminationRefused> {
+                terminationOver(harness).stop(backend, OccupancyAcknowledgement.None)
+            }
+
+            // Wait the window out. The seal lapses, correctly — nothing is shutting
+            // down, so the backend should take players again.
+            harness.clock.advance(forcedStopWindow(backend) + 1.minutes)
+            harness.pass(harness.proxyDefinition.metadata.name)
+            harness.plugin.backend(name.value)?.admits shouldBe true
+
+            // Now force again, and this time it lands.
+            terminationOver(harness).stop(backend, OccupancyAcknowledgement.None)
+            node.stops shouldHaveSize 1
+
+            // **The retry must not be born already expired.** `dispatchingStop` keeps
+            // the *first* instant on purpose — "may a SIGTERM already be in that
+            // container" only ever becomes true — but a bounded reader needs the
+            // latest. With one set-once field carrying both questions, this second
+            // `SIGTERM` would have been outside its own window the moment it was
+            // sent: the next proxy sweep reopens the backend while that shutdown
+            // runs, and a third force would not see this one as overlapping either.
+            harness.pass(harness.proxyDefinition.metadata.name)
+            harness.plugin.backend(name.value)?.admits shouldBe false
         }
 
     @Test

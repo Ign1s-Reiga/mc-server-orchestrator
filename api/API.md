@@ -754,11 +754,11 @@ period is a ceiling on how long containerd waits, not a delay.
   "detail": "no world save could be sent — the container has no channel that could confirm one — so the stop grace period was the only chance the world had to reach disk" }
 ```
 
-**Read `saveAttempted` and `saveConfirmed` together.** They are different
-questions: a save can be *sent and never confirmed*, or **never sent at all** —
-which is what happens on the very population this endpoint exists for, a container
-with no working save channel. Collapsing them into "not confirmed" would report
-those two identically, and they are not the same event.
+**Read `saveAttempted` and `saveConfirmed` together.**
+They are different questions: a save can be *sent and never confirmed*, or **never
+sent at all** — which is what happens on the very population this endpoint exists
+for, a container with no working save channel. Collapsing them into "not
+confirmed" would report those two identically, and they are not the same event.
 
 **`playersOnline` may be `null`, and null is not zero.** It means the server did
 not answer a count. Render it as unknown; a client that shows it as an empty
@@ -784,6 +784,14 @@ reported and the second reading that can refuse.
 
 A server observed with **zero** players needs no acknowledgement at all.
 
+**A forced stop reaches the event stream on the status-poll cadence, not the
+change feed.** Status writes never append to the feed, so the drain transition a
+forced stop records is not pushed the moment it happens. It is still delivered
+without waiting for anything else to write: the stream re-reads every server on
+`statusPollInterval` and emits any status whose version has moved. So `GET` sees it
+immediately and a stream consumer sees it within one poll interval — **bounded and
+not dependent on the reconcile loop's next pass.**
+
 Why a count: a boolean says *"proceed regardless"*, which cannot notice that the
 population changed between an operator deciding and the request landing, and does
 not require them to have looked. It would also be **mandatory on essentially every
@@ -803,9 +811,18 @@ leave the server undrainable, unforceable, and reachable only with `crictl`.
   those players without transferring them, and the drain would have moved them.
 - **An unusable `spec.lifecycle.drain.saveTimeout`** is `FORCE_REFUSED`: no save
   could be sent, and the field is one edit away from making one possible.
-- **A stop already in flight** is `FORCE_NOT_APPLICABLE`. The container is inside
-  its grace period running its shutdown save; a second force would send another
-  save into it. Likewise an **unconfirmed save already outstanding**.
+- **A stop already in flight** is `FORCE_NOT_APPLICABLE`, while the container is
+  still inside its grace period running its shutdown save; a second force would
+  send another save into it. Once that window has passed the refusal lifts, so a
+  stop the runtime refused does not lock the endpoint.
+- An **unconfirmed save already outstanding** is neither a refusal nor a reason to
+  send nothing. The force requests its own save regardless, so `saveAttempted`
+  describes *this* request. Refusing would turn away exactly the wedged servers
+  this endpoint exists for, since nothing clears that record on a server that
+  answers no probe — and skipping would decline a save on a backend the proxy may
+  have re-admitted, where a whole session can have come and gone unobserved. A
+  redundant flush queues behind the one already running; a save not sent is play
+  that nothing recovers.
 - **A `VelocityProxy`** is `FORCE_NOT_APPLICABLE` and **is not deleted** — it holds
   no world, so its drain cannot stall on a save.
 

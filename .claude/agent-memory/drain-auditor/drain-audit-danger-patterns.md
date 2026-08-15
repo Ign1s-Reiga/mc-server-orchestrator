@@ -2645,3 +2645,154 @@ Related: [[standalone-paper-drain-shape]]
      the proxy restarts (item 46). Not a harm, but the justification is false, and
      a false justification beside a correct decision is what this project keeps
      having to unpick.
+
+## Round 53: the fix that answered one direction of a two-direction race
+
+224. **A refusal keyed on a wedge field is unbounded exactly where the wedge is
+     permanent.** `refuseSecondSideEffect` refuses a force while
+     `drain.saveRequestedAt != null`, telling the operator to *"wait for it to
+     confirm or fail"*. `DrainStatus`' own KDoc says that field is *"the wedge that
+     stops a second `save-all flush` reaching a live server, and **only a human, or
+     a pass that has observed a player**, may clear it"* — and `save()`'s
+     `Unconfirmed` arm sets it alongside a `PERMANENT` `DRAIN_SAVE_TIMEOUT`. That
+     pair *is* `operating.md` note 1. A wedged server never answers a probe, so no
+     pass ever observes a player, so nothing ever clears it: the escape hatch
+     refuses the state it was built for, permanently, below a tombstone. The sibling
+     branch keyed on `stopDispatchedAt` was bounded by the grace window for exactly
+     this reason and this one was not. Whenever a guard is keyed on a field, read
+     that field's *clearing* rule before believing the guard's remedy is reachable.
+     **Corrected from a wrong version of this item**: the original claimed
+     `recordStopDispatched` wrote without a precondition. It does not — `08f62fb`
+     added `Precondition.AtVersion` with a re-read-and-retry-once on both writes.
+     See [[audit-process-verify-before-citing]].
+225. **A `?: storedValue` fallback silently outranks whatever site deliberately
+     wrote null.** `preservingDispatch` takes the stored drain wholesale when the
+     draft has none, which suppresses `clearedDrainRecord` — the one rule for
+     retiring a drain record, whose own KDoc documents the downstream effect
+     (`ProxyPass.backends` re-derives `sealed` and `letGo` from the record, so a
+     vanished record un-seals and re-registers, level-triggered). Unreachable today
+     only because both `clearedDrainRecord` sites sit on paths a terminating
+     definition never takes. Before adding a "the draft's null must be staleness"
+     fallback, enumerate the sites that write that null on purpose and what
+     downstream re-derives from its absence.
+226. **A gate written as a performance optimisation can be the only thing holding
+     a correctness property, and only the performance reason gets documented.**
+     `preservingDispatch`'s `if (!terminating) return` is justified as "no extra
+     read on the steady-state path". It is *also* what keeps the function away from
+     `clearedDrainRecord` (item 225) and away from the `CREATED` observation whose
+     surviving record once "made the next pass drain the replacement that had just
+     been built, for ever". Widen the gate for a good reason — a second force path,
+     or someone deciding the read is cheap — and two unrelated properties break
+     with no test to say so. When a cheap guard has a cheap justification, ask what
+     else it happens to exclude.
+227. **A guard that enumerates retirements cannot see a resurrection.**
+     `every drain record this loop retires is retired through the one rule` scans
+     for `drain = <value>` assignments and was cited as having caught the new code
+     "on the way in". It caught the *addition*; it is structurally incapable of
+     catching the hazard, because `preservingDispatch` never retires a record — it
+     un-retires one. A guard's scan predicate is its blast radius; when a change
+     introduces the inverse of the operation a guard enumerates, the guard's green
+     is evidence about the old operation only.
+228. **Confirm a discrimination test by reverting the fix, not by reasoning about
+     the hook.** `StopDispatchDurabilityTest` depends on `TestStore.afterNextRead`
+     firing on the *pass's* snapshot read rather than on `preservingDispatch`'s own
+     re-read — the hook self-clears, so which read it lands on is load-bearing and
+     undocumented. Reverting the four call sites in a scratch worktree and running
+     the test took two minutes and turned "I believe it would be green against the
+     broken code" into a fact: it **fails**. Do this whenever a test's value rests
+     on an interleaving hook; the reasoning is exactly as reliable as the reasoning
+     that put the bug there.
+229. **A set-once field enforced at every call site belongs in the store's
+     transaction instead.** `stopDispatchedAt` is documented "set once, never
+     un-stamped", and enforcing that in `:core` produced an enumeration of write
+     sites, a `terminating` gate, an extra non-atomic read, and a residual window
+     nobody closed. `SqliteStore.putStatus` already runs `readStatusRow(connection,
+     name)` inside its own `write { }` transaction — preserving a non-null stamp
+     there is atomic by construction and covers every present and future writer.
+     The tension to state rather than skip: CLAUDE.md says policy in the store is
+     policy in two places. A field-level invariant the field's own KDoc declares is
+     not policy, and `:store` already knows `drain_state`.
+
+## Round 54: the seal a level trigger undoes
+
+230. **A seal asserted directly at the proxy is undone by `assertBackends` unless
+     the drain *state* says it should be held.** `assertBackends` runs on every
+     proxy pass and computes `admitsNewPlayers` as the negation of
+     `DrainState.sealsBackend()` — by design, so that a backend whose drain aborted
+     permanently takes players again. `DRAIN_FAILED.sealsBackend()` is false. So a
+     path that calls `link.assertAdmission(admits = false)` and then leaves the
+     record in `DRAIN_FAILED` has its door reopened within one `stepInterval`.
+     `stopDispatchedAt` does not save it: `stopIsInFlight` reads the stamp, but the
+     admission derivation reads the **state**. The drain's own stop is safe only
+     because `letGoAndStop` moves to `STOPPING`, which seals. Whenever a component
+     outside the loop asserts a level-triggered fact, find the expression the level
+     trigger re-derives it from and make *that* true, rather than asserting the
+     fact once.
+231. **"The count can only fall while the door is shut" is a premise about the
+     door staying shut.** The forced path skips its second occupancy probe when the
+     seal was asserted, on exactly that reasoning. If the seal lapses (item 230)
+     the premise fails silently and the skipped probe is the one that would have
+     noticed. An optimisation justified by a guarantee has the guarantee's lifetime,
+     not the guarantee's existence at the moment it was taken.
+232. **A boolean that meant "nothing could be sent" quietly gains a "we chose not
+     to" member.** `saveAttempted = false` covered *no channel* and *never went
+     out*; skipping a save the drain already has outstanding is a third meaning,
+     and the difference matters forensically in the optimistic direction — a
+     `saveRequestedAt` record means a request **did** reach the server, so the
+     world may be on disk, where the other two mean nothing ever did. Prose in
+     `detail` is not a field. The fix is usually not a fourth boolean but surfacing
+     the value that already discriminates — here the `Instant`, which also says how
+     long ago and therefore whether it plausibly landed.
+233. **Read-then-act windows are an honest floor only when both halves could have
+     shared a transaction.** Round 53's store-vs-store race had a lower layer that
+     could close it (`SqliteStore.putStatus` already reads inside its own `write`
+     block). A store read followed by an exec against a game server has no such
+     layer, so the residual really is the floor — and the right question becomes
+     whether the residual action is idempotent, not whether the window can shrink.
+     Distinguish the two before accepting or rejecting "honest floor".
+234. **A guard whose failure direction is "do the idempotent thing again" should
+     fail toward doing it.** `outstandingSave` returning null when the store throws
+     converts skip into send, and that is correct — `save-all flush` is idempotent
+     on the game side (the ruling behind item 23) and the alternative direction
+     loses a save outright. The reasoning to check is not "which way is safe" in
+     the abstract but *what the redundant action costs* versus *what the omitted
+     action costs*.
+
+## Round 55: the one-field derivation of a three-input question
+
+235. **When the codebase already has a predicate for a question, a new consumer
+     answering it from one field has dropped the inputs that predicate exists to
+     take.** `stopIsInFlight(drain, observation, hadContainer)` is three-input
+     because `stopDispatchedAt` alone is ambiguous — its `CREATED -> false` arm
+     exists specifically because a record surviving into a new incarnation once
+     "made the next pass drain the replacement that had just been built, for ever".
+     A sweep deriving `sealed = ... || drain.stopDispatchedAt != null` reads the
+     stamp raw, on a *different server's* pass, with no observation available. It
+     reintroduces the ambiguity in a second consumer. Before adding a field to a
+     boolean expression, grep for the existing predicate over that field and check
+     what else it takes.
+236. **A set-once field is a good guard and a bad level trigger.** "Set once and
+     never cleared, so it cannot re-open on its own" is the argument *for* the
+     clause and also the whole problem with it: a level trigger re-states its fact
+     every pass, so an input that never clears makes the fact permanent. Here it
+     silently inverts `DRAIN_FAILED.sealsBackend()`'s deliberate reasoning —
+     *"costs a running server no player can reach, permanently, if the abort was
+     permanent"* — for any parked drain that had dispatched, including one whose
+     `stopWorkload` threw and left the container running. The stamp's own KDoc
+     concedes it "reads true for a stop that never reached the runtime". Bound the
+     clause by the grace window, the same way the sibling refusal was bounded: the
+     reason to seal is that the container is inside its grace period, and past that
+     the reason is gone.
+237. **Check which of the added field's homes actually persist.** A field added to
+     stop a boolean lying by omission is worth nothing if it goes only to the
+     seam's return value and the HTTP response — both seen once, by the operator
+     who already knows — and not to the `LOG.warn` an investigator greps six months
+     later, which still carries the misleading boolean alone. Status is not the
+     answer either when teardown purges the row. Ask where the record *survives the
+     thing it describes*, and put it there first.
+238. **An over-sealing regression is an availability bug, not a data-loss bug, and
+     saying so is part of the finding.** A backend sealed forever loses no world; it
+     takes no players. That keeps it below this role's critical bar even when the
+     blast radius is fleet-wide — and stating the distinction is what stops a
+     reviewer's severity inflating with the size of the diff. Rank on what is lost,
+     not on how much code moved.

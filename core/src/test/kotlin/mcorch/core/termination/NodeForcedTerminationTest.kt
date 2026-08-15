@@ -5,6 +5,7 @@ import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
 import io.kotest.matchers.string.shouldContain
+import io.kotest.matchers.string.shouldNotContain
 import mcorch.core.ExecOutcome
 import mcorch.core.FakeNode
 import mcorch.core.SingleNodeScheduler
@@ -467,28 +468,80 @@ internal class NodeForcedTerminationTest {
         }
 
     @Test
-    fun `a force into an outstanding save is refused rather than sending a second one`() =
+    fun `an outstanding save from the drain does not stop this path sending its own`() =
         coreTest {
             val node = FakeNode()
+            node.online = 6
             running(node)
-            val requested = Instant.parse("2020-01-01T00:00:00Z")
+            val requested = Instant.now()
             observed(
                 drain =
                     DrainStatus(
-                        state = DrainState.SAVING,
+                        state = DrainState.DRAIN_FAILED,
                         startedAt = requested,
                         enteredStateAt = requested,
                         saveRequestedAt = requested,
                     ),
             )
+            var saves = 0
+            node.onExec = { command ->
+                if (command.joinToString(" ").contains("save-all")) saves++
+                node.defaultExec(command)
+            }
 
-            // The never-re-send wedge armed: a request went out and has not
-            // confirmed. This guard lived in `:api` until round 51, where it
-            // protected one route and no other caller of this seam.
-            shouldThrow<ForcedTerminationRefused> {
-                terminationOver(node).preflight(paperDefinition(), OccupancyAcknowledgement.None)
-            }.message.toString() shouldContain "unconfirmed world save"
-            node.stops shouldHaveSize 0
+            val outcome = terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.Count(6))
+
+            // **`saveRequestedAt` is not consulted, and four rounds of trying to
+            // consult it safely are why.** Only a confirmation or a pass that
+            // observed a player clears it, and `DRAIN_FAILED` is deliberately not a
+            // sealing state — so the proxy re-admits, a whole session can arrive and
+            // leave between two probes, and every reading this path can take still
+            // says zero. No condition on that record can be made sound here.
+            //
+            // The drain never re-sends either, but only because it never stops: it
+            // stalls and the world stays on a running server. This path stops, so it
+            // takes the trade the other way. A redundant flush queues behind the one
+            // already running and costs a stall; a save not sent costs play nothing
+            // recovers.
+            saves shouldBe 1
+            node.stops shouldHaveSize 1
+            outcome.saveAttempted shouldBe true
+        }
+
+    @Test
+    fun `a stop the node refuses reports the save that actually ran`() =
+        coreTest {
+            val node = FakeNode()
+            node.online = 6
+            running(node)
+            val requested = Instant.now()
+            observed(
+                drain =
+                    DrainStatus(
+                        state = DrainState.DRAIN_FAILED,
+                        startedAt = requested,
+                        enteredStateAt = requested,
+                        saveRequestedAt = requested,
+                    ),
+            )
+            node.failOnce(mcorch.core.NodeOperation.STOP, node.rejected(mcorch.core.NodeOperation.STOP))
+
+            // The occupancy voided the stale record, so a save really was sent. The
+            // failure branch used to quote the outstanding instant, and `describe`
+            // reads that as "no world save was sent" regardless of `attempted` — so
+            // the one message the caller gets was wrong about the side effect that
+            // had just happened on their server.
+            val message =
+                shouldThrow<ForcedTerminationRefused> {
+                    terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.Count(6))
+                }.message.toString()
+            // Discriminating, and the first version of this assertion was not:
+            // `shouldContain "confirmed"` also passes against the skipped-save
+            // wording, which says a request "had not been confirmed". The phrase
+            // below belongs to one branch only.
+            message shouldContain "the world save was confirmed before the container was stopped"
+            message shouldNotContain "no world save was sent"
+            message shouldContain "Nothing was stopped"
         }
 
     @Test

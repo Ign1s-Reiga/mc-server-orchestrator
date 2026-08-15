@@ -75,6 +75,25 @@ wait is what lets an in-flight save finish.
 > `saveConfirmed` — *"never sent"* and *"sent and not confirmed"* are different
 > events and must not be reported as one.
 
+**The save is always requested — there is no skip.** One version of this path
+declined to send when `status.drain.saveRequestedAt` was set, on the argument that
+`DrainController.save()` never re-sends either. The analogy does not hold: the
+drain never re-sends *because it never stops*. It stalls, permanently, and the
+world stays on a running server. Declining the save and stopping anyway is a trade
+the drain never makes.
+
+Nor can that record be made trustworthy here. Only a confirmation or a pass that
+has observed a player clears it, and `DRAIN_FAILED` is deliberately not a sealing
+state — so the proxy re-admits the backend, a whole session can arrive and leave
+between two orchestrator probes, and every reading this path can take still reads
+zero. Four successive conditions were tried and each was individually correct;
+none could cover a session nobody saw.
+
+So the trade is taken the other way, on the asymmetry CLAUDE.md states first: a
+redundant `save-all flush` queues behind the one already running and costs a
+stall, bounded by a grace period already floored at the save timeout. A save not
+sent costs play that no later pass recovers.
+
 **The grace period is never shortened, and on one branch it is lengthened.**
 `spec.lifecycle.stopGracePeriod` is the last-resort net that lets a server flush
 on `SIGTERM`. Shortening it under "force" would remove the one protection that
@@ -189,6 +208,9 @@ API, so it is recorded whether or not the console's audit sink exists yet:
 | acknowledged | The count the operator stated they had been shown |
 | saveConfirmed | Whether the save was confirmed before the stop. **This is the field that says whether data was lost** |
 | drainState | What the drain had reached when force was applied |
+
+Until that sink exists, the `forced stop …` log line **is** the audit record, and
+it carries every field above for that reason.
 
 `saveConfirmed: false` is the record that matters. It is the difference between
 "an operator retired a stuck server" and "an operator lost a world", and six

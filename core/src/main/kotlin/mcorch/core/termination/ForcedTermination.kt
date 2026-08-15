@@ -64,7 +64,7 @@ import kotlin.time.toJavaDuration
  * | Seal the proxy (2) | **Done.** Asserted through the same `ProxyFleet.linkFor` channel the drain uses. See below |
  * | Transfer players (4) | **Not done.** Players are disconnected |
  * | `requireEmpty` — zero players (5) | Replaced by a counted acknowledgement, read under the seal. See below |
- * | Save (5) | Requested, and **[ForcedStopOutcome.saveAttempted] says whether it really was** |
+ * | Save (5) | **Always requested**, and [ForcedStopOutcome.saveAttempted] says whether one could be sent |
  * | Deregister (6) | **Not done.** The loop's next pass does it; until then the proxy holds a registration at an address that is going away |
  * | `mayStop` (7) | Deliberately bypassed. That is the feature |
  *
@@ -232,6 +232,22 @@ public data class ForcedStopOutcome(
     val detail: String,
 )
 
+/**
+ * How long a dispatched stop stays "in flight" for a server.
+ *
+ * The declared grace period, raised by the shutdown-save allowance so it can never
+ * be shorter than the window a forced stop might itself have given the container —
+ * `NodeForcedTermination` raises the grace the same way when no save was sent, and
+ * a bound below that would expire while the container was still inside it.
+ *
+ * **One derivation, two consumers**, deliberately: the forced path's own
+ * stop-in-flight refusal and the proxy sweep's admission rule both bound themselves
+ * on this, and two copies of it would drift into disagreeing about whether the same
+ * container is still shutting down.
+ */
+internal fun forcedStopWindow(definition: PaperServerDefinition): Duration =
+    maxOf(definition.spec.lifecycle.stopGracePeriod, PaperServerDefaults.SAVE_TIMEOUT)
+
 /** There is no running workload to stop. */
 public class ForcedTerminationUnavailable(
     message: String,
@@ -315,24 +331,39 @@ public class NodeForcedTermination(
         refuseOccupancy(name, players, acknowledgement)
         refuseUnsealedPopulation(name, seal, players, acknowledgement)
 
+        // **The save is always requested, and the skip that used to sit here is
+        // gone.**
+        //
+        // It skipped when `DrainStatus.saveRequestedAt` was set, on the argument
+        // that `DrainController.save()` never re-sends either, so the force sending
+        // one was the anomaly. The analogy does not hold: the drain never re-sends
+        // *because it never stops* — it stalls, permanently, and the world stays on
+        // a running server. This path stops. Declining the save and stopping anyway
+        // is a trade the drain never makes.
+        //
+        // And the record cannot be made trustworthy here. Only a confirmation or a
+        // pass that has observed a player clears it, and `DRAIN_FAILED` is
+        // deliberately not a sealing state — so the proxy re-admits, a whole session
+        // can arrive and leave between two orchestrator probes, and every reading
+        // this path can take still says zero. Four rounds of conditionals tried to
+        // decide when the record was stale: an observed player voids it, then the
+        // *second* reading voids it, then a re-probe after the late save. Each was
+        // correct and none could cover a session nobody saw.
+        //
+        // So the trade is taken the other way round, on the asymmetry CLAUDE.md
+        // states: a redundant `save-all flush` queues behind the one already running
+        // and costs a stall, bounded by a grace period already floored at
+        // `SAVE_TIMEOUT`; a save not sent costs play that no later pass recovers.
+        // `ForcedStopOutcome.saveAttempted` now means what it says on every branch.
         val save = requestSave(agent, node, observation)
         val attempted = save !is SaveOutcome.Unconfirmable && save !is SaveOutcome.NotDelivered
         val confirmed = save is SaveOutcome.Confirmed
 
-        // **One more reading, and only when nothing is holding the last one.**
-        //
-        // With the door shut the count can only fall, so the reading above stays
-        // good enough: a second probe would cost a wedged server another 10s to
-        // learn something the seal already guarantees.
-        //
-        // Without one it does not, and `NOTHING_TO_SEAL` is not a rare case — a
-        // standalone server has no proxy to seal and players reach it directly.
-        // Dropping this probe outright, as the seal's first draft did, would have
-        // widened that window from milliseconds to a whole save timeout for exactly
-        // the servers with no door. So the probe follows the guarantee rather than
-        // the other way round.
-        val atStop = if (seal == SealResult.ASSERTED) players else occupancy(agent, node, observation)
-        refuseOccupancy(name, atStop, acknowledgement)
+        // The reading the stop is dispatched on, taken after the save so it is not a
+        // save timeout old. Under an asserted seal the count cannot rise and the
+        // earlier reading stands; without one it is read again and refused if it has
+        // moved.
+        val atStop = readingBeforeStop(name, agent, node, observation, seal, players, acknowledgement)
 
         val declared = definition.spec.lifecycle.stopGracePeriod
         // Raised, never lowered, and never a refusal. When no save request was
@@ -412,7 +443,7 @@ public class NodeForcedTermination(
     private suspend fun sealOff(name: ResourceName): SealResult {
         val stored = store.getServer(name) ?: return SealResult.NOTHING_TO_SEAL
         val binding =
-            when (val fleet = ProxyFleet.resolve(store, stored)) {
+            when (val fleet = ProxyFleet.resolve(store, stored, clock.instant())) {
                 is ProxyFleet.Resolution.Behind -> fleet.binding
 
                 // Two proxies claim it, and sealing one leaves the other admitting —
@@ -512,7 +543,7 @@ public class NodeForcedTermination(
      */
     private suspend fun refuseSecondSideEffect(name: ResourceName) {
         val drain = (store.getServer(name)?.status?.status as? PaperServerStatus)?.drain ?: return
-        val dispatched = drain.stopDispatchedAt
+        val dispatched = drain.stopLastDispatchedAt ?: drain.stopDispatchedAt
         // **Bounded by the grace period, not by the stamp's existence.**
         //
         // The reason to refuse is that the container is *inside* its grace period
@@ -533,13 +564,24 @@ public class NodeForcedTermination(
                     "grace period; forcing again would send a second save into a server already shutting down",
             )
         }
-        if (drain.saveRequestedAt != null) {
-            throw ForcedTerminationRefused(
-                "`${name.value}` has an unconfirmed world save outstanding, requested at " +
-                    "${drain.saveRequestedAt}. Forcing now would send a second save into a server already " +
-                    "running one; wait for it to confirm or fail",
-            )
-        }
+        // **`saveRequestedAt` is deliberately not a refusal here**, and used to be.
+        //
+        // It is the never-re-send wedge, and only a confirmation or a pass that has
+        // *observed a player* clears it — `forgetSaveEvidence` is reachable from
+        // nowhere else. A wedged server answers no probe, so no pass ever observes a
+        // player, so the wedge never lifts. Meanwhile the `SaveOutcome.Unconfirmed`
+        // arm sets it beside `DRAIN_SAVE_TIMEOUT` and `PERMANENT`, which is
+        // `docs/operating.md` note 1 exactly.
+        //
+        // So the refusal fired on the population this path was built for, telling
+        // the operator to "wait for it to confirm or fail" — for something that can
+        // do neither — below a tombstone, forever. Third lockout of this shape in
+        // this function; the sibling branch above was bounded in round 52 and this
+        // one was missed because the report named only that half.
+        //
+        // [stop] does not consult it either. It requests its save unconditionally —
+        // see the note at the save for why the record cannot be made trustworthy on
+        // a backend the proxy has re-admitted.
     }
 
     /**
@@ -553,8 +595,11 @@ public class NodeForcedTermination(
      */
     private suspend fun graceWindow(name: ResourceName): java.time.Duration {
         val definition = (store.getServer(name)?.definition?.definition as? PaperServerDefinition)
-        val declared = definition?.spec?.lifecycle?.stopGracePeriod ?: SHUTDOWN_SAVE_ALLOWANCE
-        return maxOf(declared, SHUTDOWN_SAVE_ALLOWANCE).toJavaDuration()
+        // A definition that will not read falls back to the allowance rather than to
+        // zero: a window of zero would make the refusal above vanish entirely, which
+        // is the failure this bound was added to avoid, in reverse.
+        val window = definition?.let(::forcedStopWindow) ?: SHUTDOWN_SAVE_ALLOWANCE
+        return window.toJavaDuration()
     }
 
     /**
@@ -675,7 +720,31 @@ public class NodeForcedTermination(
             startedAt = now,
             enteredStateAt = now,
             stopDispatchedAt = now,
+            stopLastDispatchedAt = now,
         )
+
+    /**
+     * The occupancy a stop would be dispatched on, refused if it has moved.
+     *
+     * Under an asserted seal the count cannot rise, so the previous reading stands
+     * and no probe is spent — against a wedged server, which is this endpoint's
+     * population, a probe costs a full timeout to learn what the shut door already
+     * guarantees. Without a seal nothing owns the number and it is read again.
+     */
+    private suspend fun readingBeforeStop(
+        name: ResourceName,
+        agent: PaperServerAgent,
+        node: Node,
+        observation: WorkloadObservation.Present,
+        seal: SealResult,
+        previous: Int?,
+        acknowledgement: OccupancyAcknowledgement,
+    ): Int? {
+        if (seal == SealResult.ASSERTED) return previous
+        val reading = occupancy(agent, node, observation)
+        refuseOccupancy(name, reading, acknowledgement)
+        return reading
+    }
 
     /**
      * Refuses unless the acknowledgement matches what was just observed.

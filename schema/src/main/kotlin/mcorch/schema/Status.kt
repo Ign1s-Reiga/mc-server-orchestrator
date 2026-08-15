@@ -572,6 +572,31 @@ public data class DrainStatus(
      */
     val stopDispatchedAt: Instant? = null,
     /**
+     * When the **most recent** stop request left this process, as against
+     * [stopDispatchedAt]'s *first*.
+     *
+     * That KDoc says the question every reader asks is *"may a `SIGTERM` already be
+     * in that container"*, not *"when was the most recent one sent"* — which was
+     * true when it was written and is no longer. Two readers now ask the second
+     * question, because both bound themselves on how long a stop stays in flight:
+     * the forced path's refusal against a stop already under way, and the proxy
+     * sweep's rule about which backends may admit players.
+     *
+     * A bounded reader cannot use a set-once stamp. A stop that fails is retried
+     * once its window has passed, and `dispatchingStop` keeps the first instant —
+     * so the retried `SIGTERM` would be born already expired, the proxy would
+     * reopen the backend while that shutdown ran, and a third force would not see
+     * the second as overlapping.
+     *
+     * So the two are separate rather than one field with two meanings.
+     * [stopDispatchedAt] stays monotone and answers *"may a signal be in there"*;
+     * this restamps and answers *"is one still on its way"*. Null on rows written
+     * before this field existed, and readers fall back to [stopDispatchedAt] for
+     * those — the first dispatch is the best available answer when there is no
+     * record of a later one.
+     */
+    val stopLastDispatchedAt: Instant? = null,
+    /**
      * When this drain first entered drain step 4, and the anchor its allowance is
      * measured from.
      *

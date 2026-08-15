@@ -129,6 +129,11 @@ class LegacyDrainRowTest {
             // Distinct from `enteredStateAt`, so a case that drops the key can tell
             // the reconstruction apart from the stored value.
             stopDispatchedAt = AT.minusSeconds(8),
+            // Distinct from `stopDispatchedAt` as well as from `enteredStateAt`: a
+            // re-issued stop restamps this half and not that one, so a probe where
+            // the two agreed could not tell a codec that persists them separately
+            // from one that writes the same value twice.
+            stopLastDispatchedAt = AT.minusSeconds(4),
             transferStartedAt = AT.minusSeconds(85),
             transferAttempts = 4,
             destination = name("lobby-01"),
@@ -241,6 +246,18 @@ class LegacyDrainRowTest {
                                 "`mcorch.schema.StatusReconstruction` owns that argument",
                         expected = { it.copy(stopDispatchedAt = it.enteredStateAt) },
                         reports = listOf(StatusReconstruction.STOP_DISPATCHED_FIELD),
+                    ),
+                "DrainStatus.stopLastDispatchedAt" to
+                    Reads(
+                        why =
+                            "null is safe here in a way its set-once sibling's absence is not, and the " +
+                                "difference is which question each answers. `stopDispatchedAt` answers " +
+                                "*may a signal be in that container*, where null re-admits players to a " +
+                                "process inside its shutdown save. This one answers *is one still on its " +
+                                "way*, and its readers fall back to `stopDispatchedAt` when it is absent — " +
+                                "so a legacy row is bounded from the first dispatch, which is the best " +
+                                "record it has and errs toward holding the door shut for longer",
+                        expected = { it.copy(stopLastDispatchedAt = null) },
                     ),
                 "DrainStatus.transferStartedAt" to
                     Reads(
