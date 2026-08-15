@@ -394,11 +394,17 @@ internal class ServerRoutes(
             }
         // Warn, not info, and every field an investigator reads first is on it.
         LOG.warn(
-            "forced stop identity={} server={} saveAttempted={} saveConfirmed={} playersOnline={}",
+            "forced stop identity={} server={} saveAttempted={} saveConfirmed={} saveOutstandingSince={} " +
+                "playersOnline={}",
             principal.name,
             name.value,
             outcome.saveAttempted,
             outcome.saveConfirmed,
+            // The audit sink in `spec/termination` does not exist yet, so this line
+            // is the audit record. `saveAttempted: false` without this reads as
+            // "no save was ever sent" on the branch where the drain's own request
+            // had already reached the server.
+            outcome.saveOutstandingSince ?: "none",
             outcome.playersOnline ?: "unknown",
         )
         return Response.json(

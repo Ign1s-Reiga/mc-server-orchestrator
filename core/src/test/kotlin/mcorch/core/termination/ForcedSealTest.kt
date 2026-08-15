@@ -11,6 +11,7 @@ import mcorch.core.proxyDefinition
 import mcorch.schema.DrainState
 import mcorch.schema.DrainStatus
 import org.junit.jupiter.api.Test
+import kotlin.time.Duration.Companion.minutes
 
 /**
  * Drain step 2 on the forced path, against a real proxy.
@@ -211,6 +212,47 @@ internal class ForcedSealTest {
             harness.pass(harness.proxyDefinition.metadata.name)
 
             harness.plugin.backend(name.value)?.admits shouldBe false
+        }
+
+    @Test
+    fun `a stop that never landed stops sealing the backend once its window passes`() =
+        coreTest {
+            val harness = harness()
+            harness.bringUp()
+            val name = backend.metadata.name
+            val dispatched = harness.clock.instant()
+            val current = harness.status(name)
+            if (current != null) {
+                harness.store.putStatus(
+                    current.copy(
+                        drain =
+                            DrainStatus(
+                                state = DrainState.DRAIN_FAILED,
+                                startedAt = dispatched,
+                                enteredStateAt = dispatched,
+                                stopDispatchedAt = dispatched,
+                            ),
+                    ),
+                )
+            }
+
+            // Inside the window, the door stays shut.
+            harness.pass(harness.proxyDefinition.metadata.name)
+            harness.plugin.backend(name.value)?.admits shouldBe false
+
+            // **Set-once is the argument for the clause and the danger of it.** A
+            // level trigger re-states its fact every pass, so an input that never
+            // clears makes the fact permanent — and `stopDispatchedAt` reads true
+            // for a stop that never reached the runtime, which is exactly what a
+            // `NodeException` out of `stopWorkload` leaves: stamp written, container
+            // running, caller told nothing was stopped. Unbounded, that server was
+            // sealed out of routing for ever, and `DRAIN_FAILED` is deliberately not
+            // a sealing state precisely because holding a parked backend out of
+            // routing costs a running server no player can reach.
+            harness.clock.advance(forcedStopWindow(backend) + 1.minutes)
+            harness.pass(harness.proxyDefinition.metadata.name)
+
+            harness.plugin.backend(name.value)?.admits shouldBe true
         }
 
     @Test

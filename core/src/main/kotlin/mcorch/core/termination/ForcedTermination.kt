@@ -248,6 +248,22 @@ public data class ForcedStopOutcome(
     val detail: String,
 )
 
+/**
+ * How long a dispatched stop stays "in flight" for a server.
+ *
+ * The declared grace period, raised by the shutdown-save allowance so it can never
+ * be shorter than the window a forced stop might itself have given the container —
+ * `NodeForcedTermination` raises the grace the same way when no save was sent, and
+ * a bound below that would expire while the container was still inside it.
+ *
+ * **One derivation, two consumers**, deliberately: the forced path's own
+ * stop-in-flight refusal and the proxy sweep's admission rule both bound themselves
+ * on this, and two copies of it would drift into disagreeing about whether the same
+ * container is still shutting down.
+ */
+internal fun forcedStopWindow(definition: PaperServerDefinition): Duration =
+    maxOf(definition.spec.lifecycle.stopGracePeriod, PaperServerDefaults.SAVE_TIMEOUT)
+
 /** There is no running workload to stop. */
 public class ForcedTerminationUnavailable(
     message: String,
@@ -401,11 +417,16 @@ public class NodeForcedTermination(
         val grace = StopGrace.of(requested, definition.spec.lifecycle.drain.saveTimeout)
 
         LOG.warn(
-            "forced stop server={} saveAttempted={} saveConfirmed={} playersOnline={} gracePeriodSeconds={} " +
-                "— this bypasses the drain's evidence rule",
+            "forced stop server={} saveAttempted={} saveConfirmed={} saveOutstandingSince={} playersOnline={} " +
+                "gracePeriodSeconds={} — this bypasses the drain's evidence rule",
             name.value,
             attempted,
             confirmed,
+            // Beside `saveAttempted` and never without it. `spec/termination`'s audit
+            // sink does not exist yet, so this line *is* the audit record — and
+            // `saveAttempted: false` alone says "nothing ever reached the server" on
+            // a branch where a request demonstrably did.
+            outstanding ?: "none",
             atStop ?: "unknown",
             grace.period.inWholeSeconds,
         )
@@ -657,8 +678,11 @@ public class NodeForcedTermination(
      */
     private suspend fun graceWindow(name: ResourceName): java.time.Duration {
         val definition = (store.getServer(name)?.definition?.definition as? PaperServerDefinition)
-        val declared = definition?.spec?.lifecycle?.stopGracePeriod ?: SHUTDOWN_SAVE_ALLOWANCE
-        return maxOf(declared, SHUTDOWN_SAVE_ALLOWANCE).toJavaDuration()
+        // A definition that will not read falls back to the allowance rather than to
+        // zero: a window of zero would make the refusal above vanish entirely, which
+        // is the failure this bound was added to avoid, in reverse.
+        val window = definition?.let(::forcedStopWindow) ?: SHUTDOWN_SAVE_ALLOWANCE
+        return window.toJavaDuration()
     }
 
     /**

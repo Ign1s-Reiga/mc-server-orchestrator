@@ -204,7 +204,11 @@ API, so it is recorded whether or not the console's audit sink exists yet:
 | playersOnline | **A count, read immediately before the stop** — never the one the operator acknowledged, and null when the server did not answer. The logging rule is unchanged |
 | acknowledged | The count the operator stated they had been shown |
 | saveConfirmed | Whether the save was confirmed before the stop. **This is the field that says whether data was lost** |
+| saveOutstandingSince | When the *drain* had a save outstanding, if it did — in which case this stop sent none. **Required beside `saveAttempted`, never without it**: alone, `saveAttempted: false` says "nothing ever reached the server", and on this branch something demonstrably did |
 | drainState | What the drain had reached when force was applied |
+
+Until that sink exists, the `forced stop …` log line **is** the audit record, and
+it carries every field above for that reason.
 
 `saveConfirmed: false` is the record that matters. It is the difference between
 "an operator retired a stuck server" and "an operator lost a world", and six

@@ -11,6 +11,7 @@ import mcorch.core.proxy.ProxySelfLink
 import mcorch.core.proxy.VelocityProxyAgent
 import mcorch.core.proxy.VelocityWorkloadPlanner
 import mcorch.core.proxy.credentialVerdict
+import mcorch.core.termination.forcedStopWindow
 import mcorch.schema.BackendRegistration
 import mcorch.schema.BackendRoutingStatus
 import mcorch.schema.BackendStatus
@@ -47,6 +48,7 @@ import java.time.Instant
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.toJavaDuration
 import kotlin.time.toKotlinDuration
 import java.time.Duration as JavaDuration
 
@@ -1790,12 +1792,36 @@ public class Reconciler(
                     // one proxy pass before this line handed the door back for the
                     // remaining ~178 seconds of a raised grace period.
                     //
-                    // Set-once and never cleared, so this never re-opens on its own.
-                    // That matches `restoreRegistration`, which already declines to
-                    // re-register on the same record and for the same sentence.
+                    // **Bounded by the stop's own window**, because set-once is the
+                    // argument for the clause and the whole danger of it: a level
+                    // trigger re-states its fact every pass, so an input that never
+                    // clears makes the fact permanent.
+                    //
+                    // The reason to seal is that the container is inside its grace
+                    // period running a shutdown save. Past that the reason is gone —
+                    // either the container went and the record retires with it, or
+                    // the stop never landed and the server should take players again.
+                    // `stopDispatchedAt`'s own KDoc concedes it "reads true for a
+                    // stop that never reached the runtime", which is exactly what a
+                    // `NodeException` out of `stopWorkload` leaves behind: stamp
+                    // written, container running, caller told nothing was stopped.
+                    // Unbounded, this sealed that server out of routing for ever.
+                    //
+                    // It would also have removed a repair the sweep exists to
+                    // perform — `DRAIN_FAILED` is deliberately not a sealing state,
+                    // because holding a parked backend out of routing "costs a
+                    // running server no player can reach". Bounding restores that
+                    // once the window has passed rather than inverting it.
+                    //
+                    // Through `forcedStopWindow` rather than a second derivation, so
+                    // this and the forced path's own stop-in-flight refusal cannot
+                    // drift into disagreeing about whether the same container is
+                    // still shutting down.
                     sealed =
                         status?.drain?.state?.sealsBackend() == true ||
-                            status?.drain?.stopDispatchedAt != null,
+                            status?.drain?.stopDispatchedAt?.let {
+                                now < it.plus(forcedStopWindow(backend).toJavaDuration())
+                            } == true,
                     // Null until the loop knows which node the workload is on.
                     // **Not asserted under a guessed hostname**: a registration at a
                     // name that does not resolve is one the protocol will refuse to

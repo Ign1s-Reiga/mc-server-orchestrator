@@ -2757,3 +2757,42 @@ Related: [[standalone-paper-drain-shape]]
      loses a save outright. The reasoning to check is not "which way is safe" in
      the abstract but *what the redundant action costs* versus *what the omitted
      action costs*.
+
+## Round 55: the one-field derivation of a three-input question
+
+235. **When the codebase already has a predicate for a question, a new consumer
+     answering it from one field has dropped the inputs that predicate exists to
+     take.** `stopIsInFlight(drain, observation, hadContainer)` is three-input
+     because `stopDispatchedAt` alone is ambiguous — its `CREATED -> false` arm
+     exists specifically because a record surviving into a new incarnation once
+     "made the next pass drain the replacement that had just been built, for ever".
+     A sweep deriving `sealed = ... || drain.stopDispatchedAt != null` reads the
+     stamp raw, on a *different server's* pass, with no observation available. It
+     reintroduces the ambiguity in a second consumer. Before adding a field to a
+     boolean expression, grep for the existing predicate over that field and check
+     what else it takes.
+236. **A set-once field is a good guard and a bad level trigger.** "Set once and
+     never cleared, so it cannot re-open on its own" is the argument *for* the
+     clause and also the whole problem with it: a level trigger re-states its fact
+     every pass, so an input that never clears makes the fact permanent. Here it
+     silently inverts `DRAIN_FAILED.sealsBackend()`'s deliberate reasoning —
+     *"costs a running server no player can reach, permanently, if the abort was
+     permanent"* — for any parked drain that had dispatched, including one whose
+     `stopWorkload` threw and left the container running. The stamp's own KDoc
+     concedes it "reads true for a stop that never reached the runtime". Bound the
+     clause by the grace window, the same way the sibling refusal was bounded: the
+     reason to seal is that the container is inside its grace period, and past that
+     the reason is gone.
+237. **Check which of the added field's homes actually persist.** A field added to
+     stop a boolean lying by omission is worth nothing if it goes only to the
+     seam's return value and the HTTP response — both seen once, by the operator
+     who already knows — and not to the `LOG.warn` an investigator greps six months
+     later, which still carries the misleading boolean alone. Status is not the
+     answer either when teardown purges the row. Ask where the record *survives the
+     thing it describes*, and put it there first.
+238. **An over-sealing regression is an availability bug, not a data-loss bug, and
+     saying so is part of the finding.** A backend sealed forever loses no world; it
+     takes no players. That keeps it below this role's critical bar even when the
+     blast radius is fleet-wide — and stating the distinction is what stops a
+     reviewer's severity inflating with the size of the diff. Rank on what is lost,
+     not on how much code moved.
