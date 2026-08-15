@@ -545,6 +545,52 @@ internal class NodeForcedTerminationTest {
         }
 
     @Test
+    fun `an acknowledgement larger than the population is not a blank cheque`() =
+        coreTest {
+            val node = FakeNode()
+            node.online = 8
+            running(node)
+            observed()
+
+            // **The bypass a relaxed comparator would have opened.** An earlier
+            // version of the transfer work changed `Count(n)` to mean "at most n" so
+            // a partial sweep would not be refused over the players it left. That
+            // makes any large number satisfy any population — the boolean "proceed
+            // regardless" this design rejects, respelled as 9999 and in the runbook
+            // within a week.
+            //
+            // The acknowledgement names what the operator was shown. Nothing else.
+            shouldThrow<ForcedTerminationRefused> {
+                terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.Count(9999))
+            }.message.toString() shouldContain "8 player"
+            node.stops shouldHaveSize 0
+        }
+
+    @Test
+    fun `a count that fell since the acknowledgement does not refuse the stop`() =
+        coreTest {
+            val node = FakeNode()
+            node.online = 6
+            running(node)
+            observed()
+            // Standalone, so the pre-stop reading really is taken again — and by
+            // then two have logged off.
+            node.onExec = { command ->
+                if (command.joinToString(" ").contains("save-all")) node.online = 4
+                node.defaultExec(command)
+            }
+
+            val outcome = terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.Count(6))
+
+            // A decrease is what a transfer or a logout looks like, and refusing over
+            // it would make every partial sweep a 409. Only a *rise* is the hazard
+            // the compare-and-swap was built for — and that is a separate question
+            // from the acknowledgement, which is why it is asked separately.
+            node.stops shouldHaveSize 1
+            outcome.playersOnline shouldBe 4
+        }
+
+    @Test
     fun `the reported count is the one from just before the stop`() =
         coreTest {
             val node = FakeNode()

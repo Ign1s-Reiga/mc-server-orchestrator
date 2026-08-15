@@ -2796,3 +2796,82 @@ Related: [[standalone-paper-drain-shape]]
      blast radius is fleet-wide — and stating the distinction is what stops a
      reviewer's severity inflating with the size of the diff. Rank on what is lost,
      not on how much code moved.
+
+## Round 56: the step that empties the server for somebody else
+
+239. **A step whose whole purpose is to remove players removes the precondition a
+     *different* component was parked on.** Before drain step 4 landed on the
+     forced path, a concurrent reconcile drain over the same tombstoned server was
+     structurally stuck at `requireEmpty` for as long as anybody was online — so
+     the force's long `requestSave` could not collide with a loop-issued stop on a
+     populated server. The sweep is precisely the thing that unparks it: the loop's
+     ladder from `SEALED` to `STOPPING` is ~6 passes at a 1 s `stepInterval`, and
+     the force is still inside one probe plus a `saveTimeout` that, for this
+     endpoint's population, does not confirm. The force never writes
+     `saveRequestedAt`, so the loop's `save()` sees no outstanding request and
+     issues its own flush. Whenever a new step *satisfies* a gate some other path
+     is blocked on, enumerate what that path then does and how far the caller has
+     got by the time it does it.
+240. **A guard evaluated at function entry is only as fresh as the longest thing
+     between it and the side effect it guards.** `refuseSecondSideEffect` runs at
+     the top of `stop()`; inserting a poll loop bounded by a spec field puts the
+     whole transfer allowance between the check and both `requestSave` and
+     `stopWorkload`. The fix is not a better guard, it is re-running the existing
+     one immediately above the side effect — cheap here because that refusal's
+     remedy is "wait for the grace window and re-send", which is answerable from
+     below a tombstone (unlike the ones item 208 covers).
+241. **Relaxing a compare-and-swap to an inequality to accommodate a legitimate
+     decrease deletes the detection of an illegitimate one, because a single
+     reading cannot tell them apart.** `Count(n)` satisfied by *at most* n was
+     forced by a partial sweep (nine of twelve moved). It also passes 8 against an
+     acknowledged 12 when 9 left and 5 arrived. The general shape: if a step
+     between the operator's reading and the check legitimately moves the quantity,
+     take the check's reading **before** that step and keep the exact match; use
+     the after-reading only for the record, with a monotonicity assert. Widening
+     the comparator instead makes a large acknowledged number a universal bypass —
+     item 211's boolean, respelled as `acknowledgeOccupancy=9999` — and it silently
+     weakens every *other* call site of the shared predicate, including the one
+     (`preflight`) that has no reducing step above it at all.
+242. **A clamp deliberately *not* applied, justified by "nothing waits on this
+     field", is the mirror of item 204 and fails the same way.** `SpecBounds`
+     excludes `playerTransferTimeout` with the reasoning *"wall-clock comparisons —
+     the loop records an instant and compares against it on a later pass — not
+     deadlines on a call, so an absurd value there parks nothing. They were
+     examined and cleared."* A poll loop inside an HTTP request makes it a deadline
+     on a call. `SpecBoundsTest` pins that 40 h survives the decode, and the YAML
+     reader's 1 s…1 h range does not protect a hand-edited store row. Grep `:schema`
+     for *both* directions of justification — "safe because the drain confirmed"
+     (item 204) and "unbounded because nothing waits on it" — before making any
+     field the bound of a new wait.
+243. **The counterparty's own supersede window can be smaller than the bound the
+     poller is using.** `ControlProtocol.SWEEP_MAX_AGE_MS` is 180 s: a sweep older
+     than that stops being joinable and the next `POST .../transfer` starts a fresh
+     one, re-issuing a connection request to every remaining player. A poller whose
+     KDoc says *"start-or-join, so re-asking reads progress rather than starting a
+     second sweep"* is telling the truth only below three minutes, and
+     `playerTransferTimeout` reaches an hour. When a claim about idempotence comes
+     from the far side of a wire, find the far side's expiry constant and compare
+     it against the near side's loop bound.
+244. **A poll loop's timeout branch is untestable when the clock is manual and the
+     sleep is real.** `coreTest` is `runBlocking` and `MutableClock` only advances
+     by hand, so `while (…) { …; if (clock.now >= deadline) return; delay(2.s) }`
+     can only exit via the counterparty finishing — the fake completes the sweep
+     from inside its handler, which is the path that is green. A fake that does not
+     finish hangs the build rather than exercising the bound. Before believing a
+     "bounded, then it proceeds" claim, find the test that reaches the bound; if the
+     suite's clock cannot advance underneath a real `delay`, there is none and there
+     cannot be one without injecting the interval.
+245. **A side effect on players placed above the refusal that decides the request.**
+     The sweep runs before `refuseOccupancy`, so a force that answers 409 has
+     already moved people to another server — and the audit log line that would say
+     so is only reached on the success path, so the refusal reports nothing about
+     the transfer that happened. Item 207's shape with a player-visible effect
+     instead of a store write: for every refusal in a handler, ask what has already
+     happened *to players*, not only what has been written.
+246. **`unmoved` is the number that names the people about to be disconnected, and
+     it is the one that got dropped.** `TransferReport.Sweeping` carries
+     `remaining`, `unmoved` and `finished`; the forced path keeps only `remaining`,
+     and logs "transferred its players before stopping" at INFO on
+     `finished = true` even when `remaining > 0`. The drain's own log quotes both.
+     Item 237: check which of a value's homes survive the event it describes, and
+     item 27: read what the message asserts against the branch that reached it.

@@ -94,10 +94,13 @@ and **the reason it stopped being optional is the interesting part**:
   from a state that has not held the door shut. The second so the count the
   acknowledgement is checked against is the one that survives the attempt.
 
-  It also forced a correction to the acknowledgement: `Count(n)` is now satisfied
-  by **at most** n rather than exactly n. Exact matching became wrong the moment a
-  transfer could reduce the number — an operator who acknowledged twelve and had
-  nine moved would have been refused over the three that remained.
+  The first draft put the sweep *above* the deciding refusal, which forced the
+  acknowledgement's comparator open to "at most n" so a partial sweep would not be
+  refused over the players it left. That was a bypass: any large number then
+  satisfied any population, which is the boolean this design rejects, respelled.
+  The sweep sits below the refusal instead, and the two readings are kept apart —
+  the acknowledgement settles what the operator was shown, and a separate check
+  refuses only if the count has **risen** since.
 
 Nothing is owed now. The rest are deliberate and permanent: `requireEmpty` is
 replaced by a counted acknowledgement read under the seal, the save is always

@@ -378,13 +378,26 @@ public class NodeForcedTermination(
         // admitting means racing logins the sweep cannot see the end of, which is
         // why the drain never reaches step 4 from a state that has not held the
         // door shut.
-        val transferred = transferPlayers(name, definition, sealed.router)
 
         // Read under the seal, and refused before the save rather than after it, so
         // a mismatch costs the caller neither a flush nor a save timeout.
         val players = occupancy(agent, node, observation)
         refuseOccupancy(name, players, acknowledgement)
         refuseUnsealedPopulation(name, seal, players, acknowledgement)
+
+        // **Drain step 4, below the refusal rather than above it.**
+        //
+        // The first version swept first, so the acknowledgement would have been
+        // checked against a number the sweep had already changed — which forced the
+        // comparator open and turned a compare-and-swap into a bypass. The
+        // acknowledgement refers to what the operator was shown, so it is settled
+        // first; the sweep then reduces the population it authorised.
+        //
+        // Still above the save, and that ordering is the one thing here borrowed
+        // straight from the drain: a transferred player's playerdata is written by
+        // *this* server as they quit, so sweeping first and flushing second is the
+        // only order in which the flush covers them.
+        val transferred = transferPlayers(name, definition, sealed.router)
 
         // **The save is always requested, and the skip that used to sit here is
         // gone.**
@@ -410,6 +423,28 @@ public class NodeForcedTermination(
         // and costs a stall, bounded by a grace period already floored at
         // `SAVE_TIMEOUT`; a save not sent costs play that no later pass recovers.
         // `ForcedStopOutcome.saveAttempted` now means what it says on every branch.
+        // **Re-asked here, and the sweep above is why.**
+        //
+        // `refuseSecondSideEffect` ran at entry, when this server still had players
+        // on it — and a populated server parks the loop's own drain at
+        // `requireEmpty`, which is what made a collision structurally impossible
+        // before this change. **The sweep is exactly what unparks it.** With
+        // `stepInterval` at a second the loop needs a handful of passes to walk
+        // seal → destination → transfer → requireEmpty → save → deregister → stop,
+        // and this path is still inside one probe plus a whole save timeout.
+        //
+        // Without this the two paths flush the same world concurrently, the loop
+        // stops the container properly, and then this one sends another
+        // `save-all flush` into a process already running its shutdown save and
+        // re-issues the stop on top — verbatim what `stopIsInFlight` exists to
+        // prevent, with a `SIGKILL` at the end of the grace period landing on a
+        // region write.
+        //
+        // Safe below the tombstone: the remedy is to wait out the grace window and
+        // re-send, which the caller can do, so it is not the kind of refusal that
+        // had to move into [preflight].
+        refuseSecondSideEffect(name)
+
         val save = requestSave(agent, node, observation)
         val attempted = save !is SaveOutcome.Unconfirmable && save !is SaveOutcome.NotDelivered
         val confirmed = save is SaveOutcome.Confirmed
@@ -943,8 +978,43 @@ public class NodeForcedTermination(
     ): Int? {
         if (seal == SealResult.ASSERTED) return previous
         val reading = occupancy(agent, node, observation)
-        refuseOccupancy(name, reading, acknowledgement)
+        refuseArrivals(name, previous, reading, acknowledgement)
         return reading
+    }
+
+    /**
+     * Refuses when the count has **risen** since the reading the acknowledgement
+     * settled.
+     *
+     * A separate question from [refuseOccupancy], and separating them is what let
+     * that one stay an exact match. The acknowledgement is about what the operator
+     * was shown; this is about what has happened since — and after a sweep the two
+     * cannot be the same number, because moving players is the point.
+     *
+     * So a *decrease* passes: those are sessions the transfer saved, and refusing
+     * over them would make every partial sweep a 409. An *increase* refuses, which
+     * is the hazard the compare-and-swap was built for — somebody arrived, and
+     * nobody has acknowledged them.
+     *
+     * An unreadable reading falls through to [refuseOccupancy], because "unknown"
+     * is not a number this can compare and `Unreadable` is the value that covers it.
+     */
+    private fun refuseArrivals(
+        name: ResourceName,
+        settled: Int?,
+        reading: Int?,
+        acknowledgement: OccupancyAcknowledgement,
+    ) {
+        if (reading == null || settled == null) {
+            refuseOccupancy(name, reading, acknowledgement)
+            return
+        }
+        if (reading <= settled) return
+        throw ForcedTerminationRefused(
+            "`${name.value}` now has $reading player(s) online, up from the $settled this stop was " +
+                "authorised against, so somebody has joined since. Re-send acknowledging exactly $reading " +
+                "if that is intended",
+        )
     }
 
     /**
@@ -966,19 +1036,23 @@ public class NodeForcedTermination(
 
                 is OccupancyAcknowledgement.Unreadable -> observed == null
 
-                // **At most**, not exactly. The acknowledgement says how many
-                // dropped sessions the operator accepted; accepting fewer needs no
-                // second sign-off, and the hazard this guards is the population
-                // *growing* between their decision and the request.
+                // **Exactly**, and a version of the transfer work relaxed this to
+                // "at most" so a partial sweep would not be refused over the players
+                // it left behind. That was wrong twice over.
                 //
-                // Exact matching became actively wrong when drain step 4 landed: an
-                // operator who acknowledged twelve and had nine transferred away
-                // would be refused over the three that remained, told the count was
-                // "3" when they had authorised more, and left re-sending a smaller
-                // number after every partial sweep.
-                // Null is still not covered: an unreadable count is not "at most
-                // twelve", it is unknown, and `Unreadable` is the value that says so.
-                is OccupancyAcknowledgement.Count -> observed != null && observed <= acknowledgement.players
+                // It stops detecting arrivals as soon as the sweep removes anybody:
+                // acknowledge twelve, nine move, five arrive, the probe reads eight,
+                // eight is at most twelve, and eight sessions go — five of them a
+                // number nobody was ever shown. And an open inequality makes a large
+                // number a universal bypass, so `acknowledgeOccupancy=9999` would
+                // satisfy every force against every population. That is the boolean
+                // "proceed regardless" this design rejects, respelled.
+                //
+                // The mistake was collapsing two readings into one. What the
+                // operator was shown is settled here, before the sweep; what the
+                // sweep leaves behind is a different question, asked by
+                // [refuseArrivals].
+                is OccupancyAcknowledgement.Count -> observed == acknowledgement.players
             }
         if (matches) return
         throw ForcedTerminationRefused(
@@ -990,9 +1064,8 @@ public class NodeForcedTermination(
                 }
 
                 else -> {
-                    "`${name.value}` has $observed player(s) online, more than was acknowledged. Any who " +
-                        "cannot be transferred will be disconnected; re-send acknowledging at least $observed " +
-                        "if that is intended"
+                    "`${name.value}` has $observed player(s) online. Any who cannot be transferred will be " +
+                        "disconnected; re-send acknowledging exactly $observed if that is intended"
                 }
             },
         )
