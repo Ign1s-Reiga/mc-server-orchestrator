@@ -433,6 +433,39 @@ internal class ForcedSealTest {
         }
 
     @Test
+    fun `a decrease bigger than the sweep moved is not forgiven`() =
+        coreTest {
+            val destination = backendDefinition("survival-02", hostPort = 30002)
+            val harness = ProxyHarness(backends = listOf(backend, destination))
+            harness.bringUp()
+            val name = backend.metadata.name
+            val node = harness.nodeOf(backend)
+            node.online = 12
+            // The proxy knows about nine of them; three are connected straight to the
+            // backend's port, which the seal does not close and the proxy cannot see.
+            harness.plugin.backend(name.value)?.players = 9
+            harness.plugin.onTransfer = { harness.plugin.completeSweep(name.value) }
+            node.onExec = { command ->
+                // Nine move out, five join directly while the sweep runs: 12 -> 8.
+                if (command.joinToString(" ").contains("mc-monitor")) {
+                    if (harness.plugin.backend(name.value)?.players == 0) node.online = 8
+                }
+                node.defaultExec(command)
+            }
+
+            shouldThrow<ForcedTerminationRefused> {
+                terminationOver(harness).stop(backend, OccupancyAcknowledgement.Count(12))
+            }
+
+            // **A sweep having run is not a licence for any fall.** Nine moved, so a
+            // fall of nine is accounted for; the count fell by four, which means five
+            // arrived on the port behind them. `attempted` alone would have passed
+            // this — eight is less than twelve — and dropped five sessions nobody
+            // signed off, which is the masking case in a third disguise.
+            node.stops shouldHaveSize 0
+        }
+
+    @Test
     fun `a fleet with nowhere to put them still stops the server`() =
         coreTest {
             // One backend, so the only candidate is the server being drained.

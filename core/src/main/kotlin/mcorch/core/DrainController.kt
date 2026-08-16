@@ -3823,17 +3823,6 @@ internal class DrainController(
                 "can join while the seal is on, so that wait is what ends"
 
         /**
-         * Added to `spec.lifecycle.drain.playerTransferTimeout` per player.
-         *
-         * A fixed transfer allowance always fails on a full server
-         * (`docs/state-machine.md`), so the declared timeout is
-         * the floor and this is the slope. Together they are the **only** bound on
-         * step 4 — the retry limit the orchestrator was said to own is this, in the
-         * unit an operator can reason about.
-         */
-        private val PER_PLAYER_TRANSFER_ALLOWANCE = 2.seconds
-
-        /**
          * How long a drain may keep failing before it is reported as needing a
          * human. Long enough that an ordinary blocked drain — players online,
          * a node restarting — never trips it.
@@ -4889,6 +4878,23 @@ internal fun DrainStatus.unconfirmWorldSave(): DrainStatus = copy(worldSavedAt =
 internal fun DrainStatus.forgetSaveConfirmation(): DrainStatus = unconfirmWorldSave().copy(playersEvacuated = false)
 
 /**
+ * Added to `spec.lifecycle.drain.playerTransferTimeout` per player.
+ *
+ * A fixed transfer allowance always fails on a full server
+ * (`docs/state-machine.md`), so the declared timeout is the floor and this is the
+ * slope. Together they are the **only** bound on step 4 — the retry limit the
+ * orchestrator was said to own is this, in the unit an operator can reason about.
+ *
+ * Top-level and internal rather than private to this controller, because
+ * `NodeForcedTermination` issues the same sweep and needs the same derivation —
+ * `playerTransferTimeout + PER_PLAYER_TRANSFER_ALLOWANCE * online`. The fixed
+ * field on its own "always fails on a full server", which is exactly where the
+ * most sessions are at stake, so two copies of this number would fail differently
+ * on the servers that matter most.
+ */
+internal val PER_PLAYER_TRANSFER_ALLOWANCE: Duration = 2.seconds
+
+/**
  * Records that a container stop request is about to leave this process.
  *
  * Set once: a drain that already carries the record keeps the *first* instant,
@@ -4901,6 +4907,7 @@ internal fun DrainStatus.forgetSaveConfirmation(): DrainStatus = unconfirmWorldS
  * at both call sites, because it is the whole content of the record and a stamp
  * moved below the call would look identical to a reviewer.
  */
+
 internal fun DrainStatus.dispatchingStop(now: Instant): DrainStatus =
     copy(
         // Set once, as the field's own KDoc argues: there is no un-dispatch, and

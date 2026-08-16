@@ -2939,3 +2939,61 @@ Related: [[standalone-paper-drain-shape]]
      acknowledgement can be sent, each attempt costs a flush, and the definition is
      already tombstoned. Verify which side of an escape hatch a `null` falls to, and
      then check that *some* acknowledgement value is still reachable.
+
+## Round 58: the attribution guard with the comparison the wrong way round
+
+253. **An "explained by" bound must be an equality, because an inequality only ever
+     catches the benign direction.** With `reading = settled - departures + arrivals`
+     and `departures >= moved`, the clause `settled - reading > moved` fires exactly
+     when *more people left than the sweep moved* — harmless — and is silent
+     whenever arrivals hide under the sweep's own reduction. Its own comment's
+     worked example (acknowledge 12, move 9, five arrive, read 8) evaluates to
+     `4 > 9`, false, and proceeds. The sound arrival detector is the mirror,
+     `reading > settled - moved`, and the coherent rule is the equality
+     `reading == settled - moved`: a fall nothing accounts for refuses (which is the
+     no-transfer rule the same commit re-affirmed), a fall the sweep accounts for
+     passes, an arrival refuses. Whenever a guard forgives a change "up to" what
+     something else caused, write the expected value and compare to it; the
+     inequality is almost always oriented at the direction that cannot hurt you.
+254. **A guard's error direction under a mis-measured input is part of the design.**
+     `moved` is derived from the proxy's first and last `remaining`, so it
+     under-counts anything moved before the first response and it mixes populations
+     (proxy-visible) with the SLP readings either side of it. Under the equality
+     rule, under-counting raises `expected` and refuses benignly; over-counting is
+     impossible (`coerceAtLeast(0)`, and `remaining` only falls). State that
+     direction next to the rule — a guard whose input can only err safe is a
+     different object from one whose input can err either way.
+255. **"May not depend on" is worth checking against the build file and the import
+     list before it justifies a copy.** A timing bound was re-declared in `:core`
+     as `SWEEP_SUPERSEDE_WINDOW = 180.seconds` with the comment *"Named here rather
+     than imported because `:core` may not depend on the plugin's constants … see
+     the module note in CLAUDE.md"*. `core/build.gradle.kts` has
+     `implementation(project(":velocity-plugin"))`, two `:core` files already import
+     `mcorch.velocity.control.ControlProtocol`, and CLAUDE.md's actual sentence
+     permits the inward arrow *"so that the protocol version has one definition
+     rather than a copy in the reconciler"*. The copy is the thing the cited rule
+     forbids. Same commit also re-declared `PER_PLAYER_TRANSFER_ALLOWANCE` a second
+     time **inside the same module**. A review note that says "reuse the drain's
+     derivation" is satisfied by importing it, not by re-typing the number.
+256. **A KDoc that describes the behaviour a commit removed is worse than one that
+     is merely vague.** `refuseArrivals`'s doc still ends *"An unreadable reading
+     falls through to [refuseOccupancy]"* after the commit whose entire subject was
+     making an unreadable *later* reading proceed instead. Half of the sentence is
+     still true (`settled == null`), which is what makes it survive review. When a
+     function gains a branch for one of two nullable inputs, re-read every sentence
+     that says "null" and bind it to which one.
+257. **A probe added to size a timeout is a new reader of the player count, with a
+     `?: 0` on the population the feature exists for.** The sweep's allowance is
+     `playerTransferTimeout + 2s * (occupancy(...) ?: 0)` — a fresh exec, when the
+     settled reading holds the same quantity two statements up, and a null (the
+     wedged server this endpoint is for) silently deletes the per-player extension
+     that was just added because "a fixed value always fails on a full server". The
+     same expression is then `minOf(..., 180s)`, so the extension is inert above
+     thirty players anyway. Two fixes taken together can cancel; evaluate the
+     composed expression over the range that matters, not each fix on its own.
+258. **Bounding one RPC on a path leaves the siblings unbounded, and the reviewer's
+     own report is what scopes the fix.** `router.transfer` is now wrapped in
+     `withTimeout(remainingAllowance(...))` because `ControlChannel` carries the
+     *proxy's* `sealTimeout`. `link.assertAdmission` one function up, on the same
+     channel with the same field, is not — and it runs before everything. Item 49
+     again: the fix went to the call the report named.

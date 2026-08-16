@@ -9,6 +9,7 @@ import mcorch.core.DestinationChoice
 import mcorch.core.Node
 import mcorch.core.NodeException
 import mcorch.core.NodeRegistry
+import mcorch.core.PER_PLAYER_TRANSFER_ALLOWANCE
 import mcorch.core.ProxyFleet
 import mcorch.core.ReconcilerConfig
 import mcorch.core.Scheduler
@@ -31,10 +32,12 @@ import mcorch.store.Precondition
 import mcorch.store.Store
 import mcorch.store.StoreException
 import mcorch.store.WriteOutcome
+import mcorch.velocity.control.ControlProtocol
 import org.slf4j.LoggerFactory
 import java.time.Clock
 import java.time.Instant
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.toJavaDuration
 import kotlin.time.toKotlinDuration
@@ -277,6 +280,21 @@ internal fun forcedStopWindow(definition: PaperServerDefinition): Duration =
 public data class TransferAttempt(
     val attempted: Boolean,
     val remaining: Int? = null,
+    /**
+     * How many the sweep is known to have moved: the proxy's first reported count
+     * for this sweep, less its last.
+     *
+     * **Not the same question as [attempted]**, and the difference is a hole. A seal
+     * shuts the *proxy's* door and nothing else — `DrainSubject` says in as many
+     * words that a client connected straight to the backend's port is invisible to
+     * the proxy and visible to a Server List Ping. So "a sweep ran" cannot license a
+     * fall in the count: acknowledge twelve, move nine proxied players, let five
+     * join directly, and eight is a fall that hides five arrivals nobody signed off.
+     *
+     * Only a fall this number can account for is forgiven. Null when the proxy never
+     * reported one, which forgives nothing.
+     */
+    val moved: Int? = null,
 )
 
 /** There is no running workload to stop. */
@@ -382,7 +400,7 @@ public class NodeForcedTermination(
         // straight from the drain: a transferred player's playerdata is written by
         // *this* server as they quit, so sweeping first and flushing second is the
         // only order in which the flush covers them.
-        val transferred = transferPlayers(name, definition, agent, node, observation, sealed.router)
+        val transferred = transferPlayers(name, definition, players, sealed.router)
 
         // **The save is always requested, and the skip that used to sit here is
         // gone.**
@@ -602,9 +620,7 @@ public class NodeForcedTermination(
     private suspend fun transferPlayers(
         name: ResourceName,
         definition: PaperServerDefinition,
-        agent: PaperServerAgent,
-        node: Node,
-        observation: WorkloadObservation.Present,
+        settled: Int?,
         router: mcorch.core.DrainRouter?,
     ): TransferAttempt {
         if (router == null) return TransferAttempt(attempted = false)
@@ -638,7 +654,7 @@ public class NodeForcedTermination(
                 LOG.warn("forced stop server={} could not reach its proxy to transfer players", name.value, failure)
                 return TransferAttempt(attempted = false)
             }
-        return sweep(name, definition, agent, node, observation, router, destination)
+        return sweep(name, definition, settled, router, destination)
     }
 
     /**
@@ -651,9 +667,7 @@ public class NodeForcedTermination(
     private suspend fun sweep(
         name: ResourceName,
         definition: PaperServerDefinition,
-        agent: PaperServerAgent,
-        node: Node,
-        observation: WorkloadObservation.Present,
+        settled: Int?,
         router: mcorch.core.DrainRouter,
         destination: ResourceName,
     ): TransferAttempt {
@@ -672,10 +686,11 @@ public class NodeForcedTermination(
         // `SpecBounds` deliberately does not bound it.
         val declared =
             definition.spec.lifecycle.drain.playerTransferTimeout +
-                PER_PLAYER_TRANSFER_ALLOWANCE * (occupancy(agent, node, observation) ?: 0)
+                PER_PLAYER_TRANSFER_ALLOWANCE * (settled ?: 0)
         val allowance = minOf(declared, SWEEP_SUPERSEDE_WINDOW)
         val deadline = clock.instant().plus(allowance.toJavaDuration())
         var remaining: Int? = null
+        var firstReported: Int? = null
         var polled = false
         while (true) {
             // **Before the call, not after.** The plugin joins a sweep only while it
@@ -692,7 +707,11 @@ public class NodeForcedTermination(
                     allowance,
                     remaining ?: "an unknown number of",
                 )
-                return TransferAttempt(attempted = true, remaining = remaining)
+                return TransferAttempt(
+                    attempted = true,
+                    remaining = remaining,
+                    moved = movedBetween(firstReported, remaining),
+                )
             }
             polled = true
             // **Bounded by the transfer allowance, not by the channel's own
@@ -714,13 +733,22 @@ public class NodeForcedTermination(
                         name.value,
                         allowance,
                     )
-                    return TransferAttempt(attempted = true, remaining = remaining)
+                    return TransferAttempt(
+                        attempted = true,
+                        remaining = remaining,
+                        moved = movedBetween(firstReported, remaining),
+                    )
                 } catch (failure: NodeException) {
                     LOG.warn("forced stop server={} lost its proxy mid-transfer", name.value, failure)
-                    return TransferAttempt(attempted = true, remaining = remaining)
+                    return TransferAttempt(
+                        attempted = true,
+                        remaining = remaining,
+                        moved = movedBetween(firstReported, remaining),
+                    )
                 }
             when (report) {
                 is TransferReport.Sweeping -> {
+                    if (firstReported == null) firstReported = report.remaining
                     remaining = report.remaining
                     if (report.finished || report.remaining == 0) {
                         // `finished` means the proxy settled every request, not that
@@ -744,7 +772,11 @@ public class NodeForcedTermination(
                                 destination,
                             )
                         }
-                        return TransferAttempt(attempted = true, remaining = report.remaining)
+                        return TransferAttempt(
+                            attempted = true,
+                            remaining = report.remaining,
+                            moved = movedBetween(firstReported, report.remaining),
+                        )
                     }
                 }
 
@@ -758,7 +790,11 @@ public class NodeForcedTermination(
                         name.value,
                         report.detail,
                     )
-                    return TransferAttempt(attempted = true, remaining = remaining)
+                    return TransferAttempt(
+                        attempted = true,
+                        remaining = remaining,
+                        moved = movedBetween(firstReported, remaining),
+                    )
                 }
 
                 else -> {
@@ -768,7 +804,11 @@ public class NodeForcedTermination(
                         name.value,
                         destination,
                     )
-                    return TransferAttempt(attempted = true, remaining = remaining)
+                    return TransferAttempt(
+                        attempted = true,
+                        remaining = remaining,
+                        moved = movedBetween(firstReported, remaining),
+                    )
                 }
             }
             if (!clock.instant().isBefore(deadline)) {
@@ -779,7 +819,11 @@ public class NodeForcedTermination(
                     allowance,
                     remaining ?: "an unknown number of",
                 )
-                return TransferAttempt(attempted = true, remaining = remaining)
+                return TransferAttempt(
+                    attempted = true,
+                    remaining = remaining,
+                    moved = movedBetween(firstReported, remaining),
+                )
             }
             delay(TRANSFER_POLL)
         }
@@ -1054,8 +1098,17 @@ public class NodeForcedTermination(
         // in exactly the case it is needed.
         if (seal == SealResult.ASSERTED && !transferred.attempted) return previous
         val reading = occupancy(agent, node, observation)
-        refuseArrivals(name, previous, reading, acknowledgement, transferred.attempted)
+        refuseArrivals(name, previous, reading, acknowledgement, transferred)
         return reading
+    }
+
+    /** What the proxy's own numbers say the sweep moved, or null when it never said. */
+    private fun movedBetween(
+        first: Int?,
+        last: Int?,
+    ): Int? {
+        if (first == null || last == null) return null
+        return (first - last).coerceAtLeast(0)
     }
 
     /**
@@ -1085,15 +1138,18 @@ public class NodeForcedTermination(
      * is the hazard the compare-and-swap was built for — somebody arrived, and
      * nobody has acknowledged them.
      *
-     * An unreadable reading falls through to [refuseOccupancy], because "unknown"
-     * is not a number this can compare and `Unreadable` is the value that covers it.
+     * **Two different nulls, and they are not handled alike.** A null *settled*
+     * reading falls through to [refuseOccupancy] — there is no baseline to compare
+     * against, and `Unreadable` is the value that covers it. A null *later* reading
+     * returns and lets the stop proceed, because refusing there produced a server
+     * nothing could retire; see the note at that branch.
      */
     private fun refuseArrivals(
         name: ResourceName,
         settled: Int?,
         reading: Int?,
         acknowledgement: OccupancyAcknowledgement,
-        transferred: Boolean,
+        transferred: TransferAttempt,
     ) {
         if (settled == null) {
             refuseOccupancy(name, reading, acknowledgement)
@@ -1129,11 +1185,53 @@ public class NodeForcedTermination(
         // five sessions nobody acknowledged go with the stop. A sweep is the one
         // thing that can account for the difference, so it is the one thing that
         // buys the permission.
-        if (!transferred && reading != settled) {
+        if (!transferred.attempted) {
+            // Nothing reduced the count, so `main`'s exact rule stands. A fall with
+            // nothing to attribute it to is ten logouts hiding five arrivals.
             refuseOccupancy(name, reading, acknowledgement)
             return
         }
-        if (reading <= settled) return
+        // **The count must have fallen by everything the sweep moved.** `attempted`
+        // only says an RPC went out, and the seal shuts the *proxy's* door and
+        // nothing else — `DrainSubject` says in as many words that a client
+        // connected straight to the backend's port is invisible to the proxy and
+        // visible to this probe.
+        //
+        // So the arithmetic, not the flag: nine moved off a server that held twelve
+        // should leave three. Eight means five arrived on the port behind them, and
+        // forgiving it because "a sweep ran" drops five sessions nobody signed off —
+        // the masking case in a third disguise. Fewer than three is extra logouts,
+        // which is the safe direction.
+        // Floored at zero, because the proxy's number and this probe's are allowed
+        // to disagree — the drain reads SLP for every decision and logs the proxy's
+        // count when it differs, precisely because neither sees what the other does.
+        // A sweep reporting more moved than SLP ever saw is that disagreement, not
+        // evidence of anything, and a negative expectation would refuse an empty
+        // server.
+        val expected = (settled - (transferred.moved ?: 0)).coerceAtLeast(0)
+        if (reading < expected) {
+            // **Fewer than the sweep can explain, which is not automatically safe.**
+            // Extra departures raise the band that arrivals can hide inside: five
+            // direct players leave while five join, and a reading of exactly
+            // `expected` would pass with five unacknowledged sessions on it. So the
+            // rule is an equality, not a bound — the tightest an SLP total allows,
+            // since a count cannot distinguish churn from stillness.
+            //
+            // The refusal is benign and terminates: `moved` can only under-count (it
+            // starts at the sweep's first reported `remaining`, and mixes the
+            // proxy's view with this probe's), under-counting raises `expected`, and
+            // the operator re-sends against the number this names. Over-counting
+            // cannot happen — `remaining` only falls.
+            refuseOccupancy(name, reading, acknowledgement)
+            return
+        }
+        if (reading == expected) return
+        throw ForcedTerminationRefused(
+            "`${name.value}` has $reading player(s) online after a transfer that moved " +
+                "${transferred.moved ?: 0} of the $settled this stop was authorised against, so at least " +
+                "${reading - expected} joined since — directly, past the proxy's door. Re-send acknowledging " +
+                "exactly $reading if that is intended",
+        )
         throw ForcedTerminationRefused(
             "`${name.value}` now has $reading player(s) online, up from the $settled this stop was " +
                 "authorised against, so somebody has joined since. Re-send acknowledging exactly $reading " +
@@ -1327,16 +1425,20 @@ public class NodeForcedTermination(
          */
         private val TRANSFER_POLL: Duration = 2.seconds
 
-        /** The drain's per-player extension, from `DrainController`'s own derivation. */
-        private val PER_PLAYER_TRANSFER_ALLOWANCE: Duration = 2.seconds
-
         /**
-         * How long the proxy keeps a sweep joinable, from
-         * `ControlProtocol.SWEEP_MAX_AGE_MS`. Named here rather than imported
-         * because `:core` may not depend on the plugin's constants for a timing
-         * bound — see the module note in CLAUDE.md.
+         * How long the proxy keeps a sweep joinable, **imported rather than
+         * copied**.
+         *
+         * A previous version restated it as `180.seconds` with a comment saying
+         * `:core` may not name the plugin's constants. That was false and
+         * disprovable from the build file: `core/build.gradle.kts` declares
+         * `implementation(project(":velocity-plugin"))`, `ControlChannel` and
+         * `VelocityWorkloadPlanner` already import `ControlProtocol`, and CLAUDE.md
+         * permits exactly this arrow *"so that the protocol version has one
+         * definition rather than a copy in the reconciler"*. A copy drifts silently
+         * the first time the plugin moves its own number.
          */
-        private val SWEEP_SUPERSEDE_WINDOW: Duration = 180.seconds
+        private val SWEEP_SUPERSEDE_WINDOW: Duration = ControlProtocol.SWEEP_MAX_AGE_MS.milliseconds
 
         private val LOG = LoggerFactory.getLogger(NodeForcedTermination::class.java)
     }

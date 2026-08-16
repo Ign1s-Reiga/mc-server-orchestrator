@@ -425,6 +425,11 @@ internal class ServerRoutes(
             describeAcknowledgement(acknowledgement),
             drainState ?: "none",
             outcome.transfer.attempted,
+            // Both halves, because `attempted` alone reads as an evacuation. A sweep
+            // the proxy settled with failures leaves people behind, and this line is
+            // the audit record until the sink in `spec/termination` §6 exists.
+            outcome.transfer.moved ?: "unknown",
+            outcome.transfer.remaining ?: "unknown",
             outcome.saveAttempted,
             outcome.saveConfirmed,
             outcome.playersOnline ?: "unknown",
@@ -438,6 +443,7 @@ internal class ServerRoutes(
                 // standalone server, an unsealable proxy, a fleet with nowhere to put
                 // them — and never a failure of the stop.
                 put("transferAttempted", outcome.transfer.attempted)
+                put("playersTransferMoved", Json.of(outcome.transfer.moved))
                 put("playersTransferRemaining", Json.of(outcome.transfer.remaining))
                 put("saveAttempted", outcome.saveAttempted)
                 put("saveConfirmed", outcome.saveConfirmed)
