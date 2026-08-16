@@ -418,12 +418,18 @@ internal class ServerRoutes(
             // says what population the operator signed off; without the second,
             // nothing says how far the drain had got when they gave up on it. The
             // status row that would answer either is purged by teardown.
-            "forced stop identity={} server={} acknowledged={} drainState={} saveAttempted={} " +
-                "saveConfirmed={} playersOnline={}",
+            "forced stop identity={} server={} acknowledged={} drainState={} transferAttempted={} " +
+                "transferMoved={} transferRemaining={} saveAttempted={} saveConfirmed={} playersOnline={}",
             principal.name,
             name.value,
             describeAcknowledgement(acknowledgement),
             drainState ?: "none",
+            outcome.transfer.attempted,
+            // Both halves, because `attempted` alone reads as an evacuation. A sweep
+            // the proxy settled with failures leaves people behind, and this line is
+            // the audit record until the sink in `spec/termination` §6 exists.
+            outcome.transfer.moved ?: "unknown",
+            outcome.transfer.remaining ?: "unknown",
             outcome.saveAttempted,
             outcome.saveConfirmed,
             outcome.playersOnline ?: "unknown",
@@ -433,6 +439,12 @@ internal class ServerRoutes(
             jsonObject {
                 put("accepted", true)
                 put("forced", true)
+                // Drain step 4's result. `transferAttempted: false` is ordinary — a
+                // standalone server, an unsealable proxy, a fleet with nowhere to put
+                // them — and never a failure of the stop.
+                put("transferAttempted", outcome.transfer.attempted)
+                put("playersTransferMoved", Json.of(outcome.transfer.moved))
+                put("playersTransferRemaining", Json.of(outcome.transfer.remaining))
                 put("saveAttempted", outcome.saveAttempted)
                 put("saveConfirmed", outcome.saveConfirmed)
                 // Null means the server did not answer a count. It is not zero, and

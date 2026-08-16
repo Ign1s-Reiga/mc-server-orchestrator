@@ -2796,3 +2796,204 @@ Related: [[standalone-paper-drain-shape]]
      blast radius is fleet-wide — and stating the distinction is what stops a
      reviewer's severity inflating with the size of the diff. Rank on what is lost,
      not on how much code moved.
+
+## Round 56: the step that empties the server for somebody else
+
+239. **A step whose whole purpose is to remove players removes the precondition a
+     *different* component was parked on.** Before drain step 4 landed on the
+     forced path, a concurrent reconcile drain over the same tombstoned server was
+     structurally stuck at `requireEmpty` for as long as anybody was online — so
+     the force's long `requestSave` could not collide with a loop-issued stop on a
+     populated server. The sweep is precisely the thing that unparks it: the loop's
+     ladder from `SEALED` to `STOPPING` is ~6 passes at a 1 s `stepInterval`, and
+     the force is still inside one probe plus a `saveTimeout` that, for this
+     endpoint's population, does not confirm. The force never writes
+     `saveRequestedAt`, so the loop's `save()` sees no outstanding request and
+     issues its own flush. Whenever a new step *satisfies* a gate some other path
+     is blocked on, enumerate what that path then does and how far the caller has
+     got by the time it does it.
+240. **A guard evaluated at function entry is only as fresh as the longest thing
+     between it and the side effect it guards.** `refuseSecondSideEffect` runs at
+     the top of `stop()`; inserting a poll loop bounded by a spec field puts the
+     whole transfer allowance between the check and both `requestSave` and
+     `stopWorkload`. The fix is not a better guard, it is re-running the existing
+     one immediately above the side effect — cheap here because that refusal's
+     remedy is "wait for the grace window and re-send", which is answerable from
+     below a tombstone (unlike the ones item 208 covers).
+241. **Relaxing a compare-and-swap to an inequality to accommodate a legitimate
+     decrease deletes the detection of an illegitimate one, because a single
+     reading cannot tell them apart.** `Count(n)` satisfied by *at most* n was
+     forced by a partial sweep (nine of twelve moved). It also passes 8 against an
+     acknowledged 12 when 9 left and 5 arrived. The general shape: if a step
+     between the operator's reading and the check legitimately moves the quantity,
+     take the check's reading **before** that step and keep the exact match; use
+     the after-reading only for the record, with a monotonicity assert. Widening
+     the comparator instead makes a large acknowledged number a universal bypass —
+     item 211's boolean, respelled as `acknowledgeOccupancy=9999` — and it silently
+     weakens every *other* call site of the shared predicate, including the one
+     (`preflight`) that has no reducing step above it at all.
+242. **A clamp deliberately *not* applied, justified by "nothing waits on this
+     field", is the mirror of item 204 and fails the same way.** `SpecBounds`
+     excludes `playerTransferTimeout` with the reasoning *"wall-clock comparisons —
+     the loop records an instant and compares against it on a later pass — not
+     deadlines on a call, so an absurd value there parks nothing. They were
+     examined and cleared."* A poll loop inside an HTTP request makes it a deadline
+     on a call. `SpecBoundsTest` pins that 40 h survives the decode, and the YAML
+     reader's 1 s…1 h range does not protect a hand-edited store row. Grep `:schema`
+     for *both* directions of justification — "safe because the drain confirmed"
+     (item 204) and "unbounded because nothing waits on it" — before making any
+     field the bound of a new wait.
+243. **The counterparty's own supersede window can be smaller than the bound the
+     poller is using.** `ControlProtocol.SWEEP_MAX_AGE_MS` is 180 s: a sweep older
+     than that stops being joinable and the next `POST .../transfer` starts a fresh
+     one, re-issuing a connection request to every remaining player. A poller whose
+     KDoc says *"start-or-join, so re-asking reads progress rather than starting a
+     second sweep"* is telling the truth only below three minutes, and
+     `playerTransferTimeout` reaches an hour. When a claim about idempotence comes
+     from the far side of a wire, find the far side's expiry constant and compare
+     it against the near side's loop bound.
+244. **A poll loop's timeout branch is untestable when the clock is manual and the
+     sleep is real.** `coreTest` is `runBlocking` and `MutableClock` only advances
+     by hand, so `while (…) { …; if (clock.now >= deadline) return; delay(2.s) }`
+     can only exit via the counterparty finishing — the fake completes the sweep
+     from inside its handler, which is the path that is green. A fake that does not
+     finish hangs the build rather than exercising the bound. Before believing a
+     "bounded, then it proceeds" claim, find the test that reaches the bound; if the
+     suite's clock cannot advance underneath a real `delay`, there is none and there
+     cannot be one without injecting the interval.
+245. **A side effect on players placed above the refusal that decides the request.**
+     The sweep runs before `refuseOccupancy`, so a force that answers 409 has
+     already moved people to another server — and the audit log line that would say
+     so is only reached on the success path, so the refusal reports nothing about
+     the transfer that happened. Item 207's shape with a player-visible effect
+     instead of a store write: for every refusal in a handler, ask what has already
+     happened *to players*, not only what has been written.
+246. **`unmoved` is the number that names the people about to be disconnected, and
+     it is the one that got dropped.** `TransferReport.Sweeping` carries
+     `remaining`, `unmoved` and `finished`; the forced path keeps only `remaining`,
+     and logs "transferred its players before stopping" at INFO on
+     `finished = true` even when `remaining > 0`. The drain's own log quotes both.
+     Item 237: check which of a value's homes survive the event it describes, and
+     item 27: read what the message asserts against the branch that reached it.
+
+## Round 57: the fix that moved the weakening instead of removing it
+
+247. **Two mechanisms introduced by one change can be mutually exclusive, and then
+     each one's justification describes the other's path.** The forced path's sweep
+     runs only when `sealOff` returned `ASSERTED` (that is the only way a router is
+     carried); `readingBeforeStop` returns early on `ASSERTED`, so `refuseArrivals`
+     runs only when it is *not*. A sweep therefore never happens on any path the
+     arrivals check can see, and the arrivals check never protects a transferred
+     population — while its KDoc opens *"after a sweep the two cannot be the same
+     number, because moving players is the point"*. Worse, the permission it grants
+     (a decrease passes) was justified by the sweep and lands on the standalone
+     path, where nothing can have caused the decrease: churn — ten leave, five
+     arrive — reads as a decrease and stops the server over five unacknowledged
+     sessions that `main`'s exact re-check refused. When a change adds a relaxation
+     *and* a compensating check, compute the intersection of the conditions under
+     which each runs; if it is empty, the relaxation is unpaid for and the check is
+     decoration.
+248. **Excusing a decrease requires knowing what caused it, and two scalars cannot
+     say.** The right shape is not "the count fell, so it is fine" but "the count
+     fell by no more than what this request removed" — gate the permissive branch on
+     the side effect having actually run (`TransferAttempt.attempted`), so that a
+     path where nothing could have reduced it keeps the exact match. A monotone
+     comparison between two readings of an unsealed population is indistinguishable
+     from a full turnover.
+249. **A re-asked guard is only as good as the side effect it is placed above, and
+     the second one is usually the dangerous one.** Re-asking
+     `refuseSecondSideEffect` above `requestSave` catches a stop dispatched before
+     the save starts. The loop's concurrent drain reaches `STOPPING` three to six
+     passes after the server empties, while the force is one poll behind and then
+     inside a `saveTimeout` that, for this population, runs to the full 180 s — so
+     the loop's stop reliably lands *during* the force's save, on the far side of
+     the guard. A guard against "somebody else already stopped this" belongs
+     immediately above `stopWorkload`, where the field it reads has had the save's
+     whole duration to appear. Placing it above the earlier side effect reads as
+     defence in depth and is close to inert for the ordering that actually occurs.
+250. **A comment block left at the old location asserts the reversed rule as
+     current.** When a call moves, the paragraph that justified its old position
+     stays where it was and the new paragraph is written at the new one — so
+     `stop()` now carries *"Before the probe rather than after … should not then be
+     refused over the three that remain"* twenty lines above *"below the refusal
+     rather than above it"*, both in the present tense, both about the same call.
+     Whoever reads the function top-to-bottom meets the retired rationale first.
+     After any reordering, grep the moved symbol's old neighbourhood, not just its
+     new one.
+251. **Moving the reading earlier fixes the gate and breaks the record.** With the
+     sweep below the deciding probe, `atStop` on a sealed server is now the
+     *pre-sweep* count, so `ForcedStopOutcome.playersOnline` and the route's audit
+     line report twelve dropped for a stop that dropped three — and the field's own
+     KDoc still justifies the staleness with *"under the seal the number can only
+     fall"*, which now over-states by the entire rescued population rather than by
+     decay. The feature's benefit is invisible in the one number an investigator
+     reads. A gate and an audit record want readings from different instants; when
+     one moves, check the other did not inherit it.
+252. **A `null` fall-through can be the safe direction for a gate and the
+     unrecoverable one for an escape hatch.** `refuseArrivals`'s
+     `settled == null || reading == null -> refuseOccupancy(...)` is not round 52's
+     `null == 0` bypass — nothing reads null as zero — but it inherits a two-sided
+     lockout that predates it: a server whose SLP answers when idle and times out
+     during `save-all flush` refuses `Count(n)` at the pre-stop reading (null) and
+     refuses `Unreadable` at the pre-sweep reading (answers n), so neither
+     acknowledgement can be sent, each attempt costs a flush, and the definition is
+     already tombstoned. Verify which side of an escape hatch a `null` falls to, and
+     then check that *some* acknowledgement value is still reachable.
+
+## Round 58: the attribution guard with the comparison the wrong way round
+
+253. **An "explained by" bound must be an equality, because an inequality only ever
+     catches the benign direction.** With `reading = settled - departures + arrivals`
+     and `departures >= moved`, the clause `settled - reading > moved` fires exactly
+     when *more people left than the sweep moved* — harmless — and is silent
+     whenever arrivals hide under the sweep's own reduction. Its own comment's
+     worked example (acknowledge 12, move 9, five arrive, read 8) evaluates to
+     `4 > 9`, false, and proceeds. The sound arrival detector is the mirror,
+     `reading > settled - moved`, and the coherent rule is the equality
+     `reading == settled - moved`: a fall nothing accounts for refuses (which is the
+     no-transfer rule the same commit re-affirmed), a fall the sweep accounts for
+     passes, an arrival refuses. Whenever a guard forgives a change "up to" what
+     something else caused, write the expected value and compare to it; the
+     inequality is almost always oriented at the direction that cannot hurt you.
+254. **A guard's error direction under a mis-measured input is part of the design.**
+     `moved` is derived from the proxy's first and last `remaining`, so it
+     under-counts anything moved before the first response and it mixes populations
+     (proxy-visible) with the SLP readings either side of it. Under the equality
+     rule, under-counting raises `expected` and refuses benignly; over-counting is
+     impossible (`coerceAtLeast(0)`, and `remaining` only falls). State that
+     direction next to the rule — a guard whose input can only err safe is a
+     different object from one whose input can err either way.
+255. **"May not depend on" is worth checking against the build file and the import
+     list before it justifies a copy.** A timing bound was re-declared in `:core`
+     as `SWEEP_SUPERSEDE_WINDOW = 180.seconds` with the comment *"Named here rather
+     than imported because `:core` may not depend on the plugin's constants … see
+     the module note in CLAUDE.md"*. `core/build.gradle.kts` has
+     `implementation(project(":velocity-plugin"))`, two `:core` files already import
+     `mcorch.velocity.control.ControlProtocol`, and CLAUDE.md's actual sentence
+     permits the inward arrow *"so that the protocol version has one definition
+     rather than a copy in the reconciler"*. The copy is the thing the cited rule
+     forbids. Same commit also re-declared `PER_PLAYER_TRANSFER_ALLOWANCE` a second
+     time **inside the same module**. A review note that says "reuse the drain's
+     derivation" is satisfied by importing it, not by re-typing the number.
+256. **A KDoc that describes the behaviour a commit removed is worse than one that
+     is merely vague.** `refuseArrivals`'s doc still ends *"An unreadable reading
+     falls through to [refuseOccupancy]"* after the commit whose entire subject was
+     making an unreadable *later* reading proceed instead. Half of the sentence is
+     still true (`settled == null`), which is what makes it survive review. When a
+     function gains a branch for one of two nullable inputs, re-read every sentence
+     that says "null" and bind it to which one.
+257. **A probe added to size a timeout is a new reader of the player count, with a
+     `?: 0` on the population the feature exists for.** The sweep's allowance is
+     `playerTransferTimeout + 2s * (occupancy(...) ?: 0)` — a fresh exec, when the
+     settled reading holds the same quantity two statements up, and a null (the
+     wedged server this endpoint is for) silently deletes the per-player extension
+     that was just added because "a fixed value always fails on a full server". The
+     same expression is then `minOf(..., 180s)`, so the extension is inert above
+     thirty players anyway. Two fixes taken together can cancel; evaluate the
+     composed expression over the range that matters, not each fix on its own.
+258. **Bounding one RPC on a path leaves the siblings unbounded, and the reviewer's
+     own report is what scopes the fix.** `router.transfer` is now wrapped in
+     `withTimeout(remainingAllowance(...))` because `ControlChannel` carries the
+     *proxy's* `sealTimeout`. `link.assertAdmission` one function up, on the same
+     channel with the same field, is not — and it runs before everything. Item 49
+     again: the fix went to the call the report named.

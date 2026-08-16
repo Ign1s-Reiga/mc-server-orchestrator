@@ -2,6 +2,7 @@ package mcorch.core
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import mcorch.schema.ConditionType
 import mcorch.schema.DrainSpec
 import mcorch.schema.HeapSpec
@@ -45,8 +46,31 @@ import kotlin.time.toJavaDuration
  * warning, so the suite goes green having run nothing. Every suspending test
  * here goes through this, which returns `Unit` explicitly, so that cannot
  * happen.
+ *
+ * The body is also bounded. A suspending test that awaits something the code
+ * under test never delivers does not fail: `runBlocking` parks, and the run
+ * hangs for as long as anything is willing to wait — on CI until the job
+ * timeout, locally until somebody notices. One parked here for two hours
+ * having spent ten seconds of CPU. [DEFAULT_TEST_TIMEOUT] makes that a
+ * failure that names the test instead, which is the whole difference between
+ * a diagnosis and a killed run.
+ *
+ * Nothing correct in this module needs the time. Every test drives a
+ * [MutableClock] it moves by hand precisely so elapsed time is not something
+ * the suite waits out. Pass [timeout] to widen it for one test that genuinely
+ * does, rather than raising the default for all of them.
  */
-internal fun coreTest(body: suspend CoroutineScope.() -> Unit): Unit = runBlocking(block = body)
+internal fun coreTest(
+    timeout: Duration = DEFAULT_TEST_TIMEOUT,
+    body: suspend CoroutineScope.() -> Unit,
+): Unit = runBlocking { withTimeout(timeout) { body() } }
+
+/**
+ * Long enough that a loaded machine cannot fail a correct test — this module's
+ * entire suite runs in well under a minute — and short enough that a hang
+ * surfaces as something read rather than something killed.
+ */
+internal val DEFAULT_TEST_TIMEOUT: Duration = 60.seconds
 
 /**
  * A clock the test moves by hand.

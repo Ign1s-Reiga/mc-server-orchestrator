@@ -545,6 +545,88 @@ internal class NodeForcedTerminationTest {
         }
 
     @Test
+    fun `a server that stops answering during the save is still forceable`() =
+        coreTest {
+            val node = FakeNode()
+            node.online = 5
+            running(node)
+            observed()
+            // A big world: answers a ping when idle, times out while `save-all flush`
+            // has the main thread. So the settled reading is 5 and the pre-stop one
+            // cannot answer at all.
+            node.onExec = { command ->
+                if (command.joinToString(" ").contains("save-all")) node.joinable = false
+                node.defaultExec(command)
+            }
+
+            val outcome = terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.Count(5))
+
+            // **The alternating lockout this closes.** The pre-stop reading used to
+            // fall through and demand `Unreadable`; `Unreadable` was then refused by
+            // the settled reading, which answers 5. Neither acknowledgement was
+            // sendable, every attempt cost a flush, and the definition was already
+            // tombstoned — `crictl` only, which is the state this endpoint exists to
+            // remove.
+            //
+            // An unanswered probe is not evidence that anybody arrived, and arrivals
+            // are the only thing this check is for. The operator authorised five.
+            node.stops shouldHaveSize 1
+            // And the record does not invent a number it never read.
+            outcome.playersOnline shouldBe null
+        }
+
+    @Test
+    fun `an acknowledgement larger than the population is not a blank cheque`() =
+        coreTest {
+            val node = FakeNode()
+            node.online = 8
+            running(node)
+            observed()
+
+            // **The bypass a relaxed comparator would have opened.** An earlier
+            // version of the transfer work changed `Count(n)` to mean "at most n" so
+            // a partial sweep would not be refused over the players it left. That
+            // makes any large number satisfy any population — the boolean "proceed
+            // regardless" this design rejects, respelled as 9999 and in the runbook
+            // within a week.
+            //
+            // The acknowledgement names what the operator was shown. Nothing else.
+            shouldThrow<ForcedTerminationRefused> {
+                terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.Count(9999))
+            }.message.toString() shouldContain "8 player"
+            node.stops shouldHaveSize 0
+        }
+
+    @Test
+    fun `a count that fell with no transfer to explain it still refuses`() =
+        coreTest {
+            val node = FakeNode()
+            node.online = 6
+            running(node)
+            observed()
+            // Standalone, so the pre-stop reading really is taken again — and by
+            // then two have logged off.
+            node.onExec = { command ->
+                if (command.joinToString(" ").contains("save-all")) node.online = 4
+                node.defaultExec(command)
+            }
+
+            // **A fall is only forgiven when something can be shown to have caused
+            // it.** This server is standalone, so no sweep ran and nothing here
+            // reduced the count — the four are simply a different four from the six,
+            // and "at most six" would let two arrivals through behind ten logouts.
+            //
+            // The permission to accept a decrease lives with the transfer that earns
+            // it. Without one, this is `main`'s exact rule and stays that way; the
+            // first version of this test asserted the opposite and was pinning a
+            // weakening, on a path where no transfer is even reachable.
+            shouldThrow<ForcedTerminationRefused> {
+                terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.Count(6))
+            }.message.toString() shouldContain "4 player"
+            node.stops shouldHaveSize 0
+        }
+
+    @Test
     fun `the reported count is the one from just before the stop`() =
         coreTest {
             val node = FakeNode()

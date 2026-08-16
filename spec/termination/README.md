@@ -81,15 +81,30 @@ and **the reason it stopped being optional is the interesting part**:
   between the read and the write, and on an unsealed server nothing owns the
   player count for a millisecond. The mechanism was not implementable without
   step 2. A follow-up that turns out to be a premise is not a follow-up.
-- **Attempt a player transfer.** The drain's step 4. Still owed. Forcing
-  disconnects, and the API says so plainly rather than implying otherwise — which
-  is the difference between this and the seal: an operator who has acknowledged a
-  count knows those sessions are being dropped, and nothing else in the path
-  quietly depends on the transfer having happened.
+- ~~**Attempt a player transfer.**~~ **Done.** The drain's step 4, issued once and
+  given `spec.lifecycle.drain.playerTransferTimeout` to get somewhere, then the
+  stop proceeds with whoever is left. Never a refusal: a proxy that cannot resolve
+  a destination, a fleet with no capacity, a sweep that will not run — none of
+  them is a reason to leave a server unretirable, which is the state this endpoint
+  exists to remove.
 
-The rest are deliberate and permanent: `requireEmpty` is replaced by a counted
-acknowledgement read under the seal, the save is requested but may not be
-sendable, deregistration is left to the loop, and `mayStop` is bypassed — which
+  Attempted only under an asserted seal, and only before the deciding probe. The
+  first because sweeping players off a server that is still admitting races logins
+  the sweep cannot see the end of, which is why the drain never reaches step 4
+  from a state that has not held the door shut. The second so the count the
+  acknowledgement is checked against is the one that survives the attempt.
+
+  The first draft put the sweep *above* the deciding refusal, which forced the
+  acknowledgement's comparator open to "at most n" so a partial sweep would not be
+  refused over the players it left. That was a bypass: any large number then
+  satisfied any population, which is the boolean this design rejects, respelled.
+  The sweep sits below the refusal instead, and the two readings are kept apart —
+  the acknowledgement settles what the operator was shown, and a separate check
+  refuses only if the count has **risen** since.
+
+Nothing is owed now. The rest are deliberate and permanent: `requireEmpty` is
+replaced by a counted acknowledgement read under the seal, the save is always
+requested, deregistration is left to the loop, and `mayStop` is bypassed — which
 is the feature.
 
 **One residual, stated rather than buried.** A *standalone* server has no proxy,

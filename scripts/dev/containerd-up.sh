@@ -61,12 +61,21 @@ fi
 # ─── install ─────────────────────────────────────────────────────────────────
 
 TMP_DIR=""
-cleanup() { [ -n "${TMP_DIR}" ] && rm -rf "${TMP_DIR}"; }
+# `if`, not `[ … ] && …`. An `&&` list whose test fails returns 1, that 1 is the
+# function's return value, and a non-zero command in an EXIT trap under `set -e`
+# becomes the script's exit status — overriding even an explicit `exit 0`. This
+# script reported success and exited 1 for every run that reached the end.
+cleanup() {
+    if [ -n "${TMP_DIR}" ]; then rm -rf "${TMP_DIR}"; fi
+}
 trap cleanup EXIT
 
-tmpdir() {
+# Sets [TMP_DIR]; it does not print it. Deliberately not a function you read with
+# `$(…)`: command substitution runs in a subshell, so the assignment would be
+# discarded, every caller would get a directory of its own, and the trap above
+# would find nothing to remove — one leaked directory per download, every run.
+ensure_tmpdir() {
     [ -n "${TMP_DIR}" ] || TMP_DIR="$(mktemp -d)"
-    echo "${TMP_DIR}"
 }
 
 # Download and verify against a pinned checksum. A mismatch aborts — we are
@@ -88,15 +97,27 @@ the pinned checksum in scripts/dev/containerd-env.sh after verifying it yourself
 
 installed_version() { "$1" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1; }
 
+# Takes the path this script would install to, not a name to look up.
+#
+# A PATH lookup answers "is there a containerd on this machine", which is not
+# the question. This instance runs the binary at its own pinned path and nothing
+# else; a host that already has one somewhere on PATH — every GitHub runner does,
+# because Docker ships it — would satisfy a PATH check, skip the install, and
+# leave the pinned path empty for the launch below to fail on. That is not
+# hypothetical: it is how CI first failed here, with `installing: runc crictl
+# cni-plugins` and then `/usr/local/bin/containerd: command not found`.
+#
+# WSL2 never has containerd pre-installed, so the two questions had the same
+# answer everywhere this had been run until then.
 need_install() {
-    local bin="$1" want="$2"
-    command -v "${bin}" >/dev/null 2>&1 || return 0
-    [ "$(installed_version "$(command -v "${bin}")")" = "${want}" ] || return 0
+    local path="$1" want="$2"
+    [ -x "${path}" ] || return 0
+    [ "$(installed_version "${path}")" = "${want}" ] || return 0
     return 1
 }
 
 install_containerd() {
-    local t; t="$(tmpdir)"
+    ensure_tmpdir; local t="${TMP_DIR}"
     fetch_verified \
         "https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz" \
         "${CONTAINERD_SHA256}" "${t}/containerd.tgz"
@@ -106,7 +127,7 @@ install_containerd() {
 }
 
 install_runc() {
-    local t; t="$(tmpdir)"
+    ensure_tmpdir; local t="${TMP_DIR}"
     fetch_verified \
         "https://github.com/opencontainers/runc/releases/download/v${RUNC_VERSION}/runc.amd64" \
         "${RUNC_SHA256}" "${t}/runc"
@@ -117,7 +138,7 @@ install_runc() {
 }
 
 install_cni_plugins() {
-    local t; t="$(tmpdir)"
+    ensure_tmpdir; local t="${TMP_DIR}"
     fetch_verified \
         "https://github.com/containernetworking/plugins/releases/download/v${CNI_PLUGINS_VERSION}/cni-plugins-linux-amd64-v${CNI_PLUGINS_VERSION}.tgz" \
         "${CNI_PLUGINS_SHA256}" "${t}/cni.tgz"
@@ -128,7 +149,7 @@ install_cni_plugins() {
 }
 
 install_crictl() {
-    local t; t="$(tmpdir)"
+    ensure_tmpdir; local t="${TMP_DIR}"
     fetch_verified \
         "https://github.com/kubernetes-sigs/cri-tools/releases/download/v${CRICTL_VERSION}/crictl-v${CRICTL_VERSION}-linux-amd64.tar.gz" \
         "${CRICTL_SHA256}" "${t}/crictl.tgz"
@@ -138,9 +159,9 @@ install_crictl() {
 }
 
 want=()
-need_install containerd "${CONTAINERD_VERSION}" && want+=(containerd)
-need_install runc "${RUNC_VERSION}" && want+=(runc)
-need_install crictl "${CRICTL_VERSION}" && want+=(crictl)
+need_install "${INSTALL_BIN_DIR}/containerd" "${CONTAINERD_VERSION}" && want+=(containerd)
+need_install "${INSTALL_SBIN_DIR}/runc" "${RUNC_VERSION}" && want+=(runc)
+need_install "${INSTALL_BIN_DIR}/crictl" "${CRICTL_VERSION}" && want+=(crictl)
 [ "$(cat "${CNI_STAMP}" 2>/dev/null || true)" = "${CNI_PLUGINS_VERSION}" ] || want+=(cni-plugins)
 
 if [ ${#want[@]} -gt 0 ]; then

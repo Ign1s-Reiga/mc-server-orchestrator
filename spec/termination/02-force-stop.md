@@ -53,7 +53,7 @@ likely to do permanent damage. An immediate kill is therefore not what it does.
 | Step | Ordinary delete | Force |
 |---|---|---|
 | Seal the proxy, stop new joins | Yes | Yes — free, and it costs nothing to keep |
-| Transfer players out | Wait until zero | **Attempt, then proceed** |
+| Transfer players out | Wait until zero | **Attempt once, then proceed** — under an asserted seal, below the occupancy refusal |
 | Request a world save | Yes | Yes — **always** |
 | Wait for save confirmation | Until confirmed, or fail the drain | Wait the full save timeout, then **proceed unconfirmed** |
 | Retry a failed drain | Yes, with backoff | **No** |

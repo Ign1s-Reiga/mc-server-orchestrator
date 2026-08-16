@@ -133,11 +133,21 @@ public data class BoundedDefinition(
  *
  * ## Two fields are deliberately not here
  *
- * `startupTimeout` and `spec.lifecycle.drain.playerTransferTimeout` are wall-clock
- * comparisons — the loop records an instant and compares against it on a later
- * pass — not deadlines on a call, so an absurd value there parks nothing. They
- * were examined and cleared. Do not "make it consistent" by adding them: a bound
- * on a field nothing waits on is a behaviour change with no defect behind it.
+ * `startupTimeout` is a wall-clock comparison — the loop records an instant and
+ * compares against it on a later pass — not a deadline on a call, so an absurd
+ * value there parks nothing. It was examined and cleared. Do not "make it
+ * consistent" by adding it: a bound on a field nothing waits on is a behaviour
+ * change with no defect behind it.
+ *
+ * **`spec.lifecycle.drain.playerTransferTimeout` was cleared on the same reasoning
+ * and no longer qualifies.** `NodeForcedTermination` waits it out inside an HTTP
+ * request, so it *is* a deadline on a call now, and on the last-resort path. It is
+ * still not bounded here — the wait is clamped in `:core`, at the one site that
+ * does the waiting, because the drain's use of the field remains a wall-clock
+ * comparison that a decode-time ceiling would change for no reason. The sentence
+ * above is left standing for `startupTimeout` and corrected for this field rather
+ * than deleted, because the next person to read it needs to know it was rechecked
+ * rather than overlooked.
  */
 public object SpecBounds {
     /** Two hours: the widest `stopGracePeriod` `PaperServerReader` accepts. */

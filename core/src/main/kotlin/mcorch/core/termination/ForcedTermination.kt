@@ -1,15 +1,21 @@
 package mcorch.core.termination
 
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+import mcorch.core.DestinationChoice
 import mcorch.core.Node
 import mcorch.core.NodeException
 import mcorch.core.NodeRegistry
+import mcorch.core.PER_PLAYER_TRANSFER_ALLOWANCE
 import mcorch.core.ProxyFleet
 import mcorch.core.ReconcilerConfig
 import mcorch.core.Scheduler
 import mcorch.core.SealOutcome
 import mcorch.core.StopGrace
+import mcorch.core.TransferReport
 import mcorch.core.WorkloadObservation
 import mcorch.core.WorkloadState
 import mcorch.core.dispatchingStop
@@ -26,11 +32,17 @@ import mcorch.store.Precondition
 import mcorch.store.Store
 import mcorch.store.StoreException
 import mcorch.store.WriteOutcome
+import mcorch.velocity.control.ControlProtocol
 import org.slf4j.LoggerFactory
 import java.time.Clock
 import java.time.Instant
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
+import kotlin.time.TimeSource
 import kotlin.time.toJavaDuration
+import kotlin.time.toKotlinDuration
+import java.time.Duration as JavaDuration
 
 /**
  * Stopping a server whose drain cannot finish.
@@ -62,7 +74,7 @@ import kotlin.time.toJavaDuration
  * | Drain step | Here |
  * |---|---|
  * | Seal the proxy (2) | **Done.** Asserted through the same `ProxyFleet.linkFor` channel the drain uses. See below |
- * | Transfer players (4) | **Not done.** Players are disconnected |
+ * | Transfer players (4) | **Attempted once, never waited out.** Whoever the proxy cannot move is disconnected |
  * | `requireEmpty` — zero players (5) | Replaced by a counted acknowledgement, read under the seal. See below |
  * | Save (5) | **Always requested**, and [ForcedStopOutcome.saveAttempted] says whether one could be sent |
  * | Deregister (6) | **Not done.** The loop's next pass does it; until then the proxy holds a registration at an address that is going away |
@@ -225,6 +237,15 @@ public sealed interface OccupancyAcknowledgement {
  * before the stop, because there the number can rise.
  */
 public data class ForcedStopOutcome(
+    /**
+     * Whether the proxy was asked to move this server's players first, and what it
+     * last reported.
+     *
+     * `attempted = false` is the ordinary answer for a standalone server, a proxy
+     * that could not be sealed, or a fleet with nowhere to put them. It is never a
+     * failure of the stop: this path attempts the transfer and proceeds either way.
+     */
+    val transfer: TransferAttempt,
     val saveAttempted: Boolean,
     val saveConfirmed: Boolean,
     val playersOnline: Int?,
@@ -248,6 +269,35 @@ public data class ForcedStopOutcome(
 internal fun forcedStopWindow(definition: PaperServerDefinition): Duration =
     maxOf(definition.spec.lifecycle.stopGracePeriod, PaperServerDefaults.SAVE_TIMEOUT)
 
+/**
+ * What drain step 4 achieved before the stop went out.
+ *
+ * [remaining] is the proxy's own last word on how many were still connected, which
+ * is null when no sweep ran or none ever reported. It is **not** the count the stop
+ * is decided on — that is read off the server itself, because a client connected
+ * straight to the backend's port is invisible to the proxy. The two are allowed to
+ * disagree and only one of them gates anything.
+ */
+public data class TransferAttempt(
+    val attempted: Boolean,
+    val remaining: Int? = null,
+    /**
+     * How many the sweep is known to have moved: the proxy's first reported count
+     * for this sweep, less its last.
+     *
+     * **Not the same question as [attempted]**, and the difference is a hole. A seal
+     * shuts the *proxy's* door and nothing else — `DrainSubject` says in as many
+     * words that a client connected straight to the backend's port is invisible to
+     * the proxy and visible to a Server List Ping. So "a sweep ran" cannot license a
+     * fall in the count: acknowledge twelve, move nine proxied players, let five
+     * join directly, and eight is a fall that hides five arrivals nobody signed off.
+     *
+     * Only a fall this number can account for is forgiven. Null when the proxy never
+     * reported one, which forgives nothing.
+     */
+    val moved: Int? = null,
+)
+
 /** There is no running workload to stop. */
 public class ForcedTerminationUnavailable(
     message: String,
@@ -266,6 +316,13 @@ public class NodeForcedTermination(
     private val config: ReconcilerConfig = ReconcilerConfig(),
     private val clock: Clock = Clock.systemUTC(),
 ) : ForcedTermination {
+    /** Drain step 2's outcome, and the channel step 4 needs if it worked. */
+    private class SealAttempt(
+        val result: SealResult,
+        /** Only when the door is shut: a sweep through an admitting proxy races logins it cannot see. */
+        val router: mcorch.core.DrainRouter? = null,
+    )
+
     /** What drain step 2 achieved here. Three answers, as the drain's own [SealHold] has. */
     private enum class SealResult {
         /** The proxy confirmed the workload no longer admits new players. */
@@ -323,13 +380,28 @@ public class NodeForcedTermination(
         // Drain step 2, and it comes **first**. Everything below reads a player
         // count and acts on it, and a count nobody is holding still is not a
         // reading — see "The seal is what makes the count mean something".
-        val seal = sealOff(name)
+        val sealed = sealOff(name)
+        val seal = sealed.result
 
         // Read under the seal, and refused before the save rather than after it, so
         // a mismatch costs the caller neither a flush nor a save timeout.
         val players = occupancy(agent, node, observation)
         refuseOccupancy(name, players, acknowledgement)
         refuseUnsealedPopulation(name, seal, players, acknowledgement)
+
+        // **Drain step 4, below the refusal rather than above it.**
+        //
+        // The first version swept first, so the acknowledgement would have been
+        // checked against a number the sweep had already changed — which forced the
+        // comparator open and turned a compare-and-swap into a bypass. The
+        // acknowledgement refers to what the operator was shown, so it is settled
+        // first; the sweep then reduces the population it authorised.
+        //
+        // Still above the save, and that ordering is the one thing here borrowed
+        // straight from the drain: a transferred player's playerdata is written by
+        // *this* server as they quit, so sweeping first and flushing second is the
+        // only order in which the flush covers them.
+        val transferred = transferPlayers(name, definition, players, sealed.router)
 
         // **The save is always requested, and the skip that used to sit here is
         // gone.**
@@ -355,6 +427,29 @@ public class NodeForcedTermination(
         // and costs a stall, bounded by a grace period already floored at
         // `SAVE_TIMEOUT`; a save not sent costs play that no later pass recovers.
         // `ForcedStopOutcome.saveAttempted` now means what it says on every branch.
+        // **Re-asked here, and the sweep above is why.**
+        //
+        // `refuseSecondSideEffect` ran at entry, when this server still had players
+        // on it — and a populated server parks the loop's own drain at
+        // `requireEmpty`, which is what made a collision structurally impossible
+        // before this change. **The sweep is exactly what unparks it.** With
+        // `stepInterval` at a second the loop needs a handful of passes to walk
+        // seal → destination → transfer → requireEmpty → save → deregister → stop,
+        // and this path is still inside one probe plus a whole save timeout.
+        //
+        // What this catches is the **stop**, not the flush: it reads
+        // `stopLastDispatchedAt`, and deliberately not `saveRequestedAt`, which
+        // round 53 removed for a reason that still holds. Two concurrent flushes
+        // serialise on Paper's main thread and both complete; what must not happen
+        // is this path re-issuing a stop on a container the loop has already stopped
+        // properly, restarting a grace clock around a shutdown that is already
+        // running.
+        //
+        // Safe below the tombstone: the remedy is to wait out the grace window and
+        // re-send, which the caller can do, so it is not the kind of refusal that
+        // had to move into [preflight].
+        refuseSecondSideEffect(name)
+
         val save = requestSave(agent, node, observation)
         val attempted = save !is SaveOutcome.Unconfirmable && save !is SaveOutcome.NotDelivered
         val confirmed = save is SaveOutcome.Confirmed
@@ -363,7 +458,8 @@ public class NodeForcedTermination(
         // save timeout old. Under an asserted seal the count cannot rise and the
         // earlier reading stands; without one it is read again and refused if it has
         // moved.
-        val atStop = readingBeforeStop(name, agent, node, observation, seal, players, acknowledgement)
+        val atStop =
+            readingBeforeStop(name, agent, node, observation, seal, players, acknowledgement, transferred)
 
         val declared = definition.spec.lifecycle.stopGracePeriod
         // Raised, never lowered, and never a refusal. When no save request was
@@ -399,6 +495,13 @@ public class NodeForcedTermination(
         // record costs a player's session and no later pass repairs it. Under
         // `NonCancellable` for the same asymmetry — a shutdown landing between the
         // write and the stop must not be able to drop it.
+        // Asked again, because the one above the save could only ever catch a stop
+        // dispatched *before* it. The loop's own drain needs a handful of
+        // `stepInterval` passes to reach its stop, and this path has just spent a
+        // whole save timeout — so the dispatch it has to notice reliably lands in
+        // that interval, not before it. This is the reading that has had time to
+        // appear.
+        refuseSecondSideEffect(name)
         recordStopDispatched(name)
         try {
             node.stopWorkload(observation.handle, grace)
@@ -413,6 +516,7 @@ public class NodeForcedTermination(
         }
 
         return ForcedStopOutcome(
+            transfer = transferred,
             saveAttempted = attempted,
             saveConfirmed = confirmed,
             playersOnline = atStop,
@@ -440,8 +544,8 @@ public class NodeForcedTermination(
      * as the proxy was"* — and it applies with more force here, on the path whose
      * whole purpose is that a server can always be retired.
      */
-    private suspend fun sealOff(name: ResourceName): SealResult {
-        val stored = store.getServer(name) ?: return SealResult.NOTHING_TO_SEAL
+    private suspend fun sealOff(name: ResourceName): SealAttempt {
+        val stored = store.getServer(name) ?: return SealAttempt(SealResult.NOTHING_TO_SEAL)
         val binding =
             when (val fleet = ProxyFleet.resolve(store, stored, clock.instant())) {
                 is ProxyFleet.Resolution.Behind -> fleet.binding
@@ -459,26 +563,310 @@ public class NodeForcedTermination(
                 // permissively than the milder one, off a comment that reasoned
                 // about it correctly and then routed it to the value whose
                 // documented meaning is the opposite.
-                is ProxyFleet.Resolution.Conflicted -> return SealResult.FAILED
+                is ProxyFleet.Resolution.Conflicted -> return SealAttempt(SealResult.FAILED)
 
                 // Standalone: no proxy routes to it at all, so players reach it
                 // directly and there is no door. The pre-stop re-probe is what
                 // stands in for one.
-                else -> return SealResult.NOTHING_TO_SEAL
+                else -> return SealAttempt(SealResult.NOTHING_TO_SEAL)
             }
         val runtime = (stored.status?.status as? PaperServerStatus)?.runtime
         val link =
-            ProxyFleet.linkFor(binding, name, nodes, scheduler, runtime?.node ?: return SealResult.FAILED, config)
-                ?: return SealResult.FAILED
-        return try {
-            when (val outcome = link.assertAdmission(admits = false)) {
-                is SealOutcome.Asserted -> if (outcome.admits) SealResult.FAILED else SealResult.ASSERTED
-                is SealOutcome.Refused -> SealResult.FAILED
-                is SealOutcome.Unavailable -> SealResult.FAILED
+            ProxyFleet.linkFor(
+                binding,
+                name,
+                nodes,
+                scheduler,
+                runtime?.node ?: return SealAttempt(SealResult.FAILED),
+                config,
+            ) ?: return SealAttempt(SealResult.FAILED)
+        val result =
+            try {
+                when (val outcome = link.assertAdmission(admits = false)) {
+                    is SealOutcome.Asserted -> if (outcome.admits) SealResult.FAILED else SealResult.ASSERTED
+                    is SealOutcome.Refused -> SealResult.FAILED
+                    is SealOutcome.Unavailable -> SealResult.FAILED
+                }
+            } catch (failure: NodeException) {
+                LOG.debug("the login seal could not be asserted for a forced stop", failure)
+                SealResult.FAILED
             }
-        } catch (failure: NodeException) {
-            LOG.debug("the login seal could not be asserted for a forced stop", failure)
-            SealResult.FAILED
+        // The router half is carried out only when the door is actually shut. A
+        // transfer through an unsealed proxy moves players off a server that is
+        // still admitting, so the sweep races logins it cannot see the end of —
+        // which is the same reason `DrainController` never reaches step 4 from a
+        // state that has not held the seal.
+        return SealAttempt(result, if (result == SealResult.ASSERTED) link else null)
+    }
+
+    /**
+     * Drain step 4: ask the proxy to move this server's players somewhere else.
+     *
+     * **One attempt, bounded, and never a refusal.** The drain issues the same
+     * sweep and then blocks until the server is empty, re-checking each pass. This
+     * path has no next pass — a caller is holding a request open — so it asks once,
+     * gives the sweep `spec.lifecycle.drain.playerTransferTimeout` to get somewhere,
+     * and proceeds with whoever is left. Every failure here is logged and swallowed:
+     * a proxy that will not resolve a destination, a fleet with no capacity, a
+     * refused sweep. None of them is a reason to leave a server unretirable, which
+     * is the state this endpoint exists to remove.
+     *
+     * What it changes for the operator is real rather than cosmetic. Before this,
+     * forcing a populated server dropped every session on it; now the ones that can
+     * be moved are moved, and the acknowledgement is checked against what is left.
+     *
+     * @return how many players the proxy reported still on the server when the
+     *   attempt ended, or null when no attempt could be made.
+     */
+    private suspend fun transferPlayers(
+        name: ResourceName,
+        definition: PaperServerDefinition,
+        settled: Int?,
+        router: mcorch.core.DrainRouter?,
+    ): TransferAttempt {
+        if (router == null) return TransferAttempt(attempted = false)
+        val destination =
+            try {
+                when (val choice = router.resolveDestination()) {
+                    is DestinationChoice.Chosen -> {
+                        choice.destination
+                    }
+
+                    is DestinationChoice.NoCapacity -> {
+                        LOG.warn(
+                            "forced stop server={} could not transfer: {}. Its players will be disconnected",
+                            name.value,
+                            choice.detail,
+                        )
+                        return TransferAttempt(attempted = false)
+                    }
+
+                    is DestinationChoice.Unavailable -> {
+                        LOG.warn(
+                            "forced stop server={} could not resolve a transfer destination: {}. Its players " +
+                                "will be disconnected",
+                            name.value,
+                            choice.detail,
+                        )
+                        return TransferAttempt(attempted = false)
+                    }
+                }
+            } catch (failure: NodeException) {
+                LOG.warn("forced stop server={} could not reach its proxy to transfer players", name.value, failure)
+                return TransferAttempt(attempted = false)
+            }
+        return sweep(name, definition, settled, router, destination)
+    }
+
+    /**
+     * Polls the sweep until it finishes or the allowance runs out.
+     *
+     * `DrainRouter.transfer` is start-or-join, so re-asking is how progress is read
+     * rather than a second sweep — the same call the drain makes once per pass, made
+     * here on a timer because there is no next pass.
+     *
+     * **The loop is bounded twice: once by the injected clock, once by wall
+     * clock.** The clock bound is the real one — it produces the allowance this
+     * path advertises and the message an operator reads. The wall-clock bound
+     * only exists because the loop does not measure in the units it spends.
+     *
+     * It paces with [TRANSFER_POLL], which is real time, and decides it is done
+     * from `clock.instant()`, which is not. Production ties the two together by
+     * passing `Clock.systemUTC()`, and nothing else does. A clock that stops —
+     * every test in this module drives one deliberately, since `MutableClock` is
+     * how elapsed time is made cheap here — leaves a loop that spends real time
+     * forever and never reads any as having passed. That is not a slow test; it
+     * is a run with no end, and it cost twenty-six minutes of CI once already.
+     *
+     * So elapsed wall clock ends the loop on the same terms. Under a clock that
+     * advances, the clock bound is reached first and the backstop never fires;
+     * under one that does not, the loop still terminates, and says why.
+     */
+    private suspend fun sweep(
+        name: ResourceName,
+        definition: PaperServerDefinition,
+        settled: Int?,
+        router: mcorch.core.DrainRouter,
+        destination: ResourceName,
+    ): TransferAttempt {
+        // The drain's own derivation, not the bare field: `awaitEvacuated` uses
+        // `playerTransferTimeout + PER_PLAYER_TRANSFER_ALLOWANCE * online`, and its
+        // KDoc says the fixed value "always fails on a full server". Using the bare
+        // one here would time out earliest on precisely the servers where the most
+        // sessions are at stake.
+        //
+        // Clamped by the proxy's supersede window as well. `transfer` is
+        // start-or-join only while the sweep is younger than
+        // `ControlProtocol.SWEEP_MAX_AGE_MS`; past that the plugin starts a fresh
+        // one, re-notifying and re-requesting a connection for every player still
+        // there. Polling beyond that would turn "reading progress" into pestering
+        // them once per cadence — and `playerTransferTimeout` reaches an hour, while
+        // `SpecBounds` deliberately does not bound it.
+        val declared =
+            definition.spec.lifecycle.drain.playerTransferTimeout +
+                PER_PLAYER_TRANSFER_ALLOWANCE * (settled ?: 0)
+        val allowance = minOf(declared, SWEEP_SUPERSEDE_WINDOW)
+        val deadline = clock.instant().plus(allowance.toJavaDuration())
+        // Monotonic, not the injected clock — the point of it is to hold when that
+        // clock does not, so reading the same source twice would defeat it.
+        val startedAt = TimeSource.Monotonic.markNow()
+        var remaining: Int? = null
+        var moved: Int? = null
+        var polled = false
+        while (true) {
+            // **Before the call, not after.** The plugin joins a sweep only while it
+            // is *younger* than its supersede window, so a poll landing on the
+            // boundary starts a fresh one — re-notifying and re-requesting a
+            // connection for every player still there, immediately before this
+            // returns for timeout. The first request is always made; only follow-ups
+            // are gated.
+            val clockExpired = !clock.instant().isBefore(deadline)
+            if (polled && (clockExpired || startedAt.elapsedNow() >= allowance)) {
+                if (!clockExpired) {
+                    // Reached only under a clock that is not advancing. Worth its own
+                    // line: the allowance was spent, but not by the measure this path
+                    // reports, and an operator reading only the message below would
+                    // conclude the clock was fine.
+                    LOG.warn(
+                        "forced stop server={} spent its full allowance of {} in wall clock while its clock " +
+                            "reported no elapsed time; ending the sweep on elapsed wall clock instead",
+                        name.value,
+                        allowance,
+                    )
+                }
+                LOG.warn(
+                    "forced stop server={} gave the transfer its full allowance of {} and {} player(s) are " +
+                        "still on it; they will be disconnected",
+                    name.value,
+                    allowance,
+                    remaining ?: "an unknown number of",
+                )
+                return TransferAttempt(
+                    attempted = true,
+                    remaining = remaining,
+                    moved = moved,
+                )
+            }
+            polled = true
+            // **Bounded by the transfer allowance, not by the channel's own
+            // timeout.** `ControlChannel` is built from the *proxy's*
+            // `spec.backends.drain.sealTimeout`, which is an independent field and
+            // reaches an hour. A proxy that stops answering after the seal landed
+            // would otherwise park this call — and with it the whole request, the
+            // save and the stop — far past the allowance this loop advertises.
+            //
+            // The remaining allowance rather than the whole of it, so the bound
+            // holds across polls rather than resetting on each one.
+            val report =
+                try {
+                    withTimeout(remainingAllowance(deadline)) { router.transfer(destination) }
+                } catch (timedOut: TimeoutCancellationException) {
+                    LOG.warn(
+                        "forced stop server={} gave up on its proxy after {}; whoever is left will be " +
+                            "disconnected",
+                        name.value,
+                        allowance,
+                    )
+                    return TransferAttempt(
+                        attempted = true,
+                        remaining = remaining,
+                        moved = moved,
+                    )
+                } catch (failure: NodeException) {
+                    LOG.warn("forced stop server={} lost its proxy mid-transfer", name.value, failure)
+                    return TransferAttempt(
+                        attempted = true,
+                        remaining = remaining,
+                        moved = moved,
+                    )
+                }
+            when (report) {
+                is TransferReport.Sweeping -> {
+                    remaining = report.remaining
+                    // **The operation's own tally, never a difference between two
+                    // readings.** Velocity's futures can complete before the first
+                    // response is serialised, so a first reading already reflects the
+                    // moves and `first - last` is zero — which would tell the
+                    // occupancy check that the sweep explains nothing and refuse a
+                    // force that had in fact just evacuated nine of twelve, after the
+                    // save, on an already-tombstoned definition.
+                    moved = report.moved
+                    if (report.finished || report.remaining == 0) {
+                        // `finished` means the proxy settled every request, not that
+                        // every request succeeded — a refused or failed transfer
+                        // leaves `remaining` positive on a finished sweep. Reporting
+                        // that as an evacuation would describe a stop that
+                        // disconnected people as one that saved them.
+                        if (report.remaining > 0) {
+                            LOG.warn(
+                                "forced stop server={} finished its sweep to {} with {} player(s) still on it " +
+                                    "({} could not be moved); they will be disconnected",
+                                name.value,
+                                destination,
+                                report.remaining,
+                                report.unmoved,
+                            )
+                        } else {
+                            LOG.info(
+                                "forced stop server={} transferred its players to {} before stopping",
+                                name.value,
+                                destination,
+                            )
+                        }
+                        return TransferAttempt(
+                            attempted = true,
+                            remaining = report.remaining,
+                            moved = report.moved,
+                        )
+                    }
+                }
+
+                is TransferReport.DestinationLost -> {
+                    // The drain goes back to step 3 and picks another. Here there is
+                    // no going back: one attempt, and the stop is what the caller
+                    // came for.
+                    LOG.warn(
+                        "forced stop server={} lost its transfer destination: {}. Whoever is left will be " +
+                            "disconnected",
+                        name.value,
+                        report.detail,
+                    )
+                    return TransferAttempt(
+                        attempted = true,
+                        remaining = remaining,
+                        moved = moved,
+                    )
+                }
+
+                else -> {
+                    LOG.warn(
+                        "forced stop server={} could not sweep its players to {}. Whoever is left will be " +
+                            "disconnected",
+                        name.value,
+                        destination,
+                    )
+                    return TransferAttempt(
+                        attempted = true,
+                        remaining = remaining,
+                        moved = moved,
+                    )
+                }
+            }
+            if (!clock.instant().isBefore(deadline)) {
+                LOG.warn(
+                    "forced stop server={} gave the transfer its full allowance of {} and {} player(s) are " +
+                        "still on it; they will be disconnected",
+                    name.value,
+                    allowance,
+                    remaining ?: "an unknown number of",
+                )
+                return TransferAttempt(
+                    attempted = true,
+                    remaining = remaining,
+                    moved = moved,
+                )
+            }
+            delay(TRANSFER_POLL)
         }
     }
 
@@ -739,11 +1127,148 @@ public class NodeForcedTermination(
         seal: SealResult,
         previous: Int?,
         acknowledgement: OccupancyAcknowledgement,
+        transferred: TransferAttempt,
     ): Int? {
-        if (seal == SealResult.ASSERTED) return previous
+        // **A sweep is a reason to re-probe, not a reason to skip.**
+        //
+        // The seal means the count cannot *rise*, which is why an asserted seal
+        // otherwise lets the earlier reading stand rather than spending a probe
+        // timeout against a wedged server. A sweep makes it fall, and by the whole
+        // rescued population — so the number left over is one this path has to go
+        // and read. The proxy has just answered a sweep, so a probe here is cheap
+        // in exactly the case it is needed.
+        if (seal == SealResult.ASSERTED && !transferred.attempted) return previous
         val reading = occupancy(agent, node, observation)
-        refuseOccupancy(name, reading, acknowledgement)
+        refuseArrivals(name, previous, reading, acknowledgement, transferred)
         return reading
+    }
+
+    /**
+     * What is left of the sweep's allowance, never zero or negative.
+     *
+     * `withTimeout` treats a non-positive value as already expired, which would turn
+     * the first call of a sweep whose deadline has just passed into a cancellation
+     * rather than a request. A floor of one poll keeps the call meaningful; the loop
+     * above is what decides not to make another.
+     */
+    private fun remainingAllowance(deadline: Instant): Duration {
+        val left = JavaDuration.between(clock.instant(), deadline).toKotlinDuration()
+        return if (left > TRANSFER_POLL) left else TRANSFER_POLL
+    }
+
+    /**
+     * Refuses when the count has **risen** since the reading the acknowledgement
+     * settled.
+     *
+     * A separate question from [refuseOccupancy], and separating them is what let
+     * that one stay an exact match. The acknowledgement is about what the operator
+     * was shown; this is about what has happened since — and after a sweep the two
+     * cannot be the same number, because moving players is the point.
+     *
+     * So a *decrease* passes: those are sessions the transfer saved, and refusing
+     * over them would make every partial sweep a 409. An *increase* refuses, which
+     * is the hazard the compare-and-swap was built for — somebody arrived, and
+     * nobody has acknowledged them.
+     *
+     * **Two different nulls, and they are not handled alike.** A null *settled*
+     * reading falls through to [refuseOccupancy] — there is no baseline to compare
+     * against, and `Unreadable` is the value that covers it. A null *later* reading
+     * returns and lets the stop proceed, because refusing there produced a server
+     * nothing could retire; see the note at that branch.
+     */
+    private fun refuseArrivals(
+        name: ResourceName,
+        settled: Int?,
+        reading: Int?,
+        acknowledgement: OccupancyAcknowledgement,
+        transferred: TransferAttempt,
+    ) {
+        if (settled == null) {
+            refuseOccupancy(name, reading, acknowledgement)
+            return
+        }
+        // **A later reading that cannot answer is not evidence of arrival**, and
+        // refusing on it produced a server nothing could retire.
+        //
+        // The alternating lockout: a big world answers SLP when idle and times out
+        // during `save-all flush`, so the settled reading is `n` and the pre-stop one
+        // is null. Falling through refused `Count(n)` and asked for `Unreadable` —
+        // and `Unreadable` was then refused by the *settled* reading, which answers
+        // `n`. Neither acknowledgement was sendable, each attempt cost a flush, and
+        // the definition was already tombstoned. Erring safe **and** unrecoverable is
+        // the shape this file has been bitten by three times.
+        //
+        // Proceeding is what the operator already authorised: they acknowledged `n`,
+        // this check exists to catch a *rise* above it, and an unanswered probe is
+        // not one. The count carried into the record stays null, so nothing claims
+        // to know what it does not.
+        if (reading == null) {
+            LOG.warn(
+                "server={} did not answer a player count before its forced stop; proceeding on the {} " +
+                    "acknowledged earlier",
+                name.value,
+                settled,
+            )
+            return
+        }
+        // **Exact unless a transfer explains the fall.** `main`'s rule, and the one
+        // five rounds of audit built: with nothing to attribute a decrease to, "at
+        // most" masks arrivals — ten log off, five log in, the number is lower, and
+        // five sessions nobody acknowledged go with the stop. A sweep is the one
+        // thing that can account for the difference, so it is the one thing that
+        // buys the permission.
+        if (!transferred.attempted) {
+            // Nothing reduced the count, so `main`'s exact rule stands. A fall with
+            // nothing to attribute it to is ten logouts hiding five arrivals.
+            refuseOccupancy(name, reading, acknowledgement)
+            return
+        }
+        // **The count must have fallen by everything the sweep moved.** `attempted`
+        // only says an RPC went out, and the seal shuts the *proxy's* door and
+        // nothing else — `DrainSubject` says in as many words that a client
+        // connected straight to the backend's port is invisible to the proxy and
+        // visible to this probe.
+        //
+        // So the arithmetic, not the flag: nine moved off a server that held twelve
+        // should leave three. Eight means five arrived on the port behind them, and
+        // forgiving it because "a sweep ran" drops five sessions nobody signed off —
+        // the masking case in a third disguise. Fewer than three is extra logouts,
+        // which is the safe direction.
+        // Floored at zero, because the proxy's number and this probe's are allowed
+        // to disagree — the drain reads SLP for every decision and logs the proxy's
+        // count when it differs, precisely because neither sees what the other does.
+        // A sweep reporting more moved than SLP ever saw is that disagreement, not
+        // evidence of anything, and a negative expectation would refuse an empty
+        // server.
+        val expected = (settled - (transferred.moved ?: 0)).coerceAtLeast(0)
+        if (reading < expected) {
+            // **Fewer than the sweep can explain, which is not automatically safe.**
+            // Extra departures raise the band that arrivals can hide inside: five
+            // direct players leave while five join, and a reading of exactly
+            // `expected` would pass with five unacknowledged sessions on it. So the
+            // rule is an equality, not a bound — the tightest an SLP total allows,
+            // since a count cannot distinguish churn from stillness.
+            //
+            // The refusal is benign and terminates: `moved` can only under-count (it
+            // starts at the sweep's first reported `remaining`, and mixes the
+            // proxy's view with this probe's), under-counting raises `expected`, and
+            // the operator re-sends against the number this names. Over-counting
+            // cannot happen — `remaining` only falls.
+            refuseOccupancy(name, reading, acknowledgement)
+            return
+        }
+        if (reading == expected) return
+        throw ForcedTerminationRefused(
+            "`${name.value}` has $reading player(s) online after a transfer that moved " +
+                "${transferred.moved ?: 0} of the $settled this stop was authorised against, so at least " +
+                "${reading - expected} joined since — directly, past the proxy's door. Re-send acknowledging " +
+                "exactly $reading if that is intended",
+        )
+        throw ForcedTerminationRefused(
+            "`${name.value}` now has $reading player(s) online, up from the $settled this stop was " +
+                "authorised against, so somebody has joined since. Re-send acknowledging exactly $reading " +
+                "if that is intended",
+        )
     }
 
     /**
@@ -762,7 +1287,25 @@ public class NodeForcedTermination(
         val matches =
             when (acknowledgement) {
                 is OccupancyAcknowledgement.None -> false
+
                 is OccupancyAcknowledgement.Unreadable -> observed == null
+
+                // **Exactly**, and a version of the transfer work relaxed this to
+                // "at most" so a partial sweep would not be refused over the players
+                // it left behind. That was wrong twice over.
+                //
+                // It stops detecting arrivals as soon as the sweep removes anybody:
+                // acknowledge twelve, nine move, five arrive, the probe reads eight,
+                // eight is at most twelve, and eight sessions go — five of them a
+                // number nobody was ever shown. And an open inequality makes a large
+                // number a universal bypass, so `acknowledgeOccupancy=9999` would
+                // satisfy every force against every population. That is the boolean
+                // "proceed regardless" this design rejects, respelled.
+                //
+                // The mistake was collapsing two readings into one. What the
+                // operator was shown is settled here, before the sweep; what the
+                // sweep leaves behind is a different question, asked by
+                // [refuseArrivals].
                 is OccupancyAcknowledgement.Count -> observed == acknowledgement.players
             }
         if (matches) return
@@ -775,8 +1318,8 @@ public class NodeForcedTermination(
                 }
 
                 else -> {
-                    "`${name.value}` has $observed player(s) online. Forcing disconnects them without a " +
-                        "transfer; re-send acknowledging exactly $observed if that is intended"
+                    "`${name.value}` has $observed player(s) online. Any who cannot be transferred will be " +
+                        "disconnected; re-send acknowledging exactly $observed if that is intended"
                 }
             },
         )
@@ -904,6 +1447,30 @@ public class NodeForcedTermination(
          * callers — and the raising is done where it can be read, above.
          */
         private val SHUTDOWN_SAVE_ALLOWANCE: Duration = PaperServerDefaults.SAVE_TIMEOUT
+
+        /**
+         * How often the transfer sweep is re-asked.
+         *
+         * `transfer` is start-or-join, so this reads progress rather than starting
+         * anything a second time. Short enough that a sweep finishing early is not
+         * paid for in wall clock, long enough not to spend the allowance on RPCs.
+         */
+        private val TRANSFER_POLL: Duration = 2.seconds
+
+        /**
+         * How long the proxy keeps a sweep joinable, **imported rather than
+         * copied**.
+         *
+         * A previous version restated it as `180.seconds` with a comment saying
+         * `:core` may not name the plugin's constants. That was false and
+         * disprovable from the build file: `core/build.gradle.kts` declares
+         * `implementation(project(":velocity-plugin"))`, `ControlChannel` and
+         * `VelocityWorkloadPlanner` already import `ControlProtocol`, and CLAUDE.md
+         * permits exactly this arrow *"so that the protocol version has one
+         * definition rather than a copy in the reconciler"*. A copy drifts silently
+         * the first time the plugin moves its own number.
+         */
+        private val SWEEP_SUPERSEDE_WINDOW: Duration = ControlProtocol.SWEEP_MAX_AGE_MS.milliseconds
 
         private val LOG = LoggerFactory.getLogger(NodeForcedTermination::class.java)
     }

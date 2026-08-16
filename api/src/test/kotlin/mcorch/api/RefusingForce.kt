@@ -5,6 +5,7 @@ import mcorch.core.termination.ForcedTermination
 import mcorch.core.termination.ForcedTerminationRefused
 import mcorch.core.termination.ForcedTerminationUnavailable
 import mcorch.core.termination.OccupancyAcknowledgement
+import mcorch.core.termination.TransferAttempt
 import mcorch.schema.PaperServerDefinition
 
 /**
@@ -45,6 +46,7 @@ internal class StoppingForce(
     private val saveConfirmed: Boolean,
     private val saveAttempted: Boolean = true,
     private val playersOnline: Int? = 0,
+    private val transfer: TransferAttempt = TransferAttempt(attempted = false),
 ) : ForcedTermination {
     val recorded: MutableList<String> = mutableListOf()
 
@@ -68,6 +70,7 @@ internal class StoppingForce(
         recorded += definition.metadata.name.value
         acknowledgements += acknowledgement
         return ForcedStopOutcome(
+            transfer = transfer,
             saveAttempted = saveAttempted,
             saveConfirmed = saveConfirmed,
             playersOnline = playersOnline,
