@@ -24,17 +24,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # jvmToolchain(25) in mcorch.kotlin-conventions. The foojay resolver would
       # download a JDK itself, but a cached runner JDK is faster and makes the
       # version the build compiles against explicit rather than resolved.
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '25'
 
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v6
 
       # `build` -> `check` -> spotlessCheck, the unit tests of every module, and
       # compileIntegrationTestKotlin. Note spotless*Check*: CI must not reformat.
@@ -43,7 +43,7 @@ jobs:
 
       - name: Upload test reports
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: unit-test-reports
           path: '**/build/reports/tests/**'
@@ -55,14 +55,14 @@ jobs:
     timeout-minutes: 45
     needs: build
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '25'
 
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v6
 
       # This project's own containerd, pinned to 2.3.3 and namespaced under
       # mcorch-dev. It touches neither the runner's containerd nor its Docker.
@@ -90,7 +90,7 @@ jobs:
 
       - name: Upload test reports and containerd log
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: integration-test-reports
           path: |
