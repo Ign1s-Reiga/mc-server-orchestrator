@@ -88,10 +88,22 @@ the pinned checksum in scripts/dev/containerd-env.sh after verifying it yourself
 
 installed_version() { "$1" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1; }
 
+# Takes the path this script would install to, not a name to look up.
+#
+# A PATH lookup answers "is there a containerd on this machine", which is not
+# the question. This instance runs the binary at its own pinned path and nothing
+# else; a host that already has one somewhere on PATH — every GitHub runner does,
+# because Docker ships it — would satisfy a PATH check, skip the install, and
+# leave the pinned path empty for the launch below to fail on. That is not
+# hypothetical: it is how CI first failed here, with `installing: runc crictl
+# cni-plugins` and then `/usr/local/bin/containerd: command not found`.
+#
+# WSL2 never has containerd pre-installed, so the two questions had the same
+# answer everywhere this had been run until then.
 need_install() {
-    local bin="$1" want="$2"
-    command -v "${bin}" >/dev/null 2>&1 || return 0
-    [ "$(installed_version "$(command -v "${bin}")")" = "${want}" ] || return 0
+    local path="$1" want="$2"
+    [ -x "${path}" ] || return 0
+    [ "$(installed_version "${path}")" = "${want}" ] || return 0
     return 1
 }
 
@@ -138,9 +150,9 @@ install_crictl() {
 }
 
 want=()
-need_install containerd "${CONTAINERD_VERSION}" && want+=(containerd)
-need_install runc "${RUNC_VERSION}" && want+=(runc)
-need_install crictl "${CRICTL_VERSION}" && want+=(crictl)
+need_install "${INSTALL_BIN_DIR}/containerd" "${CONTAINERD_VERSION}" && want+=(containerd)
+need_install "${INSTALL_SBIN_DIR}/runc" "${RUNC_VERSION}" && want+=(runc)
+need_install "${INSTALL_BIN_DIR}/crictl" "${CRICTL_VERSION}" && want+=(crictl)
 [ "$(cat "${CNI_STAMP}" 2>/dev/null || true)" = "${CNI_PLUGINS_VERSION}" ] || want+=(cni-plugins)
 
 if [ ${#want[@]} -gt 0 ]; then
