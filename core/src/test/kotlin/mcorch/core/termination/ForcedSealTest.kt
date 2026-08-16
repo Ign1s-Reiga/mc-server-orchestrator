@@ -433,6 +433,49 @@ internal class ForcedSealTest {
         }
 
     @Test
+    fun `a partial evacuation is forgiven for exactly what the sweep moved`() =
+        coreTest {
+            val destination = backendDefinition("survival-02", hostPort = 30002)
+            val harness = ProxyHarness(backends = listOf(backend, destination))
+            harness.bringUp()
+            val name = backend.metadata.name
+            val node = harness.nodeOf(backend)
+            node.online = 12
+            harness.plugin.backend(name.value)?.players = 12
+            // Nine move, three refuse. The proxy settles the sweep either way.
+            harness.plugin.onTransfer = {
+                harness.plugin.backend(name.value)?.let { source ->
+                    source.sweep?.let { sweep ->
+                        sweep.refused = 3
+                        harness.plugin.backend(sweep.destination)?.let { it.players += 9 }
+                        source.players = 3
+                        sweep.finished = true
+                    }
+                }
+            }
+            node.onExec = { command ->
+                if (command.joinToString(" ").contains("mc-monitor")) {
+                    node.online = harness.plugin.backend(name.value)?.players ?: 12
+                }
+                node.defaultExec(command)
+            }
+
+            terminationOver(harness).stop(backend, OccupancyAcknowledgement.Count(12))
+
+            // **The sweep's own tally, not a difference between two readings.**
+            // Velocity's futures can settle before the first response is serialised,
+            // so `firstReported - lastReported` is zero on a sweep that moved nine —
+            // which told the occupancy check the transfer explained nothing and
+            // refused a force that had just evacuated three quarters of the server,
+            // after the save, on an already-tombstoned definition.
+            //
+            // Twelve acknowledged, nine moved, three left: expected is three and the
+            // reading is three, so it passes. With `moved` derived rather than
+            // reported, expected would be twelve and this would 409.
+            node.stops shouldHaveSize 1
+        }
+
+    @Test
     fun `a decrease bigger than the sweep moved is not forgiven`() =
         coreTest {
             val destination = backendDefinition("survival-02", hostPort = 30002)

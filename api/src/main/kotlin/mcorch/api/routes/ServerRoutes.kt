@@ -419,7 +419,7 @@ internal class ServerRoutes(
             // nothing says how far the drain had got when they gave up on it. The
             // status row that would answer either is purged by teardown.
             "forced stop identity={} server={} acknowledged={} drainState={} transferAttempted={} " +
-                "saveAttempted={} saveConfirmed={} playersOnline={}",
+                "transferMoved={} transferRemaining={} saveAttempted={} saveConfirmed={} playersOnline={}",
             principal.name,
             name.value,
             describeAcknowledgement(acknowledgement),

@@ -90,6 +90,10 @@ internal class BackendLink(
                     remaining = outcome.value.remaining,
                     unmoved = outcome.value.unmoved,
                     finished = outcome.value.finished,
+                    // Carried rather than dropped: a caller that polls cannot derive
+                    // it from successive `remaining` readings, because the first one
+                    // may already include every move.
+                    moved = outcome.value.moved,
                 )
             }
 

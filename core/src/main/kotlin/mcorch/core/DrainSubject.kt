@@ -328,6 +328,16 @@ internal sealed interface TransferReport {
         val remaining: Int,
         val unmoved: Int,
         val finished: Boolean,
+        /**
+         * How many this sweep has moved so far — the operation's own cumulative
+         * tally, not a difference between two readings.
+         *
+         * The distinction matters to any caller that polls. Futures can complete
+         * before the first response is serialised, so a first reading already
+         * reflects the moves and a derived `first - last` is zero. That zero then
+         * says "the sweep explains nothing", which is the opposite of the truth.
+         */
+        val moved: Int = 0,
     ) : TransferReport
 
     /**

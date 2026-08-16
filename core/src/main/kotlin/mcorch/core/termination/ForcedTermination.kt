@@ -690,7 +690,7 @@ public class NodeForcedTermination(
         val allowance = minOf(declared, SWEEP_SUPERSEDE_WINDOW)
         val deadline = clock.instant().plus(allowance.toJavaDuration())
         var remaining: Int? = null
-        var firstReported: Int? = null
+        var moved: Int? = null
         var polled = false
         while (true) {
             // **Before the call, not after.** The plugin joins a sweep only while it
@@ -710,7 +710,7 @@ public class NodeForcedTermination(
                 return TransferAttempt(
                     attempted = true,
                     remaining = remaining,
-                    moved = movedBetween(firstReported, remaining),
+                    moved = moved,
                 )
             }
             polled = true
@@ -736,20 +736,27 @@ public class NodeForcedTermination(
                     return TransferAttempt(
                         attempted = true,
                         remaining = remaining,
-                        moved = movedBetween(firstReported, remaining),
+                        moved = moved,
                     )
                 } catch (failure: NodeException) {
                     LOG.warn("forced stop server={} lost its proxy mid-transfer", name.value, failure)
                     return TransferAttempt(
                         attempted = true,
                         remaining = remaining,
-                        moved = movedBetween(firstReported, remaining),
+                        moved = moved,
                     )
                 }
             when (report) {
                 is TransferReport.Sweeping -> {
-                    if (firstReported == null) firstReported = report.remaining
                     remaining = report.remaining
+                    // **The operation's own tally, never a difference between two
+                    // readings.** Velocity's futures can complete before the first
+                    // response is serialised, so a first reading already reflects the
+                    // moves and `first - last` is zero — which would tell the
+                    // occupancy check that the sweep explains nothing and refuse a
+                    // force that had in fact just evacuated nine of twelve, after the
+                    // save, on an already-tombstoned definition.
+                    moved = report.moved
                     if (report.finished || report.remaining == 0) {
                         // `finished` means the proxy settled every request, not that
                         // every request succeeded — a refused or failed transfer
@@ -775,7 +782,7 @@ public class NodeForcedTermination(
                         return TransferAttempt(
                             attempted = true,
                             remaining = report.remaining,
-                            moved = movedBetween(firstReported, report.remaining),
+                            moved = report.moved,
                         )
                     }
                 }
@@ -793,7 +800,7 @@ public class NodeForcedTermination(
                     return TransferAttempt(
                         attempted = true,
                         remaining = remaining,
-                        moved = movedBetween(firstReported, remaining),
+                        moved = moved,
                     )
                 }
 
@@ -807,7 +814,7 @@ public class NodeForcedTermination(
                     return TransferAttempt(
                         attempted = true,
                         remaining = remaining,
-                        moved = movedBetween(firstReported, remaining),
+                        moved = moved,
                     )
                 }
             }
@@ -822,7 +829,7 @@ public class NodeForcedTermination(
                 return TransferAttempt(
                     attempted = true,
                     remaining = remaining,
-                    moved = movedBetween(firstReported, remaining),
+                    moved = moved,
                 )
             }
             delay(TRANSFER_POLL)
@@ -1100,15 +1107,6 @@ public class NodeForcedTermination(
         val reading = occupancy(agent, node, observation)
         refuseArrivals(name, previous, reading, acknowledgement, transferred)
         return reading
-    }
-
-    /** What the proxy's own numbers say the sweep moved, or null when it never said. */
-    private fun movedBetween(
-        first: Int?,
-        last: Int?,
-    ): Int? {
-        if (first == null || last == null) return null
-        return (first - last).coerceAtLeast(0)
     }
 
     /**
