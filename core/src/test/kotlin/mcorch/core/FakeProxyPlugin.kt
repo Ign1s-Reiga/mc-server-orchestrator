@@ -61,6 +61,24 @@ internal class FakeProxyPlugin(
      */
     var onTransfer: () -> Unit = {}
 
+    /**
+     * Settles a sweep *before* the answer describing it is serialised.
+     *
+     * [onTransfer] runs after, which models a sweep still in flight. The real
+     * plugin does the opposite: `ControlService` waits for the sweep to settle,
+     * bounded by `ControlProtocol.TRANSFER_SETTLE_TIMEOUT_MS`, and only then
+     * answers — so the response to the request that *started* a sweep already
+     * carries its final tallies and a non-null `finishedAtEpochMs`.
+     *
+     * The difference is not cosmetic, because the join rule here is the real
+     * one: `finishedAtEpochMs == null && young`. A sweep marked finished after
+     * its answer was built is therefore never reported *and* never joinable, so
+     * every poll supersedes it with a fresh unfinished sweep and no caller can
+     * observe the settled state. A sweep that finished with players still on the
+     * source — refused, not moved — is expressible only through this hook.
+     */
+    var onSweepSettling: () -> Unit = {}
+
     /** Every `POST .../transfer` that started or joined a sweep. */
     val transfers: MutableList<Pair<String, String>> = mutableListOf()
 
@@ -282,6 +300,10 @@ internal class FakeProxyPlugin(
         val sweep = Sweep(destinationName, startedAtEpochMs, source.players, finished = source.players == 0)
         source.sweep = sweep
         sweepsStarted += name
+        // **Before the answer is built**, because that is where the real plugin
+        // settles: it waits out the sweep and then serialises the result. A sweep
+        // that finishes with players still on the source is only expressible here.
+        onSweepSettling()
         // **After the answer is built.** A hook that ran first would complete the
         // sweep this call is still describing, and the next poll would then start a
         // second one rather than joining the first — an artefact of the double, not
@@ -318,7 +340,12 @@ internal class FakeProxyPlugin(
     ): String =
         """{"destination":"${sweep.destination}","startedAtEpochMs":${sweep.startedAtEpochMs},""" +
             """"finishedAtEpochMs":${if (sweep.finished) sweep.startedAtEpochMs else null},""" +
-            """"requested":${sweep.requested},"moved":${sweep.requested - sweep.refused - remaining},""" +
+            // `requested - remaining`, never `requested - refused - remaining`. A
+            // refused player is still on the source, so they are already inside
+            // `remaining`; subtracting them again counts them twice and under-reports
+            // the move. The old form only agreed with this one when `remaining` was
+            // zero, which every sweep fixture here happened to make true.
+            """"requested":${sweep.requested},"moved":${sweep.requested - remaining},""" +
             """"alreadyThere":0,"refused":${sweep.refused},"failed":0,"inFlight":0,"remaining":$remaining}"""
 
     private fun ok(body: String) = EndpointResponse(200, body)

@@ -442,8 +442,12 @@ internal class ForcedSealTest {
             val node = harness.nodeOf(backend)
             node.online = 12
             harness.plugin.backend(name.value)?.players = 12
-            // Nine move, three refuse. The proxy settles the sweep either way.
-            harness.plugin.onTransfer = {
+            // Nine move, three refuse, and the sweep settles either way — so this
+            // goes through `onSweepSettling`, not `onTransfer`. The real plugin
+            // answers a transfer only once the sweep has settled, and the join rule
+            // it shares with the double will not report or rejoin a sweep finished
+            // after its answer was built.
+            harness.plugin.onSweepSettling = {
                 harness.plugin.backend(name.value)?.let { source ->
                     source.sweep?.let { sweep ->
                         sweep.refused = 3

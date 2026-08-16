@@ -39,6 +39,7 @@ import java.time.Instant
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.TimeSource
 import kotlin.time.toJavaDuration
 import kotlin.time.toKotlinDuration
 import java.time.Duration as JavaDuration
@@ -663,6 +664,23 @@ public class NodeForcedTermination(
      * `DrainRouter.transfer` is start-or-join, so re-asking is how progress is read
      * rather than a second sweep — the same call the drain makes once per pass, made
      * here on a timer because there is no next pass.
+     *
+     * **The loop is bounded twice: once by the injected clock, once by wall
+     * clock.** The clock bound is the real one — it produces the allowance this
+     * path advertises and the message an operator reads. The wall-clock bound
+     * only exists because the loop does not measure in the units it spends.
+     *
+     * It paces with [TRANSFER_POLL], which is real time, and decides it is done
+     * from `clock.instant()`, which is not. Production ties the two together by
+     * passing `Clock.systemUTC()`, and nothing else does. A clock that stops —
+     * every test in this module drives one deliberately, since `MutableClock` is
+     * how elapsed time is made cheap here — leaves a loop that spends real time
+     * forever and never reads any as having passed. That is not a slow test; it
+     * is a run with no end, and it cost twenty-six minutes of CI once already.
+     *
+     * So elapsed wall clock ends the loop on the same terms. Under a clock that
+     * advances, the clock bound is reached first and the backstop never fires;
+     * under one that does not, the loop still terminates, and says why.
      */
     private suspend fun sweep(
         name: ResourceName,
@@ -689,6 +707,9 @@ public class NodeForcedTermination(
                 PER_PLAYER_TRANSFER_ALLOWANCE * (settled ?: 0)
         val allowance = minOf(declared, SWEEP_SUPERSEDE_WINDOW)
         val deadline = clock.instant().plus(allowance.toJavaDuration())
+        // Monotonic, not the injected clock — the point of it is to hold when that
+        // clock does not, so reading the same source twice would defeat it.
+        val startedAt = TimeSource.Monotonic.markNow()
         var remaining: Int? = null
         var moved: Int? = null
         var polled = false
@@ -699,7 +720,20 @@ public class NodeForcedTermination(
             // connection for every player still there, immediately before this
             // returns for timeout. The first request is always made; only follow-ups
             // are gated.
-            if (polled && !clock.instant().isBefore(deadline)) {
+            val clockExpired = !clock.instant().isBefore(deadline)
+            if (polled && (clockExpired || startedAt.elapsedNow() >= allowance)) {
+                if (!clockExpired) {
+                    // Reached only under a clock that is not advancing. Worth its own
+                    // line: the allowance was spent, but not by the measure this path
+                    // reports, and an operator reading only the message below would
+                    // conclude the clock was fine.
+                    LOG.warn(
+                        "forced stop server={} spent its full allowance of {} in wall clock while its clock " +
+                            "reported no elapsed time; ending the sweep on elapsed wall clock instead",
+                        name.value,
+                        allowance,
+                    )
+                }
                 LOG.warn(
                     "forced stop server={} gave the transfer its full allowance of {} and {} player(s) are " +
                         "still on it; they will be disconnected",
