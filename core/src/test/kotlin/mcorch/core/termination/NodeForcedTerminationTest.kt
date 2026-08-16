@@ -545,6 +545,37 @@ internal class NodeForcedTerminationTest {
         }
 
     @Test
+    fun `a server that stops answering during the save is still forceable`() =
+        coreTest {
+            val node = FakeNode()
+            node.online = 5
+            running(node)
+            observed()
+            // A big world: answers a ping when idle, times out while `save-all flush`
+            // has the main thread. So the settled reading is 5 and the pre-stop one
+            // cannot answer at all.
+            node.onExec = { command ->
+                if (command.joinToString(" ").contains("save-all")) node.joinable = false
+                node.defaultExec(command)
+            }
+
+            val outcome = terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.Count(5))
+
+            // **The alternating lockout this closes.** The pre-stop reading used to
+            // fall through and demand `Unreadable`; `Unreadable` was then refused by
+            // the settled reading, which answers 5. Neither acknowledgement was
+            // sendable, every attempt cost a flush, and the definition was already
+            // tombstoned — `crictl` only, which is the state this endpoint exists to
+            // remove.
+            //
+            // An unanswered probe is not evidence that anybody arrived, and arrivals
+            // are the only thing this check is for. The operator authorised five.
+            node.stops shouldHaveSize 1
+            // And the record does not invent a number it never read.
+            outcome.playersOnline shouldBe null
+        }
+
+    @Test
     fun `an acknowledgement larger than the population is not a blank cheque`() =
         coreTest {
             val node = FakeNode()

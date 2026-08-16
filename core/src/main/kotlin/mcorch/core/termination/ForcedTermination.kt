@@ -1,8 +1,10 @@
 package mcorch.core.termination
 
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import mcorch.core.DestinationChoice
 import mcorch.core.Node
 import mcorch.core.NodeException
@@ -35,6 +37,8 @@ import java.time.Instant
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.toJavaDuration
+import kotlin.time.toKotlinDuration
+import java.time.Duration as JavaDuration
 
 /**
  * Stopping a server whose drain cannot finish.
@@ -672,10 +676,45 @@ public class NodeForcedTermination(
         val allowance = minOf(declared, SWEEP_SUPERSEDE_WINDOW)
         val deadline = clock.instant().plus(allowance.toJavaDuration())
         var remaining: Int? = null
+        var polled = false
         while (true) {
+            // **Before the call, not after.** The plugin joins a sweep only while it
+            // is *younger* than its supersede window, so a poll landing on the
+            // boundary starts a fresh one — re-notifying and re-requesting a
+            // connection for every player still there, immediately before this
+            // returns for timeout. The first request is always made; only follow-ups
+            // are gated.
+            if (polled && !clock.instant().isBefore(deadline)) {
+                LOG.warn(
+                    "forced stop server={} gave the transfer its full allowance of {} and {} player(s) are " +
+                        "still on it; they will be disconnected",
+                    name.value,
+                    allowance,
+                    remaining ?: "an unknown number of",
+                )
+                return TransferAttempt(attempted = true, remaining = remaining)
+            }
+            polled = true
+            // **Bounded by the transfer allowance, not by the channel's own
+            // timeout.** `ControlChannel` is built from the *proxy's*
+            // `spec.backends.drain.sealTimeout`, which is an independent field and
+            // reaches an hour. A proxy that stops answering after the seal landed
+            // would otherwise park this call — and with it the whole request, the
+            // save and the stop — far past the allowance this loop advertises.
+            //
+            // The remaining allowance rather than the whole of it, so the bound
+            // holds across polls rather than resetting on each one.
             val report =
                 try {
-                    router.transfer(destination)
+                    withTimeout(remainingAllowance(deadline)) { router.transfer(destination) }
+                } catch (timedOut: TimeoutCancellationException) {
+                    LOG.warn(
+                        "forced stop server={} gave up on its proxy after {}; whoever is left will be " +
+                            "disconnected",
+                        name.value,
+                        allowance,
+                    )
+                    return TransferAttempt(attempted = true, remaining = remaining)
                 } catch (failure: NodeException) {
                     LOG.warn("forced stop server={} lost its proxy mid-transfer", name.value, failure)
                     return TransferAttempt(attempted = true, remaining = remaining)
@@ -684,11 +723,27 @@ public class NodeForcedTermination(
                 is TransferReport.Sweeping -> {
                     remaining = report.remaining
                     if (report.finished || report.remaining == 0) {
-                        LOG.info(
-                            "forced stop server={} transferred its players to {} before stopping",
-                            name.value,
-                            destination,
-                        )
+                        // `finished` means the proxy settled every request, not that
+                        // every request succeeded — a refused or failed transfer
+                        // leaves `remaining` positive on a finished sweep. Reporting
+                        // that as an evacuation would describe a stop that
+                        // disconnected people as one that saved them.
+                        if (report.remaining > 0) {
+                            LOG.warn(
+                                "forced stop server={} finished its sweep to {} with {} player(s) still on it " +
+                                    "({} could not be moved); they will be disconnected",
+                                name.value,
+                                destination,
+                                report.remaining,
+                                report.unmoved,
+                            )
+                        } else {
+                            LOG.info(
+                                "forced stop server={} transferred its players to {} before stopping",
+                                name.value,
+                                destination,
+                            )
+                        }
                         return TransferAttempt(attempted = true, remaining = report.remaining)
                     }
                 }
@@ -999,19 +1054,21 @@ public class NodeForcedTermination(
         // in exactly the case it is needed.
         if (seal == SealResult.ASSERTED && !transferred.attempted) return previous
         val reading = occupancy(agent, node, observation)
-        if (transferred.attempted) {
-            refuseArrivals(name, previous, reading, acknowledgement)
-        } else {
-            // **Exact when nothing reduced the count**, which is `main`'s rule and
-            // the one five rounds of audit built. `refuseArrivals` permits a
-            // decrease, and the justification for permitting one is that a transfer
-            // caused it. With no transfer there is nothing to attribute a fall to,
-            // and "at most" would mask arrivals exactly as it did when the sweep sat
-            // above the refusal: ten log off, five log in, the number is lower, and
-            // five sessions nobody acknowledged are dropped.
-            refuseOccupancy(name, reading, acknowledgement)
-        }
+        refuseArrivals(name, previous, reading, acknowledgement, transferred.attempted)
         return reading
+    }
+
+    /**
+     * What is left of the sweep's allowance, never zero or negative.
+     *
+     * `withTimeout` treats a non-positive value as already expired, which would turn
+     * the first call of a sweep whose deadline has just passed into a cancellation
+     * rather than a request. A floor of one poll keeps the call meaningful; the loop
+     * above is what decides not to make another.
+     */
+    private fun remainingAllowance(deadline: Instant): Duration {
+        val left = JavaDuration.between(clock.instant(), deadline).toKotlinDuration()
+        return if (left > TRANSFER_POLL) left else TRANSFER_POLL
     }
 
     /**
@@ -1036,8 +1093,43 @@ public class NodeForcedTermination(
         settled: Int?,
         reading: Int?,
         acknowledgement: OccupancyAcknowledgement,
+        transferred: Boolean,
     ) {
-        if (reading == null || settled == null) {
+        if (settled == null) {
+            refuseOccupancy(name, reading, acknowledgement)
+            return
+        }
+        // **A later reading that cannot answer is not evidence of arrival**, and
+        // refusing on it produced a server nothing could retire.
+        //
+        // The alternating lockout: a big world answers SLP when idle and times out
+        // during `save-all flush`, so the settled reading is `n` and the pre-stop one
+        // is null. Falling through refused `Count(n)` and asked for `Unreadable` —
+        // and `Unreadable` was then refused by the *settled* reading, which answers
+        // `n`. Neither acknowledgement was sendable, each attempt cost a flush, and
+        // the definition was already tombstoned. Erring safe **and** unrecoverable is
+        // the shape this file has been bitten by three times.
+        //
+        // Proceeding is what the operator already authorised: they acknowledged `n`,
+        // this check exists to catch a *rise* above it, and an unanswered probe is
+        // not one. The count carried into the record stays null, so nothing claims
+        // to know what it does not.
+        if (reading == null) {
+            LOG.warn(
+                "server={} did not answer a player count before its forced stop; proceeding on the {} " +
+                    "acknowledged earlier",
+                name.value,
+                settled,
+            )
+            return
+        }
+        // **Exact unless a transfer explains the fall.** `main`'s rule, and the one
+        // five rounds of audit built: with nothing to attribute a decrease to, "at
+        // most" masks arrivals — ten log off, five log in, the number is lower, and
+        // five sessions nobody acknowledged go with the stop. A sweep is the one
+        // thing that can account for the difference, so it is the one thing that
+        // buys the permission.
+        if (!transferred && reading != settled) {
             refuseOccupancy(name, reading, acknowledgement)
             return
         }
