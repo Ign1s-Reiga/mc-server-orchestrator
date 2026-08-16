@@ -61,12 +61,21 @@ fi
 # ─── install ─────────────────────────────────────────────────────────────────
 
 TMP_DIR=""
-cleanup() { [ -n "${TMP_DIR}" ] && rm -rf "${TMP_DIR}"; }
+# `if`, not `[ … ] && …`. An `&&` list whose test fails returns 1, that 1 is the
+# function's return value, and a non-zero command in an EXIT trap under `set -e`
+# becomes the script's exit status — overriding even an explicit `exit 0`. This
+# script reported success and exited 1 for every run that reached the end.
+cleanup() {
+    if [ -n "${TMP_DIR}" ]; then rm -rf "${TMP_DIR}"; fi
+}
 trap cleanup EXIT
 
-tmpdir() {
+# Sets [TMP_DIR]; it does not print it. Deliberately not a function you read with
+# `$(…)`: command substitution runs in a subshell, so the assignment would be
+# discarded, every caller would get a directory of its own, and the trap above
+# would find nothing to remove — one leaked directory per download, every run.
+ensure_tmpdir() {
     [ -n "${TMP_DIR}" ] || TMP_DIR="$(mktemp -d)"
-    echo "${TMP_DIR}"
 }
 
 # Download and verify against a pinned checksum. A mismatch aborts — we are
@@ -108,7 +117,7 @@ need_install() {
 }
 
 install_containerd() {
-    local t; t="$(tmpdir)"
+    ensure_tmpdir; local t="${TMP_DIR}"
     fetch_verified \
         "https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz" \
         "${CONTAINERD_SHA256}" "${t}/containerd.tgz"
@@ -118,7 +127,7 @@ install_containerd() {
 }
 
 install_runc() {
-    local t; t="$(tmpdir)"
+    ensure_tmpdir; local t="${TMP_DIR}"
     fetch_verified \
         "https://github.com/opencontainers/runc/releases/download/v${RUNC_VERSION}/runc.amd64" \
         "${RUNC_SHA256}" "${t}/runc"
@@ -129,7 +138,7 @@ install_runc() {
 }
 
 install_cni_plugins() {
-    local t; t="$(tmpdir)"
+    ensure_tmpdir; local t="${TMP_DIR}"
     fetch_verified \
         "https://github.com/containernetworking/plugins/releases/download/v${CNI_PLUGINS_VERSION}/cni-plugins-linux-amd64-v${CNI_PLUGINS_VERSION}.tgz" \
         "${CNI_PLUGINS_SHA256}" "${t}/cni.tgz"
@@ -140,7 +149,7 @@ install_cni_plugins() {
 }
 
 install_crictl() {
-    local t; t="$(tmpdir)"
+    ensure_tmpdir; local t="${TMP_DIR}"
     fetch_verified \
         "https://github.com/kubernetes-sigs/cri-tools/releases/download/v${CRICTL_VERSION}/crictl-v${CRICTL_VERSION}-linux-amd64.tar.gz" \
         "${CRICTL_SHA256}" "${t}/crictl.tgz"
