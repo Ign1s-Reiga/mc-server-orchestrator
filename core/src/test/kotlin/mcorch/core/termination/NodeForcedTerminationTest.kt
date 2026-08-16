@@ -567,7 +567,7 @@ internal class NodeForcedTerminationTest {
         }
 
     @Test
-    fun `a count that fell since the acknowledgement does not refuse the stop`() =
+    fun `a count that fell with no transfer to explain it still refuses`() =
         coreTest {
             val node = FakeNode()
             node.online = 6
@@ -580,14 +580,19 @@ internal class NodeForcedTerminationTest {
                 node.defaultExec(command)
             }
 
-            val outcome = terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.Count(6))
-
-            // A decrease is what a transfer or a logout looks like, and refusing over
-            // it would make every partial sweep a 409. Only a *rise* is the hazard
-            // the compare-and-swap was built for — and that is a separate question
-            // from the acknowledgement, which is why it is asked separately.
-            node.stops shouldHaveSize 1
-            outcome.playersOnline shouldBe 4
+            // **A fall is only forgiven when something can be shown to have caused
+            // it.** This server is standalone, so no sweep ran and nothing here
+            // reduced the count — the four are simply a different four from the six,
+            // and "at most six" would let two arrivals through behind ten logouts.
+            //
+            // The permission to accept a decrease lives with the transfer that earns
+            // it. Without one, this is `main`'s exact rule and stays that way; the
+            // first version of this test asserted the opposite and was pinning a
+            // weakening, on a path where no transfer is even reachable.
+            shouldThrow<ForcedTerminationRefused> {
+                terminationOver(node).stop(paperDefinition(), OccupancyAcknowledgement.Count(6))
+            }.message.toString() shouldContain "4 player"
+            node.stops shouldHaveSize 0
         }
 
     @Test

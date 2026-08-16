@@ -399,6 +399,40 @@ internal class ForcedSealTest {
         }
 
     @Test
+    fun `a transfer that empties the server is not then refused over the count it changed`() =
+        coreTest {
+            val destination = backendDefinition("survival-02", hostPort = 30002)
+            val harness = ProxyHarness(backends = listOf(backend, destination))
+            harness.bringUp()
+            val name = backend.metadata.name
+            val node = harness.nodeOf(backend)
+            node.online = 5
+            harness.plugin.backend(name.value)?.players = 5
+            harness.plugin.onTransfer = { harness.plugin.completeSweep(name.value) }
+            // The server empties as the sweep lands, which the pre-stop probe sees.
+            node.onExec = { command ->
+                if (command.joinToString(" ").contains("mc-monitor")) {
+                    node.online = if (harness.plugin.backend(name.value)?.players == 0) 0 else 5
+                }
+                node.defaultExec(command)
+            }
+
+            val outcome = terminationOver(harness).stop(backend, OccupancyAcknowledgement.Count(5))
+
+            // **This is where a decrease is forgiven, and the only place it is.**
+            // The acknowledgement was settled against five before the sweep; the
+            // sweep then moved them, so refusing over the zero it produced would
+            // make every successful transfer a 409.
+            //
+            // `refuseArrivals` is reached only because a transfer was attempted. On
+            // a path with no sweep the exact rule stands, so the permission cannot
+            // drift onto a reading nothing reduced.
+            node.stops shouldHaveSize 1
+            outcome.transfer.attempted shouldBe true
+            outcome.playersOnline shouldBe 0
+        }
+
+    @Test
     fun `a fleet with nowhere to put them still stops the server`() =
         coreTest {
             // One backend, so the only candidate is the server being drained.

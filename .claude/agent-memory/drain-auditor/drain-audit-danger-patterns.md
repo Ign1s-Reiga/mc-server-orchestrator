@@ -2875,3 +2875,67 @@ Related: [[standalone-paper-drain-shape]]
      `finished = true` even when `remaining > 0`. The drain's own log quotes both.
      Item 237: check which of a value's homes survive the event it describes, and
      item 27: read what the message asserts against the branch that reached it.
+
+## Round 57: the fix that moved the weakening instead of removing it
+
+247. **Two mechanisms introduced by one change can be mutually exclusive, and then
+     each one's justification describes the other's path.** The forced path's sweep
+     runs only when `sealOff` returned `ASSERTED` (that is the only way a router is
+     carried); `readingBeforeStop` returns early on `ASSERTED`, so `refuseArrivals`
+     runs only when it is *not*. A sweep therefore never happens on any path the
+     arrivals check can see, and the arrivals check never protects a transferred
+     population — while its KDoc opens *"after a sweep the two cannot be the same
+     number, because moving players is the point"*. Worse, the permission it grants
+     (a decrease passes) was justified by the sweep and lands on the standalone
+     path, where nothing can have caused the decrease: churn — ten leave, five
+     arrive — reads as a decrease and stops the server over five unacknowledged
+     sessions that `main`'s exact re-check refused. When a change adds a relaxation
+     *and* a compensating check, compute the intersection of the conditions under
+     which each runs; if it is empty, the relaxation is unpaid for and the check is
+     decoration.
+248. **Excusing a decrease requires knowing what caused it, and two scalars cannot
+     say.** The right shape is not "the count fell, so it is fine" but "the count
+     fell by no more than what this request removed" — gate the permissive branch on
+     the side effect having actually run (`TransferAttempt.attempted`), so that a
+     path where nothing could have reduced it keeps the exact match. A monotone
+     comparison between two readings of an unsealed population is indistinguishable
+     from a full turnover.
+249. **A re-asked guard is only as good as the side effect it is placed above, and
+     the second one is usually the dangerous one.** Re-asking
+     `refuseSecondSideEffect` above `requestSave` catches a stop dispatched before
+     the save starts. The loop's concurrent drain reaches `STOPPING` three to six
+     passes after the server empties, while the force is one poll behind and then
+     inside a `saveTimeout` that, for this population, runs to the full 180 s — so
+     the loop's stop reliably lands *during* the force's save, on the far side of
+     the guard. A guard against "somebody else already stopped this" belongs
+     immediately above `stopWorkload`, where the field it reads has had the save's
+     whole duration to appear. Placing it above the earlier side effect reads as
+     defence in depth and is close to inert for the ordering that actually occurs.
+250. **A comment block left at the old location asserts the reversed rule as
+     current.** When a call moves, the paragraph that justified its old position
+     stays where it was and the new paragraph is written at the new one — so
+     `stop()` now carries *"Before the probe rather than after … should not then be
+     refused over the three that remain"* twenty lines above *"below the refusal
+     rather than above it"*, both in the present tense, both about the same call.
+     Whoever reads the function top-to-bottom meets the retired rationale first.
+     After any reordering, grep the moved symbol's old neighbourhood, not just its
+     new one.
+251. **Moving the reading earlier fixes the gate and breaks the record.** With the
+     sweep below the deciding probe, `atStop` on a sealed server is now the
+     *pre-sweep* count, so `ForcedStopOutcome.playersOnline` and the route's audit
+     line report twelve dropped for a stop that dropped three — and the field's own
+     KDoc still justifies the staleness with *"under the seal the number can only
+     fall"*, which now over-states by the entire rescued population rather than by
+     decay. The feature's benefit is invisible in the one number an investigator
+     reads. A gate and an audit record want readings from different instants; when
+     one moves, check the other did not inherit it.
+252. **A `null` fall-through can be the safe direction for a gate and the
+     unrecoverable one for an escape hatch.** `refuseArrivals`'s
+     `settled == null || reading == null -> refuseOccupancy(...)` is not round 52's
+     `null == 0` bypass — nothing reads null as zero — but it inherits a two-sided
+     lockout that predates it: a server whose SLP answers when idle and times out
+     during `save-all flush` refuses `Count(n)` at the pre-stop reading (null) and
+     refuses `Unreadable` at the pre-sweep reading (answers n), so neither
+     acknowledgement can be sent, each attempt costs a flush, and the definition is
+     already tombstoned. Verify which side of an escape hatch a `null` falls to, and
+     then check that *some* acknowledgement value is still reachable.

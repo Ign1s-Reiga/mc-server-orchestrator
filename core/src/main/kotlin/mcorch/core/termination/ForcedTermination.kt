@@ -360,25 +360,6 @@ public class NodeForcedTermination(
         val sealed = sealOff(name)
         val seal = sealed.result
 
-        // **Drain step 4, attempted once and never waited out.**
-        //
-        // The drain moves players and *blocks* until the server is empty; this
-        // cannot, because the caller is holding an HTTP request open and the whole
-        // point of the endpoint is that it finishes. So it asks the proxy to sweep,
-        // gives the sweep the definition's own transfer allowance to get somewhere,
-        // and then proceeds with whoever is left — `spec/termination`'s "attempt,
-        // then proceed".
-        //
-        // Before the probe rather than after, so the count the acknowledgement is
-        // checked against is the one that survives the attempt. An operator who
-        // acknowledged twelve and gets nine moved should not then be refused over
-        // the three that remain.
-        //
-        // Only under an asserted seal. Sweeping players off a server that is still
-        // admitting means racing logins the sweep cannot see the end of, which is
-        // why the drain never reaches step 4 from a state that has not held the
-        // door shut.
-
         // Read under the seal, and refused before the save rather than after it, so
         // a mismatch costs the caller neither a flush nor a save timeout.
         val players = occupancy(agent, node, observation)
@@ -397,7 +378,7 @@ public class NodeForcedTermination(
         // straight from the drain: a transferred player's playerdata is written by
         // *this* server as they quit, so sweeping first and flushing second is the
         // only order in which the flush covers them.
-        val transferred = transferPlayers(name, definition, sealed.router)
+        val transferred = transferPlayers(name, definition, agent, node, observation, sealed.router)
 
         // **The save is always requested, and the skip that used to sit here is
         // gone.**
@@ -433,12 +414,13 @@ public class NodeForcedTermination(
         // seal → destination → transfer → requireEmpty → save → deregister → stop,
         // and this path is still inside one probe plus a whole save timeout.
         //
-        // Without this the two paths flush the same world concurrently, the loop
-        // stops the container properly, and then this one sends another
-        // `save-all flush` into a process already running its shutdown save and
-        // re-issues the stop on top — verbatim what `stopIsInFlight` exists to
-        // prevent, with a `SIGKILL` at the end of the grace period landing on a
-        // region write.
+        // What this catches is the **stop**, not the flush: it reads
+        // `stopLastDispatchedAt`, and deliberately not `saveRequestedAt`, which
+        // round 53 removed for a reason that still holds. Two concurrent flushes
+        // serialise on Paper's main thread and both complete; what must not happen
+        // is this path re-issuing a stop on a container the loop has already stopped
+        // properly, restarting a grace clock around a shutdown that is already
+        // running.
         //
         // Safe below the tombstone: the remedy is to wait out the grace window and
         // re-send, which the caller can do, so it is not the kind of refusal that
@@ -453,7 +435,8 @@ public class NodeForcedTermination(
         // save timeout old. Under an asserted seal the count cannot rise and the
         // earlier reading stands; without one it is read again and refused if it has
         // moved.
-        val atStop = readingBeforeStop(name, agent, node, observation, seal, players, acknowledgement)
+        val atStop =
+            readingBeforeStop(name, agent, node, observation, seal, players, acknowledgement, transferred)
 
         val declared = definition.spec.lifecycle.stopGracePeriod
         // Raised, never lowered, and never a refusal. When no save request was
@@ -489,6 +472,13 @@ public class NodeForcedTermination(
         // record costs a player's session and no later pass repairs it. Under
         // `NonCancellable` for the same asymmetry — a shutdown landing between the
         // write and the stop must not be able to drop it.
+        // Asked again, because the one above the save could only ever catch a stop
+        // dispatched *before* it. The loop's own drain needs a handful of
+        // `stepInterval` passes to reach its stop, and this path has just spent a
+        // whole save timeout — so the dispatch it has to notice reliably lands in
+        // that interval, not before it. This is the reading that has had time to
+        // appear.
+        refuseSecondSideEffect(name)
         recordStopDispatched(name)
         try {
             node.stopWorkload(observation.handle, grace)
@@ -608,6 +598,9 @@ public class NodeForcedTermination(
     private suspend fun transferPlayers(
         name: ResourceName,
         definition: PaperServerDefinition,
+        agent: PaperServerAgent,
+        node: Node,
+        observation: WorkloadObservation.Present,
         router: mcorch.core.DrainRouter?,
     ): TransferAttempt {
         if (router == null) return TransferAttempt(attempted = false)
@@ -641,7 +634,7 @@ public class NodeForcedTermination(
                 LOG.warn("forced stop server={} could not reach its proxy to transfer players", name.value, failure)
                 return TransferAttempt(attempted = false)
             }
-        return sweep(name, definition, router, destination)
+        return sweep(name, definition, agent, node, observation, router, destination)
     }
 
     /**
@@ -654,10 +647,29 @@ public class NodeForcedTermination(
     private suspend fun sweep(
         name: ResourceName,
         definition: PaperServerDefinition,
+        agent: PaperServerAgent,
+        node: Node,
+        observation: WorkloadObservation.Present,
         router: mcorch.core.DrainRouter,
         destination: ResourceName,
     ): TransferAttempt {
-        val allowance = definition.spec.lifecycle.drain.playerTransferTimeout
+        // The drain's own derivation, not the bare field: `awaitEvacuated` uses
+        // `playerTransferTimeout + PER_PLAYER_TRANSFER_ALLOWANCE * online`, and its
+        // KDoc says the fixed value "always fails on a full server". Using the bare
+        // one here would time out earliest on precisely the servers where the most
+        // sessions are at stake.
+        //
+        // Clamped by the proxy's supersede window as well. `transfer` is
+        // start-or-join only while the sweep is younger than
+        // `ControlProtocol.SWEEP_MAX_AGE_MS`; past that the plugin starts a fresh
+        // one, re-notifying and re-requesting a connection for every player still
+        // there. Polling beyond that would turn "reading progress" into pestering
+        // them once per cadence — and `playerTransferTimeout` reaches an hour, while
+        // `SpecBounds` deliberately does not bound it.
+        val declared =
+            definition.spec.lifecycle.drain.playerTransferTimeout +
+                PER_PLAYER_TRANSFER_ALLOWANCE * (occupancy(agent, node, observation) ?: 0)
+        val allowance = minOf(declared, SWEEP_SUPERSEDE_WINDOW)
         val deadline = clock.instant().plus(allowance.toJavaDuration())
         var remaining: Int? = null
         while (true) {
@@ -975,10 +987,30 @@ public class NodeForcedTermination(
         seal: SealResult,
         previous: Int?,
         acknowledgement: OccupancyAcknowledgement,
+        transferred: TransferAttempt,
     ): Int? {
-        if (seal == SealResult.ASSERTED) return previous
+        // **A sweep is a reason to re-probe, not a reason to skip.**
+        //
+        // The seal means the count cannot *rise*, which is why an asserted seal
+        // otherwise lets the earlier reading stand rather than spending a probe
+        // timeout against a wedged server. A sweep makes it fall, and by the whole
+        // rescued population — so the number left over is one this path has to go
+        // and read. The proxy has just answered a sweep, so a probe here is cheap
+        // in exactly the case it is needed.
+        if (seal == SealResult.ASSERTED && !transferred.attempted) return previous
         val reading = occupancy(agent, node, observation)
-        refuseArrivals(name, previous, reading, acknowledgement)
+        if (transferred.attempted) {
+            refuseArrivals(name, previous, reading, acknowledgement)
+        } else {
+            // **Exact when nothing reduced the count**, which is `main`'s rule and
+            // the one five rounds of audit built. `refuseArrivals` permits a
+            // decrease, and the justification for permitting one is that a transfer
+            // caused it. With no transfer there is nothing to attribute a fall to,
+            // and "at most" would mask arrivals exactly as it did when the sweep sat
+            // above the refusal: ten log off, five log in, the number is lower, and
+            // five sessions nobody acknowledged are dropped.
+            refuseOccupancy(name, reading, acknowledgement)
+        }
         return reading
     }
 
@@ -1202,6 +1234,17 @@ public class NodeForcedTermination(
          * paid for in wall clock, long enough not to spend the allowance on RPCs.
          */
         private val TRANSFER_POLL: Duration = 2.seconds
+
+        /** The drain's per-player extension, from `DrainController`'s own derivation. */
+        private val PER_PLAYER_TRANSFER_ALLOWANCE: Duration = 2.seconds
+
+        /**
+         * How long the proxy keeps a sweep joinable, from
+         * `ControlProtocol.SWEEP_MAX_AGE_MS`. Named here rather than imported
+         * because `:core` may not depend on the plugin's constants for a timing
+         * bound — see the module note in CLAUDE.md.
+         */
+        private val SWEEP_SUPERSEDE_WINDOW: Duration = 180.seconds
 
         private val LOG = LoggerFactory.getLogger(NodeForcedTermination::class.java)
     }
