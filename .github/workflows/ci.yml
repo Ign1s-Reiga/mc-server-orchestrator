@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  # What you asked for: this fires on the merge commit a PR produces on main,
+  # and on any direct push to main.
+  push:
+    branches: [main]
+  # The gate. Without this, a red build is only discovered after it is already
+  # on main. Delete this block to run on merge only.
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Superseded PR runs are wasted work; runs on main are the record and finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build and unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # jvmToolchain(25) in mcorch.kotlin-conventions. The foojay resolver would
+      # download a JDK itself, but a cached runner JDK is faster and makes the
+      # version the build compiles against explicit rather than resolved.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # `build` -> `check` -> spotlessCheck, the unit tests of every module, and
+      # compileIntegrationTestKotlin. Note spotless*Check*: CI must not reformat.
+      - name: Build, verify formatting, run unit tests
+        run: ./gradlew build --stacktrace
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports
+          path: '**/build/reports/tests/**'
+          retention-days: 7
+
+  integration:
+    name: Integration tests (real containerd)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # This project's own containerd, pinned to 2.3.3 and namespaced under
+      # mcorch-dev. It touches neither the runner's containerd nor its Docker.
+      # --no-systemd takes the direct-daemon path, which needs no unit installed.
+      - name: Start the mcorch-dev containerd
+        run: ./scripts/dev/containerd-up.sh --no-systemd
+
+      - name: Integration tests
+        env:
+          MCORCH_CRI_ENDPOINT: unix:///run/mcorch-dev/containerd.sock
+        run: ./gradlew :cri:integrationTest :app:integrationTest --stacktrace
+
+      # The daemon log is the only account of what the runtime did, and it lives
+      # in a root-owned directory, so it is copied out before the upload step.
+      - name: Collect the containerd log
+        if: always()
+        run: |
+          mkdir -p build/ci-logs
+          sudo cp /run/mcorch-dev/containerd.log build/ci-logs/ 2>/dev/null || true
+          sudo chown "$(id -u):$(id -g)" build/ci-logs/containerd.log 2>/dev/null || true
+
+      - name: Stop the mcorch-dev containerd
+        if: always()
+        run: ./scripts/dev/containerd-down.sh
+
+      - name: Upload test reports and containerd log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-reports
+          path: |
+            **/build/reports/tests/**
+            build/ci-logs/**
+          retention-days: 7
